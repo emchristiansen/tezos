@@ -167,8 +167,6 @@ module MakeIterator (H : sig
 
   val hash : t -> int
 
-  (* [seeded_hash] is a seeded alternative to [hash] meant to be used to create
-     seeded hashtables. Check {!Stdlib.Hashtbl.MakeSeeded} for details. *)
   val seeded_hash : int -> t -> int
 end) =
 struct

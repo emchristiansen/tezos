@@ -229,8 +229,6 @@ let mtime_clock_os = external_sublib mtime "mtime.clock.os"
 
 let ocaml_migrate_parsetree = external_lib "ocaml-migrate-parsetree" V.True
 
-let ocamlformat = opam_only "ocamlformat" V.(exactly "0.21.0")
-
 let ocamlgraph = external_lib "ocamlgraph" V.True
 
 let ocplib_endian = external_lib ~js_compatible:true "ocplib-endian" V.True
@@ -1417,9 +1415,6 @@ let _octez_tooling =
     ~opam_only_deps:
       [
         bisect_ppx;
-        (* These next are only used in the CI, we add this dependency so that
-           it is added to tezos/opam-repository. *)
-        ocamlformat;
         ometrics;
       ]
 
@@ -1986,7 +1981,7 @@ protocols.|}
     ~ocaml:
       V.(
         (* Should be in sync with scripts/version.sh *)
-        at_least "4.14.0" && less_than "4.15")
+        at_least "5.0" && less_than "5.1")
     ~deps:
       [
         zarith;

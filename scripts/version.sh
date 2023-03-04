@@ -13,7 +13,7 @@
 ## This script is also sourced in the Makefile, as such it should be compatible
 ## with both the make and sh syntax
 
-export ocaml_version=4.14.1
+export ocaml_version=5.0.0
 export opam_version=2
 export recommended_rust_version=1.60.0
 export recommended_node_version=16.18.1

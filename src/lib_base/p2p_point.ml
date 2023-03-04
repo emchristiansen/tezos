@@ -122,6 +122,13 @@ module Id = struct
       ()
 
   let hash = Hashtbl.hash
+
+  (* See [src/lib_base/tzPervasives.ml] for an explanation *)
+  [@@@ocaml.warning "-32"]
+
+  let seeded_hash = Hashtbl.seeded_hash
+
+  [@@@ocaml.warning "+32"]
 end
 
 module Map = Map.Make (Id)
