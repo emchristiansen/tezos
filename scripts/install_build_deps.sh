@@ -102,7 +102,7 @@ if [ -n "$dev" ]; then
     # enough (for [ppx_yojson_conv_lib] in particular), so we add a
     # minimal bound to ensure it won’t be picked by opam.
     # utop is constrained to avoid reinstalling in all the times.
-    opam install --yes opam/virtual/octez-deps.opam opam/virtual/octez-dev-deps.opam --deps-only --criteria="-changed,-removed"
+    opam install --yes opam/virtual/octez-deps.opam opam/virtual/octez-dev-deps.opam --deps-only
 fi
 
 "$script_dir"/install_sapling_parameters.sh
