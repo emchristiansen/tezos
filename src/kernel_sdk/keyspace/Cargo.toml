@@ -1,0 +1,47 @@
+# SPDX-FileCopyrightText: 2025 Nomadic Labs <contact@nomadic-labs.com>
+#
+# SPDX-License-Identifier: MIT
+
+[package]
+name = "tezos-smart-rollup-keyspace"
+version = "0.0.0"
+edition = "2021"
+license = "MIT"
+publish = false
+
+[features]
+default = ["irmin-compat"]
+irmin-compat = []
+rlp = ["dep:rlp"]
+tezos-encoding = ["dep:tezos_data_encoding"]
+
+[dependencies]
+hex-literal.workspace = true
+num-traits.workspace = true
+thiserror.workspace = true
+
+[dependencies.rlp]
+workspace = true
+optional = true
+
+[dependencies.tezos_data_encoding]
+workspace = true
+optional = true
+
+[dependencies.tezos-smart-rollup-constants]
+path = "../constants"
+default-features = false
+
+[dependencies.tezos-smart-rollup-core]
+path = "../core"
+default-features = false
+
+[dependencies.tezos-smart-rollup-host]
+path = "../host"
+default-features = false
+
+[build-dependencies.tezos-smart-rollup-build-utils]
+path = "../build-utils"
+
+[dev-dependencies.tezos-smart-rollup-mock]
+path = "../mock"

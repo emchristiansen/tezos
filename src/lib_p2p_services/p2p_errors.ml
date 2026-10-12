@@ -71,8 +71,6 @@ type error +=
 
 type error += Rejected_no_common_protocol of {announced : Network_version.t}
 
-type error += Decoding_error of Data_encoding.Binary.read_error
-
 type error += Myself of P2p_connection.Id.t
 
 type error += Not_enough_proof_of_work of P2p_peer.Id.t
@@ -172,21 +170,6 @@ let () =
     (function
       | Rejected_no_common_protocol {announced} -> Some announced | _ -> None)
     (fun announced -> Rejected_no_common_protocol {announced}) ;
-  (* Decoding error *)
-  register_error_kind
-    `Permanent
-    ~id:"node.p2p_socket.decoding_error"
-    ~title:"Decoding error"
-    ~description:"An error occurred while decoding."
-    ~pp:(fun ppf re ->
-      Format.fprintf
-        ppf
-        "An error occurred while decoding: %a."
-        Data_encoding.Binary.pp_read_error
-        re)
-    Data_encoding.(obj1 @@ req "read_error" Binary.read_error_encoding)
-    (function Decoding_error re -> Some re | _ -> None)
-    (fun re -> Decoding_error re) ;
   (* Myself *)
   register_error_kind
     `Permanent
@@ -248,13 +231,34 @@ let () =
       | _ -> None)
     (fun (value, min, max) -> Invalid_chunks_size {value; min; max})
 
+(***************************** p2p conn ***********************************)
+
+type error += Peer_discovery_disabled
+
+let () =
+  (* Peer discovery disabled *)
+  register_error_kind
+    `Permanent
+    ~id:"node.p2p_conn.peer_discovery_disabled"
+    ~title:"Peer discovery disabled"
+    ~description:
+      "The peer discovery is disabled, sending advertise messages is forbidden."
+    ~pp:(fun ppf () ->
+      Format.fprintf
+        ppf
+        "The peer discovery is disabled, sending advertise messages is \
+         forbidden.")
+    Data_encoding.empty
+    (function Peer_discovery_disabled -> Some () | _ -> None)
+    (fun () -> Peer_discovery_disabled)
+
 (***************************** p2p pool ***********************************)
 
 type error += Pending_connection
 
 type error += Connected
 
-type error += Connection_refused
+type error += Connection_failed
 
 type error += Rejected of {peer : P2p_peer.Id.t; motive : P2p_rejection.t}
 
@@ -303,16 +307,17 @@ let () =
     Data_encoding.empty
     (function Connected -> Some () | _ -> None)
     (fun () -> Connected) ;
-  (* Connected refused *)
+  (* Connected failed *)
   register_error_kind
     `Permanent
-    ~id:"node.p2p_pool.connection_refused"
-    ~title:"Connection refused"
-    ~description:"Connection was refused."
-    ~pp:(fun ppf () -> Format.fprintf ppf "Connection was refused.")
+    ~id:"node.p2p_pool.connection_failed"
+    ~title:"TCP connection failed"
+    ~description:"TCP connection failed (refused or no route to host)."
+    ~pp:(fun ppf () ->
+      Format.fprintf ppf "TCP connection failed (refused or no route to host).")
     Data_encoding.empty
-    (function Connection_refused -> Some () | _ -> None)
-    (fun () -> Connection_refused) ;
+    (function Connection_failed -> Some () | _ -> None)
+    (fun () -> Connection_failed) ;
   (* Rejected *)
   register_error_kind
     `Permanent

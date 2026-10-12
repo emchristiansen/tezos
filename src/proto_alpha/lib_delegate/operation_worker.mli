@@ -23,8 +23,14 @@
 (*                                                                           *)
 (*****************************************************************************)
 
-(** Launch processes to gather operations from the mempool and make them
-    available for the baker. *)
+(** The operation worker is responsible for listening to the node's mempool
+    and collecting incoming operations in an accessible operation pool. Upon
+    request, it can monitor the (pre)quorum status for a given payload and
+    report its completion through the provided quorum stream.
+
+    Only one payload quorum or prequorum can be monitored at a time; new
+    monitoring requests override the previous one.
+*)
 
 open Protocol
 open Alpha_context
@@ -35,26 +41,36 @@ type t
 
 type candidate = {
   hash : Block_hash.t;
+  level_watched : Int32.t;
   round_watched : Round.t;
   payload_hash_watched : Block_payload_hash.t;
+  branch_watched : Block_hash.t option;
 }
 
 val candidate_encoding : candidate Data_encoding.t
 
 type event =
-  | Prequorum_reached of candidate * Kind.preendorsement operation list
-  | Quorum_reached of candidate * Kind.endorsement operation list
+  | Prequorum_reached of candidate * Kind.preattestation operation list
+  | Quorum_reached of candidate * Kind.attestation operation list
+  | Shutdown
 
 (** {1 Constructors}*)
 
-(** [create ?monitor_node_operations cctxt] creates a monitoring process to
-   fetch operations for the baker to process.
+(** [run ?monitor_node_operations ~multi_node ~round_durations cctxt]
+    spawns an operation worker.
 
     @param monitor_node_operations monitor operations on the node (defaults:
    [true]).  Set [monitor_node_operations] to [false] to only consider
-   externally provided (non-node) operations.  *)
-val create :
-  ?monitor_node_operations:bool -> #Protocol_client_context.full -> t Lwt.t
+   externally provided (non-node) operations.
+    @param multi_node if [true], the worker will gracefully shutdown on
+   fatal errors, allowing the supervisor to restart. If [false], the worker
+   will exit the entire process on fatal errors. *)
+val run :
+  ?monitor_node_operations:bool ->
+  multi_node:bool ->
+  round_durations:Protocol.Alpha_context.Round.round_durations ->
+  #Protocol_client_context.full ->
+  t Lwt.t
 
 (** {1 Utilities} *)
 
@@ -69,20 +85,49 @@ val get_quorum_event_stream : t -> event Lwt_stream.t
 
 (** {1 Observers} *)
 
-val monitor_preendorsement_quorum :
+(** [monitor_preattestation_quorum state threshold get_slot_voting_power candidate]
+    Register [candidate] as the currently monitored payload, overriding any other
+    prequorum or quorum payload. Completion of the prequorum is signaled through the
+    quorum event stream.
+*)
+val monitor_preattestation_quorum :
   t ->
-  consensus_threshold:int ->
-  get_preendorsement_voting_power:(slot:Slot.t -> int) ->
+  consensus_threshold:int64 ->
+  consensus_committee:int64 ->
+  get_slot_voting_power:(slot:Slot.t -> int64 option) ->
   candidate ->
   unit Lwt.t
 
-val monitor_endorsement_quorum :
+(** [monitor_attestation_quorum state threshold get_slot_voting_power candidate]
+    Register [candidate] as the currently monitored payload, overriding any other
+    prequorum or quorum payload. Completion of the quorum is signaled through the
+    quorum event stream.
+*)
+val monitor_attestation_quorum :
   t ->
-  consensus_threshold:int ->
-  get_endorsement_voting_power:(slot:Slot.t -> int) ->
+  consensus_threshold:int64 ->
+  consensus_committee:int64 ->
+  get_slot_voting_power:(slot:Slot.t -> int64 option) ->
   candidate ->
   unit Lwt.t
 
+(** [cancel_monitoring state] removes current monitored payload.
+    Does nothing if no payload is being monitored.
+*)
 val cancel_monitoring : t -> unit
 
+(** [shutdown_worker state] closes the monitor_operations stream and
+    removes current monitored payload.
+*)
 val shutdown_worker : t -> (unit, exn list) result Lwt.t
+
+(** {1 Internal for tests}
+
+    This module exposes internal types and functions for unit testing.
+    Do not use in production code.
+*)
+module Internal_for_tests : sig
+  (** {2 State creation} *)
+
+  val make_initial_state : ?monitor_node_operations:bool -> unit -> t
+end

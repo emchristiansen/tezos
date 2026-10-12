@@ -3,15 +3,15 @@
 
 (library
  (name tezos_clic)
- (public_name tezos-clic)
+ (public_name octez-libs.clic)
  (instrumentation (backend bisect_ppx))
  (libraries
-  tezos-stdlib
+  octez-libs.stdlib
   lwt
   re
-  tezos-error-monad
-  tezos-lwt-result-stdlib)
- (js_of_ocaml)
+  octez-libs.error-monad
+  octez-libs.lwt-result-stdlib
+  terminal)
  (flags
   (:standard)
   -open Tezos_stdlib

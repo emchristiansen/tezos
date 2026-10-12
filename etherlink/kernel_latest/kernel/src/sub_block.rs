@@ -1,0 +1,399 @@
+// SPDX-FileCopyrightText: 2025-2026 Functori <contact@functori.com>
+// SPDX-FileCopyrightText: 2025 Nomadic Labs <contact@nomadic-labs.com>
+//
+// SPDX-License-Identifier: MIT
+
+use std::collections::VecDeque;
+
+use crate::{
+    apply::WITHDRAWAL_OUTBOX_QUEUE,
+    block::{
+        compute, promote_block, BlockInProgressComputationResult,
+        BlockInProgressProvenance, GAS_LIMIT,
+    },
+    block_in_progress::BlockInProgress,
+    block_storage,
+    chains::{
+        TezlinkBlockConstants, TezosXBlockConstants, TezosXChainConfig,
+        TezosXTransaction, ETHERLINK_SAFE_STORAGE_ROOT_PATH,
+    },
+    configuration::{fetch_configuration, fetch_tezosx_configuration},
+    error::{Error, StorageError},
+    fees::DEFAULT_MICHELSON_TO_EVM_GAS_MULTIPLIER,
+    gas_price::base_fee_per_gas,
+    retrieve_da_fee,
+    storage::{self, read_michelson_to_evm_gas_multiplier, read_sequencer_pool_address},
+    upgrade,
+};
+use anyhow::anyhow;
+use ethbloom::Bloom;
+use primitive_types::{H160, H256, U256};
+use rlp::{Decodable, Encodable};
+use tezos_ethereum::{
+    block::{BlockConstants, BlockFees},
+    rlp_helpers::{
+        append_timestamp, decode_field, decode_field_u256_le, decode_timestamp, next,
+        FromRlpBytes,
+    },
+};
+use tezos_evm_logging::__trace_kernel_add_attrs;
+use tezos_evm_runtime::extensions::WithGas;
+use tezos_evm_runtime::runtime_keyspaces::RuntimeKeyspaces;
+use tezos_evm_runtime::safe_storage::SafeStorage;
+use tezos_smart_rollup::{host::RuntimeError, outbox::OutboxQueue, types::Timestamp};
+use tezos_smart_rollup_host::storage::StorageV1;
+use tezos_smart_rollup_host::wasm::WasmHost;
+use tezos_smart_rollup_keyspace::{Key, KeySpace, KeySpaceLoader};
+use tezos_tezlink::block::OperationsWithReceipts;
+use tezos_tracing::trace_kernel;
+use tezosx_types::Wei;
+
+// Key to the single-transaction execution input, inside the `/base` keyspace.
+// Resolves to the durable path `/base/instant_confirmation/input_tx`.
+const SINGLE_TX_EXECUTION_INPUT_KEY: Key =
+    Key::from_static(b"/instant_confirmation/input_tx");
+
+// Key to the assemble-block input, inside the `/base` keyspace. Resolves to the
+// durable path `/base/instant_confirmation/assemble_block/input`.
+const ASSEMBLE_BLOCK_INPUT_KEY: Key =
+    Key::from_static(b"/instant_confirmation/assemble_block/input");
+
+pub struct SingleTxExecutionInput {
+    pub tx: TezosXTransaction,
+    pub timestamp: Timestamp,
+    pub block_number: U256,
+}
+
+impl Encodable for SingleTxExecutionInput {
+    fn rlp_append(&self, stream: &mut rlp::RlpStream) {
+        stream.begin_list(3);
+        stream.append(&self.tx);
+        append_timestamp(stream, self.timestamp);
+        stream.append(&self.block_number);
+    }
+}
+
+impl Decodable for SingleTxExecutionInput {
+    fn decode(decoder: &rlp::Rlp) -> Result<Self, rlp::DecoderError> {
+        if decoder.item_count()? != 3 {
+            return Err(rlp::DecoderError::RlpIncorrectListLen);
+        }
+        let mut it = decoder.iter();
+        let tx = decode_field(&next(&mut it)?, "TezosXTransaction")?;
+        let timestamp = decode_timestamp(&next(&mut it)?)?;
+        let block_number = decode_field_u256_le(&next(&mut it)?, "Block number")?;
+        Ok(SingleTxExecutionInput {
+            tx,
+            timestamp,
+            block_number,
+        })
+    }
+}
+
+pub struct AssembleBlockInput {
+    pub timestamp: Timestamp,
+    pub block_number: U256,
+}
+
+impl Encodable for AssembleBlockInput {
+    fn rlp_append(&self, stream: &mut rlp::RlpStream) {
+        stream.begin_list(2);
+        append_timestamp(stream, self.timestamp);
+        stream.append(&self.block_number);
+    }
+}
+
+impl Decodable for AssembleBlockInput {
+    fn decode(decoder: &rlp::Rlp) -> Result<Self, rlp::DecoderError> {
+        if decoder.item_count()? != 2 {
+            return Err(rlp::DecoderError::RlpIncorrectListLen);
+        }
+        let mut it = decoder.iter();
+        let timestamp = decode_timestamp(&next(&mut it)?)?;
+        let block_number = decode_field_u256_le(&next(&mut it)?, "Block number")?;
+        Ok(AssembleBlockInput {
+            timestamp,
+            block_number,
+        })
+    }
+}
+
+pub fn read_assemble_block_input(
+    base: &mut impl KeySpace,
+) -> Result<Option<AssembleBlockInput>, Error> {
+    match base.get(&ASSEMBLE_BLOCK_INPUT_KEY) {
+        Some(bytes) => {
+            let input = AssembleBlockInput::from_rlp_bytes(&bytes)?;
+            base.delete(&ASSEMBLE_BLOCK_INPUT_KEY);
+            Ok(Some(input))
+        }
+        None => Ok(None),
+    }
+}
+
+pub fn read_single_tx_execution_input(
+    base: &mut impl KeySpace,
+) -> Result<Option<SingleTxExecutionInput>, Error> {
+    match base.get(&SINGLE_TX_EXECUTION_INPUT_KEY) {
+        Some(bytes) => {
+            let input = SingleTxExecutionInput::from_rlp_bytes(&bytes)?;
+            base.delete(&SINGLE_TX_EXECUTION_INPUT_KEY);
+            Ok(Some(input))
+        }
+        None => Ok(None),
+    }
+}
+
+fn block_constants<Host>(
+    host: &mut Host,
+    config: &TezosXChainConfig,
+    timestamp: Timestamp,
+    number: U256,
+) -> Result<TezosXBlockConstants, Error>
+where
+    Host: StorageV1,
+{
+    let coinbase = read_sequencer_pool_address(host).unwrap_or_default();
+    let da_fee_per_byte = retrieve_da_fee(host)?;
+    let minimum_base_fee_per_gas = config.get_limits().minimum_base_fee_per_gas;
+    let base_fee_per_gas = base_fee_per_gas(host, timestamp, minimum_base_fee_per_gas);
+    let block_fees =
+        BlockFees::new(minimum_base_fee_per_gas, base_fee_per_gas, da_fee_per_byte);
+    let da_fee_per_byte_mutez = Wei::from_u256(da_fee_per_byte)
+        .to_mutez_exact()
+        .map_err(|_| Error::InvalidConversion)?
+        .as_u64();
+    let michelson_to_evm_gas_multiplier = read_michelson_to_evm_gas_multiplier(host)
+        .unwrap_or(DEFAULT_MICHELSON_TO_EVM_GAS_MULTIPLIER);
+    let safe_roots = config.world_states(number);
+    let michelson_runtime_block_constants = TezlinkBlockConstants {
+        level: number.try_into()?,
+        da_fee_per_byte_mutez,
+        michelson_to_evm_gas_multiplier,
+        safe_roots,
+    };
+    Ok(TezosXBlockConstants {
+        evm_runtime_block_constants: BlockConstants {
+            number,
+            coinbase,
+            timestamp: timestamp.as_u64().into(),
+            gas_limit: GAS_LIMIT,
+            tezos_experimental_features: config.is_tezos_runtime_enabled(number),
+            block_fees,
+            chain_id: config.get_evm_chain_id(),
+            prevrandao: None,
+            spec_id: config.spec_id,
+        },
+        michelson_runtime_block_constants,
+    })
+}
+
+#[trace_kernel]
+pub fn handle_run_transaction<Host>(
+    host: &mut Host,
+    base: impl KeySpace,
+    input_data: SingleTxExecutionInput,
+) -> Result<(), anyhow::Error>
+where
+    Host: StorageV1 + WithGas + KeySpaceLoader,
+{
+    let __attrs = [
+        (
+            "etherlink.transaction.hash".to_string(),
+            tezos_evm_logging::OTelAttrValue::String(format!(
+                "{}",
+                revm::primitives::B256::from(input_data.tx.tx_hash())
+            )),
+        ),
+        (
+            "etherlink.block.number".to_string(),
+            tezos_evm_logging::OTelAttrValue::Int(
+                input_data.block_number.try_into().unwrap_or_default(),
+            ),
+        ),
+        (
+            "etherlink.sbl".to_string(),
+            tezos_evm_logging::OTelAttrValue::Bool(true),
+        ),
+    ];
+    __trace_kernel_add_attrs!(__attrs);
+
+    let config = fetch_tezosx_configuration(host, &base);
+    let block_constants =
+        block_constants(host, &config, input_data.timestamp, input_data.block_number)?;
+    let sequencer_pool_address = (block_constants.evm_runtime_block_constants.coinbase
+        != H160::default())
+    .then_some(block_constants.evm_runtime_block_constants.coinbase);
+
+    // Read the HTTP-trace replay flag before wrapping the host in
+    // [SafeStorage] — see [block::produce] for the rationale.
+    let http_trace_enabled = crate::storage::is_http_trace_enabled(&base);
+
+    let mut safe_host = SafeStorage {
+        host,
+        world_states: config.world_states(input_data.block_number),
+    };
+    let registry = config.init_registry();
+    let outbox_queue = OutboxQueue::new(&WITHDRAWAL_OUTBOX_QUEUE, u32::MAX)?;
+
+    let mut block_in_progress = match crate::storage::read_block_in_progress(&safe_host)?
+    {
+        Some(bip) => {
+            if input_data.block_number != bip.number {
+                return Err(anyhow!(
+                    "Critical: Transaction and BIP block numbers do not match"
+                ));
+            }
+            bip
+        }
+        None => {
+            safe_host.start()?;
+
+            BlockInProgress {
+                number: input_data.block_number,
+                tx_queue: VecDeque::new(),
+                valid_txs: Vec::new(),
+                delayed_txs: Vec::new(),
+                cumulative_gas: U256::zero(),
+                index: 0,
+                michelson_index: 0,
+                ethereum_parent_hash: read_current_block_hash(&safe_host)?,
+                logs_bloom: Bloom::default(),
+                logs_offset: 0,
+                timestamp: input_data.timestamp,
+                base_fee_per_gas: block_constants
+                    .evm_runtime_block_constants
+                    .base_fee_per_gas(),
+                cumulative_execution_gas: U256::zero(),
+                cumulative_receipts: Vec::new(),
+                cumulative_tx_objects: Vec::new(),
+                cumulative_tezos_operation_receipts: OperationsWithReceipts::default(),
+                tezos_parent_hash: crate::block_storage::read_current_hash(
+                    &safe_host,
+                    &crate::chains::TEZ_SAFE_STORAGE_ROOT_PATH,
+                )
+                .unwrap_or_else(|_| {
+                    H256(*tezos_tezlink::block::TezBlock::genesis_block_hash())
+                }),
+            }
+        }
+    };
+
+    block_in_progress.repush_tx(input_data.tx);
+
+    drop(base);
+    let computed = RuntimeKeyspaces::init(&mut safe_host)
+        .map_err(anyhow::Error::from)
+        .and_then(|mut rk| {
+            compute(
+                &mut rk,
+                &registry,
+                &config,
+                &outbox_queue,
+                &mut block_in_progress,
+                &block_constants,
+                sequencer_pool_address,
+                None,
+                http_trace_enabled,
+            )
+        });
+
+    let err = match computed {
+        Ok(BlockInProgressComputationResult::Finished { .. }) => {
+            storage::store_block_in_progress(&mut safe_host, &block_in_progress)?;
+            block_storage::store_current_transactions_receipts(
+                &mut safe_host,
+                &ETHERLINK_SAFE_STORAGE_ROOT_PATH,
+                &block_in_progress.cumulative_receipts,
+            )?;
+            return Ok(());
+        }
+        Ok(BlockInProgressComputationResult::RebootNeeded) => {
+            anyhow!("Critical: Reboot is required by a single transaction execution")
+        }
+        Err(err) => err,
+    };
+
+    // A transaction that fails takes the whole block with it: the mirror
+    // holds the block in progress and every write since its start.
+    match safe_host.revert() {
+        // The transaction's own error is the one the caller asked about.
+        Ok(()) => Err(err),
+        Err(why) => Err(err.context(why)),
+    }
+}
+
+fn read_current_block_hash(host: &impl StorageV1) -> Result<H256, Error> {
+    match block_storage::read_current_hash(host, &ETHERLINK_SAFE_STORAGE_ROOT_PATH) {
+        Ok(block_hash) => Ok(block_hash),
+        Err(Error::Storage(StorageError::Runtime(RuntimeError::PathNotFound))) => {
+            Ok(H256::zero())
+        }
+        Err(err) => Err(err),
+    }
+}
+
+#[trace_kernel]
+pub fn assemble_block<Host>(
+    host: &mut Host,
+    mut base: impl KeySpace,
+    input_data: AssembleBlockInput,
+) -> Result<(), anyhow::Error>
+where
+    Host: StorageV1 + KeySpaceLoader + WasmHost,
+{
+    let __attrs = [
+        (
+            "etherlink.block.number".to_string(),
+            tezos_evm_logging::OTelAttrValue::Int(
+                input_data.block_number.try_into().unwrap_or_default(),
+            ),
+        ),
+        (
+            "etherlink.sbl".to_string(),
+            tezos_evm_logging::OTelAttrValue::Bool(true),
+        ),
+    ];
+    __trace_kernel_add_attrs!(__attrs);
+
+    let config = fetch_tezosx_configuration(host, &base);
+    let block_constants =
+        block_constants(host, &config, input_data.timestamp, input_data.block_number)?;
+
+    let mut configuration = fetch_configuration(host, &base);
+    let mut safe_host = SafeStorage {
+        host,
+        world_states: config.world_states(input_data.block_number),
+    };
+    let outbox_queue = OutboxQueue::new(&WITHDRAWAL_OUTBOX_QUEUE, u32::MAX)?;
+    let block_in_progress = crate::storage::read_block_in_progress(&safe_host)?
+        .ok_or_else(|| anyhow!("Critical: BIP is not available for assemble block"))?;
+    let delayed_hashes = block_in_progress.delayed_txs.clone();
+    crate::gas_price::register_block(
+        &mut safe_host,
+        block_in_progress.cumulative_execution_gas,
+        block_in_progress.timestamp,
+        block_in_progress.queue_length(),
+    )?;
+    let number = block_in_progress.number;
+    let mut rk = RuntimeKeyspaces::init(&mut safe_host)?;
+    let block = block_in_progress.finalize_and_store(
+        &mut rk,
+        &block_constants,
+        config.is_tezos_runtime_enabled(number),
+    )?;
+
+    let timestamp = block.timestamp();
+    promote_block(
+        rk.host_mut(),
+        &mut base,
+        &outbox_queue,
+        &BlockInProgressProvenance::Storage,
+        block.header(),
+        &mut configuration,
+        delayed_hashes,
+    )?;
+    upgrade::possible_sequencer_key_change(rk.host_mut().host, &mut base, timestamp)?;
+
+    Ok(())
+}

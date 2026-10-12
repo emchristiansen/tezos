@@ -57,27 +57,53 @@ module Int_set = Set.Make (Compare.Int)
  *)
 
 type consensus_pk = {
-  delegate : Signature.Public_key_hash.t;
+  delegate : Implicit_account_repr.t;
   consensus_pk : Signature.Public_key.t;
   consensus_pkh : Signature.Public_key_hash.t;
+  companion_pk : Bls.Public_key.t option;
+  companion_pkh : Bls.Public_key_hash.t option;
 }
 
 let consensus_pk_encoding =
   let open Data_encoding in
   conv
-    (fun {delegate; consensus_pk; consensus_pkh} ->
-      if Signature.Public_key_hash.equal consensus_pkh delegate then
-        (consensus_pk, None)
-      else (consensus_pk, Some delegate))
-    (fun (consensus_pk, delegate) ->
-      let consensus_pkh = Signature.Public_key.hash consensus_pk in
+    (fun {
+           delegate;
+           consensus_pk;
+           consensus_pkh;
+           companion_pk;
+           companion_pkh = _;
+         }
+       ->
       let delegate =
-        match delegate with None -> consensus_pkh | Some del -> del
+        (* FIXME-PA *)
+        if
+          Signature.Public_key_hash.equal
+            consensus_pkh
+            (Implicit_account_repr.Forbidden.to_pkh delegate)
+        then None
+        else Some delegate
       in
-      {delegate; consensus_pk; consensus_pkh})
-    (obj2
+      (consensus_pk, delegate, companion_pk))
+    (fun (consensus_pk, delegate, companion_pk) ->
+      let consensus_pkh = Signature.Public_key.hash consensus_pk in
+      let companion_pkh = Option.map Bls.Public_key.hash companion_pk in
+      (* FIXME-PA *)
+      let delegate =
+        match delegate with
+        | None -> Implicit_account_repr.Forbidden.of_pkh consensus_pkh
+        | Some del -> del
+      in
+      {delegate; consensus_pk; consensus_pkh; companion_pk; companion_pkh})
+    (obj3
        (req "consensus_pk" Signature.Public_key.encoding)
-       (opt "delegate" Signature.Public_key_hash.encoding))
+       (opt "delegate" Implicit_account_repr.encoding)
+       (opt "companion_pk" Bls.Public_key.encoding))
+
+type consensus_power = {
+  consensus_key : consensus_pk;
+  attesting_power : Attesting_power_repr.t;
+}
 
 module Raw_consensus = struct
   (** Consensus operations are indexed by their [initial slots]. Given
@@ -85,57 +111,69 @@ module Raw_consensus = struct
       this delegate. *)
 
   type t = {
-    current_endorsement_power : int;
-        (** Number of endorsement slots recorded for the current block. *)
-    allowed_endorsements : (consensus_pk * int) Slot_repr.Map.t;
-        (** Endorsements rights for the current block. Only an endorsement
-            for the lowest slot in the block can be recorded. The map
-            associates to each initial slot the [pkh] associated to this
-            slot with its power. *)
-    allowed_preendorsements : (consensus_pk * int) Slot_repr.Map.t;
-        (** Preendorsements rights for the current block. Only a preendorsement
-            for the lowest slot in the block can be recorded. The map
-            associates to each initial slot the [pkh] associated to this
-            slot with its power. *)
-    grand_parent_endorsements_seen : Signature.Public_key_hash.Set.t;
-        (** Record the endorsements already seen for the grand
-            parent. This only useful for the partial construction mode. *)
-    endorsements_seen : Slot_repr.Set.t;
-        (** Record the endorsements already seen. Only initial slots are indexed. *)
-    preendorsements_seen : Slot_repr.Set.t;
-        (** Record the preendorsements already seen. Only initial slots
+    current_attesting_power : Attesting_power_repr.t;
+        (** Number of attestation slots and their related staking power recorded
+            for the current block. *)
+    allowed_attestations : consensus_power Slot_repr.Map.t option;
+        (** Attestations rights for the current block. Only an attestation for
+            the lowest slot in the block can be recorded. The map associates to
+            each initial slot the [pkh] associated to this slot with its
+            consensus attestation power, DAL attestation power, and staking power.
+            This is [None] only in mempool mode. *)
+    allowed_preattestations : consensus_power Slot_repr.Map.t option;
+        (** Preattestations rights for the current block. Only a preattestation
+            for the lowest slot in the block can be recorded. The map associates
+            to each initial slot the [pkh] associated to this slot with its
+            consensus attestation power, DAL attestation power and staking power. This is
+            [None] only in mempool mode, or in application mode when there is no
+            locked round (so the block cannot contain any preattestations). *)
+    allowed_consensus : consensus_power Slot_repr.Map.t Level_repr.Map.t option;
+        (** In mempool mode, hold delegates minimal slots for all allowed
+            levels. [None] in all other modes. *)
+    delegate_to_shard_count :
+      int Implicit_account_repr.Map.t Raw_level_repr.Map.t;
+        (** Holds the number of assigned shards of delegates with at least one
+            assigned shard for all relevant (future) committee levels. *)
+    forbidden_delegates : Implicit_account_repr.Set.t;
+        (** Delegates that are not allowed to bake or attest blocks; i.e.,
+            delegates which have zero frozen deposit due to a previous
+            slashing. *)
+    attestations_seen : Slot_repr.Set.t;
+        (** Record the attestations already seen. Only initial slots are indexed. *)
+    preattestations_seen : Slot_repr.Set.t;
+        (** Record the preattestations already seen. Only initial slots
             are indexed. *)
-    locked_round_evidence : (Round_repr.t * int) option;
-        (** Record the preendorsement power for a locked round. *)
-    preendorsements_quorum_round : Round_repr.t option;
-        (** in block construction mode, record the round of preendorsements
+    locked_round_evidence : (Round_repr.t * Attesting_power_repr.t) option;
+        (** Record the preattestation power and staking power for a locked round. *)
+    preattestations_quorum_round : Round_repr.t option;
+        (** in block construction mode, record the round of preattestations
             included in a block. *)
-    endorsement_branch : (Block_hash.t * Block_payload_hash.t) option;
-    grand_parent_branch : (Block_hash.t * Block_payload_hash.t) option;
+    attestation_branch : (Block_hash.t * Block_payload_hash.t) option;
   }
 
   (** Invariant:
 
-      - [slot \in endorsements_seen => Int_map.mem slot allowed_endorsements]
+      - [slot \in attestations_seen => Int_map.mem slot allowed_attestations]
 
-      - [slot \in preendorsements_seen => Int_map.mem slot allowed_preendorsements]
+      - [slot \in preattestations_seen => Int_map.mem slot allowed_preattestations]
 
-      - [ |endorsements_seen| > 0 => |included endorsements| > 0]
+      - [ |attestations_seen| > 0 => |included attestations| > 0]
 
   *)
 
   let empty : t =
     {
-      current_endorsement_power = 0;
-      allowed_endorsements = Slot_repr.Map.empty;
-      allowed_preendorsements = Slot_repr.Map.empty;
-      grand_parent_endorsements_seen = Signature.Public_key_hash.Set.empty;
-      endorsements_seen = Slot_repr.Set.empty;
-      preendorsements_seen = Slot_repr.Set.empty;
+      current_attesting_power = Attesting_power_repr.zero;
+      allowed_attestations = Some Slot_repr.Map.empty;
+      allowed_preattestations = Some Slot_repr.Map.empty;
+      allowed_consensus = None;
+      delegate_to_shard_count = Raw_level_repr.Map.empty;
+      forbidden_delegates = Implicit_account_repr.Set.empty;
+      attestations_seen = Slot_repr.Set.empty;
+      preattestations_seen = Slot_repr.Set.empty;
       locked_round_evidence = None;
-      preendorsements_quorum_round = None;
-      endorsement_branch = None;
-      grand_parent_branch = None;
+      preattestations_quorum_round = None;
+      attestation_branch = None;
     }
 
   type error += Double_inclusion_of_consensus_operation
@@ -153,33 +191,30 @@ module Raw_consensus = struct
         | Double_inclusion_of_consensus_operation -> Some () | _ -> None)
       (fun () -> Double_inclusion_of_consensus_operation)
 
-  let record_grand_parent_endorsement t pkh =
-    error_when
-      (Signature.Public_key_hash.Set.mem pkh t.grand_parent_endorsements_seen)
-      Double_inclusion_of_consensus_operation
-    >|? fun () ->
-    {
-      t with
-      grand_parent_endorsements_seen =
-        Signature.Public_key_hash.Set.add pkh t.grand_parent_endorsements_seen;
-    }
+  let record_attestation t ~initial_slot ~power =
+    let open Result_syntax in
+    let* () =
+      error_when
+        (Slot_repr.Set.mem initial_slot t.attestations_seen)
+        Double_inclusion_of_consensus_operation
+    in
+    let current_attesting_power =
+      Attesting_power_repr.add power t.current_attesting_power
+    in
+    return
+      {
+        t with
+        current_attesting_power;
+        attestations_seen = Slot_repr.Set.add initial_slot t.attestations_seen;
+      }
 
-  let record_endorsement t ~initial_slot ~power =
-    error_when
-      (Slot_repr.Set.mem initial_slot t.endorsements_seen)
-      Double_inclusion_of_consensus_operation
-    >|? fun () ->
-    {
-      t with
-      current_endorsement_power = t.current_endorsement_power + power;
-      endorsements_seen = Slot_repr.Set.add initial_slot t.endorsements_seen;
-    }
-
-  let record_preendorsement ~initial_slot ~power round t =
-    error_when
-      (Slot_repr.Set.mem initial_slot t.preendorsements_seen)
-      Double_inclusion_of_consensus_operation
-    >|? fun () ->
+  let record_preattestation ~initial_slot ~power round t =
+    let open Result_syntax in
+    let* () =
+      error_when
+        (Slot_repr.Set.mem initial_slot t.preattestations_seen)
+        Double_inclusion_of_consensus_operation
+    in
     let locked_round_evidence =
       match t.locked_round_evidence with
       | None -> Some (round, power)
@@ -188,52 +223,80 @@ module Raw_consensus = struct
              It doesn't matter in that case since quorum certificates
              are not used in mempool.
              For other cases [Apply.check_round] verifies it. *)
-          Some (round, evidences + power)
+          let power = Attesting_power_repr.add power evidences in
+          Some (round, power)
     in
+    return
+      {
+        t with
+        locked_round_evidence;
+        preattestations_seen =
+          Slot_repr.Set.add initial_slot t.preattestations_seen;
+      }
+
+  let set_forbidden_delegates delegates t =
+    {t with forbidden_delegates = delegates}
+
+  let forbid_delegate delegate t =
     {
       t with
-      locked_round_evidence;
-      preendorsements_seen =
-        Slot_repr.Set.add initial_slot t.preendorsements_seen;
+      forbidden_delegates =
+        Implicit_account_repr.Set.add delegate t.forbidden_delegates;
     }
 
-  let set_preendorsements_quorum_round round t =
-    match t.preendorsements_quorum_round with
+  let set_preattestations_quorum_round round t =
+    match t.preattestations_quorum_round with
     | Some round' ->
         (* If the rounds are different, an error should have already
            been raised. *)
         assert (Round_repr.equal round round') ;
         t
-    | None -> {t with preendorsements_quorum_round = Some round}
+    | None -> {t with preattestations_quorum_round = Some round}
 
-  let initialize_with_endorsements_and_preendorsements ~allowed_endorsements
-      ~allowed_preendorsements t =
-    {t with allowed_endorsements; allowed_preendorsements}
+  let set_allowed_operations ~allowed_attestations ~allowed_preattestations
+      ~allowed_consensus ~delegate_to_shard_count t =
+    {
+      t with
+      allowed_attestations;
+      allowed_preattestations;
+      allowed_consensus;
+      delegate_to_shard_count;
+    }
 
   let locked_round_evidence t = t.locked_round_evidence
 
-  let endorsement_branch t = t.endorsement_branch
+  let attestation_branch t = t.attestation_branch
 
-  let grand_parent_branch t = t.grand_parent_branch
-
-  let set_endorsement_branch t endorsement_branch =
-    {t with endorsement_branch = Some endorsement_branch}
-
-  let set_grand_parent_branch t grand_parent_branch =
-    {t with grand_parent_branch = Some grand_parent_branch}
+  let set_attestation_branch t attestation_branch =
+    {t with attestation_branch = Some attestation_branch}
 end
 
-type dal_committee = {
-  pkh_to_shards :
-    (Dal_attestation_repr.shard_index * int) Signature.Public_key_hash.Map.t;
-  shard_to_pkh : Signature.Public_key_hash.t Dal_attestation_repr.Shard_map.t;
-}
-
-let empty_dal_committee =
-  {
-    pkh_to_shards = Signature.Public_key_hash.Map.empty;
-    shard_to_pkh = Dal_attestation_repr.Shard_map.empty;
+module Raw_dal = struct
+  type t = {
+    cryptobox : Dal.t option;
+    slot_fee_market : Dal_slot_repr.Slot_market.t;
+        (** records the published slot headers *)
+    slot_accountability : Dal_attestations_repr.Accountability.t;
+        (** records attested shards, in order to determine protocol-attested slots *)
+    attestations : Dal_attestations_repr.t Slot_repr.Map.t;
+        (** records the included DAL attestations; used for computing rewards *)
   }
+
+  let init ~number_of_slots ~number_of_lags =
+    {
+      cryptobox = None;
+      slot_fee_market = Dal_slot_repr.Slot_market.init ~length:number_of_slots;
+      slot_accountability =
+        Dal_attestations_repr.Accountability.init
+          ~number_of_slots
+          ~number_of_lags;
+      attestations = Slot_repr.Map.empty;
+    }
+end
+
+module Raw_address_registry = struct
+  type diff = {address : Destination_repr.t; index : Z.t}
+end
 
 type back = {
   context : Context.t;
@@ -255,26 +318,12 @@ type back = {
   dictator_proposal_seen : bool;
   sampler_state : (Seed_repr.seed * consensus_pk Sampler.t) Cycle_repr.Map.t;
   stake_distribution_for_current_cycle :
-    Tez_repr.t Signature.Public_key_hash.Map.t option;
-  tx_rollup_current_messages :
-    Tx_rollup_inbox_repr.Merkle.tree Tx_rollup_repr.Map.t;
+    Stake_repr.t Implicit_account_repr.Map.t option;
+  reward_coeff_for_current_cycle : Q.t;
   sc_rollup_current_messages : Sc_rollup_inbox_merkelized_payload_hashes_repr.t;
-  dal_slot_fee_market : Dal_slot_repr.Slot_market.t;
-  (* DAL/FIXME https://gitlab.com/tezos/tezos/-/issues/3105
-
-     We associate to a slot header some fees. This enable the use
-     of a fee market for slot publication. However, this is not
-     resilient from the game theory point of view. Probably we can find
-     better incentives here. In any case, because we want the following
-     invariant:
-
-         - For each level and for each slot there is at most one slot
-     header.
-
-         - We need to provide an incentive to avoid byzantines to post
-     dummy slot headers. *)
-  dal_attestation_slot_accountability : Dal_attestation_repr.Accountability.t;
-  dal_committee : dal_committee;
+  dal : Raw_dal.t;
+  address_registry_diff_rev : Raw_address_registry.diff list;
+  all_bakers_attest_first_level : Level_repr.t option;
 }
 
 (*
@@ -311,8 +360,6 @@ let[@inline] cycle_eras ctxt = ctxt.back.cycle_eras
 
 let[@inline] constants ctxt = ctxt.back.constants
 
-let[@inline] tx_rollup ctxt = ctxt.back.constants.tx_rollup
-
 let[@inline] sc_rollup ctxt = ctxt.back.constants.sc_rollup
 
 let[@inline] zk_rollup ctxt = ctxt.back.constants.zk_rollup
@@ -342,6 +389,14 @@ let[@inline] non_consensus_operations_rev ctxt =
 let[@inline] dictator_proposal_seen ctxt = ctxt.back.dictator_proposal_seen
 
 let[@inline] sampler_state ctxt = ctxt.back.sampler_state
+
+let[@inline] reward_coeff_for_current_cycle ctxt =
+  ctxt.back.reward_coeff_for_current_cycle
+
+let[@inline] dal ctxt = ctxt.back.dal
+
+let[@inline] all_bakers_attest_first_level ctxt =
+  ctxt.back.all_bakers_attest_first_level
 
 let[@inline] update_back ctxt back = {ctxt with back}
 
@@ -384,6 +439,15 @@ let[@inline] update_dictator_proposal_seen ctxt dictator_proposal_seen =
 let[@inline] update_sampler_state ctxt sampler_state =
   update_back ctxt {ctxt.back with sampler_state}
 
+let[@inline] update_reward_coeff_for_current_cycle ctxt
+    reward_coeff_for_current_cycle =
+  update_back ctxt {ctxt.back with reward_coeff_for_current_cycle}
+
+let[@inline] update_dal ctxt dal = update_back ctxt {ctxt.back with dal}
+
+let[@inline] set_all_bakers_attest_first_level ctxt level =
+  update_back ctxt {ctxt.back with all_bakers_attest_first_level = Some level}
+
 type error += Too_many_internal_operations (* `Permanent *)
 
 type error += Block_quota_exceeded (* `Temporary *)
@@ -393,6 +457,8 @@ type error += Operation_quota_exceeded (* `Temporary *)
 type error += Stake_distribution_not_set (* `Branch *)
 
 type error += Sampler_already_set of Cycle_repr.t (* `Permanent *)
+
+type error += Stake_info_already_set of Cycle_repr.t (* `Permanent *)
 
 let () =
   let open Data_encoding in
@@ -452,13 +518,30 @@ let () =
         c)
     (obj1 (req "cycle" Cycle_repr.encoding))
     (function Sampler_already_set c -> Some c | _ -> None)
-    (fun c -> Sampler_already_set c)
+    (fun c -> Sampler_already_set c) ;
+  register_error_kind
+    `Permanent
+    ~id:"stake_info_already_set"
+    ~title:"Stake already set"
+    ~description:
+      "Internal error: Raw_context.set_stake_info_for_cycle was called twice \
+       for a given cycle"
+    ~pp:(fun ppf c ->
+      Format.fprintf
+        ppf
+        "Internal error: stake info already set for cycle %a."
+        Cycle_repr.pp
+        c)
+    (obj1 (req "cycle" Cycle_repr.encoding))
+    (function Stake_info_already_set c -> Some c | _ -> None)
+    (fun c -> Stake_info_already_set c)
 
 let fresh_internal_nonce ctxt =
+  let open Result_syntax in
   if Compare.Int.(internal_nonce ctxt >= 65_535) then
-    error Too_many_internal_operations
+    tzfail Too_many_internal_operations
   else
-    ok
+    return
       (update_internal_nonce ctxt (internal_nonce ctxt + 1), internal_nonce ctxt)
 
 let reset_internal_nonce ctxt =
@@ -474,12 +557,16 @@ let internal_nonce_already_recorded ctxt k =
 let get_collected_fees ctxt = fees ctxt
 
 let credit_collected_fees_only_call_from_token ctxt fees' =
+  let open Result_syntax in
   let previous = get_collected_fees ctxt in
-  Tez_repr.(previous +? fees') >|? fun fees -> update_fees ctxt fees
+  let+ fees = Tez_repr.(previous +? fees') in
+  update_fees ctxt fees
 
 let spend_collected_fees_only_call_from_token ctxt fees' =
+  let open Result_syntax in
   let previous = get_collected_fees ctxt in
-  Tez_repr.(previous -? fees') >|? fun fees -> update_fees ctxt fees
+  let+ fees = Tez_repr.(previous -? fees') in
+  update_fees ctxt fees
 
 type error += Undefined_operation_nonce (* `Permanent *)
 
@@ -500,19 +587,21 @@ let init_origination_nonce ctxt operation_hash =
   update_origination_nonce ctxt origination_nonce
 
 let increment_origination_nonce ctxt =
+  let open Result_syntax in
   match origination_nonce ctxt with
-  | None -> error Undefined_operation_nonce
+  | None -> tzfail Undefined_operation_nonce
   | Some cur_origination_nonce ->
       let origination_nonce =
         Some (Origination_nonce.incr cur_origination_nonce)
       in
       let ctxt = update_origination_nonce ctxt origination_nonce in
-      ok (ctxt, cur_origination_nonce)
+      return (ctxt, cur_origination_nonce)
 
 let get_origination_nonce ctxt =
+  let open Result_syntax in
   match origination_nonce ctxt with
-  | None -> error Undefined_operation_nonce
-  | Some origination_nonce -> ok origination_nonce
+  | None -> tzfail Undefined_operation_nonce
+  | Some origination_nonce -> return origination_nonce
 
 let unset_origination_nonce ctxt = update_origination_nonce ctxt None
 
@@ -525,13 +614,16 @@ let block_gas_level = remaining_block_gas
 
 let consume_gas_limit_in_block ctxt gas_limit =
   let open Gas_limit_repr in
-  check_gas_limit
-    ~hard_gas_limit_per_operation:(constants ctxt).hard_gas_limit_per_operation
-    ~gas_limit
-  >>? fun () ->
+  let open Result_syntax in
+  let* () =
+    check_gas_limit
+      ~hard_gas_limit_per_operation:
+        (constants ctxt).hard_gas_limit_per_operation
+      ~gas_limit
+  in
   let block_gas = block_gas_level ctxt in
   let limit = Arith.fp gas_limit in
-  if Arith.(limit > block_gas) then error Block_quota_exceeded
+  if Arith.(limit > block_gas) then tzfail Block_quota_exceeded
   else
     let level = Arith.sub (block_gas_level ctxt) limit in
     let ctxt = update_remaining_block_gas ctxt level in
@@ -546,14 +638,17 @@ let set_gas_limit ctxt (remaining : 'a Gas_limit_repr.Arith.t) =
 let set_gas_unlimited ctxt = update_unlimited_operation_gas ctxt true
 
 let consume_gas ctxt cost =
+  let open Result_syntax in
   match Gas_limit_repr.raw_consume (remaining_operation_gas ctxt) cost with
   | Some gas_counter -> Ok (update_remaining_operation_gas ctxt gas_counter)
   | None ->
-      if unlimited_operation_gas ctxt then ok ctxt
-      else error Operation_quota_exceeded
+      if unlimited_operation_gas ctxt then return ctxt
+      else tzfail Operation_quota_exceeded
 
 let check_enough_gas ctxt cost =
-  consume_gas ctxt cost >>? fun (_ : t) -> Result.return_unit
+  let open Result_syntax in
+  let* (_ : t) = consume_gas ctxt cost in
+  return_unit
 
 let gas_consumed ~since ~until =
   match (gas_level since, gas_level until) with
@@ -654,7 +749,7 @@ let () =
     (function Storage_error err -> Some err | _ -> None)
     (fun err -> Storage_error err)
 
-let storage_error err = error (Storage_error err)
+let storage_error err = Result_syntax.tzfail (Storage_error err)
 
 (* Initialization *********************************************************)
 
@@ -663,34 +758,49 @@ let storage_error err = error (Storage_error err)
 let version_key = ["version"]
 
 (* This value is set by the snapshot_alpha.sh script, don't change it. *)
-let version_value = "alpha_current"
-
-let version = "v1"
 
 let protocol_migration_internal_message =
-  Sc_rollup_inbox_message_repr.Protocol_migration version_value
+  Sc_rollup_inbox_message_repr.Protocol_migration Constants_repr.version_value
 
-let cycle_eras_key = [version; "cycle_eras"]
+let protocol_migration_serialized_message =
+  match
+    Sc_rollup_inbox_message_repr.serialize
+      (Internal protocol_migration_internal_message)
+  with
+  | Ok msg -> msg
+  | Error trace ->
+      Format.kasprintf
+        failwith
+        "%s: Could not serialize protocol message : %a"
+        __LOC__
+        pp_trace
+        trace
 
-let constants_key = [version; "constants"]
+let cycle_eras_key = [Constants_repr.version; "cycle_eras"]
+
+let constants_key = [Constants_repr.version; "constants"]
 
 let protocol_param_key = ["protocol_parameters"]
 
 let get_cycle_eras ctxt =
-  Context.find ctxt cycle_eras_key >|= function
+  let open Lwt_syntax in
+  let+ bytes_opt = Context.find ctxt cycle_eras_key in
+  match bytes_opt with
   | None -> storage_error (Missing_key (cycle_eras_key, Get))
   | Some bytes -> (
       match
         Data_encoding.Binary.of_bytes_opt Level_repr.cycle_eras_encoding bytes
       with
       | None -> storage_error (Corrupted_data cycle_eras_key)
-      | Some cycle_eras -> ok cycle_eras)
+      | Some cycle_eras -> Ok cycle_eras)
 
 let set_cycle_eras ctxt cycle_eras =
+  let open Lwt_result_syntax in
   let bytes =
     Data_encoding.Binary.to_bytes_exn Level_repr.cycle_eras_encoding cycle_eras
   in
-  Context.add ctxt cycle_eras_key bytes >|= ok
+  let*! ctxt = Context.add ctxt cycle_eras_key bytes in
+  return ctxt
 
 type error += Failed_to_parse_parameter of bytes
 
@@ -728,13 +838,15 @@ let () =
     (fun (json, msg) -> Failed_to_decode_parameter (json, msg))
 
 let get_proto_param ctxt =
-  Context.find ctxt protocol_param_key >>= function
+  let open Lwt_result_syntax in
+  let*! bytes_opt = Context.find ctxt protocol_param_key in
+  match bytes_opt with
   | None -> failwith "Missing protocol parameters."
   | Some bytes -> (
       match Data_encoding.Binary.of_bytes_opt Data_encoding.json bytes with
       | None -> tzfail (Failed_to_parse_parameter bytes)
       | Some json -> (
-          Context.remove ctxt protocol_param_key >|= fun ctxt ->
+          let*! ctxt = Context.remove ctxt protocol_param_key in
           match Data_encoding.Json.destruct Parameters_repr.encoding json with
           | exception (Data_encoding.Json.Cannot_destruct _ as exn) ->
               Format.kasprintf
@@ -745,8 +857,8 @@ let get_proto_param ctxt =
                 Data_encoding.Json.pp
                 json
           | param ->
-              Parameters_repr.check_params param >>? fun () -> ok (param, ctxt))
-      )
+              let*? () = Parameters_repr.check_params param in
+              return (param, ctxt)))
 
 let add_constants ctxt constants =
   let bytes =
@@ -757,7 +869,9 @@ let add_constants ctxt constants =
   Context.add ctxt constants_key bytes
 
 let get_constants ctxt =
-  Context.find ctxt constants_key >|= function
+  let open Lwt_result_syntax in
+  let*! bytes_opt = Context.find ctxt constants_key in
+  match bytes_opt with
   | None -> failwith "Internal error: cannot read constants in context."
   | Some bytes -> (
       match
@@ -766,20 +880,24 @@ let get_constants ctxt =
           bytes
       with
       | None -> failwith "Internal error: cannot parse constants in context."
-      | Some constants -> ok constants)
+      | Some constants -> return constants)
 
 let patch_constants ctxt f =
+  let open Lwt_syntax in
   let constants = f (constants ctxt) in
-  add_constants (context ctxt) constants >|= fun context ->
+  let+ context = add_constants (context ctxt) constants in
   let ctxt = update_context ctxt context in
   update_constants ctxt constants
 
 let check_inited ctxt =
-  Context.find ctxt version_key >|= function
+  let open Lwt_syntax in
+  let+ bytes_opt = Context.find ctxt version_key in
+  match bytes_opt with
   | None -> failwith "Internal error: un-initialized context."
   | Some bytes ->
       let s = Bytes.to_string bytes in
-      if Compare.String.(s = version_value) then Result.return_unit
+      if Compare.String.(s = Constants_repr.version_value) then
+        Result.return_unit
       else storage_error (Incompatible_protocol_version s)
 
 let check_cycle_eras (cycle_eras : Level_repr.cycle_eras)
@@ -791,19 +909,28 @@ let check_cycle_eras (cycle_eras : Level_repr.cycle_eras)
     Compare.Int32.(
       current_era.blocks_per_commitment = constants.blocks_per_commitment))
 
-let prepare ~level ~predecessor_timestamp ~timestamp ctxt =
-  Raw_level_repr.of_int32 level >>?= fun level ->
-  check_inited ctxt >>=? fun () ->
-  get_constants ctxt >>=? fun constants ->
-  Round_repr.Durations.create
-    ~first_round_duration:constants.minimal_block_delay
-    ~delay_increment_per_round:constants.delay_increment_per_round
-  >>?= fun round_durations ->
-  get_cycle_eras ctxt >|=? fun cycle_eras ->
+let prepare ~level ~predecessor_timestamp ~timestamp
+    ~all_bakers_attest_first_level ctxt =
+  let open Lwt_result_syntax in
+  let*? level = Raw_level_repr.of_int32 level in
+  let* () = check_inited ctxt in
+  let* constants = get_constants ctxt in
+  let*? round_durations =
+    Round_repr.Durations.create
+      ~first_round_duration:constants.minimal_block_delay
+      ~delay_increment_per_round:constants.delay_increment_per_round
+  in
+  let+ cycle_eras = get_cycle_eras ctxt in
   check_cycle_eras cycle_eras constants ;
   let level = Level_repr.level_from_raw ~cycle_eras level in
   let sc_rollup_current_messages =
     Sc_rollup_inbox_repr.init_witness_no_history
+  in
+  let dal =
+    Raw_dal.init
+      ~number_of_slots:constants.Constants_parametric_repr.dal.number_of_slots
+      ~number_of_lags:
+        (List.length constants.Constants_parametric_repr.dal.attestation_lags)
   in
   {
     remaining_operation_gas = Gas_limit_repr.Arith.zero;
@@ -830,39 +957,48 @@ let prepare ~level ~predecessor_timestamp ~timestamp ctxt =
         dictator_proposal_seen = false;
         sampler_state = Cycle_repr.Map.empty;
         stake_distribution_for_current_cycle = None;
-        tx_rollup_current_messages = Tx_rollup_repr.Map.empty;
+        reward_coeff_for_current_cycle = Q.one;
         sc_rollup_current_messages;
-        dal_slot_fee_market =
-          Dal_slot_repr.Slot_market.init
-            ~length:constants.Constants_parametric_repr.dal.number_of_slots;
-        dal_attestation_slot_accountability =
-          Dal_attestation_repr.Accountability.init
-            ~length:constants.Constants_parametric_repr.dal.number_of_slots;
-        dal_committee = empty_dal_committee;
+        dal;
+        all_bakers_attest_first_level;
+        address_registry_diff_rev = [];
       };
   }
 
-type previous_protocol = Genesis of Parameters_repr.t | Mumbai_016
+type previous_protocol =
+  | Genesis of Parameters_repr.t
+  | Alpha
+  | (* Alpha predecessor *) U025 (* Alpha predecessor *)
 
 let check_and_update_protocol_version ctxt =
-  (Context.find ctxt version_key >>= function
-   | None ->
-       failwith "Internal error: un-initialized context in check_first_block."
-   | Some bytes ->
-       let s = Bytes.to_string bytes in
-       if Compare.String.(s = version_value) then
-         failwith "Internal error: previously initialized context."
-       else if Compare.String.(s = "genesis") then
-         get_proto_param ctxt >|=? fun (param, ctxt) -> (Genesis param, ctxt)
-       else if Compare.String.(s = "mumbai_016") then return (Mumbai_016, ctxt)
-       else Lwt.return @@ storage_error (Incompatible_protocol_version s))
-  >>=? fun (previous_proto, ctxt) ->
-  Context.add ctxt version_key (Bytes.of_string version_value) >|= fun ctxt ->
-  ok (previous_proto, ctxt)
+  let open Lwt_result_syntax in
+  let* previous_proto, ctxt =
+    let*! bytes_opt = Context.find ctxt version_key in
+    match bytes_opt with
+    | None ->
+        failwith "Internal error: un-initialized context in check_first_block."
+    | Some bytes ->
+        let s = Bytes.to_string bytes in
+        if Compare.String.(s = Constants_repr.version_value) then
+          failwith "Internal error: previously initialized context."
+        else if Compare.String.(s = "genesis") then
+          let+ param, ctxt = get_proto_param ctxt in
+          (Genesis param, ctxt)
+        else if Compare.String.(s = "alpha_current") then return (Alpha, ctxt)
+        else if (* Alpha predecessor *) Compare.String.(s = "u025_025") then
+          return (U025, ctxt) (* Alpha predecessor *)
+        else Lwt.return @@ storage_error (Incompatible_protocol_version s)
+  in
+  let*! ctxt =
+    Context.add ctxt version_key (Bytes.of_string Constants_repr.version_value)
+  in
+  return (previous_proto, ctxt)
 
 (* only for the migration *)
-let[@warning "-32"] get_previous_protocol_constants ctxt =
-  Context.find ctxt constants_key >>= function
+let get_previous_protocol_constants ctxt =
+  let open Lwt_syntax in
+  let* bytes_opt = Context.find ctxt constants_key in
+  match bytes_opt with
   | None ->
       failwith
         "Internal error: cannot read previous protocol constants in context."
@@ -876,7 +1012,23 @@ let[@warning "-32"] get_previous_protocol_constants ctxt =
           failwith
             "Internal error: cannot parse previous protocol constants in \
              context."
-      | Some constants -> Lwt.return constants)
+      | Some constants -> return constants)
+
+(* Start of code to remove at next automatic protocol snapshot *)
+
+(* Please add here any code that should be removed at the next automatic protocol snapshot *)
+
+(* End of code to remove at next automatic protocol snapshot *)
+
+let mainnet = Chain_id.of_b58check_exn "NetXdQprcVkpaWU"
+
+let mainnet_canonical_rollup =
+  Smart_rollup.Address.of_b58check_exn "sr1Ghq66tYK9y3r8CC1Tf8i8m5nxh8nTvZEf"
+
+let shadownet = Chain_id.of_b58check_exn "NetXsqzbfFenSTS"
+
+let shadownet_canonical_rollup =
+  Smart_rollup.Address.of_b58check_exn "sr19fMYrr5C4qqvQqQrDSjtP31GcrWjodzvg"
 
 (* You should ensure that if the type `Constants_parametric_repr.t` is
    different from `Constants_parametric_previous_repr.t` or the value of these
@@ -889,152 +1041,659 @@ let[@warning "-32"] get_previous_protocol_constants ctxt =
    encoding directly in a way which is compatible with the previous
    protocol. However, by doing so, you do not change the value of
    these constants inside the context. *)
-let prepare_first_block ~level ~timestamp ctxt =
-  check_and_update_protocol_version ctxt >>=? fun (previous_proto, ctxt) ->
-  (match previous_proto with
-  | Genesis param ->
-      Raw_level_repr.of_int32 level >>?= fun first_level ->
-      let cycle_era =
-        {
-          Level_repr.first_level;
-          first_cycle = Cycle_repr.root;
-          blocks_per_cycle = param.constants.blocks_per_cycle;
-          blocks_per_commitment = param.constants.blocks_per_commitment;
-        }
-      in
-      Level_repr.create_cycle_eras [cycle_era] >>?= fun cycle_eras ->
-      set_cycle_eras ctxt cycle_eras >>=? fun ctxt ->
-      add_constants ctxt param.constants >|= ok
-  | Mumbai_016 ->
-      get_previous_protocol_constants ctxt >>= fun c ->
-      let tx_rollup =
-        Constants_parametric_repr.
+let prepare_first_block ~level ~timestamp chain_id ctxt =
+  let open Lwt_result_syntax in
+  let* previous_proto, ctxt = check_and_update_protocol_version ctxt in
+  let canonical_rollup_address =
+    if Chain_id.(mainnet = chain_id) then Some mainnet_canonical_rollup
+    else if Chain_id.(shadownet = chain_id) then Some shadownet_canonical_rollup
+    else None
+  in
+  let* ctxt, previous_proto_constants =
+    match previous_proto with
+    | Genesis param ->
+        let*? first_level = Raw_level_repr.of_int32 level in
+        let cycle_era =
           {
-            enable = false;
-            origination_size = c.tx_rollup.origination_size;
-            hard_size_limit_per_inbox = c.tx_rollup.hard_size_limit_per_inbox;
-            hard_size_limit_per_message =
-              c.tx_rollup.hard_size_limit_per_message;
-            max_withdrawals_per_batch = c.tx_rollup.max_withdrawals_per_batch;
-            max_ticket_payload_size = c.tx_rollup.max_ticket_payload_size;
-            commitment_bond = c.tx_rollup.commitment_bond;
-            finality_period = c.tx_rollup.finality_period;
-            withdraw_period = c.tx_rollup.withdraw_period;
-            max_inboxes_count = c.tx_rollup.max_inboxes_count;
-            max_messages_per_inbox = c.tx_rollup.max_messages_per_inbox;
-            max_commitments_count = c.tx_rollup.max_commitments_count;
-            cost_per_byte_ema_factor = c.tx_rollup.cost_per_byte_ema_factor;
-            rejection_max_proof_size = c.tx_rollup.rejection_max_proof_size;
-            sunset_level = c.tx_rollup.sunset_level;
+            Level_repr.first_level;
+            first_cycle = Cycle_repr.root;
+            blocks_per_cycle = param.constants.blocks_per_cycle;
+            blocks_per_commitment = param.constants.blocks_per_commitment;
           }
-      in
-      let cryptobox_parameters =
-        {
-          Dal.page_size = c.dal.cryptobox_parameters.page_size;
-          number_of_shards = c.dal.cryptobox_parameters.number_of_shards;
-          slot_size = c.dal.cryptobox_parameters.slot_size;
-          redundancy_factor = c.dal.cryptobox_parameters.redundancy_factor;
-        }
-      in
-      let dal =
-        Constants_parametric_repr.
+        in
+        let*? cycle_eras = Level_repr.create_cycle_eras [cycle_era] in
+        let* ctxt = set_cycle_eras ctxt cycle_eras in
+        let*! result = add_constants ctxt param.constants in
+        return (result, None)
+    (* Start of Alpha stitching. Comment used for automatic snapshot *)
+    | Alpha ->
+        (*
+            FIXME chain_id is used for Q to Alpha migration and nomore after.
+            We ignored for automatic stabilisation, should it be removed in
+            Beta?
+        *)
+        ignore chain_id ;
+        let module Previous = Constants_parametric_repr in
+        let* c = get_constants ctxt in
+        let dal =
+          let ({
+                 feature_enable;
+                 incentives_enable;
+                 dynamic_lag_enable;
+                 number_of_slots;
+                 attestation_lag;
+                 attestation_lags;
+                 attestation_threshold;
+                 cryptobox_parameters;
+                 minimal_participation_ratio;
+                 rewards_ratio;
+                 traps_fraction;
+               }
+                : Previous.dal) =
+            c.dal
+          in
           {
-            feature_enable = c.dal.feature_enable;
-            number_of_slots = c.dal.number_of_slots;
-            attestation_lag = c.dal.attestation_lag;
-            attestation_threshold = c.dal.availability_threshold;
-            blocks_per_epoch = 32l;
+            Constants_parametric_repr.feature_enable;
+            incentives_enable;
+            dynamic_lag_enable;
+            number_of_slots;
+            attestation_lag;
+            attestation_lags;
+            attestation_threshold;
             cryptobox_parameters;
+            minimal_participation_ratio;
+            rewards_ratio;
+            traps_fraction;
           }
-      in
-      let sc_rollup =
-        Constants_parametric_repr.
+        in
+        let reveal_activation_level =
+          let ({
+                 raw_data;
+                 metadata;
+                 dal_page;
+                 dal_parameters;
+                 dal_attested_slots_validity_lag;
+               }
+                : Previous.sc_rollup_reveal_activation_level) =
+            c.sc_rollup.reveal_activation_level
+          in
+          let raw_data =
+            Constants_parametric_repr.{blake2B = raw_data.blake2B}
+          in
           {
-            enable = true;
-            arith_pvm_enable = false;
-            origination_size = c.sc_rollup.origination_size;
-            challenge_window_in_blocks = c.sc_rollup.challenge_window_in_blocks;
-            stake_amount = c.sc_rollup.stake_amount;
-            commitment_period_in_blocks =
-              c.sc_rollup.commitment_period_in_blocks;
-            max_lookahead_in_blocks = c.sc_rollup.max_lookahead_in_blocks;
-            max_active_outbox_levels = c.sc_rollup.max_active_outbox_levels;
-            max_outbox_messages_per_level =
-              c.sc_rollup.max_outbox_messages_per_level;
-            number_of_sections_in_dissection =
-              c.sc_rollup.number_of_sections_in_dissection;
-            timeout_period_in_blocks = c.sc_rollup.timeout_period_in_blocks;
-            max_number_of_stored_cemented_commitments =
-              c.sc_rollup.max_number_of_stored_cemented_commitments;
-            max_number_of_parallel_games =
-              c.sc_rollup.max_number_of_parallel_games;
+            Constants_parametric_repr.raw_data;
+            metadata;
+            dal_page;
+            dal_parameters;
+            dal_attested_slots_validity_lag;
           }
-      in
-      let zk_rollup =
-        Constants_parametric_repr.
+        in
+        let sc_rollup =
+          let ({
+                 arith_pvm_enable;
+                 origination_size;
+                 challenge_window_in_blocks;
+                 stake_amount;
+                 commitment_period_in_blocks;
+                 max_lookahead_in_blocks;
+                 max_active_outbox_levels;
+                 max_outbox_messages_per_level;
+                 number_of_sections_in_dissection;
+                 timeout_period_in_blocks;
+                 max_number_of_stored_cemented_commitments;
+                 max_number_of_parallel_games;
+                 reveal_activation_level = _;
+                 private_enable;
+                 riscv_pvm_enable;
+                 canonical_rollup_address = _;
+               }
+                : Previous.sc_rollup) =
+            c.sc_rollup
+          in
+          Constants_parametric_repr.
+            {
+              arith_pvm_enable;
+              origination_size;
+              challenge_window_in_blocks;
+              stake_amount;
+              commitment_period_in_blocks;
+              max_lookahead_in_blocks;
+              max_active_outbox_levels;
+              max_outbox_messages_per_level;
+              number_of_sections_in_dissection;
+              timeout_period_in_blocks;
+              max_number_of_stored_cemented_commitments;
+              max_number_of_parallel_games;
+              reveal_activation_level;
+              private_enable;
+              riscv_pvm_enable;
+              canonical_rollup_address;
+            }
+        in
+        let zk_rollup =
+          let ({
+                 enable;
+                 origination_size;
+                 min_pending_to_process;
+                 max_ticket_payload_size;
+               }
+                : Previous.zk_rollup) =
+            c.zk_rollup
+          in
+          Constants_parametric_repr.
+            {
+              enable;
+              origination_size;
+              min_pending_to_process;
+              max_ticket_payload_size;
+            }
+        in
+        let adaptive_rewards_params =
+          let ({
+                 issuance_ratio_final_min;
+                 issuance_ratio_final_max;
+                 issuance_ratio_initial_min;
+                 issuance_ratio_initial_max;
+                 initial_period;
+                 transition_period;
+                 max_bonus;
+                 growth_rate;
+                 center_dz;
+                 radius_dz;
+               }
+                : Previous.adaptive_rewards_params) =
+            c.adaptive_issuance.adaptive_rewards_params
+          in
+          Constants_parametric_repr.
+            {
+              issuance_ratio_final_min;
+              issuance_ratio_final_max;
+              issuance_ratio_initial_min;
+              issuance_ratio_initial_max;
+              initial_period;
+              transition_period;
+              max_bonus;
+              growth_rate;
+              center_dz;
+              radius_dz;
+            }
+        in
+        let adaptive_issuance =
+          let ({
+                 global_limit_of_staking_over_baking;
+                 edge_of_staking_over_delegation;
+                 adaptive_rewards_params = _;
+               }
+                : Previous.adaptive_issuance) =
+            c.adaptive_issuance
+          in
+          Constants_parametric_repr.
+            {
+              global_limit_of_staking_over_baking;
+              edge_of_staking_over_delegation;
+              adaptive_rewards_params;
+            }
+        in
+        let issuance_weights =
+          let ({
+                 base_total_issued_per_minute;
+                 baking_reward_fixed_portion_weight;
+                 baking_reward_bonus_weight;
+                 attesting_reward_weight;
+                 seed_nonce_revelation_tip_weight;
+                 vdf_revelation_tip_weight;
+                 dal_rewards_weight;
+               }
+                : Previous.issuance_weights) =
+            c.issuance_weights
+          in
           {
-            enable = c.zk_rollup.enable;
-            origination_size = c.zk_rollup.origination_size;
-            min_pending_to_process = c.zk_rollup.min_pending_to_process;
+            Constants_parametric_repr.base_total_issued_per_minute;
+            baking_reward_fixed_portion_weight;
+            baking_reward_bonus_weight;
+            attesting_reward_weight;
+            seed_nonce_revelation_tip_weight;
+            vdf_revelation_tip_weight;
+            dal_rewards_weight;
           }
-      in
-      let constants =
-        Constants_parametric_repr.
+        in
+        let constants =
+          let ({
+                 consensus_rights_delay;
+                 blocks_preservation_cycles;
+                 delegate_parameters_activation_delay;
+                 tolerated_inactivity_period;
+                 blocks_per_cycle;
+                 blocks_per_commitment;
+                 nonce_revelation_threshold;
+                 cycles_per_voting_period;
+                 hard_gas_limit_per_operation;
+                 hard_gas_limit_per_block;
+                 proof_of_work_threshold;
+                 minimal_stake;
+                 minimal_frozen_stake;
+                 vdf_difficulty;
+                 origination_size;
+                 max_operations_time_to_live;
+                 issuance_weights = _;
+                 cost_per_byte;
+                 hard_storage_limit_per_operation;
+                 quorum_min;
+                 quorum_max;
+                 min_proposal_quorum;
+                 liquidity_baking_subsidy;
+                 liquidity_baking_toggle_ema_threshold;
+                 minimal_block_delay;
+                 delay_increment_per_round;
+                 consensus_committee_size;
+                 consensus_threshold_size;
+                 minimal_participation_ratio;
+                 limit_of_delegation_over_baking;
+                 percentage_of_frozen_deposits_slashed_per_double_baking;
+                 max_slashing_per_block;
+                 max_slashing_threshold;
+                 (* The `testnet_dictator` should absolutely be None on mainnet *)
+                 testnet_dictator;
+                 initial_seed;
+                 cache_script_size;
+                 cache_stake_distribution_cycles;
+                 cache_sampler_state_cycles;
+                 cache_stake_info_cycles;
+                 cache_swrr_selected_distribution_cycles;
+                 dal = _;
+                 sc_rollup = _;
+                 zk_rollup = _;
+                 adaptive_issuance = _;
+                 direct_ticket_spending_enable;
+                 all_bakers_attest_activation_threshold;
+                 native_contracts_enable;
+                 swrr_new_baker_lottery_enable;
+                 tz5_account_enable;
+               }
+                : Previous.t) =
+            c
+          in
           {
-            preserved_cycles = c.preserved_cycles;
-            blocks_per_cycle = c.blocks_per_cycle;
-            blocks_per_commitment = c.blocks_per_commitment;
-            nonce_revelation_threshold = c.nonce_revelation_threshold;
-            blocks_per_stake_snapshot = c.blocks_per_stake_snapshot;
-            cycles_per_voting_period = c.cycles_per_voting_period;
-            hard_gas_limit_per_operation = c.hard_gas_limit_per_operation;
-            hard_gas_limit_per_block = c.hard_gas_limit_per_block;
-            proof_of_work_threshold = c.proof_of_work_threshold;
-            minimal_stake = c.minimal_stake;
-            vdf_difficulty = c.vdf_difficulty;
-            seed_nonce_revelation_tip = c.seed_nonce_revelation_tip;
-            origination_size = c.origination_size;
-            max_operations_time_to_live = c.max_operations_time_to_live;
-            baking_reward_fixed_portion = c.baking_reward_fixed_portion;
-            baking_reward_bonus_per_slot = c.baking_reward_bonus_per_slot;
-            endorsing_reward_per_slot = c.endorsing_reward_per_slot;
-            cost_per_byte = c.cost_per_byte;
-            hard_storage_limit_per_operation =
-              c.hard_storage_limit_per_operation;
-            quorum_min = c.quorum_min;
-            quorum_max = c.quorum_max;
-            min_proposal_quorum = c.min_proposal_quorum;
-            liquidity_baking_subsidy = c.liquidity_baking_subsidy;
-            liquidity_baking_toggle_ema_threshold =
-              c.liquidity_baking_toggle_ema_threshold;
-            minimal_block_delay = c.minimal_block_delay;
-            delay_increment_per_round = c.delay_increment_per_round;
-            consensus_committee_size = c.consensus_committee_size;
-            consensus_threshold = c.consensus_threshold;
-            minimal_participation_ratio = c.minimal_participation_ratio;
-            max_slashing_period = c.max_slashing_period;
-            frozen_deposits_percentage = c.frozen_deposits_percentage;
-            double_baking_punishment = c.double_baking_punishment;
-            ratio_of_frozen_deposits_slashed_per_double_endorsement =
-              c.ratio_of_frozen_deposits_slashed_per_double_endorsement;
+            Constants_parametric_repr.consensus_rights_delay;
+            blocks_preservation_cycles;
+            delegate_parameters_activation_delay;
+            tolerated_inactivity_period;
+            blocks_per_cycle;
+            blocks_per_commitment;
+            nonce_revelation_threshold;
+            cycles_per_voting_period;
+            hard_gas_limit_per_operation;
+            hard_gas_limit_per_block;
+            proof_of_work_threshold;
+            minimal_stake;
+            minimal_frozen_stake;
+            vdf_difficulty;
+            origination_size;
+            max_operations_time_to_live;
+            issuance_weights;
+            cost_per_byte;
+            hard_storage_limit_per_operation;
+            quorum_min;
+            quorum_max;
+            min_proposal_quorum;
+            liquidity_baking_subsidy;
+            liquidity_baking_toggle_ema_threshold;
+            minimal_block_delay;
+            delay_increment_per_round;
+            consensus_committee_size;
+            consensus_threshold_size;
+            minimal_participation_ratio;
+            limit_of_delegation_over_baking;
+            percentage_of_frozen_deposits_slashed_per_double_baking;
+            max_slashing_per_block;
+            max_slashing_threshold;
             (* The `testnet_dictator` should absolutely be None on mainnet *)
-            testnet_dictator = c.testnet_dictator;
-            initial_seed = c.initial_seed;
-            cache_script_size = c.cache_script_size;
-            cache_stake_distribution_cycles = c.cache_stake_distribution_cycles;
-            cache_sampler_state_cycles = c.cache_sampler_state_cycles;
-            tx_rollup;
+            testnet_dictator;
+            initial_seed;
+            cache_script_size;
+            cache_stake_distribution_cycles;
+            cache_sampler_state_cycles;
+            cache_stake_info_cycles;
+            cache_swrr_selected_distribution_cycles;
             dal;
             sc_rollup;
             zk_rollup;
+            adaptive_issuance;
+            direct_ticket_spending_enable;
+            all_bakers_attest_activation_threshold;
+            native_contracts_enable;
+            swrr_new_baker_lottery_enable;
+            tz5_account_enable;
           }
-      in
-      add_constants ctxt constants >>= fun ctxt -> return ctxt)
-  >>=? fun ctxt ->
-  prepare ctxt ~level ~predecessor_timestamp:timestamp ~timestamp
-  >|=? fun ctxt -> (previous_proto, ctxt)
+        in
+        let*! ctxt = add_constants ctxt constants in
+        (* This line is only here to please the typechecker,
+           it should be removed in quebec when stabilising *)
+        let*! c = get_previous_protocol_constants ctxt in
+        return (ctxt, Some c)
+        (* End of Alpha stitching. Comment used for automatic snapshot *)
+        (* Start of alpha predecessor stitching. Comment used for automatic snapshot *)
+    | U025 ->
+        (*
+            FIXME chain_id is used for Q to U025 migration and nomore after.
+            We ignored for automatic stabilisation, should it be removed in
+            Beta?
+        *)
+        ignore chain_id ;
+        let module Previous = Constants_parametric_previous_repr in
+        let*! c = get_previous_protocol_constants ctxt in
+        let dal =
+          let ({
+                 feature_enable;
+                 incentives_enable;
+                 dynamic_lag_enable;
+                 number_of_slots;
+                 attestation_lag;
+                 attestation_lags;
+                 attestation_threshold;
+                 cryptobox_parameters;
+                 minimal_participation_ratio;
+                 rewards_ratio;
+                 traps_fraction;
+               }
+                : Previous.dal) =
+            c.dal
+          in
+          {
+            Constants_parametric_repr.feature_enable;
+            incentives_enable;
+            dynamic_lag_enable;
+            number_of_slots;
+            attestation_lag;
+            attestation_lags;
+            attestation_threshold;
+            cryptobox_parameters;
+            minimal_participation_ratio;
+            rewards_ratio;
+            traps_fraction;
+          }
+        in
+        let reveal_activation_level =
+          let ({
+                 raw_data;
+                 metadata;
+                 dal_page;
+                 dal_parameters;
+                 dal_attested_slots_validity_lag;
+               }
+                : Previous.sc_rollup_reveal_activation_level) =
+            c.sc_rollup.reveal_activation_level
+          in
+          let raw_data =
+            Constants_parametric_repr.{blake2B = raw_data.blake2B}
+          in
+          {
+            Constants_parametric_repr.raw_data;
+            metadata;
+            dal_page;
+            dal_parameters;
+            dal_attested_slots_validity_lag;
+          }
+        in
+        let sc_rollup =
+          let ({
+                 arith_pvm_enable;
+                 origination_size;
+                 challenge_window_in_blocks;
+                 stake_amount;
+                 commitment_period_in_blocks;
+                 max_lookahead_in_blocks;
+                 max_active_outbox_levels;
+                 max_outbox_messages_per_level;
+                 number_of_sections_in_dissection;
+                 timeout_period_in_blocks;
+                 max_number_of_stored_cemented_commitments;
+                 max_number_of_parallel_games;
+                 reveal_activation_level = _;
+                 private_enable;
+                 riscv_pvm_enable;
+                 canonical_rollup_address = _;
+               }
+                : Previous.sc_rollup) =
+            c.sc_rollup
+          in
+          Constants_parametric_repr.
+            {
+              arith_pvm_enable;
+              origination_size;
+              challenge_window_in_blocks;
+              stake_amount;
+              commitment_period_in_blocks;
+              max_lookahead_in_blocks;
+              max_active_outbox_levels;
+              max_outbox_messages_per_level;
+              number_of_sections_in_dissection;
+              timeout_period_in_blocks;
+              max_number_of_stored_cemented_commitments;
+              max_number_of_parallel_games;
+              reveal_activation_level;
+              private_enable;
+              riscv_pvm_enable;
+              canonical_rollup_address;
+            }
+        in
+        let zk_rollup =
+          let ({
+                 enable;
+                 origination_size;
+                 min_pending_to_process;
+                 max_ticket_payload_size;
+               }
+                : Previous.zk_rollup) =
+            c.zk_rollup
+          in
+          Constants_parametric_repr.
+            {
+              enable;
+              origination_size;
+              min_pending_to_process;
+              max_ticket_payload_size;
+            }
+        in
+        let adaptive_rewards_params =
+          let ({
+                 issuance_ratio_final_min;
+                 issuance_ratio_final_max;
+                 issuance_ratio_initial_min;
+                 issuance_ratio_initial_max;
+                 initial_period;
+                 transition_period;
+                 max_bonus;
+                 growth_rate;
+                 center_dz;
+                 radius_dz;
+               }
+                : Previous.adaptive_rewards_params) =
+            c.adaptive_issuance.adaptive_rewards_params
+          in
+          Constants_parametric_repr.
+            {
+              issuance_ratio_final_min;
+              issuance_ratio_final_max;
+              issuance_ratio_initial_min;
+              issuance_ratio_initial_max;
+              initial_period;
+              transition_period;
+              max_bonus;
+              growth_rate;
+              center_dz;
+              radius_dz;
+            }
+        in
+        let adaptive_issuance =
+          let ({
+                 global_limit_of_staking_over_baking;
+                 edge_of_staking_over_delegation;
+                 adaptive_rewards_params = _;
+               }
+                : Previous.adaptive_issuance) =
+            c.adaptive_issuance
+          in
+          Constants_parametric_repr.
+            {
+              global_limit_of_staking_over_baking;
+              edge_of_staking_over_delegation;
+              adaptive_rewards_params;
+            }
+        in
+        let issuance_weights =
+          let ({
+                 base_total_issued_per_minute;
+                 baking_reward_fixed_portion_weight;
+                 baking_reward_bonus_weight;
+                 attesting_reward_weight;
+                 seed_nonce_revelation_tip_weight;
+                 vdf_revelation_tip_weight;
+                 dal_rewards_weight;
+               }
+                : Previous.issuance_weights) =
+            c.issuance_weights
+          in
+          {
+            Constants_parametric_repr.base_total_issued_per_minute;
+            baking_reward_fixed_portion_weight;
+            baking_reward_bonus_weight;
+            attesting_reward_weight;
+            seed_nonce_revelation_tip_weight;
+            vdf_revelation_tip_weight;
+            dal_rewards_weight;
+          }
+        in
+        let constants =
+          let ({
+                 consensus_rights_delay;
+                 blocks_preservation_cycles;
+                 delegate_parameters_activation_delay;
+                 tolerated_inactivity_period;
+                 blocks_per_cycle;
+                 blocks_per_commitment;
+                 nonce_revelation_threshold;
+                 cycles_per_voting_period;
+                 hard_gas_limit_per_operation;
+                 hard_gas_limit_per_block;
+                 proof_of_work_threshold;
+                 minimal_stake;
+                 minimal_frozen_stake;
+                 vdf_difficulty;
+                 origination_size;
+                 max_operations_time_to_live;
+                 issuance_weights = _;
+                 cost_per_byte;
+                 hard_storage_limit_per_operation;
+                 quorum_min;
+                 quorum_max;
+                 min_proposal_quorum;
+                 liquidity_baking_subsidy;
+                 liquidity_baking_toggle_ema_threshold;
+                 minimal_block_delay;
+                 delay_increment_per_round;
+                 consensus_committee_size;
+                 consensus_threshold_size;
+                 minimal_participation_ratio;
+                 limit_of_delegation_over_baking;
+                 percentage_of_frozen_deposits_slashed_per_double_baking;
+                 max_slashing_per_block;
+                 max_slashing_threshold;
+                 (* The `testnet_dictator` should absolutely be None on mainnet *)
+                 testnet_dictator;
+                 initial_seed;
+                 cache_script_size;
+                 cache_stake_distribution_cycles;
+                 cache_sampler_state_cycles;
+                 cache_stake_info_cycles;
+                 cache_swrr_selected_distribution_cycles;
+                 dal = _;
+                 sc_rollup = _;
+                 zk_rollup = _;
+                 adaptive_issuance = _;
+                 direct_ticket_spending_enable;
+                 aggregate_attestation = _;
+                 allow_tz4_delegate_enable = _;
+                 all_bakers_attest_activation_threshold;
+                 native_contracts_enable;
+                 swrr_new_baker_lottery_enable;
+                 tz5_account_enable;
+               }
+                : Previous.t) =
+            c
+          in
+          {
+            Constants_parametric_repr.consensus_rights_delay;
+            blocks_preservation_cycles;
+            delegate_parameters_activation_delay;
+            tolerated_inactivity_period;
+            blocks_per_cycle;
+            blocks_per_commitment;
+            nonce_revelation_threshold;
+            cycles_per_voting_period;
+            hard_gas_limit_per_operation;
+            hard_gas_limit_per_block;
+            proof_of_work_threshold;
+            minimal_stake;
+            minimal_frozen_stake;
+            vdf_difficulty;
+            origination_size;
+            max_operations_time_to_live;
+            issuance_weights;
+            cost_per_byte;
+            hard_storage_limit_per_operation;
+            quorum_min;
+            quorum_max;
+            min_proposal_quorum;
+            liquidity_baking_subsidy;
+            liquidity_baking_toggle_ema_threshold;
+            minimal_block_delay;
+            delay_increment_per_round;
+            consensus_committee_size;
+            consensus_threshold_size;
+            minimal_participation_ratio;
+            limit_of_delegation_over_baking;
+            percentage_of_frozen_deposits_slashed_per_double_baking;
+            max_slashing_per_block;
+            max_slashing_threshold;
+            (* The `testnet_dictator` should absolutely be None on mainnet *)
+            testnet_dictator;
+            initial_seed;
+            cache_script_size;
+            cache_stake_distribution_cycles;
+            cache_sampler_state_cycles;
+            cache_stake_info_cycles;
+            cache_swrr_selected_distribution_cycles;
+            dal;
+            sc_rollup;
+            zk_rollup;
+            adaptive_issuance;
+            direct_ticket_spending_enable;
+            all_bakers_attest_activation_threshold;
+            native_contracts_enable;
+            swrr_new_baker_lottery_enable;
+            tz5_account_enable;
+          }
+        in
+        let*! ctxt = add_constants ctxt constants in
 
-let activate ctxt h = Updater.activate (context ctxt) h >|= update_context ctxt
+        return (ctxt, Some c)
+    (* End of alpha predecessor stitching. Comment used for automatic snapshot *)
+  in
+  let+ ctxt =
+    prepare
+      ctxt
+      ~level
+      ~predecessor_timestamp:timestamp
+      ~timestamp
+      ~all_bakers_attest_first_level:None
+  in
+  (previous_proto, previous_proto_constants, ctxt)
+
+let activate ctxt h =
+  let open Lwt_syntax in
+  let+ new_ctxt = Updater.activate (context ctxt) h in
+  update_context ctxt new_ctxt
 
 (* Generic context ********************************************************)
 
@@ -1056,70 +1715,94 @@ let mem ctxt k = Context.mem (context ctxt) k
 let mem_tree ctxt k = Context.mem_tree (context ctxt) k
 
 let get ctxt k =
-  Context.find (context ctxt) k >|= function
-  | None -> storage_error (Missing_key (k, Get))
-  | Some v -> ok v
+  let open Lwt_result_syntax in
+  let*! v_opt = Context.find (context ctxt) k in
+  match v_opt with
+  | None -> Lwt.return @@ storage_error (Missing_key (k, Get))
+  | Some v -> return v
 
 let get_tree ctxt k =
-  Context.find_tree (context ctxt) k >|= function
-  | None -> storage_error (Missing_key (k, Get))
-  | Some v -> ok v
+  let open Lwt_result_syntax in
+  let*! v_opt = Context.find_tree (context ctxt) k in
+  match v_opt with
+  | None -> Lwt.return @@ storage_error (Missing_key (k, Get))
+  | Some v -> return v
 
 let find ctxt k = Context.find (context ctxt) k
 
 let find_tree ctxt k = Context.find_tree (context ctxt) k
 
-let add ctxt k v = Context.add (context ctxt) k v >|= update_context ctxt
+let add ctxt k v =
+  let open Lwt_syntax in
+  let+ new_ctxt = Context.add (context ctxt) k v in
+  update_context ctxt new_ctxt
 
 let add_tree ctxt k v =
-  Context.add_tree (context ctxt) k v >|= update_context ctxt
+  let open Lwt_syntax in
+  let+ new_ctxt = Context.add_tree (context ctxt) k v in
+  update_context ctxt new_ctxt
 
 let init ctxt k v =
-  Context.mem (context ctxt) k >>= function
+  let open Lwt_result_syntax in
+  let*! result = Context.mem (context ctxt) k in
+  match result with
   | true -> Lwt.return @@ storage_error (Existing_key k)
   | _ ->
-      Context.add (context ctxt) k v >|= fun context ->
-      ok (update_context ctxt context)
+      let*! context = Context.add (context ctxt) k v in
+      return (update_context ctxt context)
 
 let init_tree ctxt k v : _ tzresult Lwt.t =
-  Context.mem_tree (context ctxt) k >>= function
+  let open Lwt_result_syntax in
+  let*! result = Context.mem_tree (context ctxt) k in
+  match result with
   | true -> Lwt.return @@ storage_error (Existing_key k)
   | _ ->
-      Context.add_tree (context ctxt) k v >|= fun context ->
-      ok (update_context ctxt context)
+      let*! context = Context.add_tree (context ctxt) k v in
+      return (update_context ctxt context)
 
 let update ctxt k v =
-  Context.mem (context ctxt) k >>= function
+  let open Lwt_result_syntax in
+  let*! result = Context.mem (context ctxt) k in
+  match result with
   | false -> Lwt.return @@ storage_error (Missing_key (k, Set))
   | _ ->
-      Context.add (context ctxt) k v >|= fun context ->
-      ok (update_context ctxt context)
+      let*! context = Context.add (context ctxt) k v in
+      return (update_context ctxt context)
 
 let update_tree ctxt k v =
-  Context.mem_tree (context ctxt) k >>= function
+  let open Lwt_result_syntax in
+  let*! result = Context.mem_tree (context ctxt) k in
+  match result with
   | false -> Lwt.return @@ storage_error (Missing_key (k, Set))
   | _ ->
-      Context.add_tree (context ctxt) k v >|= fun context ->
-      ok (update_context ctxt context)
+      let*! context = Context.add_tree (context ctxt) k v in
+      return (update_context ctxt context)
 
 (* Verify that the key is present before deleting *)
 let remove_existing ctxt k =
-  Context.mem (context ctxt) k >>= function
+  let open Lwt_result_syntax in
+  let*! result = Context.mem (context ctxt) k in
+  match result with
   | false -> Lwt.return @@ storage_error (Missing_key (k, Del))
   | _ ->
-      Context.remove (context ctxt) k >|= fun context ->
-      ok (update_context ctxt context)
+      let*! context = Context.remove (context ctxt) k in
+      return (update_context ctxt context)
 
 (* Verify that the key is present before deleting *)
 let remove_existing_tree ctxt k =
-  Context.mem_tree (context ctxt) k >>= function
+  let open Lwt_result_syntax in
+  let*! result = Context.mem_tree (context ctxt) k in
+  match result with
   | false -> Lwt.return @@ storage_error (Missing_key (k, Del))
   | _ ->
-      Context.remove (context ctxt) k >|= fun context ->
-      ok (update_context ctxt context)
+      let*! context = Context.remove (context ctxt) k in
+      return (update_context ctxt context)
 
 (* Do not verify before deleting *)
-let remove ctxt k = Context.remove (context ctxt) k >|= update_context ctxt
+let remove ctxt k =
+  let open Lwt_syntax in
+  let+ new_ctxt = Context.remove (context ctxt) k in
+  update_context ctxt new_ctxt
 
 let add_or_remove ctxt k = function
   | None -> remove ctxt k
@@ -1151,46 +1834,74 @@ module Tree :
   let empty ctxt = Context.Tree.empty (context ctxt)
 
   let get t k =
-    find t k >|= function
-    | None -> storage_error (Missing_key (k, Get))
-    | Some v -> ok v
+    let open Lwt_result_syntax in
+    let*! result = find t k in
+    match result with
+    | None -> Lwt.return @@ storage_error (Missing_key (k, Get))
+    | Some v -> return v
 
   let get_tree t k =
-    find_tree t k >|= function
-    | None -> storage_error (Missing_key (k, Get))
-    | Some v -> ok v
+    let open Lwt_result_syntax in
+    let*! result = find_tree t k in
+    match result with
+    | None -> Lwt.return @@ storage_error (Missing_key (k, Get))
+    | Some v -> return v
 
   let init t k v =
-    mem t k >>= function
+    let open Lwt_result_syntax in
+    let*! result = mem t k in
+    match result with
     | true -> Lwt.return @@ storage_error (Existing_key k)
-    | _ -> add t k v >|= ok
+    | _ ->
+        let*! tree = add t k v in
+        return tree
 
   let init_tree t k v =
-    mem_tree t k >>= function
+    let open Lwt_result_syntax in
+    let*! result = mem_tree t k in
+    match result with
     | true -> Lwt.return @@ storage_error (Existing_key k)
-    | _ -> add_tree t k v >|= ok
+    | _ ->
+        let*! tree = add_tree t k v in
+        return tree
 
   let update t k v =
-    mem t k >>= function
+    let open Lwt_result_syntax in
+    let*! result = mem t k in
+    match result with
     | false -> Lwt.return @@ storage_error (Missing_key (k, Set))
-    | _ -> add t k v >|= ok
+    | _ ->
+        let*! tree = add t k v in
+        return tree
 
   let update_tree t k v =
-    mem_tree t k >>= function
+    let open Lwt_result_syntax in
+    let*! result = mem_tree t k in
+    match result with
     | false -> Lwt.return @@ storage_error (Missing_key (k, Set))
-    | _ -> add_tree t k v >|= ok
+    | _ ->
+        let*! tree = add_tree t k v in
+        return tree
 
   (* Verify that the key is present before deleting *)
   let remove_existing t k =
-    mem t k >>= function
+    let open Lwt_result_syntax in
+    let*! result = mem t k in
+    match result with
     | false -> Lwt.return @@ storage_error (Missing_key (k, Del))
-    | _ -> remove t k >|= ok
+    | _ ->
+        let*! tree = remove t k in
+        return tree
 
   (* Verify that the key is present before deleting *)
   let remove_existing_tree t k =
-    mem_tree t k >>= function
+    let open Lwt_result_syntax in
+    let*! result = mem_tree t k in
+    match result with
     | false -> Lwt.return @@ storage_error (Missing_key (k, Del))
-    | _ -> remove t k >|= ok
+    | _ ->
+        let*! tree = remove t k in
+        return tree
 
   let add_or_remove t k = function None -> remove t k | Some v -> add t k v
 
@@ -1216,8 +1927,8 @@ let fold_map_temporary_lazy_storage_ids ctxt f =
   (update_temporary_lazy_storage_ids ctxt temporary_lazy_storage_ids, x)
 
 let map_temporary_lazy_storage_ids_s ctxt f =
-  f (temporary_lazy_storage_ids ctxt)
-  >|= fun (ctxt, temporary_lazy_storage_ids) ->
+  let open Lwt_syntax in
+  let+ ctxt, temporary_lazy_storage_ids = f (temporary_lazy_storage_ids ctxt) in
   update_temporary_lazy_storage_ids ctxt temporary_lazy_storage_ids
 
 module Cache = struct
@@ -1234,14 +1945,16 @@ module Cache = struct
   let find c k = Context.Cache.find (context c) k
 
   let set_cache_layout c layout =
-    Context.Cache.set_cache_layout (context c) layout >>= fun ctxt ->
-    Lwt.return (update_context c ctxt)
+    let open Lwt_syntax in
+    let+ ctxt = Context.Cache.set_cache_layout (context c) layout in
+    update_context c ctxt
 
   let update c k v = Context.Cache.update (context c) k v |> update_context c
 
   let sync c cache_nonce =
-    Context.Cache.sync (context c) ~cache_nonce >>= fun ctxt ->
-    Lwt.return (update_context c ctxt)
+    let open Lwt_syntax in
+    let+ ctxt = Context.Cache.sync (context c) ~cache_nonce in
+    update_context c ctxt
 
   let clear c = Context.Cache.clear (context c) |> update_context c
 
@@ -1273,27 +1986,33 @@ let record_dictator_proposal_seen ctxt = update_dictator_proposal_seen ctxt true
 let dictator_proposal_seen ctxt = dictator_proposal_seen ctxt
 
 let init_sampler_for_cycle ctxt cycle seed state =
+  let open Result_syntax in
   let map = sampler_state ctxt in
-  if Cycle_repr.Map.mem cycle map then error (Sampler_already_set cycle)
+  if Cycle_repr.Map.mem cycle map then tzfail (Sampler_already_set cycle)
   else
     let map = Cycle_repr.Map.add cycle (seed, state) map in
     let ctxt = update_sampler_state ctxt map in
-    ok ctxt
+    return ctxt
 
 let sampler_for_cycle ~read ctxt cycle =
+  let open Lwt_result_syntax in
   let map = sampler_state ctxt in
   match Cycle_repr.Map.find cycle map with
   | Some (seed, state) -> return (ctxt, seed, state)
   | None ->
-      read ctxt >>=? fun (seed, state) ->
+      let* ctxt, seed, state = read ctxt in
       let map = Cycle_repr.Map.add cycle (seed, state) map in
       let ctxt = update_sampler_state ctxt map in
       return (ctxt, seed, state)
 
+let find_stake_distribution_for_current_cycle ctxt =
+  ctxt.back.stake_distribution_for_current_cycle
+
 let stake_distribution_for_current_cycle ctxt =
+  let open Result_syntax in
   match ctxt.back.stake_distribution_for_current_cycle with
-  | None -> error Stake_distribution_not_set
-  | Some s -> ok s
+  | None -> tzfail Stake_distribution_not_set
+  | Some s -> return s
 
 let init_stake_distribution_for_current_cycle ctxt
     stake_distribution_for_current_cycle =
@@ -1304,6 +2023,29 @@ let init_stake_distribution_for_current_cycle ctxt
       stake_distribution_for_current_cycle =
         Some stake_distribution_for_current_cycle;
     }
+
+type delegate_stake_info = {consensus_pk : consensus_pk; stake_weight : Int64.t}
+
+type stake_info = {
+  total_stake_weight : Int64.t;
+  delegates : delegate_stake_info list;
+}
+
+let delegate_stake_info_encoding =
+  let open Data_encoding in
+  conv
+    (fun {consensus_pk; stake_weight} -> (consensus_pk, stake_weight))
+    (fun (consensus_pk, stake_weight) -> {consensus_pk; stake_weight})
+    (obj2 (req "consensus_pk" consensus_pk_encoding) (req "stake_weight" int64))
+
+let stake_info_encoding =
+  let open Data_encoding in
+  conv
+    (fun {total_stake_weight; delegates} -> (total_stake_weight, delegates))
+    (fun (total_stake_weight, delegates) -> {total_stake_weight; delegates})
+    (obj2
+       (req "total_stake_weight" int64)
+       (req "delegates" (list delegate_stake_info_encoding)))
 
 module Internal_for_tests = struct
   let add_level ctxt l =
@@ -1328,49 +2070,69 @@ module type CONSENSUS = sig
 
   type 'value slot_map
 
+  type 'value level_map
+
+  type 'value raw_level_map
+
   type slot_set
 
   type slot
 
   type round
 
-  type consensus_pk
+  type attesting_power
 
-  val allowed_endorsements : t -> (consensus_pk * int) slot_map
+  type consensus_power
 
-  val allowed_preendorsements : t -> (consensus_pk * int) slot_map
+  val allowed_attestations : t -> consensus_power slot_map option
 
-  val current_endorsement_power : t -> int
+  val allowed_preattestations : t -> consensus_power slot_map option
+
+  val allowed_consensus : t -> consensus_power slot_map level_map option
+
+  val delegate_to_shard_count :
+    t -> int Implicit_account_repr.Map.t raw_level_map
+
+  val shard_count_map :
+    t ->
+    committee_level:Raw_level_repr.t ->
+    int Implicit_account_repr.Map.t option
+
+  val forbidden_delegates : t -> Implicit_account_repr.Set.t
+
+  type error += Slot_map_not_found of {loc : string}
+
+  val current_attesting_power : t -> attesting_power
 
   val initialize_consensus_operation :
     t ->
-    allowed_endorsements:(consensus_pk * int) slot_map ->
-    allowed_preendorsements:(consensus_pk * int) slot_map ->
+    allowed_attestations:consensus_power slot_map option ->
+    allowed_preattestations:consensus_power slot_map option ->
+    allowed_consensus:consensus_power slot_map level_map option ->
+    delegate_to_shard_count:int Implicit_account_repr.Map.t raw_level_map ->
     t
 
-  val record_grand_parent_endorsement :
-    t -> Signature.Public_key_hash.t -> t tzresult
+  val record_attestation :
+    t -> initial_slot:slot -> power:attesting_power -> t tzresult
 
-  val record_endorsement : t -> initial_slot:slot -> power:int -> t tzresult
+  val record_preattestation :
+    t -> initial_slot:slot -> power:attesting_power -> round -> t tzresult
 
-  val record_preendorsement :
-    t -> initial_slot:slot -> power:int -> round -> t tzresult
+  val forbid_delegate : t -> Implicit_account_repr.t -> t
 
-  val endorsements_seen : t -> slot_set
+  val set_forbidden_delegates : t -> Implicit_account_repr.Set.t -> t
 
-  val get_preendorsements_quorum_round : t -> round option
+  val attestations_seen : t -> slot_set
 
-  val set_preendorsements_quorum_round : t -> round -> t
+  val get_preattestations_quorum_round : t -> round option
 
-  val locked_round_evidence : t -> (round * int) option
+  val set_preattestations_quorum_round : t -> round -> t
 
-  val set_endorsement_branch : t -> Block_hash.t * Block_payload_hash.t -> t
+  val locked_round_evidence : t -> (round * attesting_power) option
 
-  val endorsement_branch : t -> (Block_hash.t * Block_payload_hash.t) option
+  val set_attestation_branch : t -> Block_hash.t * Block_payload_hash.t -> t
 
-  val set_grand_parent_branch : t -> Block_hash.t * Block_payload_hash.t -> t
-
-  val grand_parent_branch : t -> (Block_hash.t * Block_payload_hash.t) option
+  val attestation_branch : t -> (Block_hash.t * Block_payload_hash.t) option
 end
 
 module Consensus :
@@ -1378,94 +2140,99 @@ module Consensus :
     with type t := t
      and type slot := Slot_repr.t
      and type 'a slot_map := 'a Slot_repr.Map.t
+     and type 'a level_map := 'a Level_repr.Map.t
+     and type 'a raw_level_map := 'a Raw_level_repr.Map.t
      and type slot_set := Slot_repr.Set.t
      and type round := Round_repr.t
-     and type consensus_pk := consensus_pk = struct
-  let[@inline] allowed_endorsements ctxt =
-    ctxt.back.consensus.allowed_endorsements
-
-  let[@inline] allowed_preendorsements ctxt =
-    ctxt.back.consensus.allowed_preendorsements
-
-  let[@inline] current_endorsement_power ctxt =
-    ctxt.back.consensus.current_endorsement_power
-
-  let[@inline] get_preendorsements_quorum_round ctxt =
-    ctxt.back.consensus.preendorsements_quorum_round
-
-  let[@inline] locked_round_evidence ctxt =
-    Raw_consensus.locked_round_evidence ctxt.back.consensus
-
+     and type attesting_power := Attesting_power_repr.t
+     and type consensus_power := consensus_power = struct
   let[@inline] update_consensus_with ctxt f =
     {ctxt with back = {ctxt.back with consensus = f ctxt.back.consensus}}
 
   let[@inline] update_consensus_with_tzresult ctxt f =
-    f ctxt.back.consensus >|? fun consensus ->
+    let open Result_syntax in
+    let+ consensus = f ctxt.back.consensus in
     {ctxt with back = {ctxt.back with consensus}}
 
-  let[@inline] initialize_consensus_operation ctxt ~allowed_endorsements
-      ~allowed_preendorsements =
+  let[@inline] allowed_attestations ctxt =
+    ctxt.back.consensus.allowed_attestations
+
+  let[@inline] allowed_preattestations ctxt =
+    ctxt.back.consensus.allowed_preattestations
+
+  let[@inline] allowed_consensus ctxt = ctxt.back.consensus.allowed_consensus
+
+  let[@inline] delegate_to_shard_count ctxt =
+    ctxt.back.consensus.delegate_to_shard_count
+
+  let[@inline] shard_count_map ctxt ~committee_level =
+    Raw_level_repr.Map.find
+      committee_level
+      ctxt.back.consensus.delegate_to_shard_count
+
+  let[@inline] forbidden_delegates ctxt =
+    ctxt.back.consensus.forbidden_delegates
+
+  let[@inline] set_forbidden_delegates ctxt delegates =
+    update_consensus_with ctxt (Raw_consensus.set_forbidden_delegates delegates)
+
+  let[@inline] current_attesting_power ctxt =
+    ctxt.back.consensus.current_attesting_power
+
+  let[@inline] get_preattestations_quorum_round ctxt =
+    ctxt.back.consensus.preattestations_quorum_round
+
+  let[@inline] locked_round_evidence ctxt =
+    Raw_consensus.locked_round_evidence ctxt.back.consensus
+
+  let[@inline] initialize_consensus_operation ctxt ~allowed_attestations
+      ~allowed_preattestations ~allowed_consensus ~delegate_to_shard_count =
     update_consensus_with
       ctxt
-      (Raw_consensus.initialize_with_endorsements_and_preendorsements
-         ~allowed_endorsements
-         ~allowed_preendorsements)
+      (Raw_consensus.set_allowed_operations
+         ~allowed_attestations
+         ~allowed_preattestations
+         ~allowed_consensus
+         ~delegate_to_shard_count)
 
-  let[@inline] record_grand_parent_endorsement ctxt pkh =
-    update_consensus_with_tzresult ctxt (fun ctxt ->
-        Raw_consensus.record_grand_parent_endorsement ctxt pkh)
-
-  let[@inline] record_preendorsement ctxt ~initial_slot ~power round =
+  let[@inline] record_preattestation ctxt ~initial_slot ~power round =
     update_consensus_with_tzresult
       ctxt
-      (Raw_consensus.record_preendorsement ~initial_slot ~power round)
+      (Raw_consensus.record_preattestation ~initial_slot ~power round)
 
-  let[@inline] record_endorsement ctxt ~initial_slot ~power =
+  let[@inline] record_attestation ctxt ~initial_slot ~power =
     update_consensus_with_tzresult
       ctxt
-      (Raw_consensus.record_endorsement ~initial_slot ~power)
+      (Raw_consensus.record_attestation ~initial_slot ~power)
 
-  let[@inline] endorsements_seen ctxt = ctxt.back.consensus.endorsements_seen
+  let[@inline] forbid_delegate ctxt delegate =
+    update_consensus_with ctxt (Raw_consensus.forbid_delegate delegate)
 
-  let[@inline] set_preendorsements_quorum_round ctxt round =
+  let[@inline] attestations_seen ctxt = ctxt.back.consensus.attestations_seen
+
+  let[@inline] set_preattestations_quorum_round ctxt round =
     update_consensus_with
       ctxt
-      (Raw_consensus.set_preendorsements_quorum_round round)
+      (Raw_consensus.set_preattestations_quorum_round round)
 
-  let[@inline] endorsement_branch ctxt =
-    Raw_consensus.endorsement_branch ctxt.back.consensus
+  let[@inline] attestation_branch ctxt =
+    Raw_consensus.attestation_branch ctxt.back.consensus
 
-  let[@inline] set_endorsement_branch ctxt branch =
+  let[@inline] set_attestation_branch ctxt branch =
     update_consensus_with ctxt (fun ctxt ->
-        Raw_consensus.set_endorsement_branch ctxt branch)
+        Raw_consensus.set_attestation_branch ctxt branch)
 
-  let[@inline] grand_parent_branch ctxt =
-    Raw_consensus.grand_parent_branch ctxt.back.consensus
+  type error += Slot_map_not_found of {loc : string}
 
-  let[@inline] set_grand_parent_branch ctxt branch =
-    update_consensus_with ctxt (fun ctxt ->
-        Raw_consensus.set_grand_parent_branch ctxt branch)
-end
-
-module Tx_rollup = struct
-  let add_message ctxt rollup message =
-    let root = ref Tx_rollup_inbox_repr.Merkle.(root empty) in
-    let updater element =
-      let tree =
-        Option.value element ~default:Tx_rollup_inbox_repr.Merkle.(empty)
-      in
-      let tree = Tx_rollup_inbox_repr.Merkle.add_message tree message in
-      root := Tx_rollup_inbox_repr.Merkle.root tree ;
-      Some tree
-    in
-    let map =
-      Tx_rollup_repr.Map.update
-        rollup
-        updater
-        ctxt.back.tx_rollup_current_messages
-    in
-    let back = {ctxt.back with tx_rollup_current_messages = map} in
-    ({ctxt with back}, !root)
+  let () =
+    register_error_kind
+      `Permanent
+      ~id:"raw_context.consensus.slot_map_not_found"
+      ~title:"Slot map not found"
+      ~description:"Pre-computed map by first slot not found."
+      Data_encoding.(obj1 (req "loc" (string Plain)))
+      (function Slot_map_not_found {loc} -> Some loc | _ -> None)
+      (fun loc -> Slot_map_not_found {loc})
 end
 
 (*
@@ -1483,161 +2250,117 @@ end
 module Dal = struct
   type cryptobox = Dal.t
 
-  let make ctxt =
+  let make_cryptobox params =
     let open Result_syntax in
-    let Constants_parametric_repr.{dal = {cryptobox_parameters; _}; _} =
-      ctxt.back.constants
-    in
-    match Dal.make cryptobox_parameters with
+    match Dal.make params with
     | Ok cryptobox -> return cryptobox
     | Error (`Fail explanation) ->
-        error (Dal_errors_repr.Dal_cryptobox_error {explanation})
+        tzfail (Dal_errors_repr.Dal_cryptobox_error {explanation})
 
-  let number_of_slots ctxt = ctxt.back.constants.dal.number_of_slots
+  let make ctxt =
+    let open Result_syntax in
+    (* Dal.make takes some time (on the order of 10ms) so we memoize
+       its result to avoid calling it more than once per block. *)
+    let dal = dal ctxt in
+    match dal.cryptobox with
+    | Some cryptobox -> return (ctxt, cryptobox)
+    | None -> (
+        match Dal.make (constants ctxt).dal.cryptobox_parameters with
+        | Ok cryptobox ->
+            let ctxt = update_dal ctxt {dal with cryptobox = Some cryptobox} in
+            return (ctxt, cryptobox)
+        | Error (`Fail explanation) ->
+            tzfail (Dal_errors_repr.Dal_cryptobox_error {explanation}))
 
-  let record_attested_shards ctxt attestation shards =
-    let dal_attestation_slot_accountability =
-      Dal_attestation_repr.Accountability.record_attested_shards
-        ctxt.back.dal_attestation_slot_accountability
-        attestation
-        shards
-    in
-    {ctxt with back = {ctxt.back with dal_attestation_slot_accountability}}
+  let committee_level_of ctxt ~attested_level ~lag =
+    let params = (constants ctxt).dal in
+    match Raw_level_repr.sub attested_level lag with
+    | None -> None
+    | Some published_level ->
+        Some (Raw_level_repr.add published_level (params.attestation_lag - 1))
 
-  let register_slot_header ctxt slot_header =
-    match
-      Dal_slot_repr.Slot_market.register
-        ctxt.back.dal_slot_fee_market
-        slot_header
-    with
-    | None ->
-        let length =
-          Dal_slot_repr.Slot_market.length ctxt.back.dal_slot_fee_market
-        in
-        error
-          (Dal_errors_repr.Dal_register_invalid_slot_header
-             {length; slot_header})
-    | Some (dal_slot_fee_market, updated) ->
-        if not updated then
-          error
-            (Dal_errors_repr.Dal_publish_slot_header_duplicate {slot_header})
-        else ok {ctxt with back = {ctxt.back with dal_slot_fee_market}}
+  let[@inline] slot_accountability ctxt =
+    let ({slot_accountability; _} : Raw_dal.t) = dal ctxt in
+    slot_accountability
 
-  let candidates ctxt =
-    Dal_slot_repr.Slot_market.candidates ctxt.back.dal_slot_fee_market
+  let[@inline] record_slot_accountability ctxt slot_accountability =
+    let dal = dal ctxt in
+    update_dal ctxt {dal with slot_accountability}
 
-  let is_slot_index_attested ctxt =
-    let threshold =
-      ctxt.back.constants.Constants_parametric_repr.dal.attestation_threshold
-    in
-    let number_of_shards =
-      ctxt.back.constants.Constants_parametric_repr.dal.cryptobox_parameters
-        .number_of_shards
-    in
-    Dal_attestation_repr.Accountability.is_slot_attested
-      ctxt.back.dal_attestation_slot_accountability
-      ~threshold
-      ~number_of_shards
+  let[@inline] slot_fee_market ctxt =
+    let ({slot_fee_market; _} : Raw_dal.t) = dal ctxt in
+    slot_fee_market
 
-  type committee = dal_committee = {
-    pkh_to_shards :
-      (Dal_attestation_repr.shard_index * int) Signature.Public_key_hash.Map.t;
-    shard_to_pkh : Signature.Public_key_hash.t Dal_attestation_repr.Shard_map.t;
+  let[@inline] record_slot_fee_market ctxt slot_fee_market =
+    let dal = dal ctxt in
+    update_dal ctxt {dal with slot_fee_market}
+
+  let record_attestation ctxt ~tb_slot attestation =
+    let dal = dal ctxt in
+    update_dal
+      ctxt
+      {
+        dal with
+        attestations = Slot_repr.Map.add tb_slot attestation dal.attestations;
+      }
+
+  let[@inline] attestations ctxt =
+    let dal = dal ctxt in
+    dal.attestations
+
+  let[@inline] get_accountability ctxt =
+    let dal = dal ctxt in
+    dal.slot_accountability
+
+  let assert_feature_enabled ctxt =
+    let constants = constants ctxt in
+    error_unless
+      Compare.Bool.(constants.dal.feature_enable = true)
+      Dal_errors_repr.Dal_feature_disabled
+
+  let only_if_feature_enabled ctxt ~default f =
+    let constants = constants ctxt in
+    if constants.dal.feature_enable then f ctxt else default ctxt
+
+  let assert_incentives_enabled ctxt =
+    let constants = constants ctxt in
+    error_unless
+      Compare.Bool.(constants.dal.incentives_enable = true)
+      Dal_errors_repr.Dal_incentives_disabled
+
+  let only_if_incentives_enabled ctxt ~default f =
+    let constants = constants ctxt in
+    if constants.dal.incentives_enable then f ctxt else default ctxt
+
+  let assert_dynamic_lag_enabled ctxt =
+    let constants = constants ctxt in
+    error_unless
+      Compare.Bool.(constants.dal.dynamic_lag_enable = true)
+      Dal_errors_repr.Dal_dynamic_lag_disabled
+
+  let only_if_dynamic_lag_enabled ctxt ~default f =
+    let constants = constants ctxt in
+    if constants.dal.dynamic_lag_enable then f ctxt else default ctxt
+end
+
+module Address_registry = struct
+  type diff = Raw_address_registry.diff = {
+    address : Destination_repr.t;
+    index : Z.t;
   }
 
-  (* DAL/FIXME https://gitlab.com/tezos/tezos/-/issues/3110
+  let register_diff ctxt diff =
+    {
+      ctxt with
+      back =
+        {
+          ctxt.back with
+          address_registry_diff_rev =
+            diff :: ctxt.back.address_registry_diff_rev;
+        };
+    }
 
-     A committee is selected by the callback function
-     [pkh_from_tenderbake_slot]. We use a callback because of circular
-     dependencies. It is not clear whether it will be the final choice
-     for the DAL committee. The current solution is a bit hackish but
-     should work. If we decide to differ from the Tenderbake
-     committee, one could just draw a new committee.
-
-     The problem with drawing a new committee is that it is not
-     guaranteed that everyone in the DAL committee will be in the
-     Tenderbake committee. Consequently, either we decide to have a
-     new consensus operation which does not count for Tenderbake,
-     and/or we take into account for the model of DAL that at every
-     level, a percentage of DAL attestations cannot be received. *)
-  let compute_committee ctxt pkh_from_tenderbake_slot =
-    let Constants_parametric_repr.
-          {
-            dal = {cryptobox_parameters = {number_of_shards; _}; _};
-            consensus_committee_size;
-            _;
-          } =
-      ctxt.back.constants
-    in
-    (* We first draw a committee by drawing slots from the Tenderbake
-       committee. To have a compact representation of slots, we can
-       sort the Tenderbake slots by [pkh], so that a committee is
-       actually only an interval. This is done by recomputing a
-       committee from the first one. *)
-    let update_committee committee pkh ~slot_index ~power =
-      {
-        pkh_to_shards =
-          Signature.Public_key_hash.Map.update
-            pkh
-            (function
-              | None -> Some (slot_index, power)
-              | Some (initial_shard_index, old_power) ->
-                  Some (initial_shard_index, old_power + power))
-            committee.pkh_to_shards;
-        shard_to_pkh =
-          List.fold_left
-            (fun shard_to_pkh slot ->
-              Dal_attestation_repr.Shard_map.add slot pkh shard_to_pkh)
-            committee.shard_to_pkh
-            Misc.(slot_index --> (slot_index + (power - 1)));
-      }
-    in
-    let rec compute_power index committee =
-      if Compare.Int.(index < 0) then return committee
-      else
-        let shard_index = index mod consensus_committee_size in
-        Slot_repr.of_int shard_index >>?= fun slot ->
-        pkh_from_tenderbake_slot slot >>=? fun (_ctxt, pkh) ->
-        (* The [Slot_repr] module is related to the Tenderbake committee. *)
-        let slot_index = Slot_repr.to_int slot in
-        (* An optimisation could be to return only [pkh_to_shards] map
-           because the second one is not used. This can be done later
-           on, if it is a good optimisation. *)
-        let committee = update_committee committee pkh ~slot_index ~power:1 in
-        compute_power (index - 1) committee
-    in
-    (* This committee is an intermediate to compute the final DAL
-       committee. This one only projects the Tenderbake committee into
-       the DAL committee. The next one reorders the slots so that they
-       are grouped by public key hash. *)
-    compute_power (number_of_shards - 1) empty_dal_committee
-    >>=? fun unordered_committee ->
-    let dal_committee =
-      Signature.Public_key_hash.Map.fold
-        (fun pkh (_, power) (total_power, committee) ->
-          let committee =
-            update_committee committee pkh ~slot_index:total_power ~power
-          in
-          let new_total_power = total_power + power in
-          (new_total_power, committee))
-        unordered_committee.pkh_to_shards
-        (0, empty_dal_committee)
-      |> snd
-    in
-    return dal_committee
-
-  let init_committee ctxt committee =
-    {ctxt with back = {ctxt.back with dal_committee = committee}}
-
-  let shards_of_attestor ctxt ~attestor:pkh =
-    let rec make acc (initial_shard_index, power) =
-      if Compare.Int.(power <= 0) then List.rev acc
-      else make (initial_shard_index :: acc) (initial_shard_index + 1, power - 1)
-    in
-    Signature.Public_key_hash.Map.find_opt
-      pkh
-      ctxt.back.dal_committee.pkh_to_shards
-    |> Option.map (fun pre_shards -> make [] pre_shards)
+  let get_diffs ctxt = List.rev ctxt.back.address_registry_diff_rev
 end
 
 (* The type for relative context accesses instead from the root. In order for
@@ -1651,8 +2374,11 @@ type local_context = {
 }
 
 let with_local_context ctxt key f =
-  (find_tree ctxt key >|= function None -> Tree.empty ctxt | Some tree -> tree)
-  >>= fun tree ->
+  let open Lwt_result_syntax in
+  let*! tree_opt = find_tree ctxt key in
+  let tree =
+    match tree_opt with None -> Tree.empty ctxt | Some tree -> tree
+  in
   let local_ctxt =
     {
       tree;
@@ -1661,12 +2387,12 @@ let with_local_context ctxt key f =
       unlimited_operation_gas = unlimited_operation_gas ctxt;
     }
   in
-  f local_ctxt >>=? fun (local_ctxt, res) ->
-  add_tree ctxt key local_ctxt.tree >|= fun ctxt ->
+  let* local_ctxt, res = f local_ctxt in
+  let*! ctxt = add_tree ctxt key local_ctxt.tree in
   update_remaining_operation_gas ctxt local_ctxt.remaining_operation_gas
   |> fun ctxt ->
   update_unlimited_operation_gas ctxt local_ctxt.unlimited_operation_gas
-  |> fun ctxt -> ok (ctxt, res)
+  |> fun ctxt -> return (ctxt, res)
 
 module Local_context : sig
   include
@@ -1684,11 +2410,12 @@ end = struct
   type t = local_context
 
   let consume_gas local cost =
+    let open Result_syntax in
     match Gas_limit_repr.raw_consume local.remaining_operation_gas cost with
     | Some gas_counter -> Ok {local with remaining_operation_gas = gas_counter}
     | None ->
-        if local.unlimited_operation_gas then ok local
-        else error Operation_quota_exceeded
+        if local.unlimited_operation_gas then return local
+        else tzfail Operation_quota_exceeded
 
   let tree local = local.tree
 
@@ -1709,35 +2436,59 @@ end = struct
   let get_tree local = Tree.get_tree (tree local)
 
   let update local key b =
-    Tree.update (tree local) key b >|=? update_root_tree local
+    let open Lwt_result_syntax in
+    let+ tree = Tree.update (tree local) key b in
+    update_root_tree local tree
 
   let update_tree local key b =
-    Tree.update_tree (tree local) key b >|=? update_root_tree local
+    let open Lwt_result_syntax in
+    let+ tree = Tree.update_tree (tree local) key b in
+    update_root_tree local tree
 
   let init local key b =
-    Tree.init (tree local) key b >|=? update_root_tree local
+    let open Lwt_result_syntax in
+    let+ tree = Tree.init (tree local) key b in
+    update_root_tree local tree
 
   let init_tree local key t =
-    Tree.init_tree (tree local) key t >|=? update_root_tree local
+    let open Lwt_result_syntax in
+    let+ tree = Tree.init_tree (tree local) key t in
+    update_root_tree local tree
 
-  let add local i b = Tree.add (tree local) i b >|= update_root_tree local
+  let add local i b =
+    let open Lwt_syntax in
+    let+ tree = Tree.add (tree local) i b in
+    update_root_tree local tree
 
   let add_tree local i t =
-    Tree.add_tree (tree local) i t >|= update_root_tree local
+    let open Lwt_syntax in
+    let+ tree = Tree.add_tree (tree local) i t in
+    update_root_tree local tree
 
-  let remove local i = Tree.remove (tree local) i >|= update_root_tree local
+  let remove local i =
+    let open Lwt_syntax in
+    let+ tree = Tree.remove (tree local) i in
+    update_root_tree local tree
 
   let remove_existing local key =
-    Tree.remove_existing (tree local) key >|=? update_root_tree local
+    let open Lwt_result_syntax in
+    let+ tree = Tree.remove_existing (tree local) key in
+    update_root_tree local tree
 
   let remove_existing_tree local key =
-    Tree.remove_existing_tree (tree local) key >|=? update_root_tree local
+    let open Lwt_result_syntax in
+    let+ tree = Tree.remove_existing_tree (tree local) key in
+    update_root_tree local tree
 
   let add_or_remove local key vopt =
-    Tree.add_or_remove (tree local) key vopt >|= update_root_tree local
+    let open Lwt_syntax in
+    let+ tree = Tree.add_or_remove (tree local) key vopt in
+    update_root_tree local tree
 
   let add_or_remove_tree local key topt =
-    Tree.add_or_remove_tree (tree local) key topt >|= update_root_tree local
+    let open Lwt_syntax in
+    let+ tree = Tree.add_or_remove_tree (tree local) key topt in
+    update_root_tree local tree
 
   let fold ?depth local key ~order ~init ~f =
     Tree.fold ?depth (tree local) key ~order ~init ~f

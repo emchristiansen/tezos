@@ -7,19 +7,23 @@
  (instrumentation (backend bisect_ppx))
  (libraries
   str
-  tezos-base
-  tezos-stdlib-unix
-  tezos-crypto
-  tezos-micheline
-  tezos-clic
-  data-encoding
+  octez-libs.base
+  octez-libs.stdlib-unix
+  octez-libs.crypto
+  octez-libs.micheline
+  octez-libs.clic
+  octez-libs.data-encoding
   prbnmcn-linalg
   prbnmcn-stats
   pringo
   pyml
-  ocamlgraph
-  ocaml-migrate-parsetree)
- (inline_tests (flags -verbose) (modes native))
+  ocamlgraph)
+ (inline_tests
+  (flags -verbose)
+  (modes native)
+  (deps %{workspace_root}/.ocamlformat)
+  (executable (link_flags -linkall -cclib -lblst))
+  (libraries bls12-381.archive))
  (preprocess (pps ppx_expect))
  (flags
   (:standard)

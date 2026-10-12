@@ -30,16 +30,13 @@
    Subject:      Check synchronization state and prevalidator status
 *)
 
-open Base
+let team = Tag.layer1
 
-let wait_for ~statuses node =
-  let filter json =
-    let status = JSON.as_string json in
-    Log.info "%s: %s" (Node.name node) status ;
-    if List.exists (fun st -> String.equal st status) statuses then Some ()
-    else None
-  in
-  Node.wait_for node "synchronisation_status.v0" filter
+(* FIXME: https://gitlab.com/tezos/tezos/-/issues/4459
+   Re-enable the "synchronisation_threshold" tests in the CI once the flakiness has
+   been fixed. *)
+
+open Base
 
 let wait_for_sync node =
   let filter json =
@@ -53,7 +50,7 @@ let wait_for_sync node =
   let is_synchronised =
     let* client = Client.init ~endpoint:(Node node) () in
     let* is_bootstrapped =
-      RPC.Client.call client @@ RPC.get_chain_is_bootstrapped ()
+      Client.RPC.call client @@ RPC.get_chain_is_bootstrapped ()
     in
     if is_bootstrapped.sync_state = Synced then Lwt.return_unit
     else fst @@ Lwt.task ()
@@ -71,7 +68,10 @@ let check_node_synchronization_state =
   Protocol.register_test
     ~__FILE__
     ~title:"check synchronization state"
-    ~tags:["synchronisation_threshold"; "bootstrap"; "node"; "sync"]
+    ~tags:
+      [
+        team; Tag.flaky; "synchronisation_threshold"; "bootstrap"; "node"; "sync";
+      ]
   @@ fun protocol ->
   let* main_node = Node.init ~name:"main_node" [] in
   let* nodes =
@@ -109,7 +109,8 @@ let check_node_synchronization_state =
   (* We register this event before restarting the node to avoid to register it too late. *)
   let synchronisation_events =
     List.map
-      (fun node -> wait_for ~statuses:["synced"; "stuck"] node)
+      (fun node ->
+        Node.wait_for_synchronisation ~statuses:["synced"; "stuck"] node)
       (main_node :: nodes)
   in
   let* _ =
@@ -156,7 +157,15 @@ let check_prevalidator_start =
   Protocol.register_test
     ~__FILE__
     ~title:"Check prevalidator start"
-    ~tags:["synchronisation_threshold"; "bootstrap"; "node"; "prevalidator"]
+    ~tags:
+      [
+        team;
+        Tag.flaky;
+        "synchronisation_threshold";
+        "bootstrap";
+        "node";
+        "prevalidator";
+      ]
   @@ fun protocol ->
   let init_node threshold = Node.init [Synchronisation_threshold threshold] in
   let* node1 = init_node 0 in
@@ -203,7 +212,7 @@ let sync_state_typ =
 
 let check_sync_state ?__LOC__ ?endpoint client expected_state =
   let* sync_state =
-    RPC.Client.call ?endpoint client @@ RPC.get_chain_is_bootstrapped ()
+    Client.RPC.call ?endpoint client @@ RPC.get_chain_is_bootstrapped ()
   in
   Check.(sync_state.sync_state = expected_state)
     sync_state_typ
@@ -215,7 +224,9 @@ let test_threshold_zero =
   Protocol.register_test
     ~__FILE__
     ~title:"bootstrap: test threshold zero"
-    ~tags:["synchronisation_threshold"; "bootstrap"; "threshold"]
+    ~tags:
+      [team; Tag.flaky; "synchronisation_threshold"; "bootstrap"; "threshold"]
+    ~uses:(fun _protocol -> [Constant.octez_agnostic_baker])
   @@ fun protocol ->
   Log.info "Setup network" ;
   let* node, client =
@@ -227,7 +238,7 @@ let test_threshold_zero =
       ~timestamp:Now
       ()
   in
-  let* _ = Baker.init ~protocol node client in
+  let* _ = Agnostic_baker.init node client in
 
   Log.info "Check that the node is bootstrapped" ;
   let* () = check_sync_state client Synced in
@@ -235,7 +246,7 @@ let test_threshold_zero =
 
 let check_is_bootstrapped ?__LOC__ ?endpoint client =
   let* sync_state =
-    RPC.Client.call ?endpoint client @@ RPC.get_chain_is_bootstrapped ()
+    Client.RPC.call ?endpoint client @@ RPC.get_chain_is_bootstrapped ()
   in
   if not sync_state.bootstrapped then
     Test.fail "Expected node to be bootstrapped" ;
@@ -251,7 +262,8 @@ let test_threshold_one =
   Protocol.register_test
     ~__FILE__
     ~title:"bootstrap: test threshold one"
-    ~tags:["bootstrap"; "threshold"]
+    ~tags:[team; "bootstrap"; "threshold"]
+    ~uses:(fun _protocol -> [Constant.octez_agnostic_baker])
   @@ fun protocol ->
   Log.info "Add a first peer with threshold zero" ;
   let* node, client =
@@ -263,7 +275,7 @@ let test_threshold_one =
       ~timestamp:Now
       ()
   in
-  let* _ = Baker.init ~protocol node client in
+  let* baker = Agnostic_baker.init node client in
 
   Log.info "Check synchronisation state of first peer" ;
   let* () = check_sync_state client Synced in
@@ -276,6 +288,8 @@ let test_threshold_one =
       ()
   in
   let* () = Client.Admin.connect_address client ~peer:node1 in
+  let* _ = Node.wait_for_level node 2 in
+  let* () = Agnostic_baker.kill baker in
 
   Log.info "Check bootstrapped state of second peer" ;
   let* () = Client.bootstrapped client1 in
@@ -287,7 +301,9 @@ let test_threshold_two =
   Protocol.register_test
     ~__FILE__
     ~title:"bootstrap: test threshold two"
-    ~tags:["synchronisation_threshold"; "bootstrap"; "threshold"]
+    ~tags:
+      [team; Tag.flaky; "synchronisation_threshold"; "bootstrap"; "threshold"]
+    ~uses:(fun _protocol -> [Constant.octez_agnostic_baker])
   @@ fun protocol ->
   Log.info "Add a first peer with threshold zero" ;
   let* node, client =
@@ -299,7 +315,7 @@ let test_threshold_two =
       ~timestamp:Now
       ()
   in
-  let* _ = Baker.init ~protocol node client in
+  let* baker = Agnostic_baker.init node client in
 
   Log.info "Add nodes and connect in clique" ;
 
@@ -334,13 +350,14 @@ let test_threshold_two =
      and hence bootstrapped.
   *)
   let* () =
-    let level = Node.get_level node in
+    let* level = Node.get_level node in
     Lwt_list.iter_p
       (fun n ->
         let* (_ : int) = Node.wait_for_level n (level + 1) in
         unit)
       [node; node1; node2; node3]
   in
+  let* () = Agnostic_baker.kill baker in
 
   let* () = Client.bootstrapped client in
   let* () = Client.bootstrapped client1 in
@@ -353,7 +370,9 @@ let test_threshold_stuck =
   Protocol.register_test
     ~__FILE__
     ~title:"bootstrap: test threshold stuck"
-    ~tags:["synchronisation_threshold"; "bootstrap"; "threshold"]
+    ~tags:
+      [team; Tag.flaky; "synchronisation_threshold"; "bootstrap"; "threshold"]
+    ~uses:(fun _protocol -> [Constant.octez_agnostic_baker])
   @@ fun protocol ->
   let sync_latency = 3 in
 
@@ -370,11 +389,12 @@ let test_threshold_stuck =
       ~timestamp:Now
       ()
   in
-  let* baker = Baker.init ~protocol node client in
+  let* baker = Agnostic_baker.init node client in
 
   Log.info "Bake a few blocks and kill baker" ;
-  let* (level : int) = Node.wait_for_level node (Node.get_level node + 3) in
-  let* () = Baker.terminate baker in
+  let* current_level = Node.get_level node in
+  let* (level : int) = Node.wait_for_level node (current_level + 3) in
+  let* () = Agnostic_baker.terminate baker in
 
   Log.info "Add two additional peers" ;
   let* node1, client1 =
@@ -414,7 +434,9 @@ let test_threshold_split_view =
   Protocol.register_test
     ~__FILE__
     ~title:"bootstrap: test threshold split view"
-    ~tags:["synchronisation_threshold"; "bootstrap"; "threshold"]
+    ~tags:
+      [team; Tag.flaky; "synchronisation_threshold"; "bootstrap"; "threshold"]
+    ~uses:(fun _protocol -> [Constant.octez_agnostic_baker])
   @@ fun protocol ->
   Log.info
     "Add two peers with threshold zero, and one with threshold 2 and a high \
@@ -446,7 +468,7 @@ let test_threshold_split_view =
       ~timestamp:Now
       ()
   in
-  let* _ = Baker.init ~protocol node client in
+  let* _ = Agnostic_baker.init node client in
   let* () = connect_clique client [node; node1; node2] in
 
   Log.info "Test that all nodes bootstrap" ;
@@ -465,7 +487,8 @@ let test_threshold_split_view =
   in
 
   Log.info "Delay for a few blocks" ;
-  let* (_ : int) = Node.wait_for_level node (3 + Node.get_level node) in
+  let* current_level = Node.get_level node in
+  let* (_ : int) = Node.wait_for_level node (3 + current_level) in
 
   Log.info "Check that additional peers are bootstrapped and synced" ;
   let* () = check_sync_state client Synced in
@@ -480,7 +503,16 @@ let test_many_nodes_bootstrap =
   Protocol.register_test
     ~__FILE__
     ~title:"bootstrap: many nodes bootstrap"
-    ~tags:["synchronisation_threshold"; "bootstrap"; "threshold"]
+    ~tags:
+      [
+        team;
+        "synchronisation_threshold";
+        "bootstrap";
+        "threshold";
+        Tag.memory_hungry;
+        Tag.slow;
+      ]
+    ~uses:(fun _protocol -> [Constant.octez_agnostic_baker])
   @@ fun protocol ->
   let num_nodes = 8 in
   let running_time = 10.0 in
@@ -490,13 +522,18 @@ let test_many_nodes_bootstrap =
     Client.init_with_protocol
       ~nodes_args:
         Node.
-          [Connections num_nodes; Synchronisation_threshold 0; Sync_latency 3]
+          [
+            Connections num_nodes;
+            Synchronisation_threshold 0;
+            Sync_latency 3;
+            History_mode default_full;
+          ]
       `Client
       ~protocol
       ~timestamp:Now
       ()
   in
-  let* _ = Baker.init ~protocol node client in
+  let* _ = Agnostic_baker.init node client in
   let* node1, client1 =
     Client.init_with_protocol
       ~nodes_args:

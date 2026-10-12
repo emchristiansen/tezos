@@ -32,8 +32,8 @@ type 'kind preapply_result =
 
 type fee_parameter = {
   minimal_fees : Tez.t;
-  minimal_nanotez_per_byte : Q.t;
-  minimal_nanotez_per_gas_unit : Q.t;
+  minimal_nanotez_per_byte : Q.t option;
+  minimal_nanotez_per_gas_unit : Q.t option;
   force_low_fee : bool;
   fee_cap : Tez.t;
   burn_cap : Tez.t;
@@ -103,7 +103,8 @@ val inject_manager_operation :
   ?verbose_signing:bool ->
   ?simulation:bool ->
   ?force:bool ->
-  source:Signature.Public_key_hash.t ->
+  ?safety_guard:Gas.Arith.integral ->
+  source:Implicit_account_repr.t ->
   src_pk:Signature.public_key ->
   src_sk:Client_keys.sk_uri ->
   fee:Tez.t Limit.t ->

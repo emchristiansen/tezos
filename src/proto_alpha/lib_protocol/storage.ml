@@ -52,6 +52,12 @@ module Encoding = struct
     let encoding = Data_encoding.z
   end
 
+  module N : VALUE with type t = Z.t = struct
+    type t = Z.t
+
+    let encoding = Data_encoding.n
+  end
+
   module Manager_counter : VALUE with type t = Manager_counter_repr.t = struct
     type t = Manager_counter_repr.t
 
@@ -105,14 +111,22 @@ module Block_round : Simple_single_data_storage with type value = Round_repr.t =
     end)
     (Round_repr)
 
-module Tenderbake = struct
-  module First_level_of_protocol =
-    Make_single_data_storage (Registered) (Raw_context)
-      (struct
-        let name = ["first_level_of_protocol"]
-      end)
-      (Raw_level_repr)
+module Consecutive_round_zero :
+  Simple_single_data_storage with type value = Int32.t =
+  Make_single_data_storage (Registered) (Raw_context)
+    (struct
+      let name = ["consecutive_round_zero"]
+    end)
+    (Encoding.Int32)
 
+module Protocol_activation_level =
+  Make_single_data_storage (Registered) (Raw_context)
+    (struct
+      let name = ["protocol_activation_level"]
+    end)
+    (Raw_level_repr)
+
+module Tenderbake = struct
   module Branch = struct
     type t = Block_hash.t * Block_payload_hash.t
 
@@ -123,42 +137,27 @@ module Tenderbake = struct
           (req "predecessor_payload" Block_payload_hash.encoding))
   end
 
-  module Endorsement_branch =
+  module Attestation_branch =
     Make_single_data_storage (Registered) (Raw_context)
       (struct
-        let name = ["endorsement_branch"]
+        let name = ["attestation_branch"]
       end)
       (Branch)
 
-  module Grand_parent_branch =
+  module Forbidden_delegates =
     Make_single_data_storage (Registered) (Raw_context)
       (struct
-        let name = ["grand_parent_branch"]
+        let name = ["forbidden_delegates"]
       end)
-      (Branch)
+      (Implicit_account_repr.Set)
 end
 
 (** Contracts handling *)
 
-type deposits = {initial_amount : Tez_repr.t; current_amount : Tez_repr.t}
+type missed_attestations_info = {remaining_slots : int; missed_levels : int}
 
-module Deposits = struct
-  type t = deposits
-
-  let encoding =
-    let open Data_encoding in
-    conv
-      (fun {initial_amount; current_amount} -> (initial_amount, current_amount))
-      (fun (initial_amount, current_amount) -> {initial_amount; current_amount})
-      (obj2
-         (req "initial_amount" Tez_repr.encoding)
-         (req "actual_amount" Tez_repr.encoding))
-end
-
-type missed_endorsements_info = {remaining_slots : int; missed_levels : int}
-
-module Missed_endorsements_info = struct
-  type t = missed_endorsements_info
+module Missed_attestations_info = struct
+  type t = missed_attestations_info
 
   let encoding =
     let open Data_encoding in
@@ -166,6 +165,109 @@ module Missed_endorsements_info = struct
       (fun {remaining_slots; missed_levels} -> (remaining_slots, missed_levels))
       (fun (remaining_slots, missed_levels) -> {remaining_slots; missed_levels})
       (obj2 (req "remaining_slots" int31) (req "missed_levels" int31))
+end
+
+type dal_delegate_participation = {attested_slots : int; attestable_slots : int}
+
+module Dal_delegate_participation = struct
+  type t = dal_delegate_participation
+
+  let encoding =
+    let open Data_encoding in
+    conv
+      (fun {attested_slots; attestable_slots} ->
+        (attested_slots, attestable_slots))
+      (fun (attested_slots, attestable_slots) ->
+        {attested_slots; attestable_slots})
+      (obj2 (req "attested_slots" int31) (req "attestable_slots" int31))
+end
+
+(* TODO #6918: move closer to its only use left after P *)
+module Slashed_deposits_history = struct
+  type slashed_percentage = Percentage.t
+
+  (* invariant: sorted list *)
+  type t = (Cycle_repr.t * slashed_percentage) list
+
+  let encoding =
+    let open Data_encoding in
+    list
+      (obj2
+         (req "cycle" Cycle_repr.encoding)
+         (req "slashed_percentage" Percentage.encoding))
+
+  let add cycle percentage history =
+    let rec loop rev_prefix = function
+      | (c, p) :: tl when Cycle_repr.(cycle = c) ->
+          let p = Percentage.add_bounded p percentage in
+          (* cycle found, do not change the order *)
+          List.rev_append rev_prefix ((c, p) :: tl)
+      | ((c, _) as hd) :: tl when Cycle_repr.(cycle > c) ->
+          (* [cycle] must be inserted later *)
+          loop (hd :: rev_prefix) tl
+      | suffix ->
+          (* [cycle] between [rev_prefix] and [suffix] *)
+          List.rev_append rev_prefix ((cycle, percentage) :: suffix)
+    in
+    loop [] history
+
+  let rec get cycle = function
+    | (c, p) :: _ when Cycle_repr.(cycle = c) -> p
+    | (c, _) :: tl when Cycle_repr.(cycle > c) -> get cycle tl
+    | _ -> Percentage.p0
+end
+
+(* TODO #6918: Remove after P *)
+module Slashed_deposits_history__Oxford = struct
+  include Slashed_deposits_history
+
+  let encoding =
+    let open Data_encoding in
+    list
+      (obj2
+         (req "cycle" Cycle_repr.encoding)
+         (req "slashed_percentage" Percentage.encoding_legacy_in_o))
+end
+
+module Unstake_request = struct
+  type request = Cycle_repr.t * Tez_repr.t
+
+  type requests = request list
+
+  type t = {delegate : Implicit_account_repr.t; requests : requests}
+
+  let request_encoding =
+    let open Data_encoding in
+    obj2
+      (req "cycle" Cycle_repr.encoding)
+      (req "requested_amount" Tez_repr.encoding)
+
+  let requests_encoding = Data_encoding.list request_encoding
+
+  let encoding =
+    let open Data_encoding in
+    conv
+      (fun {delegate; requests} -> (delegate, requests))
+      (fun (delegate, requests) -> {delegate; requests})
+      (obj2
+         (req "delegate" Contract_repr.implicit_encoding)
+         (req "requests" requests_encoding))
+
+  let add cycle amount requests =
+    let open Result_syntax in
+    if Tez_repr.(amount > zero) then
+      let rec loop rev_prefix = function
+        | [] ->
+            (* cycle does not exist -> add at the head *)
+            Ok ((cycle, amount) :: requests)
+        | (c, a) :: tl when Cycle_repr.(c = cycle) ->
+            let+ a = Tez_repr.(a +? amount) in
+            (* cycle found, do not change the order *)
+            List.rev_append rev_prefix ((c, a) :: tl)
+        | hd :: tl -> loop (hd :: rev_prefix) tl
+      in
+      loop [] requests
+    else return requests
 end
 
 module Contract = struct
@@ -207,13 +309,21 @@ module Contract = struct
       end)
       (Tez_repr)
 
-  module Missed_endorsements =
+  module Missed_attestations =
     Indexed_context.Make_map
       (Registered)
       (struct
-        let name = ["missed_endorsements"]
+        let name = ["missed_attestations"]
       end)
-      (Missed_endorsements_info)
+      (Missed_attestations_info)
+
+  module Dal_participation =
+    Indexed_context.Make_map
+      (Registered)
+      (struct
+        let name = ["dal_delegate_participation"]
+      end)
+      (Dal_delegate_participation)
 
   module Manager =
     Indexed_context.Make_map
@@ -231,14 +341,21 @@ module Contract = struct
       end)
       (Signature.Public_key)
 
-  module Pending_consensus_keys =
-    Make_indexed_data_storage
-      (Make_subcontext (Registered) (Indexed_context.Raw_context)
-         (struct
-           let name = ["consensus_key"; "pendings"]
-         end))
-         (Make_index (Cycle_repr.Index))
-      (Signature.Public_key)
+  module Companion_key =
+    Indexed_context.Make_map
+      (Registered)
+      (struct
+        let name = ["companion_key"; "active"]
+      end)
+      (Bls.Public_key)
+
+  module Staking_parameters =
+    Indexed_context.Make_map
+      (Registered)
+      (struct
+        let name = ["staking_parameters"; "active"]
+      end)
+      (Staking_parameters_repr)
 
   module Delegate =
     Indexed_context.Make_map
@@ -246,7 +363,7 @@ module Contract = struct
       (struct
         let name = ["delegate"]
       end)
-      (Signature.Public_key_hash)
+      (Implicit_account_repr)
 
   module Inactive_delegate =
     Indexed_context.Make_set
@@ -314,40 +431,53 @@ module Contract = struct
       Raw_context.consume_gas ctxt (Script_repr.force_bytes_cost value)
 
     let get ctxt contract =
-      I.get ctxt contract >>=? fun (ctxt, value) ->
-      Lwt.return
-        (consume_deserialize_gas ctxt value >|? fun ctxt -> (ctxt, value))
+      let open Lwt_result_syntax in
+      let* ctxt, value = I.get ctxt contract in
+      let*? ctxt = consume_deserialize_gas ctxt value in
+      return (ctxt, value)
 
     let find ctxt contract =
-      I.find ctxt contract >>=? fun (ctxt, value_opt) ->
-      Lwt.return
-      @@
+      let open Lwt_result_syntax in
+      let* ctxt, value_opt = I.find ctxt contract in
       match value_opt with
-      | None -> ok (ctxt, None)
+      | None -> return (ctxt, None)
       | Some value ->
-          consume_deserialize_gas ctxt value >|? fun ctxt -> (ctxt, value_opt)
+          let*? ctxt = consume_deserialize_gas ctxt value in
+          return (ctxt, value_opt)
 
     let update ctxt contract value =
-      consume_serialize_gas ctxt value >>?= fun ctxt ->
+      let open Lwt_result_syntax in
+      let*? ctxt = consume_serialize_gas ctxt value in
       I.update ctxt contract value
 
     let add_or_remove ctxt contract value_opt =
+      let open Lwt_result_syntax in
       match value_opt with
       | None -> I.add_or_remove ctxt contract None
       | Some value ->
-          consume_serialize_gas ctxt value >>?= fun ctxt ->
+          let*? ctxt = consume_serialize_gas ctxt value in
           I.add_or_remove ctxt contract value_opt
 
     let init ctxt contract value =
-      consume_serialize_gas ctxt value >>?= fun ctxt ->
+      let open Lwt_result_syntax in
+      let*? ctxt = consume_serialize_gas ctxt value in
       I.init ctxt contract value
 
     let add ctxt contract value =
-      consume_serialize_gas ctxt value >>?= fun ctxt ->
+      let open Lwt_result_syntax in
+      let*? ctxt = consume_serialize_gas ctxt value in
       I.add ctxt contract value
 
     let keys_unaccounted = I.keys_unaccounted
   end
+
+  module Native =
+    Indexed_context.Make_carbonated_map
+      (Registered)
+      (struct
+        let name = ["native"]
+      end)
+      (Script_native_repr)
 
   module Code = Make_carbonated_map_expr (struct
     let name = ["code"]
@@ -373,13 +503,37 @@ module Contract = struct
       end)
       (Encoding.Z)
 
-  module Frozen_deposits =
+  module Unstaked_frozen_deposits =
     Indexed_context.Make_map
       (Registered)
       (struct
-        let name = ["frozen_deposits"]
+        let name = ["unstaked_frozen_deposits"]
       end)
-      (Deposits)
+      (Unstaked_frozen_deposits_repr)
+
+  module Unstake_requests =
+    Indexed_context.Make_map
+      (Registered)
+      (struct
+        let name = ["unstake_requests"]
+      end)
+      (Unstake_request)
+
+  module Frozen_deposits_pseudotokens =
+    Indexed_context.Make_map
+      (Registered)
+      (struct
+        let name = ["frozen_deposits_pseudotokens"]
+      end)
+      (Staking_pseudotoken_repr)
+
+  module Staking_pseudotokens =
+    Indexed_context.Make_map
+      (Registered)
+      (struct
+        let name = ["staking_pseudotokens"]
+      end)
+      (Staking_pseudotoken_repr)
 
   module Frozen_deposits_limit =
     Indexed_context.Make_map
@@ -388,6 +542,15 @@ module Contract = struct
         let name = ["frozen_deposits_limit"]
       end)
       (Tez_repr)
+
+  (* TODO #6918: Remove after P *)
+  module Slashed_deposits__Oxford =
+    Indexed_context.Make_map
+      (Ghost)
+      (struct
+        let name = ["slashed_deposits"]
+      end)
+      (Slashed_deposits_history__Oxford)
 
   module Bond_id_index =
     Make_indexed_subcontext
@@ -414,6 +577,56 @@ module Contract = struct
         let name = ["total_frozen_bonds"]
       end)
       (Tez_repr)
+
+  module Total_supply =
+    Make_single_data_storage (Registered) (Raw_context)
+      (struct
+        let name = ["total_supply"]
+      end)
+      (Tez_repr)
+
+  module Address_registry = struct
+    module Raw_context =
+      Make_subcontext (Registered) (Raw_context)
+        (struct
+          let name = ["address_registry"]
+        end)
+
+    module Next =
+      Make_single_data_storage (Registered) (Raw_context)
+        (struct
+          let name = ["next"]
+        end)
+        (Encoding.N)
+
+    module Registry =
+      Make_indexed_carbonated_data_storage
+        (Make_subcontext (Registered) (Raw_context)
+           (struct
+             let name = ["addresses"]
+           end))
+           (Make_index (Destination_repr.Index))
+        (Encoding.N)
+  end
+
+  module Native_contracts = struct
+    module Raw_context =
+      Make_subcontext (Registered) (Raw_context)
+        (struct
+          let name = ["native_contracts"]
+        end)
+
+    module CLST =
+      Make_single_data_storage (Registered) (Raw_context)
+        (struct
+          let name = ["stez"]
+        end)
+        (struct
+          type t = Contract_hash.t
+
+          let encoding = Contract_repr.originated_encoding
+        end)
+  end
 end
 
 module type NEXT = sig
@@ -463,9 +676,10 @@ module Big_map = struct
         (Lazy_storage_kind.Big_map.Id)
 
     let incr ctxt =
-      Storage.get ctxt >>=? fun i ->
-      Storage.update ctxt (Lazy_storage_kind.Big_map.Id.next i) >|=? fun ctxt ->
-      (ctxt, i)
+      let open Lwt_result_syntax in
+      let* i = Storage.get ctxt in
+      let* ctxt = Storage.update ctxt (Lazy_storage_kind.Big_map.Id.next i) in
+      return (ctxt, i)
 
     let init ctxt = Storage.init ctxt Lazy_storage_kind.Big_map.Id.init
   end
@@ -564,18 +778,19 @@ module Big_map = struct
       Raw_context.consume_gas ctxt (Script_repr.deserialized_cost value)
 
     let get ctxt contract =
-      I.get ctxt contract >>=? fun (ctxt, value) ->
-      Lwt.return
-        (consume_deserialize_gas ctxt value >|? fun ctxt -> (ctxt, value))
+      let open Lwt_result_syntax in
+      let* ctxt, value = I.get ctxt contract in
+      let*? ctxt = consume_deserialize_gas ctxt value in
+      return (ctxt, value)
 
     let find ctxt contract =
-      I.find ctxt contract >>=? fun (ctxt, value_opt) ->
-      Lwt.return
-      @@
+      let open Lwt_result_syntax in
+      let* ctxt, value_opt = I.find ctxt contract in
       match value_opt with
-      | None -> ok (ctxt, None)
+      | None -> return (ctxt, None)
       | Some value ->
-          consume_deserialize_gas ctxt value >|? fun ctxt -> (ctxt, value_opt)
+          let*? ctxt = consume_deserialize_gas ctxt value in
+          return (ctxt, value_opt)
 
     let keys_unaccounted = I.keys_unaccounted
   end
@@ -599,9 +814,12 @@ module Sapling = struct
         (Lazy_storage_kind.Sapling_state.Id)
 
     let incr ctxt =
-      Storage.get ctxt >>=? fun i ->
-      Storage.update ctxt (Lazy_storage_kind.Sapling_state.Id.next i)
-      >|=? fun ctxt -> (ctxt, i)
+      let open Lwt_result_syntax in
+      let* i = Storage.get ctxt in
+      let* ctxt =
+        Storage.update ctxt (Lazy_storage_kind.Sapling_state.Id.next i)
+      in
+      return (ctxt, i)
 
     let init ctxt = Storage.init ctxt Lazy_storage_kind.Sapling_state.Id.init
   end
@@ -689,8 +907,11 @@ module Sapling = struct
       (Sapling.Hash)
 
   let commitments_init ctx id =
-    Indexed_context.Raw_context.remove (ctx, id) ["commitments"]
-    >|= fun (ctx, _id) -> ctx
+    let open Lwt_syntax in
+    let+ ctx, (_id : id) =
+      Indexed_context.Raw_context.remove (ctx, id) ["commitments"]
+    in
+    ctx
 
   module Ciphertexts :
     Non_iterable_indexed_carbonated_data_storage
@@ -736,8 +957,11 @@ module Sapling = struct
       (Sapling.Ciphertext)
 
   let ciphertexts_init ctx id =
-    Indexed_context.Raw_context.remove (ctx, id) ["commitments"]
-    >|= fun (ctx, _id) -> ctx
+    let open Lwt_syntax in
+    let+ ctx, (_id : id) =
+      Indexed_context.Raw_context.remove (ctx, id) ["ciphertexts"]
+    in
+    ctx
 
   module Nullifiers_size =
     Make_single_data_storage (Registered) (Indexed_context.Raw_context)
@@ -833,11 +1057,15 @@ module Sapling = struct
          end))
 
   let nullifiers_init ctx id =
-    Nullifiers_size.add (ctx, id) Int64.zero >>= fun ctx ->
-    Indexed_context.Raw_context.remove (ctx, id) ["nullifiers_ordered"]
-    >>= fun (ctx, id) ->
-    Indexed_context.Raw_context.remove (ctx, id) ["nullifiers_hashed"]
-    >|= fun (ctx, _id) -> ctx
+    let open Lwt_syntax in
+    let* ctx = Nullifiers_size.add (ctx, id) Int64.zero in
+    let* ctx, id =
+      Indexed_context.Raw_context.remove (ctx, id) ["nullifiers_ordered"]
+    in
+    let+ ctx, (_id : id) =
+      Indexed_context.Raw_context.remove (ctx, id) ["nullifiers_hashed"]
+    in
+    ctx
 
   module Roots :
     Non_iterable_indexed_data_storage
@@ -904,6 +1132,7 @@ module Public_key_hash = struct
   module Path_Secp256k1 = Path_encoding.Make_hex (Secp256k1.Public_key_hash)
   module Path_P256 = Path_encoding.Make_hex (P256.Public_key_hash)
   module Path_Bls = Path_encoding.Make_hex (Bls.Public_key_hash)
+  module Path_Mldsa44 = Path_encoding.Make_hex (Mldsa44.Public_key_hash)
 
   let to_path (key : public_key_hash) l =
     match key with
@@ -911,6 +1140,7 @@ module Public_key_hash = struct
     | Secp256k1 h -> "secp256k1" :: Path_Secp256k1.to_path h l
     | P256 h -> "p256" :: Path_P256.to_path h l
     | Bls h -> "bls" :: Path_Bls.to_path h l
+    | Mldsa44 h -> "mldsa44" :: Path_Mldsa44.to_path h l
 
   let of_path : _ -> public_key_hash option = function
     | "ed25519" :: rest -> (
@@ -929,14 +1159,19 @@ module Public_key_hash = struct
         match Path_Bls.of_path rest with
         | Some pkh -> Some (Bls pkh)
         | None -> None)
+    | "mldsa44" :: rest -> (
+        match Path_Mldsa44.of_path rest with
+        | Some pkh -> Some (Mldsa44 pkh)
+        | None -> None)
     | _ -> None
 
   let path_length =
     let l1 = Path_Ed25519.path_length
     and l2 = Path_Secp256k1.path_length
     and l3 = Path_P256.path_length
-    and l4 = Path_Bls.path_length in
-    assert (Compare.Int.(l1 = l2 && l2 = l3 && l3 = l4)) ;
+    and l4 = Path_Bls.path_length
+    and l5 = Path_Mldsa44.path_length in
+    assert (Compare.Int.(l1 = l2 && l2 = l3 && l3 = l4 && l4 = l5)) ;
     l1 + 1
 end
 
@@ -953,7 +1188,7 @@ module Delegates =
        (struct
          let name = ["delegates"]
        end))
-       (Public_key_hash_index)
+       (Make_index (Implicit_account_repr.Index))
 
 module Consensus_keys =
   Make_data_set_storage
@@ -963,22 +1198,38 @@ module Consensus_keys =
        end))
        (Public_key_hash_index)
 
+module Pending_denunciations =
+  Make_indexed_data_storage
+    (Make_subcontext (Registered) (Raw_context)
+       (struct
+         let name = ["denunciations"]
+       end))
+       (Make_index (Implicit_account_repr.Index))
+    (Denunciations_repr)
+
+module Slashed_deposits =
+  Make_indexed_data_storage
+    (Make_subcontext (Registered) (Raw_context)
+       (struct
+         let name = ["slashed_deposits"]
+       end))
+       (Make_index (Implicit_account_repr.Index))
+    (Slashed_deposits_history)
+
 (** Per cycle storage *)
 
-type slashed_level = {for_double_endorsing : bool; for_double_baking : bool}
+type denounced = {
+  for_double_preattesting : bool;
+  for_double_attesting : bool;
+  for_double_baking : bool;
+}
 
-module Slashed_level = struct
-  type t = slashed_level
-
-  let encoding =
-    let open Data_encoding in
-    conv
-      (fun {for_double_endorsing; for_double_baking} ->
-        (for_double_endorsing, for_double_baking))
-      (fun (for_double_endorsing, for_double_baking) ->
-        {for_double_endorsing; for_double_baking})
-      (obj2 (req "for_double_endorsing" bool) (req "for_double_baking" bool))
-end
+let default_denounced =
+  {
+    for_double_preattesting = false;
+    for_double_attesting = false;
+    for_double_baking = false;
+  }
 
 module Cycle = struct
   module Indexed_context =
@@ -989,14 +1240,59 @@ module Cycle = struct
          end))
          (Make_index (Cycle_repr.Index))
 
-  module Slashed_deposits =
+  module Already_denounced =
     Make_indexed_data_storage
       (Make_subcontext (Registered) (Indexed_context.Raw_context)
          (struct
-           let name = ["slashed_deposits"]
+           let name = ["already_denounced"]
          end))
-         (Pair (Make_index (Raw_level_repr.Index)) (Public_key_hash_index))
-      (Slashed_level)
+         (Pair
+            (Pair
+               (Make_index
+                  (Raw_level_repr.Index))
+                  (Make_index (Round_repr.Index)))
+               (Make_index (Implicit_account_repr.Index)))
+      (struct
+        type t = denounced
+
+        let encoding =
+          let open Data_encoding in
+          conv
+            (fun {
+                   for_double_preattesting;
+                   for_double_attesting;
+                   for_double_baking;
+                 }
+               ->
+              (for_double_preattesting, for_double_attesting, for_double_baking))
+            (fun ( for_double_preattesting,
+                   for_double_attesting,
+                   for_double_baking )
+               ->
+              {for_double_preattesting; for_double_attesting; for_double_baking})
+            (obj3
+               (req "for_double_preattesting" bool)
+               (req "for_double_attesting" bool)
+               (req "for_double_baking" bool))
+      end)
+
+  module Dal_already_denounced =
+    Make_indexed_data_storage
+      (Make_subcontext (Registered) (Indexed_context.Raw_context)
+         (struct
+           let name = ["dal_already_denounced"]
+         end))
+         (Pair
+            (Pair
+               (Make_index
+                  (Raw_level_repr.Index))
+                  (Make_index (Dal_slot_index_repr.Index)))
+               (Make_index (Implicit_account_repr.Index)))
+      (struct
+        type t = unit
+
+        let encoding = Data_encoding.unit
+      end)
 
   module Selected_stake_distribution =
     Indexed_context.Make_map
@@ -1005,14 +1301,26 @@ module Cycle = struct
         let name = ["selected_stake_distribution"]
       end)
       (struct
-        type t = (Signature.Public_key_hash.t * Tez_repr.t) list
+        type t = (Implicit_account_repr.t * Stake_repr.t) list
 
         let encoding =
           Data_encoding.(
             Variable.list
               (obj2
-                 (req "baker" Signature.Public_key_hash.encoding)
-                 (req "active_stake" Tez_repr.encoding)))
+                 (req "baker" Implicit_account_repr.encoding)
+                 (req "active_stake" Stake_repr.encoding)))
+      end)
+
+  module Selected_bakers =
+    Indexed_context.Make_map
+      (Registered)
+      (struct
+        let name = ["selected_bakers"]
+      end)
+      (struct
+        type t = Raw_context.consensus_pk FallbackArray.t
+
+        let encoding = FallbackArray.encoding Raw_context.consensus_pk_encoding
       end)
 
   module Total_active_stake =
@@ -1021,7 +1329,7 @@ module Cycle = struct
       (struct
         let name = ["total_active_stake"]
       end)
-      (Tez_repr)
+      (Stake_repr)
 
   module Delegate_sampler_state =
     Indexed_context.Make_map
@@ -1035,9 +1343,51 @@ module Cycle = struct
         let encoding = Sampler.encoding Raw_context.consensus_pk_encoding
       end)
 
+  module Delegate_stake_info =
+    Indexed_context.Make_map
+      (Registered)
+      (struct
+        let name = ["delegate_stake_info"]
+      end)
+      (struct
+        type t = Raw_context.stake_info
+
+        let encoding = Raw_context.stake_info_encoding
+      end)
+
+  module Issuance_bonus =
+    Indexed_context.Make_map
+      (Registered)
+      (struct
+        let name = ["issuance_bonus"]
+      end)
+      (Issuance_bonus_repr)
+
+  module Issuance_coeff =
+    Indexed_context.Make_map
+      (Registered)
+      (struct
+        let name = ["issuance_coeff"]
+      end)
+      (struct
+        type t = Q.t
+
+        let encoding =
+          Data_encoding.(
+            conv_with_guard
+              (fun Q.{num; den} -> (num, den))
+              (fun (num, den) ->
+                if Compare.Z.(num > Z.zero && den > Z.zero) then
+                  Ok (Q.make num den)
+                else
+                  Error
+                    "Invalid Reward Coefficient: only positive values allowed")
+              (obj2 (req "numerator" n) (req "denominator" n)))
+      end)
+
   type unrevealed_nonce = {
     nonce_hash : Nonce_hash.t;
-    delegate : Signature.Public_key_hash.t;
+    delegate : Implicit_account_repr.t;
   }
 
   type nonce_status =
@@ -1051,7 +1401,7 @@ module Cycle = struct
         case
           (Tag 0)
           ~title:"Unrevealed"
-          (tup2 Nonce_hash.encoding Signature.Public_key_hash.encoding)
+          (tup2 Nonce_hash.encoding Implicit_account_repr.encoding)
           (function
             | Unrevealed {nonce_hash; delegate} -> Some (nonce_hash, delegate)
             | _ -> None)
@@ -1088,67 +1438,143 @@ module Cycle = struct
 
         let encoding = Seed_repr.seed_encoding
       end)
+
+  module Pending_consensus_keys =
+    Make_indexed_data_storage
+      (Make_subcontext (Registered) (Indexed_context.Raw_context)
+         (struct
+           let name = ["pending_consensus_keys"]
+         end))
+         (Make_index (Contract_repr.Index))
+      (Signature.Public_key)
+
+  module Pending_companion_keys =
+    Make_indexed_data_storage
+      (Make_subcontext (Registered) (Indexed_context.Raw_context)
+         (struct
+           let name = ["pending_companion_keys"]
+         end))
+         (Make_index (Contract_repr.Index))
+      (Bls.Public_key)
+
+  module Pending_staking_parameters =
+    Make_indexed_data_storage
+      (Make_subcontext (Registered) (Indexed_context.Raw_context)
+         (struct
+           let name = ["pending_staking_parameters"]
+         end))
+         (Make_index (Contract_repr.Index))
+      (Staking_parameters_repr)
+
+  module Pending_CLST_delegate_parameters =
+    Make_indexed_data_storage
+      (Make_subcontext (Registered) (Indexed_context.Raw_context)
+         (struct
+           let name = ["pending_stez_delegate_parameters"]
+         end))
+         (Make_index (Contract_repr.Index))
+      (struct
+        type t = Clst_delegates_parameters_repr.update
+
+        let encoding = Clst_delegates_parameters_repr.update_encoding
+      end)
 end
 
-module Slashed_deposits = Cycle.Slashed_deposits
+module Already_denounced = Cycle.Already_denounced
+module Dal_already_denounced = Cycle.Dal_already_denounced
+module Pending_consensus_keys = Cycle.Pending_consensus_keys
+module Pending_companion_keys = Cycle.Pending_companion_keys
+module Pending_staking_parameters = Cycle.Pending_staking_parameters
 
 module Stake = struct
   module Staking_balance =
-    Make_indexed_data_snapshotable_storage
+    Make_indexed_data_storage
       (Make_subcontext (Registered) (Raw_context)
          (struct
            let name = ["staking_balance"]
          end))
-         (Int31_index)
-      (Public_key_hash_index)
-      (Tez_repr)
+         (Make_index (Implicit_account_repr.Index))
+      (Full_staking_balance_repr)
 
   module Active_delegates_with_minimal_stake =
-    Make_indexed_data_snapshotable_storage
+    Make_data_set_storage
       (Make_subcontext (Registered) (Raw_context)
          (struct
-           (* This name is for historical reasons, when the stake was
-              expressed in rolls (that is, pre-Ithaca). *)
-           let name = ["active_delegate_with_one_roll"]
+           let name = ["active_delegates_with_minimal_stake"]
          end))
-         (Int31_index)
-      (Public_key_hash_index)
-      (struct
-        type t = unit
-
-        let encoding = Data_encoding.unit
-      end)
+         (Make_index (Implicit_account_repr.Index))
 
   module Selected_distribution_for_cycle = Cycle.Selected_stake_distribution
   module Total_active_stake = Cycle.Total_active_stake
+  module Selected_bakers = Cycle.Selected_bakers
 
-  (* This is an index that is set to 0 by calls to
-     {!val:Stake_storage.selected_new_distribution_at_cycle_end} and
-     incremented (by 1) by calls to {!val:Stake_storage.snapshot}.
-
-     {!val:Stake_storage.snapshot} is called in relation with constant
-     [blocks_per_stake_snapshot] in
-     {!val:Level_storage.may_snapshot_stake_distribution}.
-
-     That is, the increment is done every [blocks_per_stake_snaphot]
-     blocks and reset at the end of cycles. So, it goes up to
-     [blocks_per_cycle / blocks_per_stake_snaphot], which is currently
-     16 (= 8192/512 -- the concrete values can be found in
-     {!val:Default_parameters.constants_mainnet}), then comes back to
-     0, so that a UInt16 is big enough.
-
-     The ratio [blocks_per_cycle / blocks_per_stake_snapshot] above is
-     checked in {!val:Constants_repr.check_constants} to fit in a
-     UInt16. *)
-  module Last_snapshot =
+  module SWRR_credits =
     Make_single_data_storage (Registered) (Raw_context)
       (struct
-        let name = ["last_snapshot"]
+        let name = ["swrr_credits"]
       end)
-      (Encoding.UInt16)
+      (struct
+        type t = (Implicit_account_repr.t * Z.t) list
+
+        let encoding =
+          Data_encoding.(
+            Variable.list
+              (obj2
+                 (req "delegate" Implicit_account_repr.encoding)
+                 (req "credit" z)))
+      end)
+end
+
+module Clst = struct
+  module Raw_context =
+    Make_subcontext (Registered) (Raw_context)
+      (struct
+        let name = ["clst"]
+      end)
+
+  module Deposits_balance =
+    Make_single_data_storage (Registered) (Raw_context)
+      (struct
+        let name = ["deposits"]
+      end)
+      (Tez_repr)
+
+  module Redeemed_frozen_deposits =
+    Make_single_data_storage (Registered) (Raw_context)
+      (struct
+        let name = ["redeemed_frozen_deposits"]
+      end)
+      (Unstaked_frozen_deposits_repr)
+
+  module Redemption_requests =
+    Make_indexed_data_storage
+      (Make_subcontext (Registered) (Raw_context)
+         (struct
+           let name = ["redemption_requests"]
+         end))
+         (Make_index (Contract_repr.Index))
+      (struct
+        type t = Unstake_request.requests
+
+        let encoding = Unstake_request.requests_encoding
+      end)
+
+  module Registered_delegates =
+    Make_indexed_data_storage
+      (Make_subcontext (Registered) (Raw_context)
+         (struct
+           let name = ["registered_delegates"]
+         end))
+         (Make_index (Contract_repr.Index))
+      (Clst_delegates_parameters_repr)
+
+  module Pending_delegate_parameters = Cycle.Pending_CLST_delegate_parameters
 end
 
 module Delegate_sampler_state = Cycle.Delegate_sampler_state
+module Delegate_stake_info = Cycle.Delegate_stake_info
+module Issuance_bonus = Cycle.Issuance_bonus
+module Issuance_coeff = Cycle.Issuance_coeff
 
 (** Votes *)
 
@@ -1208,7 +1634,7 @@ module Vote = struct
          (struct
            let name = ["listings"]
          end))
-         (Public_key_hash_index)
+         (Make_index (Implicit_account_repr.Index))
       (Encoding.Int64)
 
   module Proposals =
@@ -1220,7 +1646,7 @@ module Vote = struct
          (Pair
             (Make_index
                (Protocol_hash_with_path_encoding))
-               (Public_key_hash_index))
+               (Make_index (Implicit_account_repr.Index)))
 
   module Proposals_count =
     Make_indexed_data_storage
@@ -1228,7 +1654,7 @@ module Vote = struct
          (struct
            let name = ["proposals_count"]
          end))
-         (Public_key_hash_index)
+         (Make_index (Implicit_account_repr.Index))
       (Encoding.UInt16)
 
   module Ballots =
@@ -1237,7 +1663,7 @@ module Vote = struct
          (struct
            let name = ["ballots"]
          end))
-         (Public_key_hash_index)
+         (Make_index (Implicit_account_repr.Index))
       (struct
         type t = Vote_repr.ballot
 
@@ -1283,7 +1709,7 @@ module Seed_status =
 module Seed = struct
   type unrevealed_nonce = Cycle.unrevealed_nonce = {
     nonce_hash : Nonce_hash.t;
-    delegate : Signature.Public_key_hash.t;
+    delegate : Implicit_account_repr.t;
   }
 
   type nonce_status = Cycle.nonce_status =
@@ -1347,7 +1773,8 @@ module Seed = struct
     let get = Cycle.Seed.get
 
     let update ctxt cycle seed status =
-      Cycle.Seed.update ctxt cycle seed >>=? fun ctxt ->
+      let open Lwt_result_syntax in
+      let* ctxt = Cycle.Seed.update ctxt cycle seed in
       Seed_status.update ctxt status
 
     let remove_existing = Cycle.Seed.remove_existing
@@ -1373,7 +1800,8 @@ module Ramp_up = struct
   type reward = {
     baking_reward_fixed_portion : Tez_repr.t;
     baking_reward_bonus_per_slot : Tez_repr.t;
-    endorsing_reward_per_slot : Tez_repr.t;
+    attesting_reward_per_slot : Tez_repr.t;
+    dal_attesting_reward_per_shard : Tez_repr.t;
   }
 
   module Rewards =
@@ -1392,23 +1820,30 @@ module Ramp_up = struct
               (fun {
                      baking_reward_fixed_portion;
                      baking_reward_bonus_per_slot;
-                     endorsing_reward_per_slot;
-                   } ->
+                     attesting_reward_per_slot;
+                     dal_attesting_reward_per_shard;
+                   }
+                 ->
                 ( baking_reward_fixed_portion,
                   baking_reward_bonus_per_slot,
-                  endorsing_reward_per_slot ))
+                  attesting_reward_per_slot,
+                  dal_attesting_reward_per_shard ))
               (fun ( baking_reward_fixed_portion,
                      baking_reward_bonus_per_slot,
-                     endorsing_reward_per_slot ) ->
+                     attesting_reward_per_slot,
+                     dal_attesting_reward_per_shard )
+                 ->
                 {
                   baking_reward_fixed_portion;
                   baking_reward_bonus_per_slot;
-                  endorsing_reward_per_slot;
+                  attesting_reward_per_slot;
+                  dal_attesting_reward_per_shard;
                 })
-              (obj3
+              (obj4
                  (req "baking_reward_fixed_portion" Tez_repr.encoding)
                  (req "baking_reward_bonus_per_slot" Tez_repr.encoding)
-                 (req "endorsing_reward_per_slot" Tez_repr.encoding)))
+                 (req "attesting_reward_per_slot" Tez_repr.encoding)
+                 (req "dal_attesting_reward_per_shard" Tez_repr.encoding)))
       end)
 end
 
@@ -1436,10 +1871,12 @@ module Pending_migration = struct
       end)
 
   let remove ctxt =
+    let open Lwt_result_syntax in
     let balance_updates ctxt =
-      Balance_updates.find ctxt >>=? function
+      let* balance_updates_opt = Balance_updates.find ctxt in
+      match balance_updates_opt with
       | Some balance_updates ->
-          Balance_updates.remove ctxt >>= fun ctxt ->
+          let*! ctxt = Balance_updates.remove ctxt in
           (* When applying balance updates in a migration, we must attach receipts.
              The balance updates returned from here will be applied in the first
              block of the new protocol. *)
@@ -1447,14 +1884,15 @@ module Pending_migration = struct
       | None -> return (ctxt, [])
     in
     let operation_results ctxt =
-      Operation_results.find ctxt >>=? function
+      let* operation_results_opt = Operation_results.find ctxt in
+      match operation_results_opt with
       | Some operation_results ->
-          Operation_results.remove ctxt >>= fun ctxt ->
+          let*! ctxt = Operation_results.remove ctxt in
           return (ctxt, operation_results)
       | None -> return (ctxt, [])
     in
-    balance_updates ctxt >>=? fun (ctxt, balance_updates) ->
-    operation_results ctxt >>=? fun (ctxt, operation_results) ->
+    let* ctxt, balance_updates = balance_updates ctxt in
+    let* ctxt, operation_results = operation_results ctxt in
     return (ctxt, balance_updates, operation_results)
 end
 
@@ -1479,6 +1917,30 @@ module Liquidity_baking = struct
         let encoding = Contract_repr.originated_encoding
       end)
 end
+
+module Adaptive_issuance = struct
+  module Activation =
+    Make_single_data_storage (Registered) (Raw_context)
+      (struct
+        let name = ["adaptive_issuance_launch_cycle"]
+      end)
+      (struct
+        type t = Cycle_repr.t option
+
+        let encoding = Data_encoding.option Cycle_repr.encoding
+      end)
+end
+
+module All_bakers_attest_activation =
+  Make_single_data_storage (Registered) (Raw_context)
+    (struct
+      let name = ["all_bakers_attest_first_level"]
+    end)
+    (struct
+      type t = Level_repr.t
+
+      let encoding = Level_repr.encoding
+    end)
 
 module Ticket_balance = struct
   module Name = struct
@@ -1512,80 +1974,6 @@ module Ticket_balance = struct
     Make_indexed_carbonated_data_storage (Table_context) (Index) (Encoding.Z)
 end
 
-module Tx_rollup = struct
-  module Indexed_context =
-    Make_indexed_subcontext
-      (Make_subcontext (Registered) (Raw_context)
-         (struct
-           let name = ["tx_rollup"]
-         end))
-         (Make_index (Tx_rollup_repr.Index))
-
-  module State =
-    Indexed_context.Make_carbonated_map
-      (Registered)
-      (struct
-        let name = ["state"]
-      end)
-      (Tx_rollup_state_repr)
-
-  module Level_context =
-    Make_indexed_subcontext
-      (Make_subcontext (Registered) (Indexed_context.Raw_context)
-         (struct
-           let name = ["tx_level"]
-         end))
-         (Make_index (Tx_rollup_level_repr.Index))
-
-  module Inbox =
-    Level_context.Make_carbonated_map
-      (Registered)
-      (struct
-        let name = ["inbox"]
-      end)
-      (struct
-        type t = Tx_rollup_inbox_repr.t
-
-        let encoding = Tx_rollup_inbox_repr.encoding
-      end)
-
-  module Revealed_withdrawals =
-    Level_context.Make_carbonated_map
-      (Registered)
-      (struct
-        let name = ["withdrawals"]
-      end)
-      (Bitset)
-
-  module Commitment =
-    Level_context.Make_carbonated_map
-      (Registered)
-      (struct
-        let name = ["commitment"]
-      end)
-      (Tx_rollup_commitment_repr.Submitted_commitment)
-
-  module Bond_indexed_context =
-    Make_indexed_subcontext
-      (Make_subcontext (Registered) (Indexed_context.Raw_context)
-         (struct
-           let name = ["bond"]
-         end))
-         (Public_key_hash_index)
-
-  module Commitment_bond =
-    Bond_indexed_context.Make_carbonated_map
-      (Registered)
-      (struct
-        let name = ["commitment"]
-      end)
-      (struct
-        type t = int
-
-        let encoding = Data_encoding.int31
-      end)
-end
-
 module Sc_rollup = struct
   module Raw_context =
     Make_subcontext (Registered) (Raw_context)
@@ -1602,7 +1990,8 @@ module Sc_rollup = struct
          (Make_index (Sc_rollup_repr.Index))
 
   module Make_versioned
-      (Versioned_value : Sc_rollup_data_version_sig.S) (Data_storage : sig
+      (Versioned_value : Sc_rollup_data_version_sig.S)
+      (Data_storage : sig
         type context
 
         type key
@@ -1691,6 +2080,30 @@ module Sc_rollup = struct
         let encoding = Sc_rollup_commitment_repr.genesis_info_encoding
       end)
 
+  module Past_commitment_periods =
+    Make_single_data_storage (Registered) (Raw_context)
+      (struct
+        let name = ["past_commitment_periods"]
+      end)
+      (struct
+        type t = Sc_rollup_repr.Past_commitment_period.t list
+
+        let encoding =
+          Data_encoding.(list Sc_rollup_repr.Past_commitment_period.encoding)
+      end)
+
+  module Signals =
+    Make_single_data_storage (Registered) (Raw_context)
+      (struct
+        let name = ["signals"]
+      end)
+      (struct
+        type t = (string * Raw_level_repr.t) list
+
+        let encoding =
+          Data_encoding.(list (tup2 (string Plain) Raw_level_repr.encoding))
+      end)
+
   module Inbox = struct
     include
       Make_single_data_storage (Registered) (Raw_context)
@@ -1756,7 +2169,7 @@ module Sc_rollup = struct
          (struct
            let name = ["staker_index"]
          end))
-         (Public_key_hash_index)
+         (Make_index (Implicit_account_repr.Index))
       (Sc_rollup_staker_index_repr)
 
   module Stakers =
@@ -1863,7 +2276,7 @@ module Sc_rollup = struct
          (struct
            let name = ["game"]
          end))
-         (Public_key_hash_index)
+         (Make_index (Implicit_account_repr.Index))
 
   module Game =
     Make_indexed_carbonated_data_storage
@@ -1871,7 +2284,7 @@ module Sc_rollup = struct
          (struct
            let name = ["opponents"]
          end))
-         (Public_key_hash_index)
+         (Make_index (Implicit_account_repr.Index))
       (struct
         type t = Sc_rollup_game_repr.Index.t
 
@@ -1952,6 +2365,42 @@ module Sc_rollup = struct
         let name = ["applied_outbox_messages"]
       end)
       (Bitset_and_level)
+
+  module Whitelist =
+    Make_carbonated_data_set_storage
+      (Make_subcontext (Registered) (Indexed_context.Raw_context)
+         (struct
+           let name = ["whitelist"]
+         end))
+         (Make_index (Implicit_account_repr.Index))
+
+  module Whitelist_paid_storage_space =
+    Indexed_context.Make_map
+      (Registered)
+      (struct
+        let name = ["whitelist_paid_bytes"]
+      end)
+      (Encoding.Z)
+
+  module Whitelist_used_storage_space =
+    Indexed_context.Make_map
+      (Registered)
+      (struct
+        let name = ["whitelist_use_bytes"]
+      end)
+      (Encoding.Z)
+
+  module Last_whitelist_update =
+    Indexed_context.Make_carbonated_map
+      (Registered)
+      (struct
+        let name = ["last_whitelist_update"]
+      end)
+      (struct
+        type t = Sc_rollup_whitelist_repr.last_whitelist_update
+
+        let encoding = Sc_rollup_whitelist_repr.last_whitelist_update_encoding
+      end)
 end
 
 module Dal = struct
@@ -1961,20 +2410,19 @@ module Dal = struct
         let name = ["dal"]
       end)
 
-  (* DAL/FIXME https://gitlab.com/tezos/tezos/-/issues/3113
+  module AttestationHistory =
+    Make_single_data_storage (Registered) (Raw_context)
+      (struct
+        let name = ["attestation_history"]
+      end)
+      (struct
+        type t = Dal_attestations_repr.Accountability.packed_history
 
-     This is only for prototyping. Probably something smarter would be
-     to index each header directly. *)
-  (* DAL/FIXME: https://gitlab.com/tezos/tezos/-/issues/3684
+        let encoding =
+          Dal_attestations_repr.Accountability.packed_history_encoding
+      end)
 
-     This storage should be carbonated. *)
   module Slot = struct
-    module Slot_context =
-      Make_subcontext (Registered) (Raw_context)
-        (struct
-          let name = ["slot"]
-        end)
-
     module Level_context =
       Make_indexed_subcontext
         (Make_subcontext (Registered) (Raw_context)
@@ -1990,9 +2438,14 @@ module Dal = struct
           let name = ["slot_headers"]
         end)
         (struct
-          type t = Dal_slot_repr.Header.t list
+          type t = (Dal_slot_repr.Header.t * Contract_repr.t) list
 
-          let encoding = Data_encoding.(list Dal_slot_repr.Header.encoding)
+          let encoding =
+            let open Data_encoding in
+            list
+              (obj2
+                 (req "slot_header" Dal_slot_repr.Header.encoding)
+                 (req "publisher" Contract_repr.encoding))
         end)
 
     module History =
@@ -2005,7 +2458,52 @@ module Dal = struct
 
           let encoding = Dal_slot_repr.History.encoding
         end)
+
+    module LevelHistories =
+      Make_single_data_storage (Registered) (Raw_context)
+        (struct
+          let name = ["slot_headers_successive_histories_of_level"]
+        end)
+        (struct
+          type t =
+            (Dal_slot_repr.History.Pointer_hash.t * Dal_slot_repr.History.t)
+            list
+
+          let encoding =
+            let open Data_encoding in
+            let module H = Dal_slot_repr.History in
+            list
+              (obj2
+                 (req "cell_hash" H.Pointer_hash.encoding)
+                 (req "cell" H.encoding))
+        end)
   end
+
+  module Denounced_delegates =
+    Make_indexed_data_storage
+      (Make_subcontext (Registered) (Raw_context)
+         (struct
+           let name = ["dal_denounced_delegates"]
+         end))
+         (Make_index (Implicit_account_repr.Index))
+      (struct
+        type t = unit
+
+        let encoding = Data_encoding.empty
+      end)
+
+  module Past_parameters =
+    Make_single_data_storage (Registered) (Raw_context)
+      (struct
+        let name = ["past_parameters"]
+      end)
+      (struct
+        type t = Constants_parametric_repr.past_dal_parameters list
+
+        let encoding =
+          Data_encoding.list
+            Constants_parametric_repr.past_dal_parameters_encoding
+      end)
 end
 
 module Zk_rollup = struct
@@ -2094,4 +2592,13 @@ module Zk_rollup = struct
               Zk_rollup_operation_repr.encoding
               (option Ticket_hash_repr.encoding))
       end)
+end
+
+module Legacy = struct
+  module Grand_parent_branch =
+    Make_single_data_storage (Registered) (Raw_context)
+      (struct
+        let name = ["grand_parent_branch"]
+      end)
+      (Tenderbake.Branch)
 end

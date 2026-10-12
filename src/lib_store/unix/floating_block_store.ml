@@ -39,6 +39,7 @@ type t = {
   fd : Lwt_unix.file_descr;
   kind : floating_kind;
   scheduler : Lwt_idle_waiter.t;
+  readonly : bool;
 }
 
 type info = {
@@ -62,6 +63,9 @@ let mem floating_store hash =
   Lwt_idle_waiter.task floating_store.scheduler (fun () ->
       Lwt.return
         (Floating_block_index.mem floating_store.floating_block_index hash))
+
+let may_sync {floating_block_index; readonly; _} =
+  if readonly then Floating_block_index.sync floating_block_index
 
 let find_info floating_store hash =
   Lwt_idle_waiter.task floating_store.scheduler (fun () ->
@@ -150,7 +154,9 @@ let append_all floating_store (blocks : (Block_repr.t * info) Seq.t) =
       let*! eof_offset = Lwt_unix.lseek floating_store.fd 0 Unix.SEEK_END in
       let* _last_offset =
         Seq.ES.fold_left
-          (fun offset (block, ({predecessors; resulting_context_hash} : info)) ->
+          (fun offset
+               (block, ({predecessors; resulting_context_hash} : info))
+             ->
             let* written_len =
               locked_write_block
                 floating_store
@@ -490,7 +496,8 @@ let init chain_dir ~readonly kind =
       (Naming.dir_path floating_index_dir)
   in
   let scheduler = Lwt_idle_waiter.create () in
-  return {floating_block_index; fd; floating_blocks_dir; kind; scheduler}
+  return
+    {floating_block_index; fd; floating_blocks_dir; kind; scheduler; readonly}
 
 let close {floating_block_index; fd; scheduler; _} =
   let open Lwt_syntax in
@@ -651,7 +658,7 @@ let fix_integrity chain_dir kind =
                             append_block fresh_floating_store preds block
                         | None -> Lwt.fail Exit)
                       inconsistent_floating_store)
-                  (function Exit -> return_unit | exn -> Lwt.fail exn)
+                  (function Exit -> return_unit | exn -> Lwt.reraise exn)
               in
               let*! () =
                 swap ~src:fresh_floating_store ~dst:inconsistent_floating_store

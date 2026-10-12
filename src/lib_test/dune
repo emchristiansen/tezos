@@ -3,38 +3,13 @@
 
 (library
  (name tezos_test_helpers)
- (public_name tezos-test-helpers)
+ (public_name octez-libs.test-helpers)
  (instrumentation (backend bisect_ppx))
  (libraries
   uri
   fmt
   qcheck-alcotest
-  alcotest
   lwt
   pure-splitmix
-  data-encoding)
- (js_of_ocaml)
- (library_flags (:standard -linkall))
- (modules
-  assert
-  lwt_assert
-  qcheck2_helpers
-  qcheck_extra
-  qcheck_helpers
-  random_pure
-  roundtrip
-  testable))
-
-(rule (alias runtest_js) (action progn))
-
-(library
- (name lib_test_extra)
- (public_name tezos-test-helpers-extra)
- (instrumentation (backend bisect_ppx))
- (libraries
-  tezos-base
-  tezos-crypto
-  tezos-test-helpers)
- (modules assert_lib))
-
-(rule (alias runtest_js_base) (action progn))
+  octez-libs.data-encoding)
+ (library_flags (:standard -linkall)))

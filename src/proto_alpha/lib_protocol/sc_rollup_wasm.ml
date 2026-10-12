@@ -30,6 +30,8 @@ type error += WASM_proof_production_failed
 
 type error += WASM_output_proof_production_failed
 
+type error += WASM_output_proof_verification_failed
+
 type error += WASM_invalid_claim_about_outbox
 
 type error += WASM_invalid_dissection_distribution
@@ -56,6 +58,16 @@ let () =
     unit
     (function WASM_output_proof_production_failed -> Some () | _ -> None)
     (fun () -> WASM_output_proof_production_failed) ;
+  let msg = "Output proof verification failed" in
+  register_error_kind
+    `Permanent
+    ~id:"smart_rollup_wasm_output_proof_verification_failed"
+    ~title:msg
+    ~pp:(fun fmt () -> Format.fprintf fmt "%s" msg)
+    ~description:msg
+    unit
+    (function WASM_output_proof_verification_failed -> Some () | _ -> None)
+    (fun () -> WASM_output_proof_verification_failed) ;
   let msg = "Proof production failed" in
   register_error_kind
     `Permanent
@@ -66,6 +78,16 @@ let () =
     unit
     (function WASM_proof_production_failed -> Some () | _ -> None)
     (fun () -> WASM_proof_production_failed) ;
+  let msg = "Proof verification failed" in
+  register_error_kind
+    `Permanent
+    ~id:"smart_rollup_wasm_proof_verification_failed"
+    ~title:msg
+    ~pp:(fun fmt () -> Format.fprintf fmt "%s" msg)
+    ~description:msg
+    unit
+    (function WASM_proof_verification_failed -> Some () | _ -> None)
+    (fun () -> WASM_proof_verification_failed) ;
   let msg =
     "Invalid dissection distribution: not all ticks are a multiplier of the \
      maximum number of ticks of a snapshot"
@@ -81,75 +103,34 @@ let () =
     (fun () -> WASM_invalid_dissection_distribution)
 
 module V2_0_0 = struct
-  let current_version = Wasm_2_0_0.v1
+  let current_version = Wasm_2_0_0.v6
 
-  let ticks_per_snapshot = Z.of_int64 11_000_000_000L
+  let ticks_per_snapshot = Z.of_int64 50_000_000_000_000L
 
-  let outbox_validity_period = Int32.of_int 80_640
+  let outbox_validity_period = 241_920l
 
   let outbox_message_limit = Z.of_int 100
 
-  let well_known_reveal_preimage = ""
+  let well_known_reveal_preimage =
+    Sc_rollup_reveal_hash.well_known_reveal_preimage
 
-  let well_known_reveal_hash =
-    Sc_rollup_reveal_hash.hash_string
-      ~scheme:Blake2B
-      [well_known_reveal_preimage]
+  let well_known_reveal_hash = Sc_rollup_reveal_hash.well_known_reveal_hash
 
-  (*
-    This is the state hash of reference that both the prover of the
-    node and the verifier of the protocol {!Protocol_implementation}
-    have to agree on (if they do, it means they are using the same
-    tree structure).
-
-    We have to hard-code this value because the Wasm PVM uses Irmin as
-    its Merkle proof verification backend, and the economic protocol
-    cannot create an empty Irmin context. Such a context is required to
-    create an empty tree, itself required to create the initial state of
-    the Wasm PVM.
-
-    Utlimately, the value of this constant is decided by the prover of
-    reference (the only need is for it to be compatible with
-    {!Protocol_implementation}.)
-
-    Its value is the result of the following snippet
-
-    {|
-    let*! state = Prover.initial_state context in
-    Prover.state_hash state
-    |}
-  *)
-  let reference_initial_state_hash =
-    Sc_rollup_repr.State_hash.of_b58check_exn
-      "srs129wuRkckJpSyDhsqSvzE3qSVnvJZ7nD93r3b6oiBtPxa9LMBHu"
+  let decode_reveal (Wasm_2_0_0.Reveal_raw payload) =
+    match
+      Data_encoding.Binary.of_string_opt
+        Sc_rollup_PVM_sig.reveal_encoding
+        payload
+    with
+    | Some reveal -> reveal
+    | None ->
+        (* If the kernel has tried to submit an incorrect reveal request,
+           we don’t stuck the rollup. Instead, we fallback to the
+           requesting the [well_known_reveal_hash] preimage *)
+        Reveal_raw_data well_known_reveal_hash
 
   open Sc_rollup_repr
   module PS = Sc_rollup_PVM_sig
-
-  module type TreeS =
-    Context.TREE with type key = string list and type value = bytes
-
-  module type Make_wasm = module type of Wasm_2_0_0.Make
-
-  module type P = sig
-    module Tree : TreeS
-
-    type tree = Tree.tree
-
-    type proof
-
-    val proof_encoding : proof Data_encoding.t
-
-    val proof_before : proof -> State_hash.t
-
-    val proof_after : proof -> State_hash.t
-
-    val verify_proof :
-      proof -> (tree -> (tree * 'a) Lwt.t) -> (tree * 'a) option Lwt.t
-
-    val produce_proof :
-      Tree.t -> tree -> (tree -> (tree * 'a) Lwt.t) -> (proof * 'a) option Lwt.t
-  end
 
   module type S = sig
     include Sc_rollup_PVM_sig.S
@@ -167,42 +148,38 @@ module V2_0_0 = struct
       | Waiting_for_input_message
       | Waiting_for_reveal of Sc_rollup_PVM_sig.reveal
 
-    (** [get_status state] gives you the current execution status for the PVM. *)
-    val get_status : state -> status Lwt.t
+    (** [get_status ~is_reveal_enabled state] gives you the current execution status for the PVM. *)
+    val get_status :
+      is_reveal_enabled:Sc_rollup_PVM_sig.is_reveal_enabled ->
+      state ->
+      status Lwt.t
 
     val get_outbox :
       Raw_level_repr.t -> state -> Sc_rollup_PVM_sig.output list Lwt.t
   end
 
-  (* [Make (Make_backend) (Context)] creates a PVM.
+  module type WASM_PVM_MACHINE = sig
+    include Wasm_2_0_0.WASM_PVM_MACHINE
 
-     The Make_backend is a functor that creates the backend of the PVM.
-     The Conext provides the tree and the proof types.
-  *)
-  module Make (Make_backend : Make_wasm) (Context : P) :
+    val produce_proof :
+      context ->
+      state ->
+      (state -> (state * 'a) Lwt.t) ->
+      (proof * 'a) option Lwt.t
+  end
+
+  module Make_pvm (WASM_pvm_machine : WASM_PVM_MACHINE) :
     S
-      with type context = Context.Tree.t
-       and type state = Context.tree
-       and type proof = Context.proof = struct
-    module Tree = Context.Tree
-
-    type context = Context.Tree.t
-
+      with type context = WASM_pvm_machine.context
+       and type state = WASM_pvm_machine.state
+       and type proof = WASM_pvm_machine.proof = struct
     type hash = State_hash.t
 
-    type proof = Context.proof
-
-    let proof_encoding = Context.proof_encoding
-
-    let proof_start_state proof = Context.proof_before proof
-
-    let proof_stop_state proof = Context.proof_after proof
+    include WASM_pvm_machine
 
     let parse_boot_sector s = Hex.to_string @@ `Hex s
 
     let pp_boot_sector fmt s = Format.fprintf fmt "%s" s
-
-    type tree = Tree.tree
 
     type status =
       | Computing
@@ -210,7 +187,7 @@ module V2_0_0 = struct
       | Waiting_for_reveal of Sc_rollup_PVM_sig.reveal
 
     module State = struct
-      type state = tree
+      type nonrec state = state
 
       module Monad : sig
         type 'a t
@@ -223,9 +200,9 @@ module V2_0_0 = struct
           val ( let* ) : 'a t -> ('a -> 'b t) -> 'b t
         end
 
-        val get : tree t
+        val get : state t
 
-        val set : tree -> unit t
+        val set : state -> unit t
 
         val lift : 'a Lwt.t -> 'a t
       end = struct
@@ -252,9 +229,6 @@ module V2_0_0 = struct
       end
     end
 
-    type state = State.state
-
-    module WASM_machine = Make_backend (Tree)
     open State
 
     let pp _state =
@@ -262,19 +236,16 @@ module V2_0_0 = struct
 
     open Monad
 
-    let initial_state ~empty = WASM_machine.initial_state current_version empty
+    let initial_state ~empty =
+      WASM_pvm_machine.initial_state current_version empty
 
     let install_boot_sector state boot_sector =
-      WASM_machine.install_boot_sector
+      WASM_pvm_machine.install_boot_sector
         ~ticks_per_snapshot
         ~outbox_validity_period
         ~outbox_message_limit
         boot_sector
         state
-
-    let state_hash state =
-      let context_hash = Tree.hash state in
-      Lwt.return @@ State_hash.context_hash_to_state_hash context_hash
 
     let result_of m state =
       let open Lwt_syntax in
@@ -289,39 +260,15 @@ module V2_0_0 = struct
     let get_tick : Sc_rollup_tick_repr.t Monad.t =
       let open Monad.Syntax in
       let* s = get in
-      let* info = lift (WASM_machine.get_info s) in
+      let* info = lift (WASM_pvm_machine.get_info s) in
       return @@ Sc_rollup_tick_repr.of_z info.current_tick
 
     let get_tick : state -> Sc_rollup_tick_repr.t Lwt.t = result_of get_tick
 
-    let get_status : status Monad.t =
-      let open Monad.Syntax in
-      let open Sc_rollup_PVM_sig in
-      let* s = get in
-      let* info = lift (WASM_machine.get_info s) in
-      return
-      @@
-      match info.input_request with
-      | No_input_required -> Computing
-      | Input_required -> Waiting_for_input_message
-      | Reveal_required (Wasm_2_0_0.Reveal_raw_data hash) -> (
-          match
-            Data_encoding.Binary.of_string_opt
-              Sc_rollup_reveal_hash.encoding
-              hash
-          with
-          | Some hash -> Waiting_for_reveal (Reveal_raw_data hash)
-          | None ->
-              (* In case of an invalid hash, the rollup is
-                 blocked. Any commitment will be invalid. *)
-              Waiting_for_reveal (Reveal_raw_data well_known_reveal_hash))
-      | Reveal_required Wasm_2_0_0.Reveal_metadata ->
-          Waiting_for_reveal Reveal_metadata
-
     let get_last_message_read : _ Monad.t =
       let open Monad.Syntax in
       let* s = get in
-      let* info = lift (WASM_machine.get_info s) in
+      let* info = lift (WASM_pvm_machine.get_info s) in
       return
       @@
       match info.last_input_read with
@@ -330,9 +277,35 @@ module V2_0_0 = struct
           Some (inbox_level, message_counter)
       | _ -> None
 
-    let is_input_state =
+    let get_status ~is_reveal_enabled =
       let open Monad.Syntax in
-      let* status = get_status in
+      let open Sc_rollup_PVM_sig in
+      let* s = get in
+      let* info = lift (WASM_pvm_machine.get_info s) in
+      let* last_read = get_last_message_read in
+      (* We do not put the machine in a stuck condition if a kind of reveal
+         happens to not be supported. This is a sensible thing to do, as if
+         there is an off-by-one error in the WASM kernel one can do an
+         incorrect reveal, which can put the PVM in a stuck state with no way
+         to upgrade the kernel to fix the off-by-one. *)
+      let try_return_reveal candidate =
+        match last_read with
+        | Some (current_block_level, _) ->
+            let is_enabled = is_reveal_enabled ~current_block_level candidate in
+            if is_enabled then Waiting_for_reveal candidate
+            else Waiting_for_reveal (Reveal_raw_data well_known_reveal_hash)
+        | None -> Waiting_for_reveal (Reveal_raw_data well_known_reveal_hash)
+      in
+      return
+      @@
+      match info.input_request with
+      | No_input_required -> Computing
+      | Input_required -> Waiting_for_input_message
+      | Reveal_required req -> try_return_reveal (decode_reveal req)
+
+    let is_input_state ~is_reveal_enabled =
+      let open Monad.Syntax in
+      let* status = get_status ~is_reveal_enabled in
       match status with
       | Waiting_for_input_message -> (
           let* last_read = get_last_message_read in
@@ -342,20 +315,22 @@ module V2_0_0 = struct
       | Computing -> return PS.No_input_required
       | Waiting_for_reveal reveal -> return (PS.Needs_reveal reveal)
 
-    let is_input_state = result_of is_input_state
+    let is_input_state ~is_reveal_enabled =
+      result_of (is_input_state ~is_reveal_enabled)
 
-    let get_status : state -> status Lwt.t = result_of get_status
+    let get_status ~is_reveal_enabled : state -> status Lwt.t =
+      result_of (get_status ~is_reveal_enabled)
 
     let get_outbox outbox_level state =
+      let open Lwt_syntax in
       let outbox_level_int32 =
         Raw_level_repr.to_int32_non_negative outbox_level
       in
-      let open Lwt_syntax in
       let rec aux outbox message_index =
         let output =
           Wasm_2_0_0.{outbox_level = outbox_level_int32; message_index}
         in
-        let* res = WASM_machine.get_output output state in
+        let* res = WASM_pvm_machine.get_output output state in
         match res with
         | None -> return (List.rev outbox)
         | Some msg -> (
@@ -371,7 +346,9 @@ module V2_0_0 = struct
                    output produced by the kernel. *)
                 (aux [@ocaml.tailcall]) outbox (Z.succ message_index)
             | Ok message ->
-                let output = PS.{outbox_level; message_index; message} in
+                let output =
+                  PS.{output_info = {outbox_level; message_index}; message}
+                in
                 (aux [@ocaml.tailcall])
                   (output :: outbox)
                   (Z.succ message_index))
@@ -387,7 +364,7 @@ module V2_0_0 = struct
           let* s = get in
           let* s =
             lift
-              (WASM_machine.set_input_step
+              (WASM_pvm_machine.set_input_step
                  {
                    inbox_level = Raw_level_repr.to_int32_non_negative inbox_level;
                    message_counter;
@@ -396,37 +373,35 @@ module V2_0_0 = struct
                  s)
           in
           set s
-      | PS.Reveal (PS.Raw_data data) ->
+      | PS.Reveal reveal_data ->
+          let reveal_data_bytes = PS.reveal_response_to_bytes reveal_data in
           let* s = get in
-          let* s = lift (WASM_machine.reveal_step (Bytes.of_string data) s) in
+          let* s = lift (WASM_pvm_machine.reveal_step reveal_data_bytes s) in
           set s
-      | PS.Reveal (PS.Metadata metadata) ->
-          let metadata_bytes =
-            Data_encoding.Binary.to_bytes_exn
-              Sc_rollup_metadata_repr.encoding
-              metadata
-          in
-          let* s = get in
-          let* s = lift (WASM_machine.reveal_step metadata_bytes s) in
-          set s
-      | PS.Reveal (PS.Dal_page _content_opt) ->
-          (* FIXME/DAL: https://gitlab.com/tezos/tezos/-/issues/3927.
-             Handle DAL pages in wasm PVM. *)
-          assert false
 
     let set_input input = state_of @@ set_input_state input
 
     let eval_step =
       let open Monad.Syntax in
       let* s = get in
-      let* s = lift (WASM_machine.compute_step s) in
+      let* s = lift (WASM_pvm_machine.compute_step s) in
       set s
 
     let eval state = state_of eval_step state
 
-    let step_transition input_given state =
+    let get_current_level state =
       let open Lwt_syntax in
-      let* request = is_input_state state in
+      let+ res = result_of get_last_message_read state in
+      Option.map fst res
+
+    let step_transition ~is_reveal_enabled input_given state =
+      let open Lwt_syntax in
+      (* Get the current level to include it in the proof. It is needed as the
+       tick's merkle proof is also used to retrieve the level at which the tick
+       was executed. If the proof production gets the the current level, then
+       then proof verification can get it as well. *)
+      let* _current_level = get_current_level state in
+      let* request = is_input_state ~is_reveal_enabled state in
       let* state =
         match request with
         | PS.No_input_required -> eval state
@@ -437,113 +412,112 @@ module V2_0_0 = struct
       in
       return (state, request)
 
-    let verify_proof input_given proof =
+    let get_proof_state_level proof =
       let open Lwt_result_syntax in
-      let*! result = Context.verify_proof proof (step_transition input_given) in
+      let proof = WASM_pvm_machine.cast_read_only proof in
+      let*! result =
+        WASM_pvm_machine.verify_proof proof (fun state ->
+            let*! current_level_opt = get_current_level state in
+            Lwt.return (state, current_level_opt))
+      in
+      match result with
+      | None -> tzfail WASM_proof_verification_failed
+      | Some (_state, current_level_opt) -> return current_level_opt
+
+    let verify_proof ~is_reveal_enabled input_given proof =
+      let open Lwt_result_syntax in
+      let*! result =
+        WASM_pvm_machine.verify_proof
+          proof
+          (step_transition ~is_reveal_enabled input_given)
+      in
       match result with
       | None -> tzfail WASM_proof_verification_failed
       | Some (_state, request) -> return request
 
-    let produce_proof context input_given state =
+    let produce_proof context ~is_reveal_enabled input_given state =
       let open Lwt_result_syntax in
       let*! result =
-        Context.produce_proof context state (step_transition input_given)
+        WASM_pvm_machine.produce_proof
+          context
+          state
+          (step_transition ~is_reveal_enabled input_given)
       in
       match result with
       | Some (tree_proof, _requested) -> return tree_proof
       | None -> tzfail WASM_proof_production_failed
 
-    let verify_origination_proof proof boot_sector =
-      let open Lwt_syntax in
-      let before = Context.proof_before proof in
-      if State_hash.(before <> reference_initial_state_hash) then return false
-      else
-        let* result =
-          Context.verify_proof proof (fun state ->
-              let* state = install_boot_sector state boot_sector in
-              return (state, ()))
-        in
-        match result with None -> return false | Some (_, ()) -> return true
-
-    let produce_origination_proof context boot_sector =
-      let open Lwt_result_syntax in
-      let*! state = initial_state ~empty:(Tree.empty context) in
-      let*! result =
-        Context.produce_proof context state (fun state ->
-            let open Lwt_syntax in
-            let* state = install_boot_sector state boot_sector in
-            return (state, ()))
-      in
-      match result with
-      | Some (tree_proof, ()) -> return tree_proof
-      | None -> tzfail WASM_proof_production_failed
-
     type output_proof = {
-      output_proof : Context.proof;
-      output_proof_state : hash;
+      output_proof : WASM_pvm_machine.proof;
       output_proof_output : PS.output;
     }
 
     let output_proof_encoding =
       let open Data_encoding in
       conv
-        (fun {output_proof; output_proof_state; output_proof_output} ->
-          (output_proof, output_proof_state, output_proof_output))
-        (fun (output_proof, output_proof_state, output_proof_output) ->
-          {output_proof; output_proof_state; output_proof_output})
-        (obj3
-           (req "output_proof" Context.proof_encoding)
-           (req "output_proof_state" State_hash.encoding)
+        (fun {output_proof; output_proof_output} ->
+          (output_proof, output_proof_output))
+        (fun (output_proof, output_proof_output) ->
+          {output_proof; output_proof_output})
+        (obj2
+           (req "output_proof" WASM_pvm_machine.proof_encoding)
            (req "output_proof_output" PS.output_encoding))
 
-    let output_of_output_proof s = s.output_proof_output
+    let output_info_of_output_proof s = s.output_proof_output.output_info
 
-    let state_of_output_proof s = s.output_proof_state
+    let state_of_output_proof s = proof_start_state s.output_proof
 
-    let has_output : PS.output -> bool Monad.t = function
-      | {outbox_level; message_index; message} -> (
-          let open Monad.Syntax in
-          let* s = get in
-          let* result =
-            lift
-              (WASM_machine.get_output
-                 {
-                   outbox_level =
-                     Raw_level_repr.to_int32_non_negative outbox_level;
-                   message_index;
-                 }
-                 s)
-          in
-          let message_encoded =
-            Data_encoding.Binary.to_string_exn
-              Sc_rollup_outbox_message_repr.encoding
-              message
-          in
-          return
-          @@
-          match result with
-          | Some result -> Compare.String.(result = message_encoded)
-          | None -> false)
+    let get_output : PS.output -> Sc_rollup_outbox_message_repr.t option Monad.t
+        =
+     fun {output_info = {outbox_level; message_index}; message} ->
+      let open Monad.Syntax in
+      let* s = get in
+      let* result =
+        lift
+          (WASM_pvm_machine.get_output
+             {
+               outbox_level = Raw_level_repr.to_int32_non_negative outbox_level;
+               message_index;
+             }
+             s)
+      in
+      let message_encoded =
+        Data_encoding.Binary.to_string_exn
+          Sc_rollup_outbox_message_repr.encoding
+          message
+      in
+      return
+      @@ Option.bind result (fun result ->
+             if Compare.String.(result = message_encoded) then Some message
+             else None)
 
     let verify_output_proof p =
-      let open Lwt_syntax in
-      let transition = run @@ has_output p.output_proof_output in
-      let* result = Context.verify_proof p.output_proof transition in
-      match result with None -> return false | Some _ -> return true
+      let open Lwt_result_syntax in
+      let transition = run @@ get_output p.output_proof_output in
+      let*! result = WASM_pvm_machine.verify_proof p.output_proof transition in
+      match result with
+      | Some (_state, Some message) ->
+          return
+            Sc_rollup_PVM_sig.
+              {output_info = p.output_proof_output.output_info; message}
+      | _ -> tzfail WASM_output_proof_verification_failed
 
     let produce_output_proof context state output_proof_output =
       let open Lwt_result_syntax in
-      let*! output_proof_state = state_hash state in
       let*! result =
-        Context.produce_proof context state
+        WASM_pvm_machine.produce_proof context state
         @@ run
-        @@ has_output output_proof_output
+        @@ get_output output_proof_output
       in
       match result with
-      | Some (output_proof, true) ->
-          return {output_proof; output_proof_state; output_proof_output}
-      | Some (_, false) -> fail WASM_invalid_claim_about_outbox
-      | None -> fail WASM_output_proof_production_failed
+      | Some (output_proof, Some message) ->
+          return
+            {
+              output_proof;
+              output_proof_output =
+                {output_info = output_proof_output.output_info; message};
+            }
+      | _ -> fail WASM_output_proof_production_failed
 
     let check_sections_number ~default_number_of_sections ~number_of_sections
         ~dist =
@@ -556,7 +530,7 @@ module V2_0_0 = struct
         Compare.Z.min
           (Z.of_int default_number_of_sections)
           (if is_stop_chunk_aligned then max_number_of_sections
-          else Z.succ max_number_of_sections)
+           else Z.succ max_number_of_sections)
       in
       let given = Z.of_int number_of_sections in
       error_unless
@@ -663,61 +637,19 @@ module V2_0_0 = struct
              dissection)
           WASM_invalid_dissection_distribution
 
-    let get_current_level state =
-      let open Lwt_syntax in
-      let+ res = result_of get_last_message_read state in
-      Option.map fst res
-
-    module Internal_for_tests = struct
-      let insert_failure state =
-        let add n = Tree.add state ["failures"; string_of_int n] Bytes.empty in
-        let open Lwt_syntax in
-        let* n = Tree.length state ["failures"] in
-        add n
-    end
+    let get_current_level = get_current_level
   end
 
-  module Protocol_implementation =
-    Make
-      (Wasm_2_0_0.Make)
-      (struct
-        module Tree = struct
-          include Context.Tree
+  let protocol_implementation ~config =
+    let (module Wasm_pvm_machine) = Wasm_2_0_0.wasm_pvm_machine ~config in
+    let module Impl = Make_pvm (struct
+      include Wasm_pvm_machine
 
-          type tree = Context.tree
-
-          type t = Context.t
-
-          type key = string list
-
-          type value = bytes
-        end
-
-        type tree = Context.tree
-
-        type proof = Context.Proof.tree Context.Proof.t
-
-        let verify_proof p f =
-          let open Lwt_option_syntax in
-          let*? () =
-            Result.to_option (Context_binary_proof.check_is_binary p)
-          in
-          Lwt.map Result.to_option (Context.verify_tree_proof p f)
-
-        let produce_proof _context _state _f =
-          (* Can't produce proof without full context*)
-          Lwt.return None
-
-        let kinded_hash_to_state_hash = function
-          | `Value hash | `Node hash ->
-              State_hash.context_hash_to_state_hash hash
-
-        let proof_before proof =
-          kinded_hash_to_state_hash proof.Context.Proof.before
-
-        let proof_after proof =
-          kinded_hash_to_state_hash proof.Context.Proof.after
-
-        let proof_encoding = Context.Proof_encoding.V2.Tree2.tree_proof_encoding
-      end)
+      (* TODO: L2-908 - Refactor Make_pvm to not require produce_proof *)
+      let produce_proof _ctx _state _step = Lwt.return_none
+    end) in
+    (module Impl : Sc_rollup_PVM_sig.PROTO_VERIFICATION
+      with type context = Wasm_2_0_0.wasm_pvm_machine_context
+       and type state = Wasm_2_0_0.wasm_pvm_machine_state
+       and type proof = Wasm_2_0_0.wasm_pvm_machine_proof)
 end

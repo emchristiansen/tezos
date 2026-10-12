@@ -39,7 +39,7 @@ type simulation_params = {
   now : Script_timestamp.t option;
   level : Script_int.n Script_int.num option;
   source : Contract.t option;
-  payer : Tezos_crypto.Signature.public_key_hash option;
+  payer : Signature.public_key_hash option;
   gas : Gas.Arith.integral option;
 }
 
@@ -166,6 +166,8 @@ val print_typecheck_result :
   emacs:bool ->
   show_types:bool ->
   print_source_on_error:bool ->
+  display_names:bool ->
+  name:string ->
   Michelson_v1_parser.parsed ->
   (Script_tc_errors.type_map * Gas.t) tzresult ->
   #Client_context.printer ->

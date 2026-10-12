@@ -26,7 +26,8 @@
 (** Testing
     -------
     Component:    Operation_repr
-    Invocation:   dune exec ./src/proto_alpha/lib_protocol/test/unit/main.exe -- test Operation_repr
+    Invocation:   dune exec src/proto_alpha/lib_protocol/test/unit/main.exe \
+                  -- --file test_operation_repr.ml
     Dependencies: --
     Subject:      To test the modules (including the top-level)
                   in operation_repr.ml as individual units, particularly
@@ -40,6 +41,7 @@ module Test_operation_repr = struct
   open Operation_repr
 
   let test_of_list_single_case () =
+    let open Lwt_result_wrap_syntax in
     let op =
       Manager_operation
         {
@@ -51,12 +53,13 @@ module Test_operation_repr = struct
           source = Obj.magic 0;
         }
     in
-    Environment.wrap_tzresult @@ of_list [Contents op] >>?= fun contents_list ->
+    let*?@ contents_list = of_list [Contents op] in
     match contents_list with
-    | Contents_list (Single op') when op == Obj.magic op' -> return_unit
+    | Contents_list (Single op') when Obj.repr op == Obj.repr op' -> return_unit
     | _ -> failwith "Unexpected value"
 
   let test_of_list_multiple_case () =
+    let open Lwt_result_wrap_syntax in
     let op1 =
       Manager_operation
         {
@@ -79,15 +82,15 @@ module Test_operation_repr = struct
           source = Obj.magic 0;
         }
     in
-    Environment.wrap_tzresult @@ of_list [Contents op1; Contents op2]
-    >>?= fun contents_list ->
+    let*?@ contents_list = of_list [Contents op1; Contents op2] in
     match contents_list with
     | Contents_list (Cons (op1', Single op2'))
-      when op1 == Obj.magic op1' && op2 == Obj.magic op2' ->
+      when Obj.repr op1 == Obj.repr op1' && Obj.repr op2 == Obj.repr op2' ->
         return_unit
     | _ -> failwith "Unexpected value"
 
   let test_of_list_empty_case () =
+    let open Lwt_result_syntax in
     match of_list [] with
     | Ok _ -> failwith "of_list of an empty list was expected to fail"
     | Error _ -> return_unit
@@ -102,6 +105,7 @@ module Test_operation_repr = struct
         (Bytes.cat (Bytes.of_string "\255") prefix, suffix)
 
   let test_split_signatures error assemble =
+    let open Lwt_result_syntax in
     let op_bytes =
       Data_encoding.Binary.to_bytes_exn
         Operation_repr.contents_encoding
@@ -182,3 +186,7 @@ let tests =
       `Quick
       Test_operation_repr.test_multiple_non_manager;
   ]
+
+let () =
+  Alcotest_lwt.run ~__FILE__ Protocol.name [("Operation_repr.ml", tests)]
+  |> Lwt_main.run

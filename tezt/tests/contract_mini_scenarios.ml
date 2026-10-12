@@ -30,6 +30,7 @@
    Invocation:   dune exec tezt/tests/main.exe -- --file contract_mini_scenarios.ml
    Subject:      Test mini scenarios
 *)
+let team = Tag.layer1
 
 let test_replay client ~protocol =
   Log.info "Replay 'originate'" ;
@@ -427,7 +428,7 @@ let test_contract_noop client ~protocol =
   let burn_cap = Tez.one in
   let prg = Michelson_script.(find ["opcodes"; "noop"] protocol |> path) in
   let* () = Client.remember_script client ~alias:"noop" ~src:("file:" ^ prg) in
-  let* () = Client.typecheck_script client ~script:prg in
+  let* () = Client.typecheck_script client ~scripts:[prg] in
   let* _contract =
     Client.originate_contract
       ~alias:"noop"
@@ -487,7 +488,8 @@ let register ~protocols =
       Protocol.register_test
         ~__FILE__
         ~title
-        ~tags:["client"; "michelson"; "mini_scenarios"]
+        ~tags:[team; "client"; "michelson"; "mini_scenarios"]
+        ~uses_node:false
         (fun protocol ->
           let* client = Client.init_mockup ~protocol () in
           test_function client ~protocol)

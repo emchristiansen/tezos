@@ -18,7 +18,7 @@ Version 8.1 fixes a performance regression related to operations
 involving ``tz3`` addresses and several compilation problems in
 some contexts.
 
-Version 8.2 replaces `PtEdoTez` by `PtEdo2Zk` and provides RPCs to
+Version 8.2 replaces ``PtEdoTez`` by ``PtEdo2Zk`` and provides RPCs to
 "normalize" Michelson expressions returned by the Edo protocol along
 with constraining the size of p2p messages at low level and updating
 some external dependencies.
@@ -33,7 +33,9 @@ Starting from version 8.0, compiling Tezos requires the Rust compiler,
 version 1.44.0, and the Cargo package manager to be installed.
 See :ref:`instructions to set up Rust<setup_rust>`.
 
-To update from sources::
+To update from sources:
+
+.. code-block:: shell
 
   git fetch
   git checkout v8.3

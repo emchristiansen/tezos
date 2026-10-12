@@ -8,15 +8,21 @@ and :doc:`the RPC references <../shell/rpc>`.
 Most practically, however, is to use Octez Metrics to gather information and statistics, which has been integrated directly into the node
 since Octez version 14. Users are now able to get metrics without using an external tool,
 such as `tezos-metrics <https://gitlab.com/nomadic-labs/tezos-metrics>`_ (which is now deprecated).
-The node now includes a server that registers the implemented metrics and outputs them for each received ``/metrics`` http request.
-So now you can configure and launch your node with a metrics exporter.
+The node includes a dedicated metrics server that registers the implemented metrics and outputs them for each received ``/metrics`` http request.
+So you can configure and launch your node with a metrics exporter.
 
 
 Starting a node with monitoring
 -------------------------------
 
-Start
-~~~~~
+Metrics are exposed on the ``/metrics`` endpoint of the dedicated metrics server, which is enabled with the ``--metrics-addr`` argument. They are **not** served on the ``--rpc-addr`` (or ``--external-rpc-addr``) listener: querying ``/metrics`` on the RPC port returns ``404``.
+
+.. note::
+
+   Before Octez v26, metrics were also served on the ``/metrics`` endpoint of the RPC listener. This is no longer the case: use ``--metrics-addr`` instead, consistently with the smart rollup and DAL nodes.
+
+Starting metrics server manually
+~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
 
 The node can be started with its metrics exporter with the option ``--metrics-addr`` which takes as a parameter ``<ADDR>:<PORT>`` or ``<ADDR>`` or ``:<PORT>``.
 
@@ -28,9 +34,6 @@ By default, ``<ADDR>`` is ``localhost`` and ``<PORT>`` is ``9932``.
    octez-node run --metrics-addr=<ADDR>:<PORT> …
 
 Note that it is possible to serve metrics on several addresses by using the option more than once.
-
-Configure
-~~~~~~~~~
 
 You can also add this configuration to your persistent configuration file through the command line:
 
@@ -49,16 +52,16 @@ A correct setup should write an entry in the logs similar to:
 
    <date> - node.main: starting metrics server on <addr>:<port>
 
+As some metrics (i.e. node internal metrics) are issued by the node only, some metrics accessible on the external RPC process metrics server may lack some data.
+It is therefore the duty of the user to aggregate both metrics if needed.
+
 Gathering data
 --------------
-
-This section focuses on access to the metrics and their uses.
-More details on the metrics specifications are available :doc:`here <../developer/openmetrics>`
 
 Scraping Octez Metrics
 ~~~~~~~~~~~~~~~~~~~~~~
 
-Once your node is correctly set up to export metrics, you can scrape them by querying the metrics server of your node with the request `/metrics`.
+Once your node is correctly set up to export metrics, you can scrape them by querying the metrics server of your node with the request ``/metrics``.
 
 Ex.:
 
@@ -110,11 +113,19 @@ For instance, the metric ``octez_distributed_db_requester_table_length`` has a l
   octez_distributed_db_requester_table_length{requester_kind="protocol"} y
   ...
 
-Metrics provide information about the node in the form of a `gauge <https://github.com/OpenObservability/OpenMetrics/blob/main/specification/OpenMetrics.md#gauge>`_ that can increase or decrease (like the number of connections),
-a `counter <https://github.com/OpenObservability/OpenMetrics/blob/main/specification/OpenMetrics.md#counter>`_ that can only increase (like the head level),
-or a `histogram <https://github.com/OpenObservability/OpenMetrics/blob/main/specification/OpenMetrics.md#histogram>`_ used to track the size of events and how long they usually take (e.g., the time taken by an RPC call).
+Metrics provide information about the node in the form of a `gauge <https://github.com/prometheus/OpenMetrics/blob/main/specification/OpenMetrics.md#gauge>`_ that can increase or decrease (like the number of connections),
+a `counter <https://github.com/prometheus/OpenMetrics/blob/main/specification/OpenMetrics.md#counter>`_ that can only increase (like the head level),
+or a `histogram <https://github.com/prometheus/OpenMetrics/blob/main/specification/OpenMetrics.md#histogram>`_ used to track the size of events and how long they usually take (e.g., the time taken by an RPC call).
 
 The label value is sometimes used to store information that can't be described by the metric value (which can only be a float). This is used for example by the ``octez_version`` metric that provides the version within the labels.
+
+For the list of metrics provided by the node, and a typical monitoring setup, see the following page:
+
+.. toctree::
+   :maxdepth: 2
+
+   ../developer/openmetrics
+
 
 .. note::
 
@@ -129,21 +140,57 @@ Scraping metrics gives you instant values of the metrics. For a more effective m
 
 We suggest using `Prometheus <https://prometheus.io/>`_ for that purpose.
 
-Once installed, you need to add the scraping job to the configuration file.
+First, you need to install Prometheus from your favourite package manager, e.g.::
 
-::
+  sudo apt install prometheus
+
+Once installed, you need to add the scraping job to the configuration file (e.g. ``/etc/prometheus/prometheus.yml``)::
 
    - job_name: 'octez-exporter'
-     scrape_interval: interval s
+     scrape_interval: <interval> s
      metrics_path: "/metrics"
      static_configs:
-       - targets: ['addr:port']
+       - targets: ['<addr>:<port>']
 
-Prometheus is a service, so you need to start it. Note that Prometheus can also scrape metrics from several nodes!
+For instance, a typical target address can be ``localhost:9091``.
+
+If you plan to also use Netdata (as described :ref:`below <hardware_metrics>`), you should also add::
+
+  - job_name: 'netdata-scrape'
+    metrics_path: "/api/v1/allmetrics"
+    params:
+      format: [prometheus]
+    static_configs:
+      - targets: ['<addr>:<port>']
+
+For instance, a typical target address may be ``localhost:19999``.
+
+Note that Prometheus can also scrape metrics from several nodes.
+
+Prometheus is a service, so you need to start it:
 
 .. code-block:: shell
 
    sudo systemctl start prometheus
+
+You may visualize the log in real time to make sure the service works correctly::
+
+  sudo journalctl --follow --unit=prometheus.service
+
+History size
+""""""""""""
+
+By default, Prometheus keeps 15 days of data. It may be useful to increase the history window to keep wider history. To do so, update the Prometheus service execution argument (typically, in ``/etc/systemd/system/multi-user.target.wants/prometheus.service``).
+To increase the history to 30 days, simply update the following line::
+
+  ExecStart=/usr/bin/prometheus $ARGS --storage.tsdb.retention 30d
+
+It is also possible to limit the size of the history by adding ``--storage.tsdb.retention.size 5GB``. The first limit reached will trigger the cleanup.
+You can also add ``--storage.tsdb.path <path>`` to change the path were Prometheus stores data.
+
+There are RPCs to trigger an early garbage collection of the Prometheus data but this requires to start the Prometheus RPC server and tweak some rights. Alternatively, the easiest way to delete the whole history is to remove the output directory (typically, ``/var/lib/prometheus/metrics2/``).
+
+Mind restarting the Prometheus service after updating its parameters.
 
 .. _hardware_metrics:
 
@@ -160,7 +207,7 @@ To install Netdata:
 
   bash <(curl -Ss https://my-netdata.io/kickstart.sh)
 
-Add the following at the end of ``/etc/netdata/app_groups.conf``
+Add the following at the end of ``/etc/netdata/apps_groups.conf``
 
 .. code-block:: shell
 
@@ -216,16 +263,16 @@ With a correct install, you should see lines such as::
   SET '/path/to/data/dir/' = 48585735837
   END
 
-Note, if you use filecheck for storage monitoring, you need to configure your dashboards accordingly. More details in the :ref:`Grafazos configuration section <grafazos_configuration>`.
+Note, if you use filecheck for storage monitoring, you need to configure your dashboards accordingly. More details in the :doc:`Grafazos documentation <../grafazos-doc/index>`.
 
 .. _monitoring_logs:
 
 Logs
 ~~~~
 
-Eventually, you may want to gather the logs from the different Octez executables. To do so, we suggest to use `Loki <https://grafana.com/docs/loki/latest/>`_ and `Promtail <https://grafana.com/docs/loki/latest/clients/promtail/>`_. Promtail is used to gather the logs from each executable of Octez and pushes them to a Loki instance, for indexing metadata about the logs.
+Eventually, you may want to gather the logs from the different Octez executables. To do so, we suggest to use `Loki <https://grafana.com/docs/loki/latest/>`_ and `Promtail <https://grafana.com/docs/loki/latest/send-data/promtail/>`_. Promtail is used to gather the logs from each executable of Octez and pushes them to a Loki instance, for indexing metadata about the logs.
 
-You first need to install both tools, following `their installation instructions <https://grafana.com/docs/loki/latest/installation/local/>`_.
+You first need to install both tools, following `their installation instructions <https://grafana.com/docs/loki/latest/setup/install/local/>`_.
 
 A configuration file will be required, which can be downloaded with:
 
@@ -278,23 +325,6 @@ Grafazos
 
 You can interactively create your own dashboards to monitor your node, using the Grafana GUI. Alternatively Grafana allows you to import dashboards from JSON files.
 
-`Grafazos <https://gitlab.com/nomadic-labs/grafazos>`_ generates JSON files that you can import into the Grafana interface.
+:src:`Grafazos <grafazos/>` generates JSON files that you can import into the Grafana interface.
 
-This tool generates the following dashboards:
-
-- ``octez-compact``: A compact dashboard that gives a brief overview of the various node metrics on a single page.
-- ``octez-basic``: A basic dashboard with all the node metrics.
-- ``octez-with-logs``: Same as basic but also displays the node's logs. This dashboard requires to follow the instructions of :ref:`the logs part <monitoring_logs>`.
-- ``octez-full``: A full dashboard with the logs and hardware data. This dashboard should be used with `Netdata <https://www.netdata.cloud/>`_ (for supporting hardware data) in addition to Promtail.
-
-You can generate them from the sources, with your own configuration. Or you can use the JSON files, compatible with your node version found `here <https://gitlab.com/nomadic-labs/grafazos/-/packages>`_.
-
-.. _grafazos_configuration:
-
-The dashboards can be configured by setting environment variables before starting their generation (using ``make``).
-
-The available variables are:
-
-- ``BRANCH``: Used to specify the name of the branch of the node.
-- ``NODE_INSTANCE_LABEL``: Used to set the name of the node instance label in the metrics.
-- ``STORAGE_MODE``: To be set to ``filecheck`` if the :ref:`storage monitoring with filecheck <filecheck>` is enabled.
+For more details on how to use it, check :doc:`Grafazos documentation <../grafazos-doc/index>`.

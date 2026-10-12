@@ -23,6 +23,14 @@
 (*                                                                           *)
 (*****************************************************************************)
 
+(* Testing
+   -------
+   Component:    Stdlib
+   Invocation:   dune exec src/lib_lwt_result_stdlib/test/main.exe \
+                  -- --file test_fuzzing_list_against_stdlib.ml
+   Subject:      Test fuzzing list against stdlib
+*)
+
 open Test_fuzzing_lib
 
 let init =
@@ -700,4 +708,4 @@ let all_list : unit Alcotest.test_case list =
     equal;
   ]
 
-let () = Alcotest.run "FuzzRef" [("List", all_list)]
+let () = Alcotest.run ~__FILE__ "FuzzRef" [("List", all_list)]

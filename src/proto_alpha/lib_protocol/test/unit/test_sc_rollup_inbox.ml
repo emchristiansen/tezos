@@ -27,7 +27,7 @@
     -------
     Component:  Protocol (smart contract rollup inbox)
     Invocation: dune exec src/proto_alpha/lib_protocol/test/unit/main.exe \
-                -- test "^\[Unit\] sc rollup inbox$"
+                  -- --file test_sc_rollup_inbox.ml
     Subject:    These unit tests check the off-line inbox implementation for
                 smart contract rollups
 *)
@@ -62,7 +62,7 @@ let assert_equal_payload_option ~__LOC__ found expected =
     (Format.pp_print_option
        ~none:(fun fmt () -> Format.pp_print_string fmt "None")
        (fun fmt v ->
-         Format.fprintf fmt "Some \"%s\"" (Message.unsafe_to_string v)))
+         Format.fprintf fmt "Some \"%S\"" (Message.unsafe_to_string v)))
     found
     expected
 
@@ -99,12 +99,15 @@ let assert_equal_merkelized_payload ~__LOC__ ~found ~expected =
   assert_merkelized_payload ~__LOC__ ~payload_hash ~index found
 
 let assert_merkelized_payload_proof_error ~__LOC__ expected_msg result =
-  Assert.error ~loc:__LOC__ (Environment.wrap_tzresult result) (function
-      | Environment.Ecoproto_error
-          (Sc_rollup_inbox_merkelized_payload_hashes_repr
-           .Merkelized_payload_hashes_proof_error msg) ->
-          expected_msg = msg
-      | _ -> false)
+  let open Result_wrap_syntax in
+  let@ result in
+  Assert.error ~loc:__LOC__ result (function
+    | Environment.Ecoproto_error
+        (Sc_rollup_inbox_merkelized_payload_hashes_repr
+         .Merkelized_payload_hashes_proof_error
+           msg) ->
+        expected_msg = msg
+    | _ -> false)
 
 let verify_merkelized_payload_proof_fails ~__LOC__ expected_msg proof =
   assert_merkelized_payload_proof_error ~__LOC__ expected_msg
@@ -120,11 +123,12 @@ let assert_equal_history_proof ~__LOC__ found expected =
     found
 
 let assert_inbox_proof_error ~__LOC__ expected_msg result =
-  Assert.error ~loc:__LOC__ (Environment.wrap_tzresult result) (function
-      | Environment.Ecoproto_error (Sc_rollup_inbox_repr.Inbox_proof_error msg)
-        ->
-          expected_msg = msg
-      | _ -> false)
+  let open Result_wrap_syntax in
+  let@ result in
+  Assert.error ~loc:__LOC__ result (function
+    | Environment.Ecoproto_error (Sc_rollup_inbox_repr.Inbox_proof_error msg) ->
+        expected_msg = msg
+    | _ -> false)
 
 let verify_payloads_proof_fails ~__LOC__ expected_msg proof head_cell_hash
     message_counter =
@@ -235,22 +239,23 @@ let gen_payloads_for_levels_and_two_levels_and_two_indexes ?inbox_creation_level
   return (payloads_for_levels, level, index, level', index')
 
 let fill_merkelized_payload history payloads =
-  let open Lwt_result_syntax in
+  let open Lwt_result_wrap_syntax in
   let* first, payloads =
     match payloads with
     | x :: xs -> return (x, xs)
     | [] -> failwith "empty payloads"
   in
-  let*? history, merkelized_payload =
-    Environment.wrap_tzresult @@ Merkelized_payload_hashes.genesis history first
+  let*?@ history, merkelized_payload =
+    Merkelized_payload_hashes.genesis history first
   in
-
-  Lwt.return @@ Environment.wrap_tzresult
-  @@ List.fold_left_e
-       (fun (history, payloads) payload ->
-         Merkelized_payload_hashes.add_payload history payloads payload)
-       (history, merkelized_payload)
-       payloads
+  let*?@ result =
+    List.fold_left_e
+      (fun (history, payloads) payload ->
+        Merkelized_payload_hashes.add_payload history payloads payload)
+      (history, merkelized_payload)
+      payloads
+  in
+  return result
 
 let construct_merkelized_payload_hashes payloads =
   let history = Merkelized_payload_hashes.History.empty ~capacity:1000L in
@@ -293,7 +298,7 @@ let test_merkelized_payload_hashes_history payloads =
 
 (** Produce a merkelized payload hashes proof and verify it's valid. *)
 let test_merkelized_payload_hashes_proof (payloads, index) =
-  let open Lwt_result_syntax in
+  let open Lwt_result_wrap_syntax in
   let* history, merkelized_payload =
     construct_merkelized_payload_hashes payloads
   in
@@ -315,8 +320,8 @@ let test_merkelized_payload_hashes_proof (payloads, index) =
       ~payload_hash
       target_merkelized_payload
   in
-  let*? proof_ancestor_merkelized, proof_current_merkelized =
-    Environment.wrap_tzresult @@ Merkelized_payload_hashes.verify_proof proof
+  let*?@ proof_ancestor_merkelized, proof_current_merkelized =
+    Merkelized_payload_hashes.verify_proof proof
   in
   let* () =
     assert_equal_merkelized_payload
@@ -438,11 +443,8 @@ let test_inclusion_proof_production (payloads_for_levels, level) =
     Node_inbox.produce_inclusion_proof node_inbox node_inbox_snapshot level
   in
   let proto_inbox_snapshot = Inbox.take_snapshot proto_inbox in
-  let*? verified_old_levels_messages =
-    Environment.wrap_tzresult
-    @@ Inbox.Internal_for_tests.verify_inclusion_proof
-         proof
-         proto_inbox_snapshot
+  let*?@ verified_old_levels_messages =
+    Inbox.Internal_for_tests.verify_inclusion_proof proof proto_inbox_snapshot
   in
   assert_equal_history_proof
     ~__LOC__
@@ -453,16 +455,17 @@ let test_inclusion_proof_production (payloads_for_levels, level) =
     against the snapshot of the next (empty) level. *)
 let test_inclusion_proof_verification (payloads_for_levels, level) =
   let open Lwt_result_wrap_syntax in
+  let inbox_creation_level = Raw_level.root in
   let*? node_inbox, proto_inbox =
-    construct_node_and_protocol_inbox
-      ~inbox_creation_level:Raw_level.root
-      payloads_for_levels
+    construct_node_and_protocol_inbox ~inbox_creation_level payloads_for_levels
   in
   let node_inbox_snapshot = Inbox.old_levels_messages node_inbox.inbox in
   let* proof, _node_old_level_messages =
     Node_inbox.produce_inclusion_proof node_inbox node_inbox_snapshot level
   in
-  let*? proto_inbox = Protocol_inbox.add_new_level proto_inbox [] in
+  let*? proto_inbox =
+    Protocol_inbox.add_new_level ~inbox_creation_level proto_inbox []
+  in
   (* This snapshot is not the same one as node_inbox_snapshot because we
      added an empty level. *)
   let proto_inbox_snapshot = Inbox.take_snapshot proto_inbox in
@@ -490,7 +493,7 @@ let test_empty_inclusion_proof_fails payloads =
 (** A node produces an inbox payloads proof and the protocol verify it. *)
 let test_payloads_proof_production
     ((payloads : payloads_per_level), message_counter) =
-  let open Lwt_result_syntax in
+  let open Lwt_result_wrap_syntax in
   let payloads_for_levels = [payloads] in
   let exp_message =
     first_after payloads_for_levels payloads.level message_counter |> function
@@ -512,12 +515,11 @@ let test_payloads_proof_production
   in
   (* Verify the produced proof using the {!Protocol_inbox}. *)
   let proto_head_cell_hash = latest_level_proof_hash proto_inbox in
-  let*? verified_input =
-    Environment.wrap_tzresult
-    @@ Inbox.Internal_for_tests.verify_payloads_proof
-         proof
-         proto_head_cell_hash
-         message_counter
+  let*?@ verified_input =
+    Inbox.Internal_for_tests.verify_payloads_proof
+      proof
+      proto_head_cell_hash
+      message_counter
   in
   let* () = assert_equal_payload_option ~__LOC__ proof_input verified_input in
   assert_equal_payload_option ~__LOC__ exp_message verified_input
@@ -526,10 +528,9 @@ let test_payloads_proof_production
     against the snapshot of the next (empty) level. *)
 let test_payloads_proof_invalid_inbox_snapshot (payloads, message_counter) =
   let open Lwt_result_syntax in
+  let inbox_creation_level = Raw_level.root in
   let*? node_inbox, proto_inbox =
-    construct_node_and_protocol_inbox
-      ~inbox_creation_level:Raw_level.root
-      [payloads]
+    construct_node_and_protocol_inbox ~inbox_creation_level [payloads]
   in
   let* proof =
     let node_head_cell_hash = latest_level_proof_hash node_inbox.inbox in
@@ -538,7 +539,9 @@ let test_payloads_proof_invalid_inbox_snapshot (payloads, message_counter) =
       node_head_cell_hash
       message_counter
   in
-  let*? proto_inbox = Protocol_inbox.add_new_level proto_inbox [] in
+  let*? proto_inbox =
+    Protocol_inbox.add_new_level ~inbox_creation_level proto_inbox []
+  in
   (* As we added one level in the [proto_inbox], it is one level further than
      the [node_inbox]. The proof will not match the history. *)
   let head_cell_hash = latest_level_proof_hash proto_inbox in
@@ -725,9 +728,8 @@ let test_inbox_proof_production (payloads_for_levels, level, message_counter) =
   let* () =
     assert_equal_history_proof ~__LOC__ node_inbox_snapshot proto_inbox_snapshot
   in
-  let*? input_in_proof =
-    Environment.wrap_tzresult
-    @@ Inbox.verify_proof (level, message_counter) proto_inbox_snapshot proof
+  let*?@ input_in_proof =
+    Inbox.verify_proof (level, message_counter) proto_inbox_snapshot proof
   in
   let* () =
     assert_inbox_message ~__LOC__ input_of_produced_proof input_in_proof
@@ -787,25 +789,23 @@ let test_invalid_inbox_proof_fails
     {!Inbox.add_all_messages}. *)
 let test_messages_are_correctly_added_in_history
     {predecessor_timestamp; predecessor; messages; _} =
-  let open Lwt_result_syntax in
+  let open Lwt_result_wrap_syntax in
   let inbox = dumb_init Raw_level.root in
   let messages = List.map (fun message -> Message.External message) messages in
-  let*? payloads_history, _history, _inbox, witness, messages =
-    Environment.wrap_tzresult
-    @@ Inbox.add_all_messages
-         ~first_block:false
-         ~predecessor_timestamp
-         ~predecessor
-         (Inbox.History.empty ~capacity:0L)
-         inbox
-         messages
+  let*?@ payloads_history, _history, _inbox, witness, messages =
+    Inbox.add_all_messages
+      ~first_block:false
+      ~dal_attested_slots_messages:[]
+      ~predecessor_timestamp
+      ~predecessor
+      (Inbox.History.empty ~capacity:0L)
+      inbox
+      messages
   in
   List.iteri_es
     (fun i message ->
       let index = Z.of_int i in
-      let*? expected_payload =
-        Environment.wrap_tzresult @@ Message.serialize message
-      in
+      let*?@ expected_payload = Message.serialize message in
       let expected_hash = Message.hash_serialized_message expected_payload in
       let found_merkelized_opt =
         Sc_rollup.Inbox_merkelized_payload_hashes.Internal_for_tests
@@ -862,8 +862,130 @@ let merkelized_payload_hashes_tests =
       test_invalid_merkelized_payload_hashes_proof_fails;
   ]
 
+(* Test that verifies the binary encoding of Dal_attested_slots messages.
+   This encoding must match what the Rust kernel SDK expects to parse.
+   The test generates a known message and verifies the binary format. *)
+let test_dal_attested_slots_encoding () =
+  let open Lwt_result_syntax in
+  (* Create a slots_by_publisher map with one publisher having slot 4 attested *)
+  let pkh =
+    WithExceptions.Option.get
+      ~loc:__LOC__
+      (Implicit_account_repr.of_b58check_opt
+         "tz1KqTpEZ7Yob7QbPE4Hy4Wo8fHG8LhKxZSx")
+  in
+  let slot_index =
+    WithExceptions.Option.get ~loc:__LOC__
+    @@ Dal_slot_index_repr.of_int_opt ~number_of_slots:16 4
+  in
+  let slots_by_publisher =
+    Implicit_account_repr.Map.singleton pkh [slot_index]
+  in
+  let published_level = Raw_level_repr.of_int32_exn 8l in
+  let msg =
+    Sc_rollup_inbox_message_repr.dal_attested_slots_serialized
+      ~published_level
+      ~number_of_slots:16
+      ~slot_size:126944
+      ~page_size:4096
+      ~slots_by_publisher
+  in
+  let bytes = Sc_rollup_inbox_message_repr.unsafe_to_string msg in
+  (* Print hex for use in Rust golden test - only printed if test is run with -v *)
+  Format.printf
+    "@[<v>Dal_attested_slots encoding (for Rust golden test):@,\
+     Hex: %a@,\
+     Length: %d bytes@]@."
+    Hex.pp
+    (Hex.of_string bytes)
+    (String.length bytes) ;
+  (* Verify the structure of the encoding:
+     - Byte 0: 0x00 (Internal message tag)
+     - Byte 1: 0x05 (Dal_attested_slots tag)
+     - Bytes 2-5: published_level (int32, big-endian) = 8
+     - Bytes 6-7: number_of_slots (uint16) = 16
+     - Bytes 8-11: slot_size (int32) = 126944
+     - Bytes 12-13: page_size (uint16) = 4096
+     - Bytes 14-17: map byte length (uint32, dynamic encoding)
+     - Remaining: map contents (pkh + bitset pairs)
+  *)
+  let* () = Assert.equal_int ~loc:__LOC__ (Char.code bytes.[0]) 0x00 in
+  let* () = Assert.equal_int ~loc:__LOC__ (Char.code bytes.[1]) 0x05 in
+  (* published_level = 8 in big-endian *)
+  let* () = Assert.equal_int ~loc:__LOC__ (Char.code bytes.[2]) 0x00 in
+  let* () = Assert.equal_int ~loc:__LOC__ (Char.code bytes.[3]) 0x00 in
+  let* () = Assert.equal_int ~loc:__LOC__ (Char.code bytes.[4]) 0x00 in
+  let* () = Assert.equal_int ~loc:__LOC__ (Char.code bytes.[5]) 0x08 in
+  (* number_of_slots = 16 in big-endian *)
+  let* () = Assert.equal_int ~loc:__LOC__ (Char.code bytes.[6]) 0x00 in
+  let* () = Assert.equal_int ~loc:__LOC__ (Char.code bytes.[7]) 0x10 in
+  return_unit
+
+let test_dal_attested_slots_messages_of_cells_split_large_messages () =
+  let open Lwt_result_syntax in
+  let open Sc_rollup_inbox_message_repr in
+  let published_level = Raw_level_repr.of_int32_exn 8l in
+  let number_of_slots = 160 in
+  let slots_by_publisher =
+    Stdlib.List.init number_of_slots Fun.id
+    |> List.fold_left
+         (fun acc i ->
+           let seed = Bytes.make 32 '\000' in
+           Bytes.set_int8 seed 0 i ;
+           let pkh, _pk, _sk = Signature.generate_key ~seed () in
+           let slot_index =
+             WithExceptions.Option.get ~loc:__LOC__
+             @@ Dal_slot_index_repr.of_int_opt ~number_of_slots i
+           in
+           (* FIXME-PA *)
+           let pkh = Implicit_account_repr.Forbidden.of_pkh pkh in
+           Implicit_account_repr.Map.add pkh [slot_index] acc)
+         Implicit_account_repr.Map.empty
+  in
+  let*? messages =
+    Environment.wrap_tzresult
+      (Internal_for_tests.dal_attested_slots_messages_for_level
+         ~published_level
+         ~number_of_slots
+         ~slot_size:380_832
+         ~page_size:3967
+         ~slots_by_publisher)
+  in
+  let* () = Assert.leq_int ~loc:__LOC__ 2 (List.length messages) in
+  let check_serializable msg =
+    match serialize (Internal msg) with
+    | Ok _ -> return_unit
+    | Error _ ->
+        failwith "split Dal_attested_slots message should remain serializable"
+  in
+  let* () = List.iter_es check_serializable messages in
+  let* () =
+    let nb_serialized_slots =
+      List.fold_left
+        (fun acc -> function
+          | Dal_attested_slots {slots_by_publisher; _} ->
+              Implicit_account_repr.Map.fold
+                (fun _key slots acc -> acc + List.length slots)
+                slots_by_publisher
+                acc
+          | _ -> 0)
+        0
+        messages
+    in
+    Assert.equal_int ~loc:__LOC__ nb_serialized_slots number_of_slots
+  in
+  return_unit
+
 let inbox_tests =
   [
+    Tztest.tztest
+      "Dal_attested_slots encoding matches expected format"
+      `Quick
+      test_dal_attested_slots_encoding;
+    Tztest.tztest
+      "Dal_attested_slots messages are split to satisfy size limit"
+      `Quick
+      test_dal_attested_slots_messages_of_cells_split_large_messages;
     Tztest.tztest_qcheck2
       ~count:1000
       ~name:"produce inclusion proof and verifies it."
@@ -939,3 +1061,7 @@ let inbox_tests =
 let tests =
   merkelized_payload_hashes_tests @ inbox_tests
   @ Test_sc_rollup_inbox_legacy.tests
+
+let () =
+  Alcotest_lwt.run ~__FILE__ Protocol.name [("sc rollup inbox", tests)]
+  |> Lwt_main.run

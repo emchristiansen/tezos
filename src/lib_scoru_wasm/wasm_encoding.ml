@@ -43,10 +43,12 @@ let string_tag = value [] Data_encoding.string
 let lazy_vector_encoding field_name tree_encoding =
   scope
     [field_name]
-    (int32_lazy_vector (value [] Data_encoding.int32) tree_encoding)
+    (Lazy_vector.Int32Vector.encoding
+       (value [] Data_encoding.int32)
+       tree_encoding)
 
 let lazy_vector_encoding' tree_encoding =
-  int32_lazy_vector (value [] Data_encoding.int32) tree_encoding
+  Lazy_vector.Int32Vector.encoding (value [] Data_encoding.int32) tree_encoding
 
 let func'_encoding =
   let ftype = value ["ftype"] Interpreter_encodings.Ast.var_encoding in
@@ -564,7 +566,7 @@ let memory_encoding =
        ~flatten:false
        (value ["min"] Data_encoding.int32)
        (value_option ["max"] Data_encoding.int32)
-       (scope ["chunks"] chunked_byte_vector))
+       (scope ["chunks"] Chunked_byte_vector.encoding))
 
 let table_encoding =
   conv
@@ -657,7 +659,7 @@ let block_table_encoding =
     (lazy_vector_encoding "instructions" instruction_encoding)
 
 let datas_table_encoding =
-  lazy_vector_encoding "datas-table" chunked_byte_vector
+  lazy_vector_encoding "datas-table" Chunked_byte_vector.encoding
 
 let allocations_encoding =
   conv
@@ -675,7 +677,8 @@ let module_instance_encoding =
            exports,
            elems,
            datas,
-           allocations ) ->
+           allocations )
+       ->
       {
         Instance.types;
         funcs;
@@ -697,7 +700,8 @@ let module_instance_encoding =
            elems;
            datas;
            allocations;
-         } ->
+         }
+       ->
       ( types,
         funcs,
         tables,
@@ -882,13 +886,15 @@ let input_buffer_message_encoding =
        ~flatten:true
        (value ["raw-level"] Data_encoding.int32)
        (value ["message-counter"] Data_encoding.z)
-       chunked_byte_vector)
+       Chunked_byte_vector.encoding)
 
 let input_buffer_encoding =
   conv
     (fun index -> Lazy_vector.Mutable.ZVector.of_immutable index)
     (fun buffer -> Lazy_vector.Mutable.ZVector.snapshot buffer)
-    (z_lazy_vector (value [] Data_encoding.z) input_buffer_message_encoding)
+    (Lazy_vector.ZVector.encoding
+       (value [] Data_encoding.z)
+       input_buffer_message_encoding)
 
 let label_encoding =
   conv
@@ -982,14 +988,50 @@ let reveal_encoding =
       case
         "Reveal_raw_data"
         reveal_hash_encoding
-        (function Host_funcs.Reveal_raw_data hash -> Some hash | _ -> None)
+        (fun reveal ->
+          match Wasm_pvm_state.Compatibility.of_current_opt reveal with
+          | Some (Reveal_raw_data hash) -> Some hash
+          | Some Reveal_metadata | None -> None)
+        (fun hash -> Wasm_pvm_state.reveal_raw_data hash);
+      case
+        "Reveal_metadata"
+        (value [] Data_encoding.unit)
+        (fun reveal ->
+          match Wasm_pvm_state.Compatibility.of_current_opt reveal with
+          | Some Reveal_metadata -> Some ()
+          | Some (Reveal_raw_data _) | None -> None)
+        (fun () -> Wasm_pvm_state.reveal_metadata);
+      case
+        "Reveal_raw"
+        (value [] Data_encoding.string)
+        (function Wasm_pvm_state.Reveal_raw payload -> Some payload)
+        (fun payload -> Reveal_raw payload);
+    ]
+
+let compatibility_reveal_encoding =
+  tagged_union
+    string_tag
+    [
+      case
+        "Reveal_raw_data"
+        reveal_hash_encoding
+        (function
+          | Wasm_pvm_state.Compatibility.Reveal_raw_data hash -> Some hash
+          | _ -> None)
         (fun hash -> Reveal_raw_data hash);
       case
         "Reveal_metadata"
         (value [] Data_encoding.unit)
-        (function Host_funcs.Reveal_metadata -> Some () | _ -> None)
+        (function
+          | Wasm_pvm_state.Compatibility.Reveal_metadata -> Some () | _ -> None)
         (fun () -> Reveal_metadata);
     ]
+
+module Internal_for_tests = struct
+  let reveal_encoding = reveal_encoding
+
+  let compatibility_reveal_encoding = compatibility_reveal_encoding
+end
 
 let invoke_step_kont_encoding =
   tagged_union
@@ -1209,7 +1251,9 @@ let messages_encoding =
   conv
     (fun index -> Output_buffer.Messages.of_immutable index)
     (fun buffer -> Output_buffer.Messages.snapshot buffer)
-    (z_lazy_vector (value [] Data_encoding.z) (value [] Data_encoding.bytes))
+    (Lazy_vector.ZVector.encoding
+       (value [] Data_encoding.z)
+       (value [] Data_encoding.bytes))
 
 let outboxes_encoding =
   conv
@@ -1231,11 +1275,10 @@ let output_buffer_encoding =
        (value ["validity_period"] Data_encoding.int32)
        (value ["message_limit"] Data_encoding.z))
 
-let config_encoding ~host_funcs =
+let config_encoding =
   conv
-    (fun (step_kont, stack_size_limit) ->
-      Eval.{step_kont; host_funcs; stack_size_limit})
-    (fun Eval.{step_kont; stack_size_limit; _} -> (step_kont, stack_size_limit))
+    (fun (step_kont, stack_size_limit) -> Eval.{step_kont; stack_size_limit})
+    (fun Eval.{step_kont; stack_size_limit} -> (step_kont, stack_size_limit))
     (tup2
        ~flatten:true
        (scope ["step_kont"] step_kont_encoding)

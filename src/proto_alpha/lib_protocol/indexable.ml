@@ -64,14 +64,16 @@ let value : 'a -> 'a value = fun v -> Value v
 let from_value : 'a -> 'a either = fun v -> Hidden_value v
 
 let index : int32 -> 'a index tzresult =
- fun i ->
-  if Compare.Int32.(0l <= i) then ok (Index i)
-  else error (Index_cannot_be_negative i)
+  let open Result_syntax in
+  fun i ->
+    if Compare.Int32.(0l <= i) then return (Index i)
+    else tzfail (Index_cannot_be_negative i)
 
 let from_index : int32 -> 'a either tzresult =
- fun i ->
-  if Compare.Int32.(0l <= i) then ok (Hidden_index i)
-  else error (Index_cannot_be_negative i)
+  let open Result_syntax in
+  fun i ->
+    if Compare.Int32.(0l <= i) then return (Hidden_index i)
+    else tzfail (Index_cannot_be_negative i)
 
 let index_exn : int32 -> 'a index =
  fun i ->
@@ -98,8 +100,7 @@ let to_int32 = function Index x -> x
 let to_value = function Value x -> x
 
 let is_value_e : error:'trace -> ('state, 'a) t -> ('a, 'trace) result =
- fun ~error v ->
-  match destruct v with Left _ -> Result.error error | Right v -> Result.ok v
+ fun ~error v -> match destruct v with Left _ -> Error error | Right v -> Ok v
 
 let compact val_encoding =
   Data_encoding.Compact.(
@@ -112,16 +113,14 @@ let encoding : 'a Data_encoding.t -> 'a either Data_encoding.t =
  fun val_encoding ->
   Data_encoding.Compact.make ~tag_size:`Uint8 @@ compact val_encoding
 
-let pp :
-    type state a.
+let pp : type state a.
     (Format.formatter -> a -> unit) -> Format.formatter -> (state, a) t -> unit
     =
  fun ppv fmt -> function
   | Hidden_index x | Index x -> Format.(fprintf fmt "#%ld" x)
   | Hidden_value x | Value x -> Format.(fprintf fmt "%a" ppv x)
 
-let in_memory_size :
-    type state a.
+let in_memory_size : type state a.
     (a -> Cache_memory_helpers.sint) ->
     (state, a) t ->
     Cache_memory_helpers.sint =
@@ -136,9 +135,8 @@ let size : type state a. (a -> int) -> (state, a) t -> int =
   | Hidden_value x | Value x -> 1 + s x
   | Hidden_index _ | Index _ -> (* tag + int32 *) 1 + 4
 
-let compare :
-    type state state' a. (a -> a -> int) -> (state, a) t -> (state', a) t -> int
-    =
+let compare : type state state' a.
+    (a -> a -> int) -> (state, a) t -> (state', a) t -> int =
  fun c x y ->
   match (x, y) with
   | (Hidden_index x | Index x), (Hidden_index y | Index y) ->

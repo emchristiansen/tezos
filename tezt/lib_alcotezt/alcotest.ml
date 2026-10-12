@@ -24,6 +24,7 @@
 (*****************************************************************************)
 
 open Tezt_core
+open Tezt_core.Base
 
 type return = unit
 
@@ -37,23 +38,32 @@ exception Test_error
 
 type 'a test = string * 'a test_case list
 
-let run library_name tests =
+let run ~__FILE__ ?(tags = []) library_name tests =
+  let proto_tags = Alcotezt_utils.is_proto_test __FILE__ in
   tests
   |> List.iter @@ fun (test_name, test_cases) ->
-     Test.register
-       ~__FILE__:library_name
-       ~title:(library_name ^ ": " ^ test_name)
-       ~tags:["alcotest"]
-     @@ fun () ->
-     (test_cases
+     test_cases
      |> List.iter @@ fun (test_case_name, speed_level, body) ->
-        match speed_level with
-        | `Slow when Cli.get_bool ~default:false "quick" ->
-            Log.info "Skipped test: %s" test_case_name
-        | `Slow | `Quick ->
-            Log.info "Test: %s" test_case_name ;
-            body ()) ;
-     Base.unit
+        let tags =
+          "alcotezt"
+          :: (match speed_level with `Quick -> ["quick"] | `Slow -> ["slow"])
+          @ proto_tags @ tags
+        in
+        let title = sf "%s: %s (%s)" library_name test_name test_case_name in
+        Test.register ~__FILE__ ~title ~tags @@ fun () ->
+        body () ;
+        Base.unit
+
+module type TESTABLE = sig
+  (** The type to test. *)
+  type t
+
+  (** A way to pretty-print the value. *)
+  val pp : Format.formatter -> t -> unit
+
+  (** Test for equality between two values. *)
+  val equal : t -> t -> bool
+end
 
 type 'a testable = (module Tezt_core.Check.EQUALABLE with type t = 'a)
 
@@ -70,6 +80,8 @@ let testable (type a) (pp : Format.formatter -> a -> return)
 let pp (type a) (t : a testable) =
   let module T = (val t) in
   T.pp
+
+let of_pp pp = testable pp ( = )
 
 let equal (type a) (t : a testable) =
   let module T = (val t) in
@@ -114,6 +126,15 @@ let int32 : int32 testable =
     let pp fmt i = Format.pp_print_string fmt (Int32.to_string i)
   end)
 
+let unit : unit testable =
+  (module struct
+    type t = unit
+
+    let equal () () = true
+
+    let pp fmt () = Format.fprintf fmt "()"
+  end)
+
 let int : int testable =
   (module struct
     type t = int
@@ -151,6 +172,16 @@ let result (type a e) (ok : a testable) (error : e testable) :
 
     let equal = Result.equal ~ok:Ok.equal ~error:Error.equal
   end)
+
+let reject (type a) =
+  let module M = struct
+    type t = a
+
+    let pp fmt _ = Format.fprintf fmt "Alcotest.reject"
+
+    let equal _ _ = false
+  end in
+  (module M : TESTABLE with type t = M.t)
 
 let pp_list ?(left = "[") ?(right = "]") pp_item fmt list =
   Format.pp_print_string fmt left ;

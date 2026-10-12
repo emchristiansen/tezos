@@ -1,7 +1,8 @@
 (*****************************************************************************)
 (*                                                                           *)
 (* Open Source License                                                       *)
-(* Copyright (c) 2022 Nomadic Labs, <contact@nomadic-labs.com>               *)
+(* Copyright (c) 2023 Nomadic Labs, <contact@nomadic-labs.com>               *)
+(* Copyright (c) 2023 Functori, <contact@functori.com>                       *)
 (*                                                                           *)
 (* Permission is hereby granted, free of charge, to any person obtaining a   *)
 (* copy of this software and associated documentation files (the "Software"),*)
@@ -30,6 +31,20 @@ type error +=
   | Io_error of [`Close | `Open] Lwt_utils_unix.io_error
   | Unix_error of Unix.error
   | Decoding_error of Data_encoding.Binary.read_error
+
+(** [maybe_read_value ~warn filename encoding] reads the value with [encoding]
+    from the file [filename]. It returns [None] if it fails to read a value and
+    will emit a warning with the [warn] function in this case.  *)
+val maybe_read_value :
+  warn:(string -> error trace -> unit Lwt.t) ->
+  string ->
+  'a Data_encoding.t ->
+  'a option Lwt.t
+
+(** [write_value filename encoding v] write the value [v] to the file [filename]
+    in binary form following the [encoding]. *)
+val write_value :
+  string -> 'a Data_encoding.t -> 'a -> (unit, error trace) result Lwt.t
 
 (** Signature for hash tables with additional information *)
 module type H = sig
@@ -80,6 +95,9 @@ module Make_table (H : H) : sig
   val iter_es :
     (key -> value -> unit tzresult Lwt.t) -> t -> unit tzresult Lwt.t
 
+  (** Same as {!module-type-H.fold} *)
+  val fold : (key -> value -> 'a -> 'a) -> t -> 'a -> 'a
+
   (** Same as {!module-type-H.length} *)
   val length : t -> int
 
@@ -100,39 +118,64 @@ module Make_table (H : H) : sig
     t tzresult Lwt.t
 end
 
-(** Create an on-disk persistent version of the {!Hash_queue} data structure. *)
-module Make_queue (N : sig
-  (** Name used to derive a path (relative to [data_dir] in [load_from_disk]) of where
+(** Create an on-disk persistent version of the {!Bounded_min_heap}
+    data structure. *)
+module Make_heap
+    (N : sig
+      (** Name used to derive a path (relative to [data_dir] in [load_from_disk]) of where
       to store the persistent information for this queue. *)
-  val name : string
-end)
-(K : Tezos_crypto.Intfs.HASH) (V : sig
+      val name : string
+    end)
+    (K : Tezos_crypto.Intfs.HASH)
+    (V : sig
+      type t
+
+      val id : t -> K.t
+
+      val compare : t -> t -> int
+
+      val persist : t -> bool
+
+      val encoding : t Data_encoding.t
+    end) : sig
   type t
 
-  val encoding : t Data_encoding.t
-end) : sig
-  type t
-
-  (** [remove q k] removes the binding from [k] in [q]. If [k] is not bound in
+  (** [remove h k] removes the binding from [k] in [h]. If [k] is not bound in
       [c], it does nothing. The removal is persisted on disk. *)
   val remove : t -> K.t -> unit tzresult Lwt.t
 
-  (** [replace q k v] binds the key [k] to the value [v] in the queue [q]. This
-      may or may not cause another binding to be removed, depending on the
-      number of bindings already present in [q]. The addition (or replacement)
-      is persisted on disk. *)
-  val replace : t -> K.t -> V.t -> unit tzresult Lwt.t
+  (** [remove_predicate f h] removes the binding in [h] where [f elt =
+      true]. The removal is persisted on disk. *)
+  val remove_predicate : (V.t -> bool) -> t -> unit tzresult Lwt.t
 
-  (** [fold f q init] folds the function [f] over the bindings
-      of [q] (in memory). The elements are iterated from oldest to newest. *)
-  val fold : (K.t -> V.t -> 'a -> 'a) -> t -> 'a -> 'a
+  (** [insert h K.t v] binds the key [k] to the value [v] in the queue [h]. This
+        may or may not cause another binding to be removed, depending on the
+        number of bindings already present in [h]. The addition (or replacement)
+        is persisted on disk. *)
+  val insert : t -> K.t -> V.t -> unit tzresult Lwt.t
 
-  (** [find_opt q k] is [Some v] if [k] is bound to [v] in [q]. It is [None]
+  (** [peek_min h] return, without removing, the smallest element from
+      the heap [h], [None] if empty. *)
+  val peek_min : t -> V.t option
+
+  (** [pop h] remove the smallest element from the heap [h],
+      [None] if empty. *)
+  val pop : t -> V.t option tzresult Lwt.t
+
+  (** [find_opt h k] is [Some v] if [k] is bound to [v] in [h]. It is [None]
       otherwise. *)
   val find_opt : t -> K.t -> V.t option
 
-  (** [length q] is the number of bindings held by [q]. *)
+  (** [elemets h] returns the elements of the queue [h] from oldest to
+      newest. *)
+  val elements : t -> V.t list
+
+  (** [length h] is the number of bindings held by [h]. *)
   val length : t -> int
+
+  (** [clear h] empties the queue [h] and removes its persistent content on
+      disk. *)
+  val clear : t -> unit Lwt.t
 
   (** [load_from_disk ~warn_unreadable ~capacity ~data_dir ~filter] creates a
       bounded hash queue of capacity [capacity]. The queue is populated by

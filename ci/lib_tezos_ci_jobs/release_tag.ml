@@ -1,0 +1,506 @@
+(*****************************************************************************)
+(*                                                                           *)
+(* SPDX-License-Identifier: MIT                                              *)
+(* Copyright (c) 2024 Nomadic Labs. <contact@nomadic-labs.com>               *)
+(*                                                                           *)
+(*****************************************************************************)
+
+(* This module defines the jobs of the [release_tag] family of pipelines.
+
+   These pipeline runs on each pushes to the various release tags (see
+   [main.ml] for the set of regular expressions that define the
+   language of release tags).
+
+   The goal of these pipelines is to create
+   {{:https://gitlab.com/tezos/tezos/-/releases}Octez releases on
+   GitLab}, the associated artifacts, and to push releases to opam. *)
+
+open Tezos_ci
+
+(* Some jobs have been migrated to Cacio, in the shared component. *)
+module CI = Cacio.Shared
+
+let job_docker = Docker.job_docker `released
+
+let job_docker_merge_manifests = Docker.job_docker_merge_manifests `released
+
+let vuln_predicate = "vuln-predicate.json"
+
+let scanning_report = "gl-container-scanning-report.json"
+
+let job_docker_container_scanning =
+  Cacio.parameterize @@ fun mode ->
+  CI.job
+    "docker:container_scanning"
+    ~__POS__
+    ~description:
+      "Scan released Docker images for vulnerabilities using GCP Artifact \
+       Registry scanning"
+    ~stage:Publish
+    ~image:Images.Base_images.alpine_docker_ci
+    ~needs:[(Job, job_docker_merge_manifests mode)]
+    ~artifacts:
+      (Gitlab_ci.Util.artifacts
+         ~reports:
+           (Gitlab_ci.Util.reports ~container_scanning:scanning_report ())
+         [vuln_predicate])
+    ~variables:
+      [("CI_DOCKER_HUB", match mode with `test -> "false" | `real -> "true")]
+    ~script:
+      [
+        "./scripts/ci/docker_image_names.sh";
+        ". ./scripts/ci/docker.env";
+        ". ./scripts/ci/docker.sh";
+        sf
+          "./scripts/ci/container_scanning_gcp.sh %s %s"
+          scanning_report
+          vuln_predicate;
+      ]
+
+(* This job normally runs in the {!Tezos_ci_pipelines.octez_latest_release} pipeline
+   that is triggered manually after a release is made.
+   However, to make release testing easier, we include it in other test release pipelines.
+   Thus, release testers are not required to trigger two separate pipelines
+   (indeed, the second [latest_release_test] pipeline is rarely tested).
+   This version of the job is only for testing (mode [`test]);
+   the [`real] version is in [octez_latest_release.ml]. *)
+let job_docker_promote_to_latest =
+  Cacio.parameterize @@ fun mode ->
+  CI.job
+    "docker:promote_to_latest"
+    ~__POS__
+    ~description:"Add the latest tag to the new Docker images."
+    ~image:Images.Base_images.alpine_docker_ci
+    ~stage:Publish
+    ~needs:
+      (match mode with
+      | `test_wait ->
+          (* [test_wait] is used in tag test pipelines where the Docker
+             image is built in the same pipeline.  We wait for the image
+             build and vulnerability scan to finish before promoting. *)
+          [
+            (Job, job_docker_merge_manifests `test);
+            (Artifacts, job_docker_container_scanning `test);
+          ]
+      | `test | `real ->
+          (* In latest release pipelines, the Docker image already exists,
+             as it was created by another pipeline (the tag pipeline). *)
+          [])
+    ~retry:no_retry
+    ~services:[{name = Images.Base_images.dind_service}]
+    ~variables:
+      ([
+         ("DOCKER_VERSION", Docker.version);
+         ( "CI_DOCKER_HUB",
+           match mode with `test | `test_wait -> "false" | `real -> "true" );
+       ]
+      @
+      match mode with
+      | `test_wait -> [("VULN_PREDICATE", vuln_predicate)]
+      | `test | `real ->
+          (* TODO: wire VULN_PREDICATE for real/test modes once the
+             container_scanning job is added to production release
+             pipelines (Major, Minor, Beta/RC; octez_latest_release.ml). *)
+          [])
+      (* Docker Hub credentials (CI_DOCKER_AUTH) are scoped to the
+       [docker-publish] environment; only [`real] jobs (CI_DOCKER_HUB=true)
+       authenticate and thus need access. *)
+    ?environment:
+      (match mode with
+      | `real ->
+          Some Gitlab_ci.Types.{name = "docker-publish"; action = Some Access}
+      | `test | `test_wait -> None)
+    ~script:
+      [
+        "./scripts/ci/docker_initialize.sh --image-names";
+        "./scripts/ci/docker_promote_to_latest.sh";
+      ]
+
+let job_gitlab_release =
+  Cacio.parameterize @@ fun mode ->
+  CI.job
+    "gitlab:release"
+    ~__POS__
+    ~description:"Create a GitLab release."
+    ~image:Images.Base_images.ci_release
+    ~stage:Publish
+    ~needs:
+      [
+        ( Artifacts,
+          Build.job_build_static_linux_released_binaries Amd64 `release );
+        ( Artifacts,
+          Build.job_build_static_linux_released_binaries Arm64 `release );
+        (Job, job_docker_merge_manifests mode);
+        (Artifacts, Homebrew.job_create_homebrew_formula);
+      ]
+    ~id_tokens:Tezos_ci.id_tokens
+    ~script:
+      [
+        "./scripts/ci/restrict_export_to_octez_source.sh";
+        "./scripts/releases/gitlab-release.sh";
+      ]
+
+let job_gitlab_publish =
+  Cacio.parameterize @@ fun mode ->
+  CI.job
+    "gitlab:publish"
+    ~__POS__
+    ~description:"Create a GitLab package."
+    ~image:Images.Base_images.ci_release
+    ~stage:Publish
+    ~needs:
+      [
+        ( Artifacts,
+          Build.job_build_static_linux_released_binaries Amd64 `release );
+        ( Artifacts,
+          Build.job_build_static_linux_released_binaries Arm64 `release );
+        (Artifacts, Homebrew.job_create_homebrew_formula);
+      ]
+    ?variables:
+      (match mode with
+      | `scheduled_test -> Some [("CI_COMMIT_TAG", "octez-v0.0")]
+      | `non_release_tag -> None)
+    ~id_tokens:Tezos_ci.id_tokens
+    ~script:
+      ((match mode with
+       | `scheduled_test -> ["git tag octez-v0.0"]
+       | `non_release_tag -> [])
+      @ [
+          ("${CI_PROJECT_DIR}/scripts/ci/create_gitlab_package.sh"
+          ^
+          match mode with
+          | `scheduled_test -> " --dry-run"
+          | `non_release_tag -> "");
+        ])
+
+let release_page_variables ~mode =
+  (* The S3_BUCKET and DISTRIBUTION_ID depend on the release type (tests or
+     not). *)
+  match mode with
+  | `test ->
+      [
+        ("S3_BUCKET", "release-page-test.nomadic-labs.com");
+        ("DISTRIBUTION_ID", "E19JF46UG3Z747");
+      ]
+  | `real ->
+      [
+        ("S3_BUCKET", "site-prod.octez.tezos.com");
+        ("BUCKET_PATH", "/releases");
+        ("URL", "octez.tezos.com");
+        ("DISTRIBUTION_ID", "${CLOUDFRONT_DISTRIBUTION_ID}");
+      ]
+
+let job_deploy_release_page_assets =
+  Cacio.parameterize @@ fun mode ->
+  CI.job
+    "release_page.deploy-assets"
+    ~__POS__
+    ~image:Images.Base_images.alpine_release_page
+    ~stage:Publish
+    ~environment:Gitlab_ci.Types.{name = "release-page"; action = Some Access}
+    ~description:
+      "Deploy the Octez release assets and versions.json. If running in a test \
+       pipeline, the assets are pushed in the \
+       [release-page-test.nomadic-labs.com] bucket. Otherwise they are pushed \
+       in [site.prod.octez.tezos.com]."
+    ~needs:
+      [
+        ( Artifacts,
+          Build.job_build_static_linux_released_binaries Amd64 `release );
+        ( Artifacts,
+          Build.job_build_static_linux_released_binaries Arm64 `release );
+      ]
+    ~variables:(release_page_variables ~mode)
+    ~script:
+      ["eval $(opam env)"; "./scripts/releases/deploy-release-page-assets.sh"]
+
+let job_deploy_release_page_assets_packaging_revision =
+  Cacio.parameterize @@ fun mode ->
+  CI.job
+    "release_page.deploy-assets-packaging-revision"
+    ~__POS__
+    ~image:Images.Base_images.alpine_release_page
+    ~stage:Publish
+    ~environment:Gitlab_ci.Types.{name = "release-page"; action = Some Access}
+    ~description:
+      "Deploy the Octez release assets for a packaging revision: update the \
+       build number in versions.json and re-upload the binaries. If running in \
+       a test pipeline, the assets are pushed in the \
+       [release-page-test.nomadic-labs.com] bucket. Otherwise they are pushed \
+       in [site.prod.octez.tezos.com]."
+    ~needs:
+      [
+        ( Artifacts,
+          Build.job_build_static_linux_released_binaries Amd64 `release );
+        ( Artifacts,
+          Build.job_build_static_linux_released_binaries Arm64 `release );
+      ]
+    ~variables:(release_page_variables ~mode)
+    ~script:
+      [
+        "eval $(opam env)";
+        "./scripts/releases/deploy-release-page-assets-packaging-revision.sh";
+      ]
+
+(* [release_site.render] needs every [deploy-assets] job in the pipeline. *)
+let job_render_site ?(components = []) mode =
+  let needs =
+    (Cacio.Job, job_deploy_release_page_assets mode)
+    :: List.map (fun deploy -> (Cacio.Job, deploy mode)) components
+  in
+  Release_site_ci.job_render mode ~needs
+
+let component_deploys =
+  [
+    Grafazos_ci.job_deploy_release_page_assets;
+    Teztale_ci.job_deploy_release_page_assets;
+    Rollup_node_ci.job_deploy_release_page_assets;
+  ]
+
+let job_dispatch_call =
+  CI.job
+    "dispatch-call"
+    ~__POS__
+    ~image:Images.Base_images.alpine_prebuild
+    ~stage:Publish
+    ~description:
+      "A job release that triggers pipelines from other repositories after a \
+       release.\n\
+       For now, it triggers the release pipeline from \
+       tez-capital/tezos-macos-pipeline"
+    ~needs:
+      [
+        (Job, job_gitlab_release `real);
+        (Job, job_deploy_release_page_assets `real);
+      ]
+    ~environment:
+      Gitlab_ci.Types.{name = "tezcapital-dispatch"; action = Some Access}
+    ~script:["./scripts/releases/dispatch-call.sh"]
+
+let () =
+  (* Major *)
+  (* TODO: add (Auto, job_docker_container_scanning `real) and
+     (Auto, job_docker_promote_to_latest `real) with VULN_PREDICATE
+     to production release pipelines (Major, Minor, Beta/RC) once the
+     scanning job is validated in test pipelines. Same for
+     octez_latest_release.ml. *)
+  Cacio.register_jobs
+    Tezos_ci_pipelines.octez_major_release_tag
+    [
+      (Auto, job_docker_merge_manifests `real);
+      (Auto, job_gitlab_release `real);
+      (Manual, job_deploy_release_page_assets `real);
+      (Auto, job_render_site `real ~components:component_deploys);
+      (Auto, job_dispatch_call);
+      (Auto, Debian_repository.job_apt_repo_debian Release);
+      (Auto, Debian_repository.job_apt_repo_ubuntu Release);
+    ] ;
+  Cacio.register_jobs
+    Tezos_ci_pipelines.octez_major_release_tag_test
+    [
+      (Auto, job_docker_merge_manifests `test);
+      (Auto, job_docker_container_scanning `test);
+      (Auto, job_gitlab_release `test);
+      (Manual, job_deploy_release_page_assets `test);
+      (Auto, job_render_site `test ~components:component_deploys);
+      (Auto, job_docker_promote_to_latest `test_wait);
+      (Auto, Debian_repository.job_apt_repo_debian Release);
+      (Auto, Debian_repository.job_apt_repo_ubuntu Release);
+    ] ;
+  (* Minor *)
+  Cacio.register_jobs
+    Tezos_ci_pipelines.octez_minor_release_tag
+    [
+      (Auto, job_docker_merge_manifests `real);
+      (Auto, job_gitlab_release `real);
+      (Manual, job_deploy_release_page_assets `real);
+      (Auto, job_render_site `real);
+      (Auto, job_dispatch_call);
+      (Auto, Debian_repository.job_apt_repo_debian Release);
+      (Auto, Debian_repository.job_apt_repo_ubuntu Release);
+    ] ;
+  Cacio.register_jobs
+    Tezos_ci_pipelines.octez_minor_release_tag_test
+    [
+      (Auto, job_docker_merge_manifests `test);
+      (Auto, job_docker_container_scanning `test);
+      (Auto, job_gitlab_release `test);
+      (Manual, job_deploy_release_page_assets `test);
+      (Auto, job_render_site `test);
+      (Auto, job_docker_promote_to_latest `test_wait);
+      (Auto, Debian_repository.job_apt_repo_debian Release);
+      (Auto, Debian_repository.job_apt_repo_ubuntu Release);
+    ] ;
+  (* Beta *)
+  Cacio.register_jobs
+    Tezos_ci_pipelines.octez_beta_release_tag
+    [
+      (Auto, job_docker_merge_manifests `real);
+      (Auto, job_gitlab_release `real);
+      (Manual, job_deploy_release_page_assets `real);
+      (Auto, job_render_site `real ~components:component_deploys);
+      (Auto, job_dispatch_call);
+      (Auto, Debian_repository.job_apt_repo_debian Release);
+      (Auto, Debian_repository.job_apt_repo_ubuntu Release);
+    ] ;
+  Cacio.register_jobs
+    Tezos_ci_pipelines.octez_beta_release_tag_test
+    [
+      (Auto, job_docker_merge_manifests `test);
+      (Auto, job_docker_container_scanning `test);
+      (Auto, job_gitlab_release `test);
+      (Manual, job_deploy_release_page_assets `test);
+      (Auto, job_render_site `test ~components:component_deploys);
+      (Auto, Debian_repository.job_apt_repo_debian Release);
+      (Auto, Debian_repository.job_apt_repo_ubuntu Release);
+    ] ;
+  (* Non-release *)
+  Cacio.register_jobs
+    Tezos_ci_pipelines.non_release_tag
+    [
+      (Auto, job_docker_merge_manifests `real);
+      (Auto, job_gitlab_publish `non_release_tag);
+      (Auto, Debian_repository.job_apt_repo_debian Release);
+      (Auto, Debian_repository.job_apt_repo_ubuntu Release);
+    ] ;
+  Cacio.register_jobs
+    Tezos_ci_pipelines.non_release_tag_test
+    [
+      (Auto, job_docker_merge_manifests `test);
+      (Auto, job_docker_container_scanning `test);
+      (Auto, job_gitlab_publish `non_release_tag);
+      (Auto, Debian_repository.job_apt_repo_debian Release);
+      (Auto, Debian_repository.job_apt_repo_ubuntu Release);
+    ] ;
+  (* Scheduled *)
+  Cacio.register_jobs
+    Tezos_ci_pipelines.schedule_test_release
+    [
+      (Auto, job_docker_merge_manifests `test);
+      (Auto, job_docker_container_scanning `test);
+      (Auto, job_gitlab_publish `scheduled_test);
+      (Auto, Debian_repository.job_apt_repo_debian Release);
+      (Auto, Debian_repository.job_apt_repo_ubuntu Release);
+    ] ;
+  (* Octez Latest Release *)
+  Cacio.register_jobs
+    Tezos_ci_pipelines.octez_latest_release
+    [(Auto, job_docker_promote_to_latest `real)] ;
+  Cacio.register_jobs
+    Tezos_ci_pipelines.octez_latest_release_test
+    [(Auto, job_docker_promote_to_latest `test)] ;
+  ()
+
+let job_docker_promote_to_version =
+  Cacio.parameterize @@ fun mode ->
+  CI.job
+    "oc.docker:promote_revision_to_version"
+    ~__POS__
+    ~description:
+      "Promote the Docker image from the packaging revision tag to the \
+       canonical version tag (e.g., octez-v1.2 from octez-v1.2-1)"
+    ~image:Images.Base_images.alpine_docker_ci
+    ~stage:Publish
+    ~allow_failure:No
+    ~needs:[(Job, job_docker_merge_manifests mode)]
+    ~retry:no_retry
+    ~services:[{name = Images.Base_images.dind_service}]
+    ~variables:
+      [
+        ("DOCKER_VERSION", Docker.version);
+        ("CI_DOCKER_HUB", match mode with `test -> "false" | `real -> "true");
+      ]
+      (* Docker Hub credentials (CI_DOCKER_AUTH) are scoped to the
+       [docker-publish] environment; only [`real] jobs (CI_DOCKER_HUB=true)
+       authenticate and thus need access. *)
+    ?environment:
+      (match mode with
+      | `real ->
+          Some Gitlab_ci.Types.{name = "docker-publish"; action = Some Access}
+      | `test -> None)
+    ~script:
+      [
+        "./scripts/ci/docker_initialize.sh --image-names";
+        "./scripts/ci/docker_promote_to_version.sh";
+      ]
+
+let job_create_gitlab_package =
+  CI.job
+    "gitlab:create_package"
+    ~__POS__
+    ~image:Images.Base_images.ci_release
+    ~stage:Publish
+    ~description:
+      "Create GitLab packages with static binaries from this packaging revision"
+    ~needs:
+      [
+        ( Artifacts,
+          Build.job_build_static_linux_released_binaries Amd64 `release );
+        ( Artifacts,
+          Build.job_build_static_linux_released_binaries Arm64 `release );
+      ]
+    ~id_tokens:Tezos_ci.id_tokens
+    ~allow_failure:No
+    ~script:["./scripts/ci/create_gitlab_package.sh"]
+    ~retry:no_retry
+    ~tag:Gcp_not_interruptible
+
+let job_update_gitlab_release =
+  CI.job
+    "gitlab:update_release"
+    ~__POS__
+    ~image:Images.Base_images.ci_release
+    ~stage:Publish
+    ~description:
+      "Update existing GitLab release with new static binaries from this \
+       packaging revision"
+    ~needs:[(Job, job_create_gitlab_package)]
+    ~id_tokens:Tezos_ci.id_tokens
+    ~script:["./scripts/releases/update_gitlab_release.sh"]
+    ~retry:no_retry
+    ~tag:Gcp_not_interruptible
+
+let register () =
+  Cacio.register_jobs
+    Tezos_ci_pipelines.octez_packaging_revision
+    [
+      (Manual, job_create_gitlab_package);
+      (Auto, job_update_gitlab_release);
+      (Manual, job_docker `real Amd64);
+      (Manual, job_docker `real Arm64);
+      (Auto, job_docker_merge_manifests `real);
+      (Manual, job_docker_promote_to_version `real);
+      (Manual, job_deploy_release_page_assets_packaging_revision `real);
+      ( Auto,
+        Release_site_ci.job_render
+          `real
+          ~needs:
+            [(Job, job_deploy_release_page_assets_packaging_revision `real)] );
+      (Manual, Debian_repository.job_build_data_packages);
+      (Manual, Debian_repository.job_build_debian Release);
+      (Manual, Debian_repository.job_build_ubuntu Release);
+      (Auto, Debian_repository.job_apt_repo_debian Release);
+      (Auto, Debian_repository.job_apt_repo_ubuntu Release);
+    ] ;
+  Cacio.register_jobs
+    Tezos_ci_pipelines.octez_packaging_revision_test
+    [
+      (Manual, job_create_gitlab_package);
+      (Auto, job_update_gitlab_release);
+      (Manual, job_docker `test Amd64);
+      (Manual, job_docker `test Arm64);
+      (Auto, job_docker_merge_manifests `test);
+      (Manual, job_docker_promote_to_version `test);
+      (Manual, job_deploy_release_page_assets_packaging_revision `test);
+      ( Auto,
+        Release_site_ci.job_render
+          `test
+          ~needs:
+            [(Job, job_deploy_release_page_assets_packaging_revision `test)] );
+      (Manual, Debian_repository.job_build_data_packages);
+      (Manual, Debian_repository.job_build_debian Release);
+      (Manual, Debian_repository.job_build_ubuntu Release);
+      (Auto, Debian_repository.job_apt_repo_debian Release);
+      (Auto, Debian_repository.job_apt_repo_ubuntu Release);
+    ] ;
+  ()

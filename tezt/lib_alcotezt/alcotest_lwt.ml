@@ -47,18 +47,17 @@ let test_case_sync name speed_level body =
 
 type 'a test = string * 'a test_case list
 
-let run library_name tests =
+let run ~__FILE__ ?(tags = []) library_name tests =
+  let proto_tags = Alcotezt_utils.is_proto_test __FILE__ in
   (tests
   |> List.iter @@ fun (test_name, test_cases) ->
-     Test.register ~__FILE__:library_name ~title:test_name ~tags:["alcotest"]
-     @@ fun () ->
      test_cases
-     |> Lwt_list.iter_s @@ fun (test_case_name, speed_level, body) ->
-        match speed_level with
-        | `Slow when Cli.get_bool ~default:false "quick" ->
-            Log.info "Skipped test: %s" test_case_name ;
-            unit
-        | `Slow | `Quick ->
-            Log.info "Test: %s" test_case_name ;
-            body ()) ;
+     |> List.iter @@ fun (test_case_name, speed_level, body) ->
+        let tags =
+          "alcotezt"
+          :: (match speed_level with `Quick -> ["quick"] | `Slow -> ["slow"])
+          @ proto_tags @ tags
+        in
+        let title = sf "%s: %s (%s)" library_name test_name test_case_name in
+        Test.register ~__FILE__ ~title ~tags @@ fun () -> body ()) ;
   unit

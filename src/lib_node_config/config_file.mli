@@ -3,6 +3,7 @@
 (* Open Source License                                                       *)
 (* Copyright (c) 2018 Dynamic Ledger Solutions, Inc. <contact@tezos.com>     *)
 (* Copyright (c) 2019-2020 Nomadic Labs, <contact@nomadic-labs.com>          *)
+(* Copyright (c) 2024 TriliTech <contact@trili.tech>                         *)
 (*                                                                           *)
 (* Permission is hereby granted, free of charge, to any person obtaining a   *)
 (* copy of this software and associated documentation files (the "Software"),*)
@@ -38,6 +39,7 @@ type blockchain_network = {
   user_activated_upgrades : User_activated.upgrades;
   user_activated_protocol_overrides : User_activated.protocol_overrides;
   default_bootstrap_peers : string list;
+  dal_config : Tezos_crypto_dal.Cryptobox.Config.t;
 }
 
 (** List of built-in networks with their alias. *)
@@ -51,12 +53,12 @@ type t = {
   disable_config_validation : bool;
   p2p : p2p;
   rpc : rpc;
-  log : Lwt_log_sink_unix.cfg;
-  internal_events : Tezos_base.Internal_event_config.t;
+  log : Logs_simple_config.cfg;
+  internal_events : Tezos_base.Internal_event_config.t option;
   shell : Shell_limits.limits;
   blockchain_network : blockchain_network;
   metrics_addr : string list;
-  dal : Tezos_crypto_dal.Cryptobox.Config.t;
+  profiling : Tezos_profiler.Profiler.profiling_config;
 }
 
 and p2p = {
@@ -70,15 +72,19 @@ and p2p = {
   disable_mempool : bool;
   enable_testchain : bool;
   reconnection_config : Tezos_p2p_services.Point_reconnection_config.t;
+  disable_peer_discovery : bool;
 }
 
 and rpc = {
   listen_addrs : string list;
+  external_listen_addrs : string list;
   cors_origins : string list;
   cors_headers : string list;
   tls : tls option;
   acl : RPC_server.Acl.policy;
   media_type : Media_type.Command_line.t;
+  max_active_rpc_connections : RPC_server.Max_active_rpc_connections.t;
+  enable_http_cache_headers : bool;
 }
 
 and tls = {cert : string; key : string}
@@ -90,6 +96,8 @@ val default_data_dir : string
 val default_p2p_port : int
 
 val default_rpc_port : int
+
+val default_max_active_rpc_connections : RPC_server.Max_active_rpc_connections.t
 
 val default_p2p : p2p
 
@@ -115,23 +123,29 @@ val update :
   ?advertised_net_port:int ->
   ?discovery_addr:string ->
   ?rpc_listen_addrs:string list ->
+  ?external_rpc_listen_addrs:string list ->
   ?allow_all_rpc:P2p_point.Id.addr_port_id list ->
   ?media_type:Media_type.Command_line.t ->
+  ?max_active_rpc_connections:RPC_server.Max_active_rpc_connections.t ->
   ?metrics_addr:string list ->
   ?operation_metadata_size_limit:Shell_limits.operation_metadata_size_limit ->
   ?private_mode:bool ->
   ?disable_p2p_maintenance:bool ->
+  ?disable_p2p_swap:bool ->
   ?disable_mempool:bool ->
-  ?disable_mempool_precheck:bool ->
   ?enable_testchain:bool ->
   ?cors_origins:string list ->
   ?cors_headers:string list ->
   ?rpc_tls:tls ->
-  ?log_output:Lwt_log_sink_unix.Output.t ->
+  ?log_output:Logs_simple_config.Output.t ->
+  ?log_coloring:bool ->
   ?synchronisation_threshold:int ->
   ?history_mode:History_mode.t ->
   ?network:blockchain_network ->
   ?latency:int ->
+  ?enable_http_cache_headers:bool ->
+  ?disable_context_pruning:bool ->
+  ?storage_maintenance_delay:Storage_maintenance.delay ->
   t ->
   t tzresult Lwt.t
 
@@ -144,8 +158,6 @@ val read : string -> t tzresult Lwt.t
     Also check whether the directory of the given filename
     is a data directory. *)
 val write : string -> t -> unit tzresult Lwt.t
-
-type error += Failed_to_parse_address of (string * string)
 
 (** [resolve_listening_addrs listening_addr] parses [listening_addr]
    and returns a list of [points].  The default port is
@@ -176,6 +188,8 @@ val resolve_metrics_addrs :
    [default_p2p_port]. Fails if the address could not be parsed. *)
 val resolve_bootstrap_addrs :
   string list -> (P2p_point.Id.t * P2p_peer.Id.t option) list tzresult Lwt.t
+
+val rpc_encoding : rpc Data_encoding.t
 
 val encoding : t Data_encoding.t
 

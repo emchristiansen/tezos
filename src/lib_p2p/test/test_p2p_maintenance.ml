@@ -89,7 +89,7 @@ let partitioni f l =
   let remove_i l = snd (List.split l) in
   (remove_i l1, remove_i l2)
 
-let rec connect ~timeout connect_handler pool point =
+let rec connect ~timeout connect_handler point =
   let open Lwt_syntax in
   let* () =
     Event.(emit maintenance_debug)
@@ -98,6 +98,7 @@ let rec connect ~timeout connect_handler pool point =
   let* r = P2p_connect_handler.connect connect_handler point ~timeout in
   match r with
   | Error (Tezos_p2p_services.P2p_errors.Connected :: _) -> (
+      let pool = P2p_connect_handler.get_pool connect_handler in
       match P2p_pool.Connection.find_by_point pool point with
       | Some conn -> return_ok conn
       | None ->
@@ -106,7 +107,7 @@ let rec connect ~timeout connect_handler pool point =
             P2p_point.Id.pp
             point)
   | Error
-      ((( Tezos_p2p_services.P2p_errors.Connection_refused
+      ((( Tezos_p2p_services.P2p_errors.Connection_failed
         | Tezos_p2p_services.P2p_errors.Pending_connection
         | Tezos_p2p_services.P2p_errors.Rejected_socket_connection
         | Tezos_p2p_services.P2p_errors.Rejected_by_nack _ | Canceled | Timeout
@@ -120,8 +121,8 @@ let rec connect ~timeout connect_handler pool point =
              point
              (fun ppf err ->
                match err with
-               | Tezos_p2p_services.P2p_errors.Connection_refused ->
-                   Format.fprintf ppf "connection refused"
+               | Tezos_p2p_services.P2p_errors.Connection_failed ->
+                   Format.fprintf ppf "connection failed"
                | Tezos_p2p_services.P2p_errors.Pending_connection ->
                    Format.fprintf ppf "pending connection"
                | Tezos_p2p_services.P2p_errors.Rejected_socket_connection ->
@@ -150,7 +151,7 @@ let rec connect ~timeout connect_handler pool point =
              head_err)
       in
       let* () = Lwt_unix.sleep (0.5 +. Random.float 2.) in
-      connect ~timeout connect_handler pool point
+      connect ~timeout connect_handler point
   | (Ok _ | Error _) as res -> Lwt.return res
 
 module Triggers = struct
@@ -183,7 +184,7 @@ module Triggers = struct
       let maintenance_log, maintenance_stopper =
         Lwt_watcher.create_stream maintenance_watcher
       in
-      let maintenance =
+      let* maintenance =
         let maintenance_config =
           {
             P2p_maintenance.maintenance_idle_time;
@@ -196,7 +197,6 @@ module Triggers = struct
         in
         P2p_maintenance.create
           maintenance_config
-          node.pool
           node.connect_handler
           node.trigger
           ~log:(Lwt_watcher.notify maintenance_watcher)
@@ -216,7 +216,8 @@ module Triggers = struct
           ~arg:maintenance_log
           ()
       in
-      let active_connections = P2p_pool.active_connections node.pool in
+      let pool = P2p_connect_handler.get_pool node.connect_handler in
+      let active_connections = P2p_pool.active_connections pool in
       let*! () = Event.(emit maintenance_stop) () in
       let*! () = Event.(emit x_active_connections) active_connections in
       (* Establish new client connection to get to max_connections - 1. *)
@@ -236,11 +237,10 @@ module Triggers = struct
             connect
               ~timeout:(Time.System.Span.of_seconds_exn 10.)
               node.connect_handler
-              node.pool
               point)
           (filteri (fun i _ -> i <= nb_connections_to_add) overconnect_points)
       in
-      let active_connections = P2p_pool.active_connections node.pool in
+      let active_connections = P2p_pool.active_connections pool in
       (*assert (active_connections = max_connections - 1) ;*)
       let*! () = Event.(emit x_active_connections) active_connections in
       (* We have max_connections - 1. Now we try to connect one mode client,
@@ -286,7 +286,7 @@ module Triggers = struct
       (* End of the test *)
       let* () = Node.sync node in
       (* the number of connection is not back to max_connections - 1 *)
-      let active_connections = P2p_pool.active_connections node.pool in
+      let active_connections = P2p_pool.active_connections pool in
       (*assert (active_connections = max_connections - 1) ;*)
       let*! () = Event.(emit x_active_connections) active_connections in
       Lwt_watcher.shutdown maintenance_stopper ;
@@ -309,7 +309,6 @@ module Triggers = struct
               connect
                 ~timeout:(Time.System.Span.of_seconds_exn 10.)
                 node.connect_handler
-                node.pool
                 point
             in
             match res with
@@ -342,27 +341,31 @@ module Triggers = struct
      * List.length points = 42
      * max_connections = 36
      *)
-    let run points =
+    let run points_with_holding_fd =
       let expected_connections = 24 in
       let max_connections i =
-        if i = 0 then 3 * expected_connections / 2 else List.length points
+        if i = 0 then 3 * expected_connections / 2
+        else List.length points_with_holding_fd
       in
       (* min connection set to zero to avoid triggering the
          maintenance at node start *)
       let min_connections _ = 0 in
       let initial_points, overconnect_points =
-        let client_points = filteri (fun i _ -> i > 1) points in
-        (* we create a list of points. some of them are going to be the initial
+        let client_points =
+          filteri (fun i _ -> i > 1) points_with_holding_fd |> List.map fst
+        in
+        (* We create a list of points. some of them are going to be the initial
          * points, and other used to trigger too_many_connections. We discriminate
          * this using the index of the list *)
         partitioni (fun i _ -> i < expected_connections) client_points
       in
       Node.detach_nodes
         ~prefix
+        ~expected_connections:(fun _ -> expected_connections)
         ~max_connections
         ~min_connections
         (node expected_connections (max_connections 0) overconnect_points)
-        points
+        points_with_holding_fd
         ~trusted:(trusted initial_points)
   end
 
@@ -391,7 +394,7 @@ module Triggers = struct
       let maintenance_log, maintenance_stopper =
         Lwt_watcher.create_stream maintenance_watcher
       in
-      let maintenance =
+      let* maintenance =
         let maintenance_config =
           {
             P2p_maintenance.maintenance_idle_time;
@@ -404,7 +407,6 @@ module Triggers = struct
         in
         P2p_maintenance.create
           maintenance_config
-          node.pool
           node.connect_handler
           node.trigger
           ~log:(Lwt_watcher.notify maintenance_watcher)
@@ -423,19 +425,23 @@ module Triggers = struct
           ~arg:maintenance_log
           ()
       in
-      let active_connections = P2p_pool.active_connections node.pool in
+      let pool = P2p_connect_handler.get_pool node.connect_handler in
+      let active_connections = P2p_pool.active_connections pool in
       let*! () = Event.(emit x_active_connections) active_connections in
-      (* Close connections to each min_connections. *)
+      (* Close connections to reach min_connections. *)
       let nb_connections_to_close = active_connections - min_connections + 1 in
       let*! () =
         Lwt_list.iteri_p
           (fun i (_, conn) ->
             if i < nb_connections_to_close then
-              P2p_conn.disconnect ~wait:true conn
+              P2p_conn.disconnect
+                ~wait:true
+                ~reason:(User "close connection to reach min_connections")
+                conn
             else Lwt.return_unit)
-          (P2p_pool.Connection.list node.pool)
+          (P2p_pool.Connection.list pool)
       in
-      let active_connections = P2p_pool.active_connections node.pool in
+      let active_connections = P2p_pool.active_connections pool in
       let*! () = Event.(emit x_active_connections) active_connections in
       (* Check that the maintenance has been triggered. *)
       let* () =
@@ -487,114 +493,69 @@ module Triggers = struct
       let min_connections i = if i = 0 then expected_connections / 2 else 0 in
       Node.detach_nodes
         ~prefix
+        ~expected_connections:(fun _ -> expected_connections)
         ~min_connections
         (node expected_connections (min_connections 0))
         points
   end
 
   module Timed = struct
-    (* TODO: checks that the maintenance maintains every
+    (* TODO: https://gitlab.com/tezos/tezos/-/issues/7357
+       Checks that the maintenance maintains every
        [P2p_maintenance.config.maintenance_idle_time] seconds. *)
     let _run _nodes = Lwt_result_syntax.return_unit
   end
 end
 
-let points = ref []
-
-let gen_points () =
-  let clients = 42 in
-  (*let addr = Ipaddr.V6.localhost in*)
-  let addr = Ipaddr.v6_of_v4 @@ Ipaddr.V4.make 127 0 0 3 in
-  let port = 29152 + Random.int 16384 in
-  let ports = port -- (port + clients - 1) in
-  points :=
-    List.map
-      (fun port ->
-        (* to each node, we add one topic to its state. *)
-        (addr, port))
-      ports
-
-let wrap n f =
+let wrap addr n f =
   Alcotest_lwt.test_case n `Quick (fun _ () ->
       let open Lwt_syntax in
       let rec aux n f =
-        let* r = f () in
+        let points = Node.gen_points 42 addr in
+        let* r = f points in
         match r with
         | Ok () -> Lwt.return_unit
         | Error (Exn (Unix.Unix_error ((EADDRINUSE | EADDRNOTAVAIL), _, _)) :: _)
           ->
-            gen_points () ;
-            (*warn "Conflict on ports, retry the test." ;*)
             aux n f
         | Error error ->
             Format.kasprintf Stdlib.failwith "%a" pp_print_trace error
       in
       aux n f)
 
-let log_config = ref None
-
-let spec =
-  Arg.
-    [
-      ( "-v",
-        Unit
-          (fun () ->
-            log_config :=
-              Some
-                (Lwt_log_sink_unix.create_cfg
-                   ~rules:
-                     "test.p2p.maintenance -> debug; p2p.maintenance -> debug"
-                   ())),
-        " Log up to info msgs" );
-      ( "-vv",
-        Unit
-          (fun () ->
-            log_config :=
-              Some
-                (Lwt_log_sink_unix.create_cfg
-                   ~rules:
-                     "test.p2p.maintenance -> debug; p2p.maintenance -> debug; \
-                      p2p.connect_handler -> debug; test.p2p.node -> debug"
-                   ())),
-        " Log up to debug msgs" );
-      ( "-vvv",
-        Unit
-          (fun () ->
-            log_config :=
-              Some
-                (Lwt_log_sink_unix.create_cfg
-                   ~rules:
-                     "test.p2p.maintenance -> debug; p2p.maintenance -> debug; \
-                      p2p.socket -> debug; p2p.io_scheduler -> debug;p2p.fd -> \
-                      debug;p2p.connect_handler -> debug; test.p2p.node -> \
-                      debug"
-                   ())),
-        " Log up to debug msgs, socket included" );
-    ]
-
 let main () =
-  let anon_fun _num_peers = raise (Arg.Bad "No anonymous argument.") in
-  let usage_msg = "Usage: %s <num_peers>.\nArguments are:" in
-  Arg.parse spec anon_fun usage_msg ;
-  let () =
-    Lwt_main.run
-      (Tezos_base_unix.Internal_event_unix.init ?lwt_log_sink:!log_config ())
+  let rules =
+    match Tezt.Cli.Logs.level with
+    | Quiet | Error | Warn | Report | Info -> None
+    | Debug ->
+        Some
+          "test.p2p.maintenance -> debug; p2p.maintenance -> debug; \
+           p2p.connect_handler -> debug; test.p2p.node -> debug"
   in
-  gen_points () ;
+  let log_cfg = Tezos_base_unix.Logs_simple_config.create_cfg ?rules () in
+  let config =
+    Tezos_base_unix.Internal_event_unix.make_with_defaults ~log_cfg ()
+  in
+  let () =
+    Tezos_base_unix.Internal_event_unix.init ~config () |> Lwt_main.run
+  in
+  let addr = Node.default_ipv6_addr in
   Lwt_main.run
   @@ Alcotest_lwt.run
-       ~argv:[|""|]
+       ~__FILE__
        "tezos-p2p"
        [
          ( "p2p-maintenance",
            [
-             wrap "triggers.too-few-connections" (fun _ ->
-                 Triggers.Too_few_connections.run !points);
-             wrap "triggers.too-many-connections" (fun _ ->
-                 Triggers.Too_many_connections.run !points);
+             wrap addr "triggers.too-few-connections" (fun points ->
+                 Triggers.Too_few_connections.run points);
+             wrap addr "triggers.too-many-connections" (fun points ->
+                 Triggers.Too_many_connections.run points);
            ] );
        ]
 
 let () =
   Sys.catch_break true ;
   try main () with _ -> ()
+
+let () = Tezt.Test.run ()

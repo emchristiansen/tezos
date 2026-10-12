@@ -30,6 +30,8 @@
    Subject:      Tests injection of nonce revelations
 *)
 
+let team = Tag.layer1
+
 let first_protocol_block = 1
 
 let minimal_block_delay = 1
@@ -54,7 +56,8 @@ let test_nonce_seed_revelation =
   Protocol.register_test
     ~__FILE__
     ~title:"Nonce seed revelation"
-    ~tags:["nonce"; "seed"; "revelation"]
+    ~tags:[team; "nonce"; "seed"; "revelation"]
+    ~uses:(fun _protocol -> [Constant.octez_agnostic_baker])
   @@ fun protocol ->
   (* Run a node and a baker.
      The node runs in archive mode to obtain metadata with [RPC.get_chain_block]. *)
@@ -95,7 +98,7 @@ let test_nonce_seed_revelation =
       (fun i node ->
         let* client = Client.init ~endpoint:(Node node) () in
         let delegates = [Account.Bootstrap.keys.(i).alias] in
-        Baker.init ~protocol ~delegates node client)
+        Agnostic_baker.init ~delegates node client)
       nodes
   in
   let* () =
@@ -111,15 +114,16 @@ let test_nonce_seed_revelation =
   (* Wait until target level is reached *)
   let* () = cycle_two_promise in
   (* No need to bake further *)
-  let* () = Lwt_list.iter_p Baker.terminate bakers in
+  let* () = Lwt_list.iter_p Agnostic_baker.terminate bakers in
   Log.info "Get all blocks" ;
   (* Retrieve all blocks for two full cycles. *)
   let* blocks =
     Lwt_list.map_p
       (fun level ->
         let* block =
-          RPC.call ~log_request:false head_node
-          @@ RPC.get_chain_block ~block:(string_of_int level) ()
+          Node.RPC.(
+            call ~log_request:false head_node
+            @@ get_chain_block ~block:(string_of_int level) ())
         in
         let level_info = JSON.(block |-> "metadata" |-> "level_info") in
         return
@@ -226,4 +230,121 @@ let test_nonce_seed_revelation =
          hashes (%R)") ;
   unit
 
-let register ~protocols = test_nonce_seed_revelation protocols
+let test_baking_nonce_migration =
+  Protocol.register_test
+    ~__FILE__
+    ~title:"Baking nonce format migration"
+    ~tags:[team; "nonce"; "migration"]
+    ~uses:(fun _protocol -> [Constant.octez_agnostic_baker])
+  @@ fun protocol ->
+  Log.info "Initialize node and client" ;
+  let* node, client =
+    Client.init_with_node ~nodes_args:[Synchronisation_threshold 0] `Client ()
+  in
+  let* () = Node.wait_for_ready node in
+
+  Log.info "Initialize baker with all bootstrap keys" ;
+  let delegates =
+    Array.to_list
+    @@ Array.map (fun key -> Account.(key.alias)) Account.Bootstrap.keys
+  in
+  let baker = Agnostic_baker.create ~delegates node client in
+
+  (* Reduce the block per cycle to gain some time *)
+  let blocks_per_cycle = 4 in
+
+  (* Target level is 2 cycles *)
+  let target_level = first_protocol_block + (blocks_per_cycle * 2) in
+  let target_level_promise = Node.wait_for_level node target_level in
+
+  Log.info "Activate protocol %s" (Protocol.name protocol) ;
+  let* parameter_file =
+    Protocol.write_parameter_file
+      ~base:(Right (protocol, None))
+      [
+        (["blocks_per_cycle"], `Int blocks_per_cycle);
+        (["nonce_revelation_threshold"], `Int 2);
+      ]
+  in
+  let* () =
+    Client.activate_protocol_and_wait
+      ~timestamp:Now
+      ~parameter_file
+      ~protocol
+      client
+  in
+
+  Log.info "Start the baker and wait for success migration nonces baker event" ;
+  let successful_migration_event =
+    Agnostic_baker.wait_for baker "success_migrate_nonces.v0" Option.some
+  in
+  let* () = Agnostic_baker.run baker in
+
+  let* _ = successful_migration_event in
+
+  Log.info
+    "Bake until the level: %d (end of the second cycle) then kill the baker"
+    target_level ;
+  let* _ = target_level_promise in
+  let* () = Agnostic_baker.kill baker in
+
+  Log.info "Retrieve the nonce file contents" ;
+  let* chain_id = Client.RPC.call client @@ RPC.get_chain_chain_id () in
+  let convert_to_b58_short b58_long =
+    Tezos_crypto.Hashed.Chain_id.(of_b58check_exn b58_long |> to_short_b58check)
+  in
+  let nonces_file =
+    Filename.concat
+      (Client.base_dir client)
+      (convert_to_b58_short chain_id ^ "_nonces")
+  in
+  let old_nonces_contents = Base.read_file nonces_file in
+
+  let target_level = (target_level * 2) + blocks_per_cycle in
+  let target_level_promise = Node.wait_for_level node target_level in
+
+  Log.info
+    "Restart the baker until level: %d (end of the fifth cycle) then kill the \
+     baker"
+    target_level ;
+  let* () = Agnostic_baker.run baker in
+  let* _ = target_level_promise in
+  let* () = Agnostic_baker.kill baker in
+
+  Log.info "Concat old nonces contents with the new one" ;
+  let new_nonces_contents = Base.read_file nonces_file in
+  let merged_nonces_contents =
+    match
+      ( Data_encoding.Json.from_string old_nonces_contents,
+        Data_encoding.Json.from_string new_nonces_contents )
+    with
+    | Ok (`A old), Ok (`A new_) ->
+        Data_encoding.Json.to_string (`A (old @ new_))
+    | _ -> Test.fail "Incorrectly formatted nonces files"
+  in
+  let () = Base.write_file nonces_file ~contents:merged_nonces_contents in
+
+  Log.info
+    "Restart the baker and wait for ignore failed nonce migration event then \
+     kill the baker" ;
+  let failed_migration_event =
+    Agnostic_baker.wait_for baker "ignore_failed_nonce_migration.v0" Option.some
+  in
+  let* () = Agnostic_baker.run baker in
+  let* _ = failed_migration_event in
+  let* () = Agnostic_baker.kill baker in
+
+  Log.info "Remove old nonces contents from nonces file" ;
+  let () = Base.write_file nonces_file ~contents:new_nonces_contents in
+
+  Log.info "Restart the baker and wait for success migrate nonces event" ;
+  let successful_migration_event =
+    Agnostic_baker.wait_for baker "success_migrate_nonces.v0" Option.some
+  in
+  let* () = Agnostic_baker.run baker in
+  let* _ = successful_migration_event in
+  unit
+
+let register ~protocols =
+  test_nonce_seed_revelation protocols ;
+  test_baking_nonce_migration protocols

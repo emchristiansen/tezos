@@ -1,0 +1,138 @@
+Version 24.4
+============
+
+Changes
+-------
+
+Summary
+~~~~~~~
+
+Version 24 introduces the following changes or new features:
+  (1) Support of the **Tallinn Protocol proposal** (See :ref:`the protocol support section <protocol_support_v24>`)
+  (2) Deprecation of the protocol-dependent executables  (See :ref:`the protocol-dependent executables section <octez_baker_v24>`)
+  (3) New Octez Releases Page (See :ref:`the Octez Releases page section <octez_releases_page_v24>`)
+
+An overview of breaking changes and deprecations introduced in Octez
+v24 can be found :ref:`here <v24_breaking_changes>`.
+
+Octez v24.1
+~~~~~~~~~~~
+
+Octez v24.1 addresses two issues in v24.0:
+
+- A downstream ``opam`` dependency issue that can prevent bakers and operators from building v24.0 from sources in certain setups. v24.1 makes the opam cache the default archive provider when building Octez from sources. This ensures operators can build Octez without disruptions to their deployment infrastructure.
+
+- A regression in the snapshot import mechanism in v24.0, which made the process slower than usual. v24.1 restores the usual performance of the snapshot import mechanism.
+
+Octez v24.2
+~~~~~~~~~~~
+
+Octez v24.2 fixes two minor bugs in Octez node. Notably, it addresses an issue where the node can, in some scenarios, stop processing new blocks after a peer disconnects, hence being unable to follow the chain unless restarted.
+
+If you deploy Octez v24.1 (or earlier) infrastructure, and notice your octez-node to be falling behind, we recommend upgrading to v24.2 at your earliest convenience.
+
+Octez v24.3
+~~~~~~~~~~~
+
+Octez v24.3 fixes a protocol vulnerability and strengthens defensive protections on the peer-to-peer (P2P) layer. User funds remain safe.
+
+
+Octez v24.4
+~~~~~~~~~~~
+
+Octez v24.4 fixes two bugs in Octez node. Notably, it addresses an issue where the node can become fully unresponsive — unable to process blocks, serve RPCs, or produce logs — for an extended period after a peer connects and immediately disconnects, requiring a manual restart to recover. It also fixes a gas-limit computation error in run-code RPC introduced in v24.3.
+
+If you deploy Octez v24.3 (or earlier) infrastructure and notice your octez-node becoming unresponsive or falling behind the chain, we recommend upgrading to v24.4 at your earliest convenience.
+
+.. _protocol_support_v24:
+
+Protocol Support
+~~~~~~~~~~~~~~~~
+
+Version 24 is compatible with all protocols that depend on a protocol environment version up to V15
+That includes `the Tallinn protocol proposal <https://research-development.nomadic-labs.com/tallinn-announcement.html>`__.
+
+.. _octez_baker_v24:
+
+Octez-baker executable
+~~~~~~~~~~~~~~~~~~~~~~
+
+Version 23 introduced protocol-independent baker and accuser executables, which are capable of operating with any supported protocol, and can work seamlessly across protocol upgrades – provided the protocol being activated is supported.
+
+These executables replace protocol-dependent executables. As a result, the latter are deprecated starting from Octez v24 and will be removed in v25.
+
+.. note:
+
+	The baker sub-command ``octez-baker run dal`` (allowing to start the DAL node via the baker) is experimental in version 24. **It should not be used in production.** Instead, the DAL node should be run the usual way, by invoking the ``octez-dal-node`` binary directly.
+
+.. _octez_releases_page_v24:
+
+New Octez releases page
+~~~~~~~~~~~~~~~~~~~~~~~
+
+A new Octez Releases website is now available at https://octez.tezos.com/releases/. It replaces the `Gitlab Releases page <https://gitlab.com/tezos/tezos/-/releases>`__, which is now deprecated.
+This new Releases page centralizes  release information for the different Octez :ref:`components <component_releases>` developed on the tezos/tezos Gitlab repository: Octez, Grafazos, Teztale.
+
+Moreover, it provides predictable links to assets (for instance, https://octez.tezos.com/releases/octez-v24.0/binaries/x86_64/octez-v24.0.tar.gz), a `machine-readable releases summary <https://octez.tezos.com/releases/versions.json>`__ file, and an `RSS feed <https://octez.tezos.com/releases/feed.xml>`__.
+
+Minimal hardware specifications
+-------------------------------
+
+Our benchmarks suggest the following *minimal* specs for Octez node and baker operators:
+
+- 3 CPU cores: 2 needed by the node and 1 needed by the baker (arm64 or amd64/x86-64)
+- 8GB of RAM + 8GB of swap (or 16GB of RAM)
+- 100GB SSD storage (or similar I/O performance)
+- A low-latency reliable internet connection
+
+This configuration has been tested for running an Octez node in :doc:`rolling history mode <../user/history_modes>`.
+Other more specific uses may need adequate configurations.
+For instance:
+
+- running a node in full or archive mode requires extra storage space;
+- bakers participating to the DAL should consult :ref:`The DAL node requirements <dal_node_specs>`.
+
+Update Instructions
+-------------------
+
+This section contains update instructions specialized for the current release, handling only a few installation types that are most common or that require special handling for this version.
+For full instructions on updating your Octez suite for any types of installation, refer to :doc:`../introduction/howtoget`.
+
+If you are installing Ubuntu and Debian packages from scratch, follow :ref:`their install instructions <installing_deb>`
+
+RPM Octez packages
+~~~~~~~~~~~~~~~~~~
+
+**RPM packages are no longer provided starting with Octez version 24.**
+
+Please choose another installation method.
+
+From sources
+~~~~~~~~~~~~
+
+.. note::
+
+	For building v24 from sources, please make sure that you have installed opam 2.3 or later.
+
+.. code-block:: shell
+
+  git fetch
+  git checkout octez-v24.4
+  make clean
+  opam switch remove . # To be used if the next step fails
+  make build-deps
+  eval $(opam env)
+  make
+
+If you are using Docker instead, use the ``octez-v24.4`` Docker images of Octez.
+
+Changelog
+---------
+
+- `Version 24.4 <../CHANGES.html#version-24-4>`_
+- `Version 24.3 <../CHANGES.html#version-24-3>`_
+- `Version 24.2 <../CHANGES.html#version-24-2>`_
+- `Version 24.1 <../CHANGES.html#version-24-1>`_
+- `Version 24.0 <../CHANGES.html#version-24-0>`_
+- `Version 24.0~rc2 <../CHANGES.html#version-24-0-rc2>`_
+- `Version 24.0~rc1 <../CHANGES.html#version-24-0-rc1>`_

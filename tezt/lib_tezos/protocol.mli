@@ -24,12 +24,20 @@
 (*****************************************************************************)
 
 (** Protocols we may want to test with. *)
-type t = Lima | Mumbai | Alpha
+type t = U025 | T024 | S023 | Alpha
+
+val encoding : t Data_encoding.t
 
 (** Protocol parameters.
 
     These values denote which file to use from the ["parameters"] directory. *)
-type constants = Constants_sandbox | Constants_mainnet | Constants_test
+type constants =
+  | Constants_sandbox
+  | Constants_mainnet
+  | Constants_mainnet_with_chain_id
+  | Constants_test
+
+val constants_to_string : constants -> string
 
 (** The default constants used by tests: [Constants_sandbox]. *)
 val default_constants : constants
@@ -56,6 +64,9 @@ val tag : t -> string
 (** Get the full hash of a protocol. *)
 val hash : t -> string
 
+(** Get the short hash of a protocol. *)
+val short_hash : t -> string
+
 (** Hash of protocol genesis *)
 val genesis_hash : string
 
@@ -74,33 +85,6 @@ val protocol_zero_hash : string
     directory of the protocol, relative to the root of the repository. *)
 val parameter_file : ?constants:constants -> t -> string
 
-(** Get the path of the accuser of a protocol, such as ["./octez-accuser-alpha"]. *)
-val accuser : t -> string
-
-(** Get the path of the baker of a protocol, such as ["./octez-baker-alpha"]. *)
-val baker : t -> string
-
-(** Get the path of the smart rollup node of a protocol, such as
-    ["./octez-smart-rollup-node-alpha"]. *)
-val sc_rollup_node : t -> string
-
-(** Get the path of the smart rollup client of a protocol, such as
-    ["./octez-smart-rollup-client-alpha"]. *)
-val sc_rollup_client : t -> string
-
-(** Get the path of the Tx rollup node of a protocol, such as
-    ["./octez-tx-rollup-node-alpha"]. *)
-val tx_rollup_node : t -> string
-
-(** Get the path of the Tx rollup client of a protocol, such as
-    ["./octez-tx-rollup-client-alpha"]. *)
-val tx_rollup_client : t -> string
-
-(** Get the part of the daemon name that is specific to a protocol (e.g. ["PtEdo2Zk"]).
-
-    This should not be used for anything except to compute the name of executables. *)
-val daemon_name : t -> string
-
 (** Get the part which is added at the beginning of all encoding names. *)
 val encoding_prefix : t -> string
 
@@ -115,6 +99,33 @@ val encoding_prefix : t -> string
 type parameter_overrides =
   (string list * [`None | `Int of int | `String_of_int of int | JSON.u]) list
 
+type bootstrap_smart_rollup = {
+  address : string;
+  pvm_kind : string;
+  boot_sector : string;
+  parameters_ty : Ezjsonm.value;
+  whitelist : string list option;
+}
+
+type bootstrap_contract = {
+  delegate : string option;
+  amount : Tez.t;
+  script : Ezjsonm.value;
+  hash : string option;
+}
+
+type bootstrap_parameters = {
+  balance : int64 option;
+  consensus_key : Account.key option;
+  delegate : Account.key option;
+}
+
+(** All fields are set to [None]. A [None] balance will resolve into [default_bootstrap_balance]. *)
+val default_bootstrap_parameters : bootstrap_parameters
+
+(** The value is the same as the one in src/proto_alpha/lib_parameters/default_parameters.ml. *)
+val default_bootstrap_balance : int64
+
 (** Write a protocol parameter file.
 
     This function first builds a default parameter file from the [base]
@@ -124,28 +135,46 @@ type parameter_overrides =
     the default parameters of the given protocol are the base parameters.
 
     Then, the base parameters are tweaked with:
-    - [bootstrap_accounts], when given these accounts are used instead of
+    - [overwrite_bootstrap_accounts], when given these accounts are used instead of
       [Account.Bootstrap.keys]
     - [parameters_overrides]
     - [additional_bootstrap_accounts] is a list of bootstrap accounts to
       add to activation parameters. Each account is a triplet
       [(key, balance, revealed)]. If [revealed] the public key is added,
       else the public key hash is added. Revealed keys are expected to bake
-      from the start. Default [balance] is 4000000 tez. *)
+      from the start. Default [balance] is 4000000 tez.
+    - [bootstrap_smart_rollups] when given.
+    - [bootstrap_contracts] when given.
+    - [output_file] the path where to write the protocol parameter file,
+      a [Temp.file] temporary file "parameters.json" by default.
+*)
 val write_parameter_file :
-  ?bootstrap_accounts:(Account.key * int option) list ->
-  ?additional_bootstrap_accounts:(Account.key * int option * bool) list ->
+  ?overwrite_bootstrap_accounts:
+    (Account.key * bootstrap_parameters option) list option ->
+  ?additional_bootstrap_accounts:
+    (Account.key * bootstrap_parameters option * bool) list ->
+  ?bootstrap_smart_rollups:bootstrap_smart_rollup list ->
+  ?bootstrap_contracts:bootstrap_contract list ->
+  ?output_file:string ->
   base:(string, t * constants option) Either.t ->
   parameter_overrides ->
   string Lwt.t
 
-(** Get the successor of a protocol.
+(** Changes the parameter values that are related to the consensus rights delay.
 
-    WARNING: use of this function is discouraged, because:
-    - a protocol may have several possible successors;
-    - it prevents the type-checker from telling you that your test can no longer
-      run when removing a protocol. *)
-val next_protocol : t -> t option
+    The protocol enforces the following restrictions to the parameters, as
+    specified in [constants_repr.ml]:
+    - cache_stake_distribution_cycles = consensus_rights_delay + slashing_delay + 2
+    - cache_sampler_state_cycles = cache_stake_distribution_cycles
+    - cache_stake_info_cycles = cache_stake_distribution_cycles
+
+    This function ensures that the resulting parameters are acceptable by the protocol. *)
+val parameters_with_custom_consensus_rights_delay :
+  protocol:t ->
+  consensus_rights_delay:int ->
+  ?slashing_delay:int ->
+  parameter_overrides ->
+  parameter_overrides
 
 (** Get the predecessor of a protocol.
 
@@ -174,6 +203,11 @@ val all : t list
     - [Until_protocol n]: the test can run on protocols [p] such that [number p <= n].
     - [Between_protocols (a, b)]: the test can run on protocols [p]
       such that [a <= number p <= b].
+    - [Has_predecessor]: the test can run on protocols which have a predecessor
+      according to [previous_protocol].
+    - [And l]: all predicates of [l] hold.
+    - [Or l]: at least one predicate of [l] hold.
+    - [Not p]: predicate [p] does not hold.
 
     Always write the number itself, do not compute it.
     For instance, writing [Until_protocol (number Alpha)] would make your test
@@ -187,6 +221,10 @@ type supported_protocols =
   | From_protocol of int
   | Until_protocol of int
   | Between_protocols of int * int
+  | Has_predecessor
+  | And of supported_protocols list
+  | Or of supported_protocols list
+  | Not of supported_protocols
 
 (** Register a test that uses the protocol.
 
@@ -208,7 +246,12 @@ val register_test :
   __FILE__:string ->
   title:string ->
   tags:string list ->
+  ?uses:(t -> Uses.t list) ->
+  ?uses_node:bool ->
+  ?uses_client:bool ->
+  ?uses_admin_client:bool ->
   ?supports:supported_protocols ->
+  ?additional_tags:(t -> string list) ->
   (t -> unit Lwt.t) ->
   t list ->
   unit
@@ -221,10 +264,15 @@ val register_long_test :
   __FILE__:string ->
   title:string ->
   tags:string list ->
+  ?uses:(t -> Uses.t list) ->
+  ?uses_node:bool ->
+  ?uses_client:bool ->
+  ?uses_admin_client:bool ->
   ?supports:supported_protocols ->
-  ?team:string ->
+  team:string ->
   executors:Long_test.executor list ->
   timeout:Long_test.timeout ->
+  ?additional_tags:(t -> string list) ->
   (t -> unit Lwt.t) ->
   t list ->
   unit
@@ -238,7 +286,29 @@ val register_regression_test :
   __FILE__:string ->
   title:string ->
   tags:string list ->
+  ?uses:(t -> Uses.t list) ->
+  ?uses_node:bool ->
+  ?uses_client:bool ->
+  ?uses_admin_client:bool ->
   ?supports:supported_protocols ->
+  ?additional_tags:(t -> string list) ->
   (t -> unit Lwt.t) ->
   t list ->
   unit
+
+(** Convert a function that expects two successive protocols
+    into a function that expects only one.
+
+    The resulting function causes the test to fail if called on a protocol
+    which does not have a predecessor. Use [~supports:Has_predecessor]
+    to prevent this.
+
+    Typical usage:
+    {[
+      Protocol.register_test ...
+        ~supports:Has_predecessor
+      @@ Protocol.with_predecessor
+      @@ fun ~previous_protocol ~protocol ->
+      ...
+    ]}*)
+val with_predecessor : (previous_protocol:t -> protocol:t -> 'a) -> t -> 'a

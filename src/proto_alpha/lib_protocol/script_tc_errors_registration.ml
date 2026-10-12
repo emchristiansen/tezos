@@ -211,6 +211,17 @@ let () =
     (obj1 (req "loc" location_encoding))
     (function Unexpected_operation loc -> Some loc | _ -> None)
     (fun loc -> Unexpected_operation loc) ;
+  (* Unpackable type *)
+  register_error_kind
+    `Permanent
+    ~id:"michelson_v1.unpackable_type"
+    ~title:"Type cannot be packed (type error)"
+    ~description:
+      "When parsing script, a value was given to a primitive that expects a \
+       packable type."
+    (obj1 (req "loc" location_encoding))
+    (function Unpackable_type loc -> Some loc | _ -> None)
+    (fun loc -> Unpackable_type loc) ;
   (* No such entrypoint *)
   register_error_kind
     `Permanent
@@ -263,15 +274,6 @@ let () =
     Data_encoding.empty
     (function Forbidden_zero_ticket_quantity -> Some () | _ -> None)
     (fun () -> Forbidden_zero_ticket_quantity) ;
-  (* Tx rollup addresses disabled *)
-  register_error_kind
-    `Permanent
-    ~id:"michelson_v1.tx_rollup_addresses_disabled"
-    ~title:"Tx rollup addresses are disabled"
-    ~description:"Cannot parse a tx_rollup address as tx rollups are disabled."
-    (obj1 (req "location" Script.location_encoding))
-    (function Tx_rollup_addresses_disabled loc -> Some loc | _ -> None)
-    (fun loc -> Tx_rollup_addresses_disabled loc) ;
   (* Sc rollup disabled *)
   register_error_kind
     `Permanent
@@ -597,6 +599,21 @@ let () =
     (function
       | Inconsistent_types (loc, tya, tyb) -> Some (loc, tya, tyb) | _ -> None)
     (fun (loc, tya, tyb) -> Inconsistent_types (loc, tya, tyb)) ;
+  (* Inconsistent types *)
+  register_error_kind
+    `Permanent
+    ~id:"michelson_v1.unexpected_implicit_account_parameters_type"
+    ~title:"Unexpected implicit account parameters type"
+    ~description:
+      "An implicit account can only accept either a unit or a ticket value as \
+       a call parameter."
+    (obj2
+       (req "loc" Script.location_encoding)
+       (req "type" Script.expr_encoding))
+    (function
+      | Unexpected_implicit_account_parameters_type (loc, ty) -> Some (loc, ty)
+      | _ -> None)
+    (fun (loc, ty) -> Unexpected_implicit_account_parameters_type (loc, ty)) ;
   (* Inconsistent memo_sizes *)
   register_error_kind
     `Permanent

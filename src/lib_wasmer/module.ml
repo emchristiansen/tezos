@@ -23,26 +23,31 @@
 (*                                                                           *)
 (*****************************************************************************)
 
-(* For documentation please refer to the [Tezos_wasmer] module. *)
+(** WebAssembly module.
+
+    A module is a compiled WebAssembly program. It can be created from
+    text (WAT) or binary (WASM) format and then instantiated via
+    {!Instance.create}. *)
 
 open Utils
 open Vectors
 open Api
 
-type t =
-  (* TODO: https://gitlab.com/tezos/tezos/-/issues/4026
-     Ensure that ownership and lifetime of [Types.Module.t] is respected.
-  *)
-  Types.Module.t Ctypes.ptr
+type t = Types.Module.t Ctypes.ptr
 
+(** [wat2wasm code] converts WebAssembly text format to binary. *)
 let wat2wasm code =
   let source = Byte_vector.from_string code in
   let dest = Byte_vector.empty () in
   Functions.wat2wasm (Ctypes.addr source) (Ctypes.addr dest) ;
   dest
 
+(** Textual (WAT) or binary (WASM) representation of WebAssembly. *)
 type format = Text | Binary
 
+(** [create store format code] parses and compiles a WebAssembly module
+    from [code] in the given [format]. Raises {!Error.Wasmer_error} on
+    failure. *)
 let create store format code =
   let wasm =
     match format with
@@ -54,14 +59,17 @@ let create store format code =
   check_null_ptr Error.(make_exception Instantiate_module) modul ;
   modul
 
+(** [imports modul] returns a vector of import type descriptors for [modul]. *)
 let imports modul =
   let outputs = Import_type_vector.empty () in
   Functions.Module.imports modul (Ctypes.addr outputs) ;
   outputs
 
+(** [exports modul] returns a vector of export type descriptors for [modul]. *)
 let exports modul =
   let outputs = Export_type_vector.empty () in
   Functions.Module.exports modul (Ctypes.addr outputs) ;
   outputs
 
+(** [delete modul] destroys the module. Must not be used after this call. *)
 let delete = Functions.Module.delete

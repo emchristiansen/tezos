@@ -31,6 +31,8 @@
                  and [--votefile] options.
 *)
 
+let team = Tag.layer1
+
 let default_votefile = "per_block_votes.json"
 
 let ensure_removal path p =
@@ -39,12 +41,13 @@ let ensure_removal path p =
   unit
 
 let baker_wait_for_vote baker =
-  Baker.wait_for baker "vote_for_liquidity_baking_toggle.v0" @@ fun json ->
-  JSON.as_string json |> Baker.liquidity_baking_vote_of_string_opt
+  Agnostic_baker.wait_for baker "vote_for_liquidity_baking_toggle.v0"
+  @@ fun json ->
+  JSON.as_string json |> Agnostic_baker.liquidity_baking_vote_of_string_opt
 
 let baker_wait_for_per_block_vote_file_error ?expected_id ?expected_file_path
     baker =
-  Baker.wait_for baker "per_block_vote_file_error.v0" @@ fun json ->
+  Agnostic_baker.wait_for baker "per_block_vote_file_error.v0" @@ fun json ->
   let json = JSON.(json |=> 0) in
   let id = JSON.(json |-> "id" |> as_string) in
   let file_path = JSON.(json |-> "file_path" |> as_string) in
@@ -54,7 +57,8 @@ let baker_wait_for_per_block_vote_file_error ?expected_id ?expected_file_path
   then Some (id, file_path)
   else None
 
-let vote_typ = Check.(convert Baker.liquidity_baking_vote_to_string string)
+let vote_typ =
+  Check.(convert Agnostic_baker.liquidity_baking_vote_to_string string)
 
 let check_vote ?__LOC__ expected_vote obtained_vote =
   Check.(obtained_vote = expected_vote)
@@ -105,12 +109,12 @@ let test_all_per_block_votes =
   Protocol.register_test
     ~__FILE__
     ~title:"liquidity baking with per-block votes"
-    ~tags:["liquidity"; "baking"; "votes"]
+    ~tags:[team; "liquidity"; "baking"; "votes"]
     ~supports:
       (Protocol.Between_protocols (Protocol.number Alpha, Protocol.number Alpha))
+    ~uses:(fun _protocol -> [Constant.octez_agnostic_baker])
   @@ fun protocol ->
   let ( >|= ) = Lwt.( >|= ) in
-  let error_prefix = "client." ^ Protocol.encoding_prefix protocol ^ "." in
 
   if Sys.file_exists default_votefile then
     Test.fail
@@ -142,17 +146,16 @@ let test_all_per_block_votes =
      not set [--liquidity-baking-toggle-vote pass] as the normal baker
      does. *)
   let run_vote_file ?votefile ?liquidity_baking_toggle_vote baker =
-    let* () = Baker.terminate baker in
+    let* () = Agnostic_baker.terminate baker in
     let delegates =
       Array.map (fun Account.{alias; _} -> alias) Account.Bootstrap.keys
       |> Array.to_list
     in
 
     let baker =
-      Baker.create
+      Agnostic_baker.create
         ~liquidity_baking_toggle_vote
         ?votefile
-        ~protocol
         ~delegates
         node
         client
@@ -165,30 +168,42 @@ let test_all_per_block_votes =
       let* error = baker_wait_for_per_block_vote_file_error baker in
       return (baker, Error error)
     in
-    let* () = Baker.run baker in
-    let* () = Baker.wait_for_ready baker in
+    let* () = Agnostic_baker.run baker in
+    let* () = Agnostic_baker.wait_for_ready baker in
     Lwt.pick [p_vote; p_error]
   in
 
-  let* baker = Baker.init ~protocol node client in
+  let* baker = Agnostic_baker.init node client in
+
+  Log.info "Test no voting file" ;
+
+  let* baker =
+    Lwt.catch
+      (fun () ->
+        let* _ = run_vote_file baker in
+        Test.fail
+          "The baker was supposed to fail, it's missing the liquidity baking \
+           vote.")
+      (fun _exn -> return baker)
+  in
 
   Log.info "Test [off] vote file" ;
   let* baker =
-    let votefile = Baker.liquidity_baking_votefile Off in
+    let votefile = Agnostic_baker.liquidity_baking_votefile Off in
     run_vote_file ~votefile ~liquidity_baking_toggle_vote:On baker
     >|= check_vote_success ~__LOC__ Off
   in
 
   Log.info "Test [on] vote file" ;
   let* baker =
-    let votefile = Baker.liquidity_baking_votefile On in
+    let votefile = Agnostic_baker.liquidity_baking_votefile On in
     run_vote_file ~votefile ~liquidity_baking_toggle_vote:Off baker
     >|= check_vote_success ~__LOC__ On
   in
 
   Log.info "Test [pass] vote file" ;
   let* baker =
-    let votefile = Baker.liquidity_baking_votefile Pass in
+    let votefile = Agnostic_baker.liquidity_baking_votefile Pass in
     run_vote_file ~votefile ~liquidity_baking_toggle_vote:On baker
     >|= check_vote_success ~__LOC__ Pass
   in
@@ -198,41 +213,52 @@ let test_all_per_block_votes =
     let votefile = "nonexistant.json" in
     if Sys.file_exists votefile then
       Test.fail ~__LOC__ "Did not expect the file %s to exist" votefile ;
-    run_vote_file baker ~votefile ~liquidity_baking_toggle_vote:Pass
-    >|= check_vote_error
-          ~__LOC__
-          (error_prefix ^ "Client_baking_forge.block_vote_file_not_found")
-          votefile
+    Lwt.catch
+      (fun () ->
+        let* _ =
+          run_vote_file baker ~votefile ~liquidity_baking_toggle_vote:Pass
+        in
+        Test.fail ~__LOC__ "Baker should not have started")
+      (fun _exn ->
+        Log.info "As expected, baker did not start" ;
+        return baker)
   in
 
   Log.info "Test invalid json in vote file" ;
   let* baker =
     let votefile = Temp.file "invalid-vote-file.json" in
     Base.write_file votefile ~contents:{|{"liquidity_baking_toggle_vote": true|} ;
-    run_vote_file baker ~votefile ~liquidity_baking_toggle_vote:Pass
-    >|= check_vote_error
-          ~__LOC__
-          (error_prefix ^ "Client_baking_forge.block_vote_file_invalid")
-          votefile
+    Lwt.catch
+      (fun () ->
+        let* _ =
+          run_vote_file baker ~votefile ~liquidity_baking_toggle_vote:Pass
+        in
+        Test.fail ~__LOC__ "Baker should not have started")
+      (fun _exn ->
+        Log.info "As expected, baker did not start" ;
+        return baker)
   in
 
   Log.info "Test vote file at default file location " ;
   let* baker =
     ensure_removal default_votefile @@ fun () ->
-    let _ = Baker.liquidity_baking_votefile ~path:default_votefile On in
+    let _ =
+      Agnostic_baker.liquidity_baking_votefile ~path:default_votefile On
+    in
     run_vote_file baker >|= check_vote_success ~__LOC__ On
   in
 
   Log.info "Test caching of the votefile setting" ;
   let* _baker =
     ensure_removal default_votefile @@ fun () ->
-    let _ = Baker.liquidity_baking_votefile ~path:default_votefile On in
+    let _ =
+      Agnostic_baker.liquidity_baking_votefile ~path:default_votefile On
+    in
     let* baker = run_vote_file baker >|= check_vote_success ~__LOC__ On in
     (* Explicitly remove the votefile to check that the baker has retained its value *)
     let p_error =
       baker_wait_for_per_block_vote_file_error
-        ~expected_id:
-          (error_prefix ^ "Client_baking_forge.block_vote_file_not_found")
+        ~expected_id:"Per_block_vote_file.block_vote_file_not_found"
         ~expected_file_path:default_votefile
         baker
     in
@@ -248,8 +274,10 @@ let test_all_per_block_votes =
   Log.info "Test [--votefile] overrides default file location " ;
   let* baker =
     ensure_removal default_votefile @@ fun () ->
-    let _ = Baker.liquidity_baking_votefile ~path:default_votefile On in
-    let votefile = Baker.liquidity_baking_votefile Off in
+    let _ =
+      Agnostic_baker.liquidity_baking_votefile ~path:default_votefile On
+    in
+    let votefile = Agnostic_baker.liquidity_baking_votefile Off in
     run_vote_file ~votefile baker >|= check_vote_success ~__LOC__ Off
   in
 
@@ -261,11 +289,15 @@ let test_all_per_block_votes =
         Log.info "Test invalid vote file contents: %s" contents ;
         let votefile = Temp.file "invalid-vote-file.json" in
         Base.write_file votefile ~contents ;
-        run_vote_file baker ~votefile ~liquidity_baking_toggle_vote:Pass
-        >|= check_vote_error
-              (error_prefix
-             ^ "Client_baking_forge.block_vote_file_wrong_content")
-              votefile)
+        Lwt.catch
+          (fun () ->
+            let* _ =
+              run_vote_file baker ~votefile ~liquidity_baking_toggle_vote:Pass
+            in
+            Test.fail ~__LOC__ "Baker should not have started")
+          (fun _exn ->
+            Log.info "As expected, baker did not start" ;
+            return baker))
       baker
       [
         {|{"liquidity_baking_toggle_vote": true}|};

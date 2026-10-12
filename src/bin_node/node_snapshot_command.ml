@@ -108,16 +108,6 @@ module Event = struct
          last checkpoint as the default value"
       ~level:Notice
       ()
-
-  let overriding_config_file_arg =
-    declare_1
-      ~section
-      ~name:"overriding_config_file_arg"
-      ~msg:
-        "the data directory from the --config-file argument was overridden by \
-         the given --data-dir path: {path}"
-      ~level:Warning
-      ("path", Data_encoding.string)
 end
 
 module Term = struct
@@ -133,36 +123,14 @@ module Term = struct
       progress_display_mode =
     let run =
       let open Lwt_result_syntax in
-      let*! () = Log_config.init_internal_events_with_defaults () in
-      let actual_data_dir =
-        Option.value ~default:Config_file.default_data_dir data_dir
+      let*! () = Tezos_base_unix.Internal_event_unix.init () in
+      let* data_dir, node_config =
+        Shared_arg.resolve_data_dir_and_config_file ?data_dir ?config_file ()
       in
-      let config_file =
-        Option.value
-          ~default:
-            Filename.Infix.(
-              actual_data_dir // Data_version.default_config_file_name)
-          config_file
-      in
-      let* node_config = Config_file.read config_file in
       let ({genesis; chain_name; _} : Config_file.blockchain_network) =
         node_config.blockchain_network
       in
-      let*! data_dir =
-        (* The --data-dir argument overrides the potentially given
-           configuration file. *)
-        match data_dir with
-        | Some data_dir ->
-            let*! () =
-              if not (String.equal data_dir node_config.data_dir) then
-                Event.(emit overriding_config_file_arg) data_dir
-              else Lwt.return_unit
-            in
-            Lwt.return data_dir
-        | None -> Lwt.return node_config.data_dir
-      in
       let* () = Data_version.ensure_data_dir genesis data_dir in
-      let context_dir = Data_version.context_dir data_dir in
       let store_dir = Data_version.store_dir data_dir in
       let* block =
         match block with
@@ -179,7 +147,7 @@ module Term = struct
         (Option.value export_format ~default:Snapshots.Tar)
         ~rolling
         ~store_dir
-        ~context_dir
+        ~data_dir
         ~chain_name
         ~block
         ~progress_display_mode
@@ -188,33 +156,12 @@ module Term = struct
     Shared_arg.process_command run
 
   let import data_dir config_file operation_metadata_size_limit snapshot_path
-      block disable_check reconstruct sandbox_file progress_display_mode =
+      block disable_check reconstruct sandbox_file progress_display_mode force =
     let run =
       let open Lwt_result_syntax in
-      let*! () = Log_config.init_internal_events_with_defaults () in
-      let actual_data_dir =
-        Option.value ~default:Config_file.default_data_dir data_dir
-      in
-      let config_file =
-        Option.value
-          ~default:
-            Filename.Infix.(
-              actual_data_dir // Data_version.default_config_file_name)
-          config_file
-      in
-      let* node_config = Config_file.read config_file in
-      let*! data_dir =
-        (* The --data-dir argument overrides the potentially given
-           configuration file. *)
-        match data_dir with
-        | Some data_dir ->
-            let*! () =
-              if not (String.equal data_dir node_config.data_dir) then
-                Event.(emit overriding_config_file_arg) data_dir
-              else Lwt.return_unit
-            in
-            Lwt.return data_dir
-        | None -> Lwt.return node_config.data_dir
+      let*! () = Tezos_base_unix.Internal_event_unix.init () in
+      let* data_dir, node_config =
+        Shared_arg.resolve_data_dir_and_config_file ?data_dir ?config_file ()
       in
       let*! existing_data_dir = Lwt_unix.file_exists data_dir in
       let ({genesis; _} : Config_file.blockchain_network) =
@@ -230,18 +177,24 @@ module Term = struct
             let*! () =
               Lwt_utils_unix.remove_dir (Data_version.store_dir data_dir)
             in
-            Lwt_utils_unix.remove_dir (Data_version.context_dir data_dir)
+            Lwt_utils_unix.remove_dir
+              (Tezos_context_ops.Context_ops.context_dir data_dir)
           else Lwt_utils_unix.remove_dir data_dir
         in
         let lock_file = Data_version.lock_file data_dir in
         let*! lock_file_exists = Lwt_unix.file_exists lock_file in
         if lock_file_exists then Lwt_unix.unlink lock_file else Lwt.return_unit
       in
-      let* () = Data_version.ensure_data_dir ~mode:Is_bare genesis data_dir in
+      let* () =
+        Data_version.ensure_data_dir
+          ~mode:(Is_bare {clean_if_needed = force})
+          genesis
+          data_dir
+      in
       (* Lock only on snapshot import *)
-      Lwt_lock_file.try_with_lock
-        ~when_locked:(fun () ->
-          failwith "Data directory is locked by another process")
+      Lwt_lock_file.with_lock
+        ~when_locked:
+          (`Fail (Exn (Failure "Data directory is locked by another process")))
         ~filename:(Data_version.lock_file data_dir)
       @@ fun () ->
       let* sandbox_parameters =
@@ -258,7 +211,6 @@ module Term = struct
                 tzfail (Node_run_command.Invalid_sandbox_file filename)
             | Ok json -> return_some ("sandbox_parameter", json))
       in
-      let context_root = Data_version.context_dir data_dir in
       let store_root = Data_version.store_dir data_dir in
       let patch_context =
         Patch_context.patch_context genesis sandbox_parameters
@@ -285,7 +237,7 @@ module Term = struct
               ?block
               ~check_consistency
               ~dst_store_dir:store_root
-              ~dst_context_dir:context_root
+              ~dst_data_dir:data_dir
               ~chain_name:node_config.blockchain_network.chain_name
               ~configured_history_mode
               ~user_activated_upgrades:
@@ -309,7 +261,7 @@ module Term = struct
         Reconstruction.reconstruct
           ~patch_context
           ~store_dir:store_root
-          ~context_dir:context_root
+          ~data_dir
           genesis
           ~user_activated_upgrades:
             node_config.blockchain_network.user_activated_upgrades
@@ -324,7 +276,7 @@ module Term = struct
   let get_info snapshot_path format_json =
     let run =
       let open Lwt_result_syntax in
-      let*! () = Log_config.init_internal_events_with_defaults () in
+      let*! () = Tezos_base_unix.Internal_event_unix.init () in
       let* snapshot_path = check_snapshot_path snapshot_path in
       let* snapshot_header = Snapshots.read_snapshot_header ~snapshot_path in
       if format_json then
@@ -445,6 +397,14 @@ module Term = struct
           ~docv:"<auto|always|never>"
           ["progress-display-mode"])
 
+  let force =
+    let open Cmdliner in
+    let doc =
+      "Cleans leftover files in the data-dir when importing a snapshot, such \
+       as context, store and daily_logs. Must use with care."
+    in
+    Arg.(value & flag & info ~doc ["force"])
+
   let format_json =
     let open Cmdliner in
     let doc = "Displays the snapshot's information in JSON format." in
@@ -470,7 +430,8 @@ module Term = struct
             (const import $ Shared_arg.Term.data_dir
            $ Shared_arg.Term.config_file
            $ Shared_arg.Term.operation_metadata_size_limit $ file_arg $ block
-           $ disable_check $ reconstruct $ sandbox $ progress_display_mode));
+           $ disable_check $ reconstruct $ sandbox $ progress_display_mode
+           $ force));
       Cmd.v
         (Cmd.info ~doc:"displays information about the snapshot file" "info")
         Term.(ret (const get_info $ file_arg $ format_json));

@@ -31,6 +31,8 @@ type error += Operation_quota_exceeded (* `Temporary *)
 
 type error += Storage_limit_too_high (* `Permanent *)
 
+type error += Storage_increase_amount_overflow of Z.t (* `Permanent *)
+
 let () =
   let open Data_encoding in
   register_error_kind
@@ -68,7 +70,23 @@ let () =
     ~description:"A transaction tried to exceed the hard limit on storage"
     empty
     (function Storage_limit_too_high -> Some () | _ -> None)
-    (fun () -> Storage_limit_too_high)
+    (fun () -> Storage_limit_too_high) ;
+  register_error_kind
+    `Permanent
+    ~id:"contract.storage_increase_amount_overflow"
+    ~title:"Increase paid storage amount overflow"
+    ~description:
+      "The storage amount for the operation Increase_paid_storage does not fit \
+       in an int64."
+    ~pp:(fun ppf amount ->
+      Format.fprintf
+        ppf
+        "Increase_paid_storage operation error: amount %s does not fit an int64"
+        (Z.to_string amount))
+    (obj1 (req "amount" z))
+    (function
+      | Storage_increase_amount_overflow amount -> Some amount | _ -> None)
+    (fun amount -> Storage_increase_amount_overflow amount)
 
 let record_global_constant_storage_space context size =
   (* Following the precedent of big_map, a key in the
@@ -79,14 +97,17 @@ let record_global_constant_storage_space context size =
   (context, to_be_paid)
 
 let record_paid_storage_space ctxt contract_hash =
+  let open Lwt_result_syntax in
   let contract = Contract_repr.Originated contract_hash in
   (* Get the new size of the contract's storage. *)
-  Contract_storage.used_storage_space ctxt contract >>=? fun new_storage_size ->
-  Contract_storage.set_paid_storage_space_and_return_fees_to_pay
-    ctxt
-    contract
-    new_storage_size
-  >>=? fun (to_be_paid, c) -> return (c, new_storage_size, to_be_paid)
+  let* new_storage_size = Contract_storage.used_storage_space ctxt contract in
+  let+ to_be_paid, c =
+    Contract_storage.set_paid_storage_space_and_return_fees_to_pay
+      ctxt
+      contract
+      new_storage_size
+  in
+  (c, new_storage_size, to_be_paid)
 
 let source_must_exist c src =
   match src with
@@ -95,11 +116,12 @@ let source_must_exist c src =
 
 let burn_storage_fees ?(origin = Receipt_repr.Block_application) c
     ~storage_limit ~payer consumed =
+  let open Lwt_result_syntax in
   let remaining = Z.sub storage_limit consumed in
   if Compare.Z.(remaining < Z.zero) then tzfail Operation_quota_exceeded
   else
     let cost_per_byte = Constants_storage.cost_per_byte c in
-    Tez_repr.(cost_per_byte *? Z.to_int64 consumed) >>?= fun to_burn ->
+    let*? to_burn = Tez_repr.(cost_per_byte *? Z.to_int64 consumed) in
     (* Burning the fees... *)
     if Tez_repr.(to_burn = Tez_repr.zero) then
       (* If the payer was deleted by transferring all its balance, and no space
@@ -108,39 +130,31 @@ let burn_storage_fees ?(origin = Receipt_repr.Block_application) c
     else
       trace
         Cannot_pay_storage_fee
-        ( source_must_exist c payer >>=? fun () ->
-          Token.transfer ~origin c payer `Storage_fees to_burn
-          >>=? fun (ctxt, balance_updates) ->
-          return (ctxt, remaining, balance_updates) )
+        (let* () = source_must_exist c payer in
+         let+ ctxt, balance_updates =
+           Token.transfer ~origin c payer `Storage_fees to_burn
+         in
+         (ctxt, remaining, balance_updates))
 
 let burn_storage_increase_fees ?(origin = Receipt_repr.Block_application) c
     ~payer amount_in_bytes =
+  let open Lwt_result_syntax in
   if Compare.Z.(amount_in_bytes <= Z.zero) then tzfail Negative_storage_input
+  else if not (Z.fits_int64 amount_in_bytes) then
+    tzfail (Storage_increase_amount_overflow amount_in_bytes)
   else
     let cost_per_byte = Constants_storage.cost_per_byte c in
-    Tez_repr.(cost_per_byte *? Z.to_int64 amount_in_bytes) >>?= fun to_burn ->
+    let*? to_burn = Tez_repr.(cost_per_byte *? Z.to_int64 amount_in_bytes) in
     (* Burning the fees... *)
     trace
       Cannot_pay_storage_fee
-      ( source_must_exist c payer >>=? fun () ->
-        Token.transfer ~origin c payer `Storage_fees to_burn )
+      (let* () = source_must_exist c payer in
+       Token.transfer ~origin c payer `Storage_fees to_burn)
 
 let burn_origination_fees ?(origin = Receipt_repr.Block_application) c
     ~storage_limit ~payer =
   let origination_size = Constants_storage.origination_size c in
   burn_storage_fees ~origin c ~storage_limit ~payer (Z.of_int origination_size)
-
-let burn_tx_rollup_origination_fees ?(origin = Receipt_repr.Block_application) c
-    ~storage_limit ~payer =
-  let tx_rollup_origination_size =
-    Constants_storage.tx_rollup_origination_size c
-  in
-  burn_storage_fees
-    ~origin
-    c
-    ~storage_limit
-    ~payer
-    (Z.of_int tx_rollup_origination_size)
 
 let burn_sc_rollup_origination_fees ?(origin = Receipt_repr.Block_application) c
     ~storage_limit ~payer consumed =
@@ -151,9 +165,10 @@ let burn_zk_rollup_origination_fees ?(origin = Receipt_repr.Block_application) c
   burn_storage_fees ~origin c ~storage_limit ~payer consumed
 
 let check_storage_limit c ~storage_limit =
+  let open Result_syntax in
   if
     Compare.Z.(
       storage_limit > (Raw_context.constants c).hard_storage_limit_per_operation)
     || Compare.Z.(storage_limit < Z.zero)
-  then error Storage_limit_too_high
-  else Result.return_unit
+  then tzfail Storage_limit_too_high
+  else return_unit

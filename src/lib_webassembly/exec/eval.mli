@@ -1,6 +1,12 @@
 open Values
 open Instance
 
+(** Raised when an [Nds_host_func] is dispatched against
+    [Eval_storage.Durable_only] storage.  This is a PVM-level
+    invariant violation — NDS host functions must only be linked when
+    storage is [Dual]. *)
+exception Nds_host_func_without_nds_storage
+
 (* Kontinuation *)
 
 type ('a, 'b) map_kont = {
@@ -154,11 +160,7 @@ type step_kont =
 
 type buffers = {input : input_inst; output : output_inst}
 
-type config = {
-  step_kont : step_kont;
-  host_funcs : Host_funcs.registry;
-  stack_size_limit : int;
-}
+type config = {step_kont : step_kont; stack_size_limit : int}
 
 type ('a, 'b, 'acc) fold_right2_kont = {
   acc : 'acc;
@@ -176,13 +178,10 @@ type create_global_kont = Types.global_type * eval_const_kont
 type (_, _, _) init_section =
   | Func : ((Ast.func, func_inst) Either.t, Ast.func, func_inst) init_section
   | Global : (create_global_kont, Ast.global, global_inst) init_section
-  | Table
-      : ((Ast.table, table_inst) Either.t, Ast.table, table_inst) init_section
-  | Memory
-      : ( (Ast.memory, memory_inst) Either.t,
-          Ast.memory,
-          memory_inst )
-        init_section
+  | Table :
+      ((Ast.table, table_inst) Either.t, Ast.table, table_inst) init_section
+  | Memory :
+      ((Ast.memory, memory_inst) Either.t, Ast.memory, memory_inst) init_section
 
 type 'b join_kont =
   | J_Init of 'b Vector.t Vector.t
@@ -266,20 +265,21 @@ val invoke :
   caller:module_key ->
   ?input:Input_buffer.t ->
   ?output:Output_buffer.t ->
-  ?durable:Durable_storage.t ->
+  ?storage:Eval_storage.t ->
   ?init:bool ->
   Host_funcs.registry ->
   func_inst ->
   value list ->
-  (Durable_storage.t * value list) Lwt.t (* raises Trap *)
+  (Eval_storage.t * value list) Lwt.t (* raises Trap *)
 
 val step :
   ?init:bool ->
-  ?durable:Durable_storage.t ->
+  ?storage:Eval_storage.t ->
+  host_funcs:Host_funcs.registry ->
   module_reg ->
   config ->
   buffers ->
-  (Durable_storage.t * config) Lwt.t
+  (Eval_storage.t * config) Lwt.t
 
 (* Possible errors raised during the reveal ticks handling. *)
 type reveal_error =
@@ -317,7 +317,6 @@ val reveal_step :
 
 val config :
   stack_size_limit:int ->
-  Host_funcs.registry ->
   ?frame_arity:int32 (* The number of values returned by the computation *) ->
   module_key ->
   value Vector.t ->

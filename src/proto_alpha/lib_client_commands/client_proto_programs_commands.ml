@@ -72,7 +72,7 @@ let commands () =
       ~default:"0.05"
   in
   let source_arg =
-    ContractAlias.destination_arg
+    Contract_alias.destination_arg
       ~name:"source"
       ~doc:"name of the source (i.e. SENDER) contract for the transaction"
       ()
@@ -84,7 +84,7 @@ let commands () =
       ()
   in
   let self_arg =
-    OriginatedContractAlias.destination_arg
+    Originated_contract_alias.destination_arg
       ~name:"self-address"
       ~doc:"address of the contract (i.e. SELF_ADDRESS) for the transaction"
       ()
@@ -96,15 +96,17 @@ let commands () =
   in
   let now_arg = Client_proto_args.now_arg in
   let level_arg = Client_proto_args.level_arg in
-  let resolve_max_gas cctxt block =
+  let resolve_max_gas cctxt block ~unlimited_gas custom_gas =
     let open Lwt_result_syntax in
-    function
-    | None ->
-        let* {parametric = {hard_gas_limit_per_operation; _}; _} =
-          Alpha_services.Constants.all cctxt (cctxt#chain, block)
-        in
-        return hard_gas_limit_per_operation
-    | Some gas -> return gas
+    if unlimited_gas then return_none
+    else
+      match custom_gas with
+      | None ->
+          let* {parametric = {hard_gas_limit_per_operation; _}; _} =
+            Alpha_services.Constants.all cctxt (cctxt#chain, block)
+          in
+          return_some hard_gas_limit_per_operation
+      | Some gas -> return_some gas
   in
   let parse_expr expr =
     Lwt.return @@ Micheline_parser.no_parsing_error
@@ -179,6 +181,15 @@ let commands () =
          ~from_text:(fun _cctx s -> Lwt_result_syntax.return s)
          ())
   in
+  let stack_param () =
+    param
+      ~name:"stack"
+      ~desc:
+        "a Michelson stack in the following format: {Stack_elt <ty_1> <val_1>; \
+         ...; Stack_elt <ty_n> <val_n>}, where each <val_i> is a Michelson \
+         value of type <ty_i>. The topmost element of the stack is <val_1>."
+      micheline_parameter
+  in
   let handle_parsing_error label (cctxt : Protocol_client_context.full)
       (emacs_mode, no_print_source) program body =
     let open Lwt_result_syntax in
@@ -200,7 +211,7 @@ let commands () =
             (fun ppf () ->
               Michelson_v1_error_reporter.report_errors
                 ~details:(not no_print_source)
-                ~parsed
+                ~parsed:(Michelson_v1_parser.unrecognize_prims parsed)
                 ~show_source:(not no_print_source)
                 ppf
                 errors)
@@ -248,7 +259,7 @@ let commands () =
     command
       ~group
       ~desc:"Ask the node to run a script."
-      (args12
+      (args14
          trace_stack_switch
          amount_arg
          balance_arg
@@ -260,7 +271,9 @@ let commands () =
          entrypoint_arg
          (unparsing_mode_arg ~default:"Readable")
          now_arg
-         level_arg)
+         level_arg
+         other_contracts_arg
+         extra_big_maps_arg)
       (prefixes ["run"; "script"]
       @@ Program.source_param
       @@ prefixes ["on"; "storage"]
@@ -271,7 +284,7 @@ let commands () =
       (fun ( trace_exec,
              amount,
              balance,
-             source,
+             sender,
              payer,
              self,
              no_print_source,
@@ -279,11 +292,14 @@ let commands () =
              entrypoint,
              unparsing_mode,
              now,
-             level )
+             level,
+             other_contracts,
+             extra_big_maps )
            program
            storage
            input
-           cctxt ->
+           cctxt
+         ->
         let open Lwt_result_syntax in
         let*? program = Micheline_parser.no_parsing_error program in
         let show_source = not no_print_source in
@@ -299,7 +315,17 @@ let commands () =
                 program;
                 storage;
                 shared_params =
-                  {input; unparsing_mode; now; level; source; payer; gas};
+                  {
+                    input;
+                    unparsing_mode;
+                    now;
+                    level;
+                    sender;
+                    payer;
+                    gas;
+                    other_contracts;
+                    extra_big_maps;
+                  };
                 entrypoint;
                 self;
               }
@@ -317,12 +343,90 @@ let commands () =
                 program;
                 storage;
                 shared_params =
-                  {input; unparsing_mode; now; level; source; payer; gas};
+                  {
+                    input;
+                    unparsing_mode;
+                    now;
+                    level;
+                    sender;
+                    payer;
+                    gas;
+                    other_contracts;
+                    extra_big_maps;
+                  };
                 entrypoint;
                 self;
               }
           in
           print_run_result cctxt ~show_source ~parsed:program res);
+    command
+      ~group
+      ~desc:
+        "Ask the node to run a Michelson instruction or a sequence of \
+         Michelson instructions on a stack."
+      (args12
+         amount_arg
+         balance_arg
+         source_arg
+         payer_arg
+         self_arg
+         run_gas_limit_arg
+         (unparsing_mode_arg ~default:"Readable")
+         now_arg
+         level_arg
+         other_contracts_arg
+         extra_big_maps_arg
+         legacy_switch)
+      (prefixes ["run"; "michelson"; "code"]
+      @@ Program.source_param
+      @@ prefixes ["on"; "stack"]
+      @@ stack_param () @@ stop)
+      (fun ( amount,
+             balance,
+             sender,
+             payer,
+             self,
+             gas,
+             unparsing_mode,
+             now,
+             level,
+             other_contracts,
+             extra_big_maps,
+             legacy )
+           program
+           stack
+           cctxt
+         ->
+        let open Lwt_result_syntax in
+        let*? program = Micheline_parser.no_parsing_error program in
+        let*? stack = Michelson_v1_stack.parse_stack stack in
+        let*! res =
+          run_instr
+            cctxt
+            ~chain:cctxt#chain
+            ~block:cctxt#block
+            {
+              stack;
+              shared_params =
+                {
+                  input = program;
+                  unparsing_mode;
+                  now;
+                  level;
+                  sender;
+                  payer;
+                  gas;
+                  other_contracts;
+                  extra_big_maps;
+                };
+              amount;
+              balance;
+              self;
+              parameter = None;
+              legacy;
+            }
+        in
+        print_run_instr_result cctxt ~show_source:false ~parsed:program res);
     command
       ~group
       ~desc:"Ask the node to compute the size of a script."
@@ -339,17 +443,20 @@ let commands () =
       (fun (emacs_mode, no_print_source, original_gas, legacy)
            program
            storage
-           cctxt ->
+           cctxt
+         ->
         let open Lwt_result_syntax in
         let setup = (emacs_mode, no_print_source) in
-        let* original_gas = resolve_max_gas cctxt cctxt#block original_gas in
+        let* gas =
+          resolve_max_gas cctxt cctxt#block ~unlimited_gas:false original_gas
+        in
         handle_parsing_error "size" cctxt setup program @@ fun program ->
         let* code_size =
           script_size
             cctxt
             ~chain:cctxt#chain
             ~block:cctxt#block
-            ~gas:original_gas
+            ~gas
             ~legacy
             ~program
             ~storage
@@ -359,56 +466,235 @@ let commands () =
         return_unit);
     command
       ~group
-      ~desc:"Ask the node to typecheck a script."
-      (args5
+      ~desc:"Ask the node to run Michelson unit tests from files or literals"
+      no_options
+      (prefixes ["run"; "unit"; "tests"; "from"]
+      @@ seq_of_param
+      @@ file_or_literal_with_origin_param ())
+      (fun () tests (cctxt : Protocol_client_context.full) ->
+        let open Lwt_result_syntax in
+        match tests with
+        | [] ->
+            let*! () =
+              cctxt#warning "No test file was specified on the command line"
+            in
+            return_unit
+        | _ :: _ ->
+            let*! ( (_number_of_literals : int),
+                    number_of_seen_tests,
+                    number_of_passed_tests,
+                    errors ) =
+              List.fold_left_s
+                (fun (i, number_of_seen_tests, number_of_passed_tests, error_acc)
+                     content_with_origin
+                   ->
+                  let name, i =
+                    match content_with_origin with
+                    | Client_proto_args.File {path; _} -> (path, i)
+                    | Text _ ->
+                        let i = i + 1 in
+                        ("Literal script " ^ string_of_int i, i)
+                  in
+                  let source =
+                    Client_proto_args.content_of_file_or_text
+                      content_with_origin
+                  in
+                  let parsed, parsing_errors =
+                    Michelson_v1_parser.expand_toplevel source
+                  in
+                  let*! res =
+                    let open Client_proto_tzt in
+                    let*? (test : unit_test_with_source) =
+                      Micheline_parser.no_parsing_error
+                        ({source; parsed}, parsing_errors)
+                    in
+                    run_unit_test
+                      cctxt
+                      ~chain:cctxt#chain
+                      ~block:cctxt#block
+                      ~test
+                      ()
+                  in
+                  match res with
+                  | Ok () ->
+                      Lwt.return
+                        ( i,
+                          number_of_seen_tests + 1,
+                          number_of_passed_tests + 1,
+                          error_acc )
+                  | Error err ->
+                      Lwt.return
+                        ( i,
+                          number_of_seen_tests + 1,
+                          number_of_passed_tests,
+                          (name, parsed, err) :: error_acc ))
+                (0, 0, 0, [])
+                tests
+            in
+            let number_of_failed_tests =
+              number_of_seen_tests - number_of_passed_tests
+            in
+            let print_result () =
+              cctxt#message
+                "Test results: Passed:%d Failed:%d Total:%d"
+                number_of_passed_tests
+                number_of_failed_tests
+                number_of_seen_tests
+            in
+            if number_of_failed_tests > 0 then
+              let*! () =
+                List.iter_s
+                  (fun (name, parsed, errs) ->
+                    let*! errs =
+                      Michelson_v1_error_reporter.enrich_runtime_errors
+                        cctxt
+                        ~chain:cctxt#chain
+                        ~block:cctxt#block
+                        ~parsed:(Some parsed)
+                        errs
+                    in
+                    cctxt#message
+                      "%s:@.%a"
+                      name
+                      (Michelson_v1_error_reporter.report_errors
+                         ~details:true
+                         ~parsed
+                         ~show_source:true)
+                      errs)
+                  errors
+              in
+              let*! () = print_result () in
+              let*! () = cctxt#error "Some tests have failed" in
+              return_unit
+            else
+              let*! () = print_result () in
+              let*! () = cctxt#message "All tests have passed" in
+              return_unit);
+    command
+      ~group
+      ~desc:"Ask the node to typecheck one or several scripts."
+      (args8
          show_types_switch
          emacs_mode_switch
          no_print_source_flag
          run_gas_limit_arg
-         legacy_switch)
-      (prefixes ["typecheck"; "script"] @@ Program.source_param @@ stop)
-      (fun (show_types, emacs_mode, no_print_source, original_gas, legacy)
-           program
-           cctxt ->
+         unlimited_gas_arg
+         legacy_switch
+         display_names_flag
+         keep_going_flag)
+      (prefixes ["typecheck"; "script"]
+      @@ seq_of_param
+      @@ file_or_literal_with_origin_param ())
+      (fun ( show_types,
+             emacs_mode,
+             no_print_source,
+             original_gas,
+             unlimited_gas,
+             legacy,
+             display_names,
+             keep_going )
+           expr_strings
+           cctxt
+         ->
         let open Lwt_result_syntax in
         let setup = (emacs_mode, no_print_source) in
-        handle_parsing_error "types" cctxt setup program @@ fun program ->
-        let* original_gas = resolve_max_gas cctxt cctxt#block original_gas in
-        let*! res =
-          typecheck_program
-            cctxt
-            ~chain:cctxt#chain
-            ~block:cctxt#block
-            ~gas:original_gas
-            ~legacy
-            ~show_types
-            program
-        in
-        print_typecheck_result
-          ~emacs:emacs_mode
-          ~show_types
-          ~print_source_on_error:(not no_print_source)
-          program
-          res
-          cctxt);
+        match expr_strings with
+        | [] ->
+            let*! () =
+              cctxt#warning "No scripts were specified on the command line"
+            in
+            return_unit
+        | _ :: _ ->
+            let successes = ref 0 in
+            let* _number_of_literal_scripts =
+              List.fold_left_es
+                (fun i content_with_origin ->
+                  let expr_string =
+                    Client_proto_args.content_of_file_or_text
+                      content_with_origin
+                  in
+                  let program =
+                    Michelson_v1_parser.parse_toplevel expr_string
+                  in
+                  let name, i =
+                    match content_with_origin with
+                    | Client_proto_args.File {path; _} -> (path, i)
+                    | Text _ ->
+                        let i = i + 1 in
+                        ("Literal script " ^ string_of_int i, i)
+                  in
+                  let* () =
+                    handle_parsing_error "types" cctxt setup program
+                    @@ fun program ->
+                    let* gas =
+                      resolve_max_gas
+                        cctxt
+                        cctxt#block
+                        ~unlimited_gas
+                        original_gas
+                    in
+                    let*! res =
+                      typecheck_program
+                        cctxt
+                        ~chain:cctxt#chain
+                        ~block:cctxt#block
+                        ~gas
+                        ~legacy
+                        ~show_types
+                        program
+                    in
+                    let* success =
+                      print_typecheck_result
+                        ~emacs:emacs_mode
+                        ~show_types
+                        ~print_source_on_error:(not no_print_source)
+                        ~display_names
+                        ~name
+                        ~keep_going
+                        program
+                        res
+                        cctxt
+                    in
+                    if success then incr successes ;
+                    return_unit
+                  in
+                  return i)
+                0
+                expr_strings
+            in
+            let successes = !successes in
+            let total = List.length expr_strings in
+            if successes = total then return_unit
+            else
+              cctxt#error
+                "%d scripts are ill-typed, %d scripts are well-typed, total: %d"
+                (total - successes)
+                successes
+                total);
     command
       ~group
       ~desc:"Ask the node to typecheck a data expression."
-      (args3 no_print_source_flag run_gas_limit_arg legacy_switch)
+      (args4
+         no_print_source_flag
+         run_gas_limit_arg
+         unlimited_gas_arg
+         legacy_switch)
       (prefixes ["typecheck"; "data"]
       @@ param ~name:"data" ~desc:"the data to typecheck" data_parameter
       @@ prefixes ["against"; "type"]
       @@ param ~name:"type" ~desc:"the expected type" data_parameter
       @@ stop)
-      (fun (no_print_source, custom_gas, legacy) data ty cctxt ->
+      (fun (no_print_source, custom_gas, unlimited_gas, legacy) data ty cctxt ->
         let open Lwt_result_syntax in
-        let* original_gas = resolve_max_gas cctxt cctxt#block custom_gas in
+        let* gas =
+          resolve_max_gas cctxt cctxt#block ~unlimited_gas custom_gas
+        in
         let*! r =
           Client_proto_programs.typecheck_data
             cctxt
             ~chain:cctxt#chain
             ~block:cctxt#block
-            ~gas:original_gas
+            ~gas
             ~legacy
             ~data
             ~ty
@@ -450,12 +736,14 @@ let commands () =
       @@ stop)
       (fun (custom_gas, scriptable) data typ cctxt ->
         let open Lwt_result_syntax in
-        let* original_gas = resolve_max_gas cctxt cctxt#block custom_gas in
+        let* gas =
+          resolve_max_gas cctxt cctxt#block ~unlimited_gas:false custom_gas
+        in
         let*! r =
           Plugin.RPC.Scripts.pack_data
             cctxt
             (cctxt#chain, cctxt#block)
-            ~gas:original_gas
+            ~gas
             ~data:data.expanded
             ~ty:typ.expanded
         in
@@ -525,60 +813,67 @@ let commands () =
       @@ file_or_literal_with_origin_param ())
       (fun (check, display_names, scriptable)
            expr_strings
-           (cctxt : Protocol_client_context.full) ->
+           (cctxt : Protocol_client_context.full)
+         ->
         let open Lwt_result_syntax in
-        if List.compare_length_with expr_strings 0 = 0 then
-          let*! () =
-            cctxt#warning "No scripts were specified on the command line"
-          in
-          return_unit
-        else
-          let* hash_name_rows =
-            List.mapi_ep
-              (fun i content_with_origin ->
-                let expr_string =
-                  Client_proto_args.content_of_file_or_text content_with_origin
+        match expr_strings with
+        | [] ->
+            let*! () =
+              cctxt#warning "No scripts were specified on the command line"
+            in
+            return_unit
+        | _ :: _ ->
+            let* hash_name_rows_rev, _number_of_literal_scripts =
+              List.fold_left_es
+                (fun (l, i) content_with_origin ->
+                  let expr_string =
+                    Client_proto_args.content_of_file_or_text
+                      content_with_origin
+                  in
+                  let program =
+                    Michelson_v1_parser.parse_toplevel ~check expr_string
+                  in
+                  let*? program = Micheline_parser.no_parsing_error program in
+                  let code = program.expanded in
+                  let bytes =
+                    Data_encoding.Binary.to_bytes_exn
+                      Alpha_context.Script.expr_encoding
+                      code
+                  in
+                  let hash =
+                    Format.asprintf
+                      "%a"
+                      Script_expr_hash.pp
+                      (Script_expr_hash.hash_bytes [bytes])
+                  in
+                  let name, i =
+                    match content_with_origin with
+                    | Client_proto_args.File {path; _} -> (path, i)
+                    | Text _ ->
+                        let i = i + 1 in
+                        ("Literal script " ^ string_of_int i, i)
+                  in
+                  return ((hash, name) :: l, i))
+                ([], 0)
+                expr_strings
+            in
+            let hash_name_rows = List.rev hash_name_rows_rev in
+            Tezos_clic_unix.Scriptable.output
+              scriptable
+              ~for_human:(fun () ->
+                let*! () =
+                  List.iter_s
+                    (fun (hash, name) ->
+                      if display_names then cctxt#answer "%s\t%s" hash name
+                      else cctxt#answer "%s" hash)
+                    hash_name_rows
                 in
-                let program =
-                  Michelson_v1_parser.parse_toplevel ~check expr_string
-                in
-                let*? program = Micheline_parser.no_parsing_error program in
-                let code = program.expanded in
-                let bytes =
-                  Data_encoding.Binary.to_bytes_exn
-                    Alpha_context.Script.expr_encoding
-                    code
-                in
-                let hash =
-                  Format.asprintf
-                    "%a"
-                    Script_expr_hash.pp
-                    (Script_expr_hash.hash_bytes [bytes])
-                in
-                let name =
-                  match content_with_origin with
-                  | Client_proto_args.File {path; _} -> path
-                  | Text _ -> "Literal script " ^ string_of_int (i + 1)
-                in
-                return (hash, name))
-              expr_strings
-          in
-          Tezos_clic_unix.Scriptable.output
-            scriptable
-            ~for_human:(fun () ->
-              let*! () =
-                List.iter_s
+                return_unit)
+              ~for_script:(fun () ->
+                List.map
                   (fun (hash, name) ->
-                    if display_names then cctxt#answer "%s\t%s" hash name
-                    else cctxt#answer "%s" hash)
-                  hash_name_rows
-              in
-              return_unit)
-            ~for_script:(fun () ->
-              List.map
-                (fun (hash, name) ->
-                  if display_names then [hash; name] else [hash])
-                hash_name_rows));
+                    if display_names then [hash; name] else [hash])
+                  hash_name_rows));
     command
       ~group
       ~desc:
@@ -648,7 +943,11 @@ let commands () =
     command
       ~group
       ~desc:"Ask the node to normalize a data expression."
-      (args2 (unparsing_mode_arg ~default:"Readable") legacy_switch)
+      (args4
+         (unparsing_mode_arg ~default:"Readable")
+         legacy_switch
+         other_contracts_arg
+         extra_big_maps_arg)
       (prefixes ["normalize"; "data"]
       @@ param
            ~name:"data"
@@ -657,7 +956,11 @@ let commands () =
       @@ prefixes ["of"; "type"]
       @@ param ~name:"type" ~desc:"type of the data expression" data_parameter
       @@ stop)
-      (fun (unparsing_mode, legacy) data typ cctxt ->
+      (fun (unparsing_mode, legacy, other_contracts, extra_big_maps)
+           data
+           typ
+           cctxt
+         ->
         let open Lwt_result_syntax in
         let*! r =
           Plugin.RPC.Scripts.normalize_data
@@ -667,6 +970,8 @@ let commands () =
             ~data:data.expanded
             ~ty:typ.expanded
             ~unparsing_mode
+            ~other_contracts
+            ~extra_big_maps
         in
         match r with
         | Ok expr ->
@@ -687,7 +992,51 @@ let commands () =
             cctxt#error "ill-typed data expression");
     command
       ~group
-      ~desc:"Ask the node to normalize a type."
+      ~desc:"Ask the node to normalize a typed Michelson stack."
+      (args4
+         (unparsing_mode_arg ~default:"Readable")
+         legacy_switch
+         other_contracts_arg
+         extra_big_maps_arg)
+      (prefixes ["normalize"; "stack"] @@ stack_param () @@ stop)
+      (fun (unparsing_mode, legacy, other_contracts, extra_big_maps)
+           stack
+           cctxt
+         ->
+        let open Lwt_result_syntax in
+        let*? stack = Michelson_v1_stack.parse_stack stack in
+        let*! r =
+          Plugin.RPC.Scripts.normalize_stack
+            cctxt
+            (cctxt#chain, cctxt#block)
+            ~legacy
+            ~stack
+            ~unparsing_mode
+            ~other_contracts
+            ~extra_big_maps
+        in
+        match r with
+        | Ok expr ->
+            let*! () =
+              cctxt#message "%a" Michelson_v1_printer.print_typed_stack expr
+            in
+            return_unit
+        | Error errs ->
+            let*! () =
+              cctxt#warning
+                "%a"
+                (Michelson_v1_error_reporter.report_errors
+                   ~details:false
+                   ~show_source:false
+                   ?parsed:None)
+                errs
+            in
+            cctxt#error "ill-typed stack");
+    command
+      ~group
+      ~desc:
+        "Ask the node to normalize a type (remove annotations and flatten \
+         combs)."
       no_options
       (prefixes ["normalize"; "type"]
       @@ param
@@ -754,7 +1103,8 @@ let commands () =
            bytes
            (_, (key_locator, _))
            signature
-           (cctxt : #Protocol_client_context.full) ->
+           (cctxt : #Protocol_client_context.full)
+         ->
         let open Lwt_result_syntax in
         let* check = Client_keys.check key_locator signature bytes in
         if check then
@@ -851,14 +1201,24 @@ let commands () =
          Micheline, JSON, binary or OCaml"
       (args3 zero_loc_switch legacy_switch enforce_indentation_flag)
       (prefixes ["convert"; "script"]
-      @@ file_or_literal_param () @@ prefix "from" @@ convert_input_format_param
-      @@ prefix "to" @@ convert_output_format_param @@ stop)
+      @@ file_or_literal_with_origin_param ()
+      @@ prefix "from" @@ convert_input_format_param @@ prefix "to"
+      @@ convert_output_format_param @@ stop)
       (fun (zero_loc, legacy, check)
-           expr_string
+           content_with_origin
            from_format
            to_format
-           (cctxt : Protocol_client_context.full) ->
+           (cctxt : Protocol_client_context.full)
+         ->
         let open Lwt_result_syntax in
+        let expr_string =
+          Client_proto_args.content_of_file_or_text content_with_origin
+        in
+        let name =
+          match content_with_origin with
+          | Client_proto_args.File {path; _} -> path
+          | Text _ -> "Literal script"
+        in
         let* (expression : Alpha_context.Script.expr) =
           match from_format with
           | `Michelson ->
@@ -874,17 +1234,24 @@ let commands () =
                     ~block:cctxt#block
                     ~legacy
                     ~show_types:true
+                    ~gas:None
                     program
                 in
                 match r with
                 | Error _ as res ->
-                    print_typecheck_result
-                      ~emacs:false
-                      ~show_types:true
-                      ~print_source_on_error:true
-                      program
-                      res
-                      cctxt
+                    let* (_success : bool) =
+                      print_typecheck_result
+                        ~emacs:false
+                        ~show_types:true
+                        ~print_source_on_error:true
+                        ~display_names:false
+                        ~name
+                        ~keep_going:false
+                        program
+                        res
+                        cctxt
+                    in
+                    return_unit
                 | Ok _ -> return_unit
               in
               return program.expanded
@@ -943,7 +1310,8 @@ let commands () =
            data_string
            from_format
            to_format
-           (cctxt : Protocol_client_context.full) ->
+           (cctxt : Protocol_client_context.full)
+         ->
         let open Lwt_result_syntax in
         let micheline_of_expr expr =
           Micheline_printer.printable
@@ -959,6 +1327,8 @@ let commands () =
               ~block:cctxt#block
               ~data
               ~ty
+              ~gas:None
+              ~legacy:false
               ()
           in
           match r with
@@ -1034,39 +1404,59 @@ let commands () =
     command
       ~group
       ~desc:"Ask the node to run a TZIP-4 view."
-      (args6
+      (args8
          source_arg
          payer_arg
          run_gas_limit_arg
          (unparsing_mode_arg ~default:"Readable")
          now_arg
-         level_arg)
+         level_arg
+         other_contracts_arg
+         extra_big_maps_arg)
       (prefixes ["run"; "tzip4"; "view"]
       @@ param
            ~name:"entrypoint"
            ~desc:"the name of the view"
            entrypoint_parameter
       @@ prefixes ["on"; "contract"]
-      @@ OriginatedContractAlias.destination_param
+      @@ Originated_contract_alias.destination_param
            ~name:"contract"
            ~desc:"viewed contract"
       @@ prefixes ["with"; "input"]
       @@ param ~name:"input" ~desc:"the input data" data_parameter
       @@ stop)
-      (fun (source, payer, gas, unparsing_mode, now, level)
+      (fun ( sender,
+             payer,
+             gas,
+             unparsing_mode,
+             now,
+             level,
+             other_contracts,
+             extra_big_maps )
            entrypoint
            contract
            input
-           cctxt ->
-        let open Lwt_syntax in
-        let* res =
+           cctxt
+         ->
+        let open Lwt_result_syntax in
+        let*! res =
           Client_proto_programs.run_view
             cctxt
             ~chain:cctxt#chain
             ~block:cctxt#block
             {
               shared_params =
-                {input; unparsing_mode; now; level; source; payer; gas};
+                {
+                  input;
+                  unparsing_mode;
+                  now;
+                  level;
+                  sender;
+                  payer;
+                  gas;
+                  other_contracts;
+                  extra_big_maps;
+                };
               contract;
               entrypoint;
             }
@@ -1075,25 +1465,36 @@ let commands () =
     command
       ~group
       ~desc:"Ask the node to run a Michelson view with Unit as input."
-      (args7
+      (args9
          source_arg
          payer_arg
          run_gas_limit_arg
          unlimited_gas_arg
          (unparsing_mode_arg ~default:"Readable")
          now_arg
-         level_arg)
+         level_arg
+         other_contracts_arg
+         extra_big_maps_arg)
       (prefixes ["run"; "view"]
       @@ param ~name:"view" ~desc:"the name of the view" string_parameter
       @@ prefixes ["on"; "contract"]
-      @@ OriginatedContractAlias.destination_param
+      @@ Originated_contract_alias.destination_param
            ~name:"contract"
            ~desc:"the contract containing the view"
       @@ stop)
-      (fun (source, payer, gas, unlimited_gas, unparsing_mode, now, level)
+      (fun ( sender,
+             payer,
+             gas,
+             unlimited_gas,
+             unparsing_mode,
+             now,
+             level,
+             other_contracts,
+             extra_big_maps )
            view
            contract
-           cctxt ->
+           cctxt
+         ->
         let open Lwt_result_syntax in
         let*? input =
           Micheline_parser.no_parsing_error
@@ -1106,7 +1507,17 @@ let commands () =
             ~block:cctxt#block
             {
               shared_params =
-                {input; unparsing_mode; now; level; source; payer; gas};
+                {
+                  input;
+                  unparsing_mode;
+                  now;
+                  level;
+                  sender;
+                  payer;
+                  gas;
+                  other_contracts;
+                  extra_big_maps;
+                };
               contract;
               view;
               unlimited_gas;
@@ -1116,18 +1527,20 @@ let commands () =
     command
       ~group
       ~desc:"Ask the node to run a Michelson view."
-      (args7
+      (args9
          source_arg
          payer_arg
          run_gas_limit_arg
          unlimited_gas_arg
          (unparsing_mode_arg ~default:"Readable")
          now_arg
-         level_arg)
+         level_arg
+         other_contracts_arg
+         extra_big_maps_arg)
       (prefixes ["run"; "view"]
       @@ param ~name:"view" ~desc:"the name of the view" string_parameter
       @@ prefixes ["on"; "contract"]
-      @@ OriginatedContractAlias.destination_param
+      @@ Originated_contract_alias.destination_param
            ~name:"contract"
            ~desc:"the contract containing the view"
       @@ prefixes ["with"; "input"]
@@ -1136,20 +1549,39 @@ let commands () =
            ~desc:"the argument provided to the view"
            data_parameter
       @@ stop)
-      (fun (source, payer, gas, unlimited_gas, unparsing_mode, now, level)
+      (fun ( sender,
+             payer,
+             gas,
+             unlimited_gas,
+             unparsing_mode,
+             now,
+             level,
+             other_contracts,
+             extra_big_maps )
            view
            contract
            input
-           cctxt ->
-        let open Lwt_syntax in
-        let* res =
+           cctxt
+         ->
+        let open Lwt_result_syntax in
+        let*! res =
           Client_proto_programs.run_script_view
             cctxt
             ~chain:cctxt#chain
             ~block:cctxt#block
             {
               shared_params =
-                {input; unparsing_mode; now; level; source; payer; gas};
+                {
+                  input;
+                  unparsing_mode;
+                  now;
+                  level;
+                  sender;
+                  payer;
+                  gas;
+                  other_contracts;
+                  extra_big_maps;
+                };
               contract;
               view;
               unlimited_gas;

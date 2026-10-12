@@ -1,0 +1,2544 @@
+// SPDX-FileCopyrightText: 2025 Functori <contact@functori.com>
+//
+// SPDX-License-Identifier: MIT
+
+//! Tezos operations
+
+use crate::lazy_storage_diff::LazyStorageDiffList;
+use crate::operation::{
+    ManagerOperation, ManagerOperationContent, ManagerOperationContentConv,
+    OperationContent, OriginationContent, RevealContent, TransferContent,
+};
+use crate::protocol::TARGET_TEZOS_PROTOCOL;
+use mir::ast::Entrypoint;
+use mir::gas;
+/// The whole module is inspired of `src/proto_alpha/lib_protocol/apply_result.ml` to represent the result of an operation
+/// In Tezlink, operation is equivalent to manager operation because there is no other type of operation that interests us.
+use nom::error::ParseError;
+use primitive_types::U256;
+use std::borrow::Cow;
+use std::fmt::Debug;
+use tezos_crypto_rs::hash::ContractKt1Hash;
+use tezos_crypto_rs::hash::UnknownSignature;
+use tezos_crypto_rs::CryptoError;
+use tezos_data_encoding::enc as tezos_enc;
+use tezos_data_encoding::nom as tezos_nom;
+use tezos_data_encoding::nom::error::DecodeError;
+use tezos_data_encoding::types::Narith;
+use tezos_data_encoding::types::Zarith;
+use tezos_enc::BinWriter;
+use tezos_nom::NomReader;
+use tezos_protocol::contract::Contract;
+use tezos_smart_rollup::types::{PublicKey, PublicKeyHash};
+use tezos_smart_rollup_host::runtime::RuntimeError;
+use tezos_smart_rollup_keyspace::KeySpaceLoaderError;
+use thiserror::Error;
+
+#[derive(Debug, PartialEq, Eq)]
+pub struct CounterError {
+    pub expected: Narith,
+    pub found: Narith,
+}
+
+#[derive(Error, Debug, PartialEq, Eq)]
+pub enum ValidityError {
+    #[error("Counter in the past: {0:?}.")]
+    CounterInThePast(CounterError),
+    #[error("Counter in the future: {0:?}.")]
+    CounterInTheFuture(CounterError),
+    #[error("The manager key for {0} has not been revealed yet.")]
+    UnrevealedManagerKey(PublicKeyHash),
+    #[error("Cannot pay {0:?} in fees.")]
+    CantPayFees(Narith),
+    #[error("Empty implicit contract.")]
+    EmptyImplicitContract,
+    #[error("Storage limit is too high.")]
+    StorageLimitTooHigh,
+    #[error("Invalid signature.")]
+    InvalidSignature,
+    #[error("Failed to fetch account")]
+    FailedToFetchAccount,
+    #[error("Failed to compute fee balance update")]
+    FailedToComputeFeeBalanceUpdate,
+    #[error("Failed to fetch counter")]
+    FailedToFetchCounter,
+    #[error("Failed to fetch manager key")]
+    FailedToFetchManagerKey,
+    #[error("Failed to fetch balance")]
+    FailedToFetchBalance,
+    #[error("Failed to update balance")]
+    FailedToUpdateBalance,
+    #[error("Failed to increment counter.")]
+    FailedToIncrementCounter,
+    #[error("Batch is empty.")]
+    EmptyBatch,
+    #[error("Batch contains operations from multiple sources.")]
+    MultipleSources,
+    #[error("Cannot set gas limit due to : {0}")]
+    GasLimitSetError(String),
+    #[error("Gas exhaustion")]
+    OutOfGas,
+    #[error("Operation not supported")]
+    UnsupportedOperation,
+    #[error("Failed to serialize operation for DA fee computation.")]
+    FailedToSerializeOperation,
+    #[error("Insufficient fee: the total fees for this batch do not cover DA cost.")]
+    InsufficientFee,
+    #[error("The public key hash {0} is inconsistent with the public key provided.")]
+    InconsistentPublicKey(PublicKeyHash),
+}
+
+impl From<gas::OutOfGas> for ValidityError {
+    fn from(_: gas::OutOfGas) -> Self {
+        ValidityError::OutOfGas
+    }
+}
+
+impl From<CryptoError> for ValidityError {
+    fn from(_: CryptoError) -> Self {
+        ValidityError::InvalidSignature
+    }
+}
+
+#[derive(Error, Clone, Debug, PartialEq, Eq)]
+pub enum RevealError {
+    #[error("Revelation failed because the manager key of {0} was already revealed.")]
+    PreviouslyRevealedKey(Contract),
+    /// The manager hash registered for the source is not the source.
+    #[error(
+        "The manager hash {expected_hash} registered for {source_hash} is inconsistent."
+    )]
+    InconsistentHash {
+        public_key: PublicKey,
+        expected_hash: PublicKeyHash,
+        source_hash: PublicKeyHash,
+    },
+    #[error("The public key {public_key} hashes to {computed_hash} instead of {expected_hash}.")]
+    InconsistentPublicKey {
+        public_key: PublicKey,
+        expected_hash: PublicKeyHash,
+        computed_hash: PublicKeyHash,
+    },
+    #[error("Could not retrieve manager.")]
+    UnretrievableManager,
+    #[error("Failed to write manager.")]
+    FailedToWriteManager,
+    #[error("Gas exhaustion")]
+    OutOfGas,
+}
+
+#[derive(thiserror::Error, Clone, Debug, PartialEq, Eq)]
+#[error("Balance of contract {contract} too low ({}) to spend {}", .balance.0, .amount.0)]
+pub struct BalanceTooLow {
+    pub contract: Contract,
+    pub balance: Narith,
+    pub amount: Narith,
+}
+
+#[derive(Error, Clone, Debug, PartialEq, Eq)]
+pub enum TransferError {
+    #[error(transparent)]
+    BalanceTooLow(BalanceTooLow),
+    #[error("{0} is unspendable")]
+    UnspendableContract(Contract),
+    /// A non-`default` entrypoint was called on an implicit account.
+    #[error("No entrypoint {0} on an implicit account")]
+    NoSuchEntrypoint(Entrypoint),
+    /// An implicit account was called with a parameter other than
+    /// `Unit`. Carries the sender, as L1 does.
+    #[error("A parameter other than Unit was given by {0} to an implicit account")]
+    BadContractParameter(Contract),
+    // TODO: #8003 propagate the error generated by MIR
+    #[error("Apply operation failed because of micheline (de)serialization {0}")]
+    MichelineSerializationError(String),
+    // TODO: #8003 propagate the error generated by MIR
+    #[error("Failed interpreting the Michelson contract with {0}")]
+    MichelsonContractInterpretError(String),
+    // TODO: #8003 propagate the error generated by MIR
+    #[error("Mir failed to typecheck the contract with {0}")]
+    MirTypecheckingError(String),
+    #[error("Failed to allocate destination")]
+    FailedToAllocateDestination,
+    #[error("Failed to compute balance update: {0}")]
+    FailedToComputeBalanceUpdate(String),
+    #[error("Failed to apply balance changes")]
+    FailedToApplyBalanceChanges,
+    #[error("Failed to fetch destination account")]
+    FailedToFetchDestinationAccount,
+    #[error("Failed to fetch contract code")]
+    FailedToFetchContractCode,
+    #[error("Failed to fetch contract storage")]
+    FailedToFetchContractStorage,
+    #[error("Failed to fetch destination balance")]
+    FailedToFetchDestinationBalance,
+    #[error("Failed to fetch sender balance")]
+    FailedToFetchSenderBalance,
+    #[error("Failed to update contract storage")]
+    FailedToUpdateContractStorage,
+    #[error("Failed to update destination balance")]
+    FailedToUpdateDestinationBalance,
+    #[error("Apply operation failed because of an unsupported address error")]
+    MirAddressUnsupportedError,
+    #[error("Failed to execute internal operation: {0}")]
+    FailedToExecuteInternalOperation(String),
+    #[error("Failed to convert amount to Narith: {0}")]
+    MirAmountToNarithError(String),
+    #[error("Failed to convert Narith to amount: {0}")]
+    MirNarithToAmountError(String),
+    /// A transfer of 0 tez towards `0`, an implicit account.
+    #[error("Transactions of 0 tez towards {0}, an implicit account, are forbidden")]
+    EmptyImplicitTransfer(Contract),
+    #[error("Failed to convert storage fees: {0}")]
+    StorageFeesConversion(String),
+    #[error("Gas exhaustion")]
+    OutOfGas(#[from] gas::OutOfGas),
+    #[error("Unexpected deposit error: {0}")]
+    DepositError(String),
+    // TODO: L2-971
+    // this should reference tezosx-interfaces::TezosXRuntimeError if possible
+    #[error("Gateway problem: {0}")]
+    GatewayError(String),
+    #[error("Contract {0} does not exist.")]
+    ContractDoesNotExist(Contract),
+    /// MIR's `VIEW` opcode reached a synthetic enshrined-view dispatch
+    /// (today: the gateway's `staticcall_evm`) and the peer runtime
+    /// returned a 5xx or could not be reached. Distinct from the
+    /// caller-mistake variants of `EnshrinedViewDispatchError` (which
+    /// stay routed through `MichelsonContractInterpretError` →
+    /// `CracError::Operation`) — this one routes to
+    /// `CracError::BlockAbort`, matching how Boundary-2 (gateway HTTP)
+    /// already classifies the same brokenness on the entrypoint path.
+    #[error("Enshrined view dispatch reported peer-runtime failure: {0}")]
+    EnshrinedViewDispatchAbort(String),
+    /// Kernel-internal storage failure from the address registry; routes to
+    /// `CracError::BlockAbort` like the `FailedTo*` variants.
+    #[error("Address registry reported a storage I/O failure: {0}")]
+    AddressRegistryAbort(String),
+}
+
+#[derive(Error, Clone, Debug, PartialEq, Eq)]
+pub enum OriginationError {
+    #[error("Failed to fetch source account")]
+    FailedToFetchSourceAccount,
+    #[error("Failed to fetch originated smart contract")]
+    FailedToFetchOriginated,
+    #[error("Failed to compute balance update: {0}")]
+    FailedToComputeBalanceUpdate(String),
+    #[error("Failed to applied balance update")]
+    FailedToApplyBalanceUpdate,
+    #[error(transparent)]
+    BalanceTooLow(BalanceTooLow),
+    #[error("Can't initialize smart contract")]
+    CantInitContract,
+    #[error("Can't originate an empty smart contract")]
+    CantOriginateEmptyContract,
+    #[error("Mir failed to allocate big_map because {0}")]
+    MirBigMapAllocation(String),
+    #[error("Mir failed to typecheck the contract with {0}")]
+    MirTypecheckingError(String),
+    /// The originated script exceeded the maximum allowed size (mirrors L1's
+    /// `max_operation_data_length`; see L2-1706). Message carries size and limit.
+    #[error("Script too large: {0}")]
+    ScriptTooLarge(String),
+    #[error("Failed because of micheline (de)serialization {0}")]
+    MichelineSerializationError(String),
+    #[error("Gas exhaustion")]
+    OutOfGas(#[from] gas::OutOfGas),
+}
+
+impl From<mir::serializer::DecodeError> for TransferError {
+    fn from(err: mir::serializer::DecodeError) -> Self {
+        Self::MichelineSerializationError(err.to_string())
+    }
+}
+
+/// Apart from running out of gas, the borrowed unparser only fails on values the
+/// typechecker already rejected: an `operation`, or a sub-value lacking the
+/// property the caller restricted the walk to. Neither can appear in a value
+/// reaching these paths. Map both to a serialization error rather than panicking:
+/// the kernel must not abort on any input, however unreachable.
+impl From<mir::ast::BorrowedUnparseError> for TransferError {
+    fn from(err: mir::ast::BorrowedUnparseError) -> Self {
+        match err {
+            mir::ast::BorrowedUnparseError::OutOfGas => Self::OutOfGas(gas::OutOfGas),
+            mir::ast::BorrowedUnparseError::UnsupportedUnparsing => {
+                Self::MichelineSerializationError(
+                    "value carries an operation, which is not storable".to_string(),
+                )
+            }
+            mir::ast::BorrowedUnparseError::UnsatisfiedProperty(prop) => {
+                Self::MichelineSerializationError(format!(
+                    "value carries a sub-value that is not {prop}"
+                ))
+            }
+        }
+    }
+}
+
+/// The originated storage is unparsed through the borrowed walk, so its
+/// refusals have to land somewhere. Both are unreachable: a storage type is
+/// `Storable`, `operation` is not, and the property the walk is restricted to
+/// was already checked at typecheck time. Map them to a serialization error
+/// rather than panicking, on the same reasoning as the [TransferError] impl
+/// above: the kernel must not abort on any input, however unreachable.
+impl From<mir::ast::BorrowedUnparseError> for OriginationError {
+    fn from(err: mir::ast::BorrowedUnparseError) -> Self {
+        match err {
+            mir::ast::BorrowedUnparseError::OutOfGas => Self::OutOfGas(gas::OutOfGas),
+            mir::ast::BorrowedUnparseError::UnsupportedUnparsing => {
+                Self::MichelineSerializationError(
+                    "value carries an operation, which is not storable".to_string(),
+                )
+            }
+            mir::ast::BorrowedUnparseError::UnsatisfiedProperty(prop) => {
+                Self::MichelineSerializationError(format!(
+                    "value carries a sub-value that is not {prop}"
+                ))
+            }
+        }
+    }
+}
+
+impl From<mir::interpreter::ContractInterpretError<'_>> for TransferError {
+    fn from(err: mir::interpreter::ContractInterpretError) -> Self {
+        use mir::interpreter::{
+            ContractInterpretError, EnshrinedViewDispatchError, InterpretError,
+        };
+        // Peer-runtime brokenness (5xx, gas-budget overflow, dispatch-
+        // request build) reaching MIR via `VIEW staticcall_evm` must
+        // map to the block-abort lane, not collapse onto the generic
+        // operation-failure string — same `CracError::BlockAbort`
+        // outcome the gateway-HTTP classifier produces on the
+        // entrypoint path. `InvalidDestination` is the one caller-
+        // controllable variant and stays on the operation-failure
+        // lane.
+        if let ContractInterpretError::InterpretError(
+            InterpretError::EnshrinedViewDispatch(ref inner),
+        ) = err
+        {
+            if !matches!(inner, EnshrinedViewDispatchError::InvalidDestination { .. }) {
+                return Self::EnshrinedViewDispatchAbort(inner.to_string());
+            }
+        }
+        if let ContractInterpretError::InterpretError(
+            InterpretError::AddressRegistryError(ref inner),
+        ) = err
+        {
+            return Self::AddressRegistryAbort(inner.to_string());
+        }
+        // Running out of gas is reported as such, like on L1, rather than
+        // folded into the interpretation-failure string.
+        if err.is_out_of_gas() {
+            return Self::OutOfGas(gas::OutOfGas);
+        }
+        Self::MichelsonContractInterpretError(mir::bounded_fmt::display_bounded(
+            &err,
+            mir::bounded_fmt::MAX_INTERPRET_ERROR_RENDER_BYTES,
+        ))
+    }
+}
+
+impl From<mir::typechecker::TcError> for TransferError {
+    fn from(err: mir::typechecker::TcError) -> Self {
+        // Bounded like the interpreter sink above: a `TcError` can embed a
+        // `Type` synthesised during typechecking that is a structurally-shared
+        // DAG whose render is far larger than its node count, and the per-type
+        // parse cap does not bound instruction-synthesised types. Building
+        // such a type is gas-bounded (the typechecker's `DUP` walks the
+        // unfolded type), so the render is `O(gas)` rather than unbounded, but
+        // that ceiling is still large enough to cap here.
+        if err.is_out_of_gas() {
+            return Self::OutOfGas(gas::OutOfGas);
+        }
+        Self::MirTypecheckingError(mir::bounded_fmt::display_bounded(
+            &err,
+            mir::bounded_fmt::MAX_INTERPRET_ERROR_RENDER_BYTES,
+        ))
+    }
+}
+
+#[derive(Error, Clone, Debug, PartialEq, Eq)]
+pub enum ApplyOperationError {
+    #[error("Reveal error: {0}")]
+    Reveal(#[from] RevealError),
+    #[error("Transfer error: {0}")]
+    Transfer(#[from] TransferError),
+    #[error("Origination error: {0}")]
+    Origination(#[from] OriginationError),
+    #[error("Smart-Contract emitted an event, which is unsupported: {0}")]
+    UnSupportedEmit(String),
+    #[error("Failed to serialize emit event payload: {0}")]
+    EmitMichelineSerializationError(String),
+    #[error("Set delegate operation is unsupported: {0}")]
+    UnSupportedSetDelegate(String),
+    #[error("Internal operation nonce overflow due to {0}")]
+    InternalOperationNonceOverflow(String),
+    #[error("Cannot pay storage fee: {0}")]
+    CannotPayStorageFee(BalanceTooLow),
+    #[error("Operation quota exceeded")]
+    OperationQuotaExceeded,
+    /// Two internal operations within the same top-level operation
+    /// carried the same MIR operation counter — the identity used to
+    /// enforce internal-operation linearity. `operation` is
+    /// `Duplicable` at the type level, so `DUP` over an `operation`
+    /// value is well-typed, but L1 rejects the duplicated internal
+    /// operation at application time with `Internal_operation_replay`,
+    /// and so do we (L2-1637).
+    #[error("Internal operation replay attempt")]
+    InternalOperationReplay,
+    // This error variant is used to encapsulate errors that were generated in the past and encoded as bson.
+    // It should not be used for new errors, which should be added as new variants to this enum.
+    // This is a temporary solution while waiting for better error support.
+    #[error("")]
+    PastError(Vec<u8>),
+    #[error("Block abort: {0}")]
+    BlockAbort(String),
+    #[error("{0}")]
+    OutOfGas(#[from] gas::OutOfGas),
+}
+
+#[derive(Error, Debug, PartialEq, Eq)]
+pub enum OperationError {
+    #[error("Validation error: {0}")]
+    Validation(#[from] ValidityError),
+    #[error("Runtime error: {0}")]
+    RuntimeError(#[from] RuntimeError),
+    /// A keyspace the operation runs over could not be loaded. Aborts the
+    /// block: the operation is not what is wrong.
+    #[error("Key space error: {0}")]
+    KeySpace(#[from] KeySpaceLoaderError),
+    #[error("Block abort: {0}")]
+    BlockAbort(String),
+}
+
+fn elements_to_bson(elts: &[(&[u8], &[u8])]) -> Vec<u8> {
+    // As per the BSON specification (https://bsonspec.org/spec.html), the BSON
+    // document is made of the concatenation of the following values:
+    //   * its full size encoded on 4 little-endian bytes, including
+    //     the size itself;
+    //   * its concatenated fields (the contents of the document);
+    //   * the byte 0.
+
+    let mut document = vec![];
+    let mut contents = vec![];
+    for (key, value) in elts {
+        // Tag 2 for a field of type string.
+        contents.push(0x02);
+        // The key does not require a size prefix.
+        contents.extend_from_slice(key);
+        // The 0 byte terminates the key.
+        contents.push(0x00);
+        // The value is also suffixed by the 0 byte and contrary to the key it is
+        // prefixed by its size (including the 0 byte, hence the + 1).
+        contents.extend_from_slice(&(value.len() as u32 + 1).to_le_bytes());
+        contents.extend_from_slice(value);
+        contents.push(0x00);
+    }
+
+    // The size here is the size of the whole document, including the trailing 0
+    // byte and the 4 bytes used to represent the size itself (hence the + 5).
+    document.extend_from_slice(&(contents.len() as u32 + 5).to_le_bytes());
+    document.extend_from_slice(&contents);
+    document.push(0x00);
+    document
+}
+
+// In Tezos data encoding, errors are encoded as bson (binary json). Unfortunately,
+// we cannot use the rust binary json crate to produce compatible bson data because
+// this crate uses Float pointer instructions (which is incompatible with the PVM).
+// To avoid reimplementing full bson support, we restrict the encoding of errors
+// to flat bson objects whose fields are all strings.
+//
+// An error that has an L1 counterpart taking only string fields is encoded as L1
+// encodes it: `{ "kind": <kind>, "id": "proto.<protocol>.<id>", <fields> }`,
+// with the fields in the order L1 registers them. The node decodes such errors as
+// the corresponding protocol errors, and wallets and indexers recognise them.
+//
+// An error without such a counterpart is encoded as
+// `{ "kind": <kind>, "id": "proto.<protocol>.tezosx_internal.<id>",
+//    "error_message": <message> }`, where the kind is temporary unless
+// retrying cannot help.
+//
+// TODO: https://linear.app/tezos/issue/L2-363/l1tzkt-compatible-errors
+// Encode the Michelson script failures (`michelson_v1.script_rejected`, ...)
+// as L1 does, which needs non-string bson fields.
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum ErrorKind {
+    Temporary,
+    Branch,
+    Permanent,
+}
+
+impl ErrorKind {
+    fn as_str(self) -> &'static str {
+        match self {
+            ErrorKind::Temporary => "temporary",
+            ErrorKind::Branch => "branch",
+            ErrorKind::Permanent => "permanent",
+        }
+    }
+}
+
+/// The id of an error, without the `proto.<protocol>.` prefix.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum ErrorId {
+    /// The id of an L1 error.
+    L1(&'static str),
+    /// The id of an error without L1 counterpart, under `tezosx_internal.`,
+    /// which is not a stable API.
+    TezosxInternal(&'static str),
+}
+
+/// An error in the shape L1 encodes it.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct L1Error {
+    pub kind: ErrorKind,
+    pub id: ErrorId,
+    /// The fields, in the order L1 encodes them.
+    pub fields: Vec<(&'static str, String)>,
+}
+
+impl L1Error {
+    fn new(
+        kind: ErrorKind,
+        id: &'static str,
+        fields: Vec<(&'static str, String)>,
+    ) -> Self {
+        Self {
+            kind,
+            id: ErrorId::L1(id),
+            fields,
+        }
+    }
+
+    /// An error without L1 counterpart, of `kind`: temporary unless retrying
+    /// cannot help, as for its closest L1 counterparts.
+    fn tezosx_internal(
+        kind: ErrorKind,
+        id: &'static str,
+        error: &impl std::fmt::Display,
+    ) -> Self {
+        Self {
+            kind,
+            id: ErrorId::TezosxInternal(id),
+            fields: vec![("error_message", error.to_string())],
+        }
+    }
+
+    fn balance_too_low(error: &BalanceTooLow) -> Self {
+        Self::new(
+            ErrorKind::Temporary,
+            "contract.balance_too_low",
+            vec![
+                ("contract", error.contract.to_string()),
+                ("balance", error.balance.0.to_string()),
+                ("amount", error.amount.0.to_string()),
+            ],
+        )
+    }
+
+    fn gas_exhausted() -> Self {
+        Self::new(ErrorKind::Temporary, "gas_exhausted.operation", vec![])
+    }
+
+    fn to_bson(&self) -> Vec<u8> {
+        let prefix = TARGET_TEZOS_PROTOCOL.error_prefix();
+        let id = match self.id {
+            ErrorId::L1(id) => format!("proto.{prefix}.{id}"),
+            ErrorId::TezosxInternal(id) => {
+                format!("proto.{prefix}.tezosx_internal.{id}")
+            }
+        };
+        let mut elements: Vec<(&[u8], &[u8])> = Vec::with_capacity(2 + self.fields.len());
+        elements.push((b"kind", self.kind.as_str().as_bytes()));
+        elements.push((b"id", id.as_bytes()));
+        for (key, value) in &self.fields {
+            elements.push((key.as_bytes(), value.as_bytes()));
+        }
+        elements_to_bson(&elements)
+    }
+}
+
+impl RevealError {
+    pub fn to_l1_error(&self) -> L1Error {
+        use ErrorKind::*;
+        match self {
+            RevealError::PreviouslyRevealedKey(contract) => L1Error::new(
+                Branch,
+                "contract.previously_revealed_key",
+                vec![("contract", contract.to_string())],
+            ),
+            RevealError::InconsistentPublicKey {
+                public_key,
+                expected_hash,
+                computed_hash,
+            } => L1Error::new(
+                Permanent,
+                "contract.manager.inconsistent_hash",
+                vec![
+                    ("public_key", public_key.to_string()),
+                    ("expected_hash", expected_hash.to_string()),
+                    ("provided_hash", computed_hash.to_string()),
+                ],
+            ),
+            RevealError::OutOfGas => L1Error::gas_exhausted(),
+            RevealError::InconsistentHash {
+                public_key,
+                expected_hash,
+                source_hash,
+            } => L1Error::new(
+                Permanent,
+                "contract.manager.inconsistent_hash",
+                vec![
+                    ("public_key", public_key.to_string()),
+                    ("expected_hash", expected_hash.to_string()),
+                    ("provided_hash", source_hash.to_string()),
+                ],
+            ),
+            RevealError::UnretrievableManager => L1Error::tezosx_internal(
+                ErrorKind::Temporary,
+                "reveal.unretrievable_manager",
+                self,
+            ),
+            RevealError::FailedToWriteManager => L1Error::tezosx_internal(
+                ErrorKind::Temporary,
+                "reveal.failed_to_write_manager",
+                self,
+            ),
+        }
+    }
+}
+
+impl TransferError {
+    pub fn to_l1_error(&self) -> L1Error {
+        use ErrorKind::*;
+        let fallback = |kind, id| L1Error::tezosx_internal(kind, id, self);
+        match self {
+            TransferError::BalanceTooLow(error) => L1Error::balance_too_low(error),
+            TransferError::NoSuchEntrypoint(entrypoint) => L1Error::new(
+                Permanent,
+                "michelson_v1.no_such_entrypoint",
+                vec![("entrypoint", entrypoint.to_string())],
+            ),
+            TransferError::BadContractParameter(contract) => L1Error::new(
+                Permanent,
+                "michelson_v1.bad_contract_parameter",
+                vec![("contract", contract.to_string())],
+            ),
+            TransferError::EmptyImplicitTransfer(contract) => L1Error::new(
+                Branch,
+                "contract.empty_transaction",
+                vec![("contract", contract.to_string())],
+            ),
+            TransferError::ContractDoesNotExist(contract) => L1Error::new(
+                Temporary,
+                "contract.non_existing_contract",
+                vec![("contract", contract.to_string())],
+            ),
+            TransferError::OutOfGas(_) => L1Error::gas_exhausted(),
+            TransferError::UnspendableContract(_) => {
+                fallback(ErrorKind::Permanent, "transfer.unspendable_contract")
+            }
+            TransferError::MichelineSerializationError(_) => fallback(
+                ErrorKind::Permanent,
+                "transfer.micheline_serialization_error",
+            ),
+            TransferError::MichelsonContractInterpretError(_) => fallback(
+                ErrorKind::Temporary,
+                "transfer.michelson_contract_interpret_error",
+            ),
+            TransferError::MirTypecheckingError(_) => {
+                fallback(ErrorKind::Permanent, "transfer.mir_typechecking_error")
+            }
+            TransferError::FailedToAllocateDestination => fallback(
+                ErrorKind::Temporary,
+                "transfer.failed_to_allocate_destination",
+            ),
+            TransferError::FailedToComputeBalanceUpdate(_) => fallback(
+                ErrorKind::Temporary,
+                "transfer.failed_to_compute_balance_update",
+            ),
+            TransferError::FailedToApplyBalanceChanges => fallback(
+                ErrorKind::Temporary,
+                "transfer.failed_to_apply_balance_changes",
+            ),
+            TransferError::FailedToFetchDestinationAccount => fallback(
+                ErrorKind::Temporary,
+                "transfer.failed_to_fetch_destination_account",
+            ),
+            TransferError::FailedToFetchContractCode => fallback(
+                ErrorKind::Temporary,
+                "transfer.failed_to_fetch_contract_code",
+            ),
+            TransferError::FailedToFetchContractStorage => fallback(
+                ErrorKind::Temporary,
+                "transfer.failed_to_fetch_contract_storage",
+            ),
+            TransferError::FailedToFetchDestinationBalance => fallback(
+                ErrorKind::Temporary,
+                "transfer.failed_to_fetch_destination_balance",
+            ),
+            TransferError::FailedToFetchSenderBalance => fallback(
+                ErrorKind::Temporary,
+                "transfer.failed_to_fetch_sender_balance",
+            ),
+            TransferError::FailedToUpdateContractStorage => fallback(
+                ErrorKind::Temporary,
+                "transfer.failed_to_update_contract_storage",
+            ),
+            TransferError::FailedToUpdateDestinationBalance => fallback(
+                ErrorKind::Temporary,
+                "transfer.failed_to_update_destination_balance",
+            ),
+            TransferError::MirAddressUnsupportedError => fallback(
+                ErrorKind::Permanent,
+                "transfer.mir_address_unsupported_error",
+            ),
+            TransferError::FailedToExecuteInternalOperation(_) => fallback(
+                ErrorKind::Temporary,
+                "transfer.failed_to_execute_internal_operation",
+            ),
+            TransferError::MirAmountToNarithError(_) => {
+                fallback(ErrorKind::Temporary, "transfer.mir_amount_to_narith_error")
+            }
+            TransferError::MirNarithToAmountError(_) => {
+                fallback(ErrorKind::Temporary, "transfer.mir_narith_to_amount_error")
+            }
+            TransferError::StorageFeesConversion(_) => {
+                fallback(ErrorKind::Temporary, "transfer.storage_fees_conversion")
+            }
+            TransferError::DepositError(_) => {
+                fallback(ErrorKind::Temporary, "transfer.deposit_error")
+            }
+            TransferError::GatewayError(_) => {
+                fallback(ErrorKind::Temporary, "transfer.gateway_error")
+            }
+            TransferError::EnshrinedViewDispatchAbort(_) => fallback(
+                ErrorKind::Temporary,
+                "transfer.enshrined_view_dispatch_abort",
+            ),
+            TransferError::AddressRegistryAbort(_) => {
+                fallback(ErrorKind::Temporary, "transfer.address_registry_abort")
+            }
+        }
+    }
+
+    /// Number of bytes this error takes in a receipt, once wrapped in an
+    /// [ApplyOperationError::Transfer].
+    pub fn persisted_len(&self) -> usize {
+        persisted_len(&[Cow::Owned(self.to_l1_error().to_bson())])
+    }
+}
+
+impl OriginationError {
+    pub fn to_l1_error(&self) -> L1Error {
+        let fallback = |kind, id| L1Error::tezosx_internal(kind, id, self);
+        match self {
+            OriginationError::BalanceTooLow(error) => L1Error::balance_too_low(error),
+            OriginationError::OutOfGas(_) => L1Error::gas_exhausted(),
+            OriginationError::FailedToFetchSourceAccount => fallback(
+                ErrorKind::Temporary,
+                "origination.failed_to_fetch_source_account",
+            ),
+            OriginationError::FailedToFetchOriginated => fallback(
+                ErrorKind::Temporary,
+                "origination.failed_to_fetch_originated",
+            ),
+            OriginationError::FailedToComputeBalanceUpdate(_) => fallback(
+                ErrorKind::Temporary,
+                "origination.failed_to_compute_balance_update",
+            ),
+            OriginationError::FailedToApplyBalanceUpdate => fallback(
+                ErrorKind::Temporary,
+                "origination.failed_to_apply_balance_update",
+            ),
+            OriginationError::CantInitContract => {
+                fallback(ErrorKind::Temporary, "origination.cant_init_contract")
+            }
+            OriginationError::CantOriginateEmptyContract => fallback(
+                ErrorKind::Permanent,
+                "origination.cant_originate_empty_contract",
+            ),
+            OriginationError::MirBigMapAllocation(_) => {
+                fallback(ErrorKind::Temporary, "origination.mir_big_map_allocation")
+            }
+            OriginationError::MirTypecheckingError(_) => {
+                fallback(ErrorKind::Permanent, "origination.mir_typechecking_error")
+            }
+            OriginationError::ScriptTooLarge(_) => {
+                fallback(ErrorKind::Permanent, "origination.script_too_large")
+            }
+            OriginationError::MichelineSerializationError(_) => fallback(
+                ErrorKind::Permanent,
+                "origination.micheline_serialization_error",
+            ),
+        }
+    }
+}
+
+impl ApplyOperationError {
+    /// The bson objects this error is encoded as. Most errors are encoded as
+    /// one object, but, as on L1, failing to pay a storage fee is reported
+    /// with the cause.
+    fn bson_objects(&self) -> Vec<Cow<'_, [u8]>> {
+        let l1_errors = match self {
+            ApplyOperationError::PastError(bytes) => return vec![Cow::Borrowed(bytes)],
+            ApplyOperationError::Reveal(error) => vec![error.to_l1_error()],
+            ApplyOperationError::Transfer(error) => vec![error.to_l1_error()],
+            ApplyOperationError::Origination(error) => vec![error.to_l1_error()],
+            ApplyOperationError::CannotPayStorageFee(error) => vec![
+                L1Error::new(
+                    ErrorKind::Temporary,
+                    "contract.cannot_pay_storage_fee",
+                    vec![],
+                ),
+                L1Error::balance_too_low(error),
+            ],
+            ApplyOperationError::OperationQuotaExceeded => vec![L1Error::new(
+                ErrorKind::Temporary,
+                "storage_exhausted.operation",
+                vec![],
+            )],
+            ApplyOperationError::OutOfGas(_) => vec![L1Error::gas_exhausted()],
+            ApplyOperationError::UnSupportedEmit(_) => vec![L1Error::tezosx_internal(
+                ErrorKind::Permanent,
+                "unsupported_emit",
+                self,
+            )],
+            ApplyOperationError::EmitMichelineSerializationError(_) => {
+                vec![L1Error::tezosx_internal(
+                    ErrorKind::Permanent,
+                    "emit_micheline_serialization_error",
+                    self,
+                )]
+            }
+            ApplyOperationError::UnSupportedSetDelegate(_) => {
+                vec![L1Error::tezosx_internal(
+                    ErrorKind::Permanent,
+                    "unsupported_set_delegate",
+                    self,
+                )]
+            }
+            ApplyOperationError::InternalOperationNonceOverflow(_) => {
+                vec![L1Error::tezosx_internal(
+                    ErrorKind::Permanent,
+                    "internal_operation_nonce_overflow",
+                    self,
+                )]
+            }
+            ApplyOperationError::InternalOperationReplay => {
+                vec![L1Error::tezosx_internal(
+                    ErrorKind::Permanent,
+                    "internal_operation_replay",
+                    self,
+                )]
+            }
+            ApplyOperationError::BlockAbort(_) => vec![L1Error::tezosx_internal(
+                ErrorKind::Temporary,
+                "block_abort",
+                self,
+            )],
+        };
+        l1_errors
+            .iter()
+            .map(|error| Cow::Owned(error.to_bson()))
+            .collect()
+    }
+
+    /// Number of bytes this error takes in a receipt.
+    pub fn persisted_len(&self) -> usize {
+        persisted_len(&self.bson_objects())
+    }
+}
+
+/// Size of the prefix giving the length of each bson object.
+const BSON_OBJECT_SIZE_PREFIX_LEN: usize = 4;
+
+fn persisted_len(objects: &[Cow<'_, [u8]>]) -> usize {
+    objects
+        .iter()
+        .map(|object| BSON_OBJECT_SIZE_PREFIX_LEN + object.len())
+        .sum()
+}
+
+// An [ApplyOperationError] is written as one or several elements of the list
+// of errors: each bson object is an element.
+impl BinWriter for ApplyOperationError {
+    fn bin_write(&self, output: &mut Vec<u8>) -> tezos_enc::BinResult {
+        for object in self.bson_objects() {
+            tezos_enc::dynamic(|object: &[u8], out: &mut Vec<u8>| {
+                tezos_enc::bytes(object, out)
+            })(&object, output)?;
+        }
+        Ok(())
+    }
+}
+
+// Errors are not decoded: each bson object is kept as a PastError with its raw
+// bytes, which re-encodes it identically.
+impl NomReader<'_> for ApplyOperationError {
+    fn nom_read(input: &'_ [u8]) -> tezos_nom::NomResult<'_, Self> {
+        tezos_nom::dynamic(|bytes| {
+            Ok((&[], ApplyOperationError::PastError(bytes.to_vec())))
+        })(input)
+    }
+}
+
+// As we're encoding the OperationError with a single String, the NomReader function is broken.
+// This is not an issue TODO: https://linear.app/tezos/issue/L2-834/errors-are-dropped-in-tezos-blocks
+impl NomReader<'_> for OperationError {
+    fn nom_read(input: &'_ [u8]) -> tezos_nom::NomResult<'_, Self> {
+        Err(nom::Err::Error(DecodeError::from_error_kind(
+            input,
+            nom::error::ErrorKind::Fail,
+        )))
+    }
+}
+
+pub trait HasConsumedMilligas {
+    fn consumed_milligas(&self) -> &Narith;
+}
+
+/// Saturating conversion of a milligas amount into a [U256]. Milligas counters
+/// are bounded by the operation gas limit, orders of magnitude below
+/// [U256::MAX], so the saturation is unreachable in practice.
+fn milligas_to_u256(milligas: &Narith) -> U256 {
+    let bytes = milligas.0.to_bytes_be();
+    if bytes.len() <= 32 {
+        U256::from_big_endian(&bytes)
+    } else {
+        U256::MAX
+    }
+}
+
+pub trait OperationKind {
+    type Success: PartialEq
+        + Eq
+        + Clone
+        + Debug
+        + BinWriter
+        + for<'a> NomReader<'a>
+        + HasConsumedMilligas;
+}
+
+impl OperationKind for TransferContent {
+    type Success = TransferTarget;
+}
+impl OperationKind for RevealContent {
+    type Success = RevealSuccess;
+}
+
+impl OperationKind for OriginationContent {
+    type Success = OriginationSuccess;
+}
+
+impl OperationKind for EventContent {
+    type Success = EventSuccess;
+}
+
+// Inspired from `src/proto_alpha/lib_protocol/apply_results.ml` : transaction_contract_variant_cases
+#[derive(PartialEq, Debug, Clone, NomReader, BinWriter, Eq)]
+pub enum TransferTarget {
+    ToContract(TransferSuccess),
+}
+
+impl From<TransferSuccess> for TransferTarget {
+    fn from(value: TransferSuccess) -> Self {
+        TransferTarget::ToContract(value)
+    }
+}
+
+impl From<TransferTarget> for TransferSuccess {
+    fn from(value: TransferTarget) -> Self {
+        match value {
+            TransferTarget::ToContract(success) => success,
+        }
+    }
+}
+
+#[derive(PartialEq, Debug, Clone, NomReader, BinWriter, Eq)]
+pub struct RevealSuccess {
+    pub consumed_milligas: Narith,
+}
+
+impl HasConsumedMilligas for RevealSuccess {
+    fn consumed_milligas(&self) -> &Narith {
+        &self.consumed_milligas
+    }
+}
+
+// PlaceHolder Type for temporary unused fields
+#[derive(PartialEq, Debug, Eq)]
+pub struct Empty;
+
+impl BinWriter for Empty {
+    fn bin_write(&self, _: &mut Vec<u8>) -> tezos_enc::BinResult {
+        Ok(())
+    }
+}
+
+impl NomReader<'_> for Empty {
+    fn nom_read(input: &'_ [u8]) -> tezos_nom::NomResult<'_, Self> {
+        Ok((input, Self))
+    }
+}
+
+// alpha.contract_id.originated (22 bytes, 8-bit tag)
+// **************************************************
+//
+// Originated (tag 1)
+// ==================
+//
+// +---------------+----------+------------------------+
+// | Name          | Size     | Contents               |
+// +===============+==========+========================+
+// | Tag           | 1 byte   | unsigned 8-bit integer |
+// +---------------+----------+------------------------+
+// | Contract_hash | 20 bytes | bytes                  |
+// +---------------+----------+------------------------+
+// | padding       | 1 byte   | padding                |
+// +---------------+----------+------------------------+
+//
+// The encoding of the alpha.contract_id.originated type is the same as
+// the one implemented in the kernel_sdk Contract. However, this type
+// cannot be an implicit account. Therefore, we created a new type that
+// only holds a KT1. The new type reuses the existing functions.
+#[derive(PartialEq, Debug, Clone, Eq)]
+pub struct Originated {
+    pub contract: ContractKt1Hash,
+}
+
+impl BinWriter for Originated {
+    fn bin_write(&self, output: &mut Vec<u8>) -> tezos_enc::BinResult {
+        let contract = Contract::Originated(self.contract.clone());
+        contract.bin_write(output)
+    }
+}
+
+impl NomReader<'_> for Originated {
+    fn nom_read(input: &'_ [u8]) -> tezos_nom::NomResult<'_, Self> {
+        let (input, contract) = Contract::nom_read(input)?;
+        match contract {
+            Contract::Originated(kt1h) => Ok((input, Originated { contract: kt1h })),
+            Contract::Implicit(_) => Err(nom::Err::Error(DecodeError::from_error_kind(
+                input,
+                nom::error::ErrorKind::Fail,
+            ))),
+        }
+    }
+}
+
+// Inspired of src/proto_023_PtSeouLo/lib_protocol/apply_internal_result.mli
+#[derive(PartialEq, Debug, Clone, BinWriter, NomReader, Eq)]
+pub struct OriginationSuccess {
+    #[encoding(dynamic, list)]
+    pub balance_updates: Vec<BalanceUpdate>,
+    #[encoding(dynamic, list)]
+    pub originated_contracts: Vec<Originated>,
+    pub consumed_milligas: Narith,
+    pub storage_size: Zarith,
+    pub paid_storage_size_diff: Zarith,
+    pub lazy_storage_diff: Option<LazyStorageDiffList>,
+}
+
+impl HasConsumedMilligas for OriginationSuccess {
+    fn consumed_milligas(&self) -> &Narith {
+        &self.consumed_milligas
+    }
+}
+
+#[derive(PartialEq, Debug, Clone, BinWriter, NomReader, Eq)]
+pub struct AddressRegistry {
+    pub address: Contract,
+    pub index: Zarith,
+}
+
+#[derive(PartialEq, Debug, Clone, BinWriter, NomReader, Eq)]
+pub struct TransferSuccess {
+    pub storage: Option<MichelineExpr>,
+    #[encoding(dynamic, list)]
+    pub balance_updates: Vec<BalanceUpdate>,
+    #[encoding(dynamic, bytes)]
+    pub ticket_receipt: Vec<u8>,
+    #[encoding(dynamic, bytes)]
+    pub originated_contracts: Vec<u8>,
+    pub consumed_milligas: Narith,
+    pub storage_size: Zarith,
+    pub paid_storage_size_diff: Zarith,
+    pub allocated_destination_contract: bool,
+    pub lazy_storage_diff: Option<LazyStorageDiffList>,
+    #[encoding(dynamic, list)]
+    pub address_registry_diff: Vec<AddressRegistry>,
+}
+
+impl HasConsumedMilligas for TransferSuccess {
+    fn consumed_milligas(&self) -> &Narith {
+        &self.consumed_milligas
+    }
+}
+
+impl HasConsumedMilligas for TransferTarget {
+    fn consumed_milligas(&self) -> &Narith {
+        let TransferTarget::ToContract(success) = self;
+        &success.consumed_milligas
+    }
+}
+
+#[derive(PartialEq, Debug, Clone, BinWriter, NomReader, Eq)]
+pub struct EventSuccess {
+    pub consumed_milligas: Narith,
+}
+
+impl HasConsumedMilligas for EventSuccess {
+    fn consumed_milligas(&self) -> &Narith {
+        &self.consumed_milligas
+    }
+}
+
+impl Default for TransferSuccess {
+    fn default() -> Self {
+        Self {
+            storage: None,
+            balance_updates: vec![],
+            ticket_receipt: vec![],
+            originated_contracts: vec![],
+            consumed_milligas: 0.into(),
+            storage_size: 0.into(),
+            paid_storage_size_diff: 0.into(),
+            allocated_destination_contract: false,
+            lazy_storage_diff: None,
+            address_registry_diff: vec![],
+        }
+    }
+}
+
+// An operation error in a Tezos receipt has no specific format
+// It should just be encoded as a JSON, so we can't derive
+// NomReader and BinWriter if we want to be Tezos compatible
+#[derive(PartialEq, Debug, Clone, BinWriter, NomReader, Eq)]
+pub struct ApplyOperationErrors {
+    #[encoding(dynamic, list)]
+    pub errors: Vec<ApplyOperationError>,
+}
+
+impl From<Vec<ApplyOperationError>> for ApplyOperationErrors {
+    fn from(value: Vec<ApplyOperationError>) -> Self {
+        ApplyOperationErrors { errors: value }
+    }
+}
+
+impl From<ApplyOperationError> for ApplyOperationErrors {
+    fn from(value: ApplyOperationError) -> Self {
+        ApplyOperationErrors {
+            errors: vec![value],
+        }
+    }
+}
+
+// Inspired from `operation_result` in `src/proto_alpha/lib_protocol/apply_operation_result.ml`
+// Still need to implement Backtracked and Skipped
+#[derive(PartialEq, Debug, Clone, BinWriter, NomReader, Eq)]
+pub enum ContentResult<M: OperationKind> {
+    Applied(M::Success),
+    Failed(ApplyOperationErrors),
+    Skipped,
+    BackTracked(BacktrackedResult<M>),
+}
+
+#[derive(PartialEq, Debug, Clone, BinWriter, NomReader, Eq)]
+pub struct BacktrackedResult<M: OperationKind> {
+    pub errors: Option<ApplyOperationErrors>,
+    pub result: M::Success,
+}
+
+impl<M: OperationKind> ContentResult<M> {
+    /// Milligas consumed by this content result. `Failed` and `Skipped`
+    /// consumed nothing; a `BackTracked` one keeps the gas burnt before the
+    /// revert, as L1 does.
+    pub fn consumed_milligas(&self) -> U256 {
+        match self {
+            ContentResult::Applied(success) => {
+                milligas_to_u256(success.consumed_milligas())
+            }
+            ContentResult::BackTracked(backtracked) => {
+                milligas_to_u256(backtracked.result.consumed_milligas())
+            }
+            ContentResult::Failed(_) | ContentResult::Skipped => U256::zero(),
+        }
+    }
+
+    pub fn backtrack_if_applied(&mut self) {
+        if let ContentResult::Applied(_) = self {
+            // Lowkey optimisation: takes the ownership of the content result by replacing
+            // the result with Skipped as a place holder
+            let current_content_result = std::mem::replace(self, ContentResult::Skipped);
+            if let ContentResult::Applied(success) = current_content_result {
+                *self = ContentResult::BackTracked(BacktrackedResult {
+                    errors: None,
+                    result: success,
+                });
+            }
+        }
+    }
+
+    /// Demotes a top-level `Applied` to `BackTracked` carrying the
+    /// supplied error trace. No-op on a non-Applied content result.
+    pub fn backtrack_if_applied_with_errors(&mut self, errors: ApplyOperationErrors) {
+        if let ContentResult::Applied(_) = self {
+            let current_content_result = std::mem::replace(self, ContentResult::Skipped);
+            if let ContentResult::Applied(success) = current_content_result {
+                *self = ContentResult::BackTracked(BacktrackedResult {
+                    errors: Some(errors),
+                    result: success,
+                });
+            }
+        }
+    }
+}
+
+/// A [Balance] updates can be triggered on different target
+/// inspired from src/proto_alpha/lib_protocol/receipt_repr.ml
+#[derive(PartialEq, Debug, Clone, NomReader, BinWriter, Eq)]
+#[encoding(tags = "u8")]
+pub enum Balance {
+    #[encoding(tag = 0)]
+    Account(Contract),
+    // Don't know why but in balance_and_update in receipt_repr.ml,
+    // the tag 1 doesn't exist
+    #[encoding(tag = 2)]
+    BlockFees,
+    #[encoding(tag = 11)]
+    StorageFees,
+}
+
+/// Inspired from update_origin_encoding src/proto_alpha/lib_protocol/receipt_repr.ml
+#[derive(PartialEq, Debug, Clone, NomReader, BinWriter, Eq)]
+pub enum UpdateOrigin {
+    BlockApplication,
+}
+
+/// Depending of the sign of [changes], the balance is credited or debited
+/// Inspired from balance_updates_encoding src/proto_alpha/lib_protocol/receipt_repr.ml
+#[derive(PartialEq, Debug, Clone, NomReader, BinWriter, Eq)]
+pub struct BalanceUpdate {
+    pub balance: Balance,
+    pub changes: i64,
+    pub update_origin: UpdateOrigin,
+}
+
+// Inspired from `Manager_operation_result` case in 'kind contents_result type
+// from `src/proto_alpha/lib_protocol/apply_results.ml` file.
+// Still need to implement internal_results
+#[derive(PartialEq, Debug, NomReader, BinWriter, Eq)]
+pub struct OperationResult<M: OperationKind> {
+    #[encoding(dynamic, list)]
+    pub balance_updates: Vec<BalanceUpdate>,
+    pub result: ContentResult<M>,
+    #[encoding(dynamic, list)]
+    pub internal_operation_results: Vec<InternalOperationSum>,
+}
+
+impl<M: OperationKind> OperationResult<M> {
+    /// Milligas consumed by the operation itself plus every internal
+    /// operation it triggered.
+    pub fn consumed_milligas(&self) -> U256 {
+        self.internal_operation_results
+            .iter()
+            .fold(self.result.consumed_milligas(), |acc, internal| {
+                acc.saturating_add(internal.consumed_milligas())
+            })
+    }
+}
+
+#[derive(PartialEq, Debug, Clone, BinWriter, NomReader, Eq)]
+pub struct InternalContentWithMetadata<M: OperationKind> {
+    pub sender: Contract,
+    pub nonce: u16,
+    pub content: M,
+    pub result: ContentResult<M>,
+}
+
+// Unlike transfers and originations, there is no event kind in Tezos external operations.
+// This structure is only used to build the
+// `InternalOperationSum::Event` receipt, so it is intentionally *not* added to
+// `sdk/rust/protocol/src/operation.rs`.
+//
+// Field mapping / encoding notes (Rust/MIR/OCaml):
+// - `ty` is `Or<Type, Vec<u8>>` in MIR, and ends up as a Micheline-encoded `Script.expr` in OCaml.
+// - `tag` corresponds to `Option<FieldAnnotation<'a>>` in MIR and `Entrypoint.t` in OCaml. We keep
+//   it as an `Option` because it is encoded as an `opt` on the OCaml side; when absent on decode,
+//   OCaml uses `Entrypoint.is_default`.
+// - `payload` corresponds to `TypedValue<'a>` in MIR and a Micheline-encoded `Script.expr` in OCaml.
+//   We keep it as an `Option` because it is encoded as an `opt` on the OCaml side; when absent on
+//   decode, OCaml uses `Script_repr.unit`.
+//
+// See: `Event` case in `internal_operation_contents` type and `event_case` value
+// in `src/proto_alpha/lib_protocol/apply_internal_results.ml`.
+pub use mir::serializer::MichelineExpr;
+
+/// Event internal operation content.
+///
+/// Binary layout (matching OCaml `event_case` in `apply_internal_results.ml`):
+///   [type: MichelineExpr] [tag: optional(Entrypoint)] [payload: optional(MichelineExpr)]
+#[derive(PartialEq, Debug, Clone, BinWriter, NomReader, Eq)]
+pub struct EventContent {
+    pub ty: MichelineExpr,
+    pub tag: Option<Entrypoint>,
+    pub payload: Option<MichelineExpr>,
+}
+
+#[derive(PartialEq, Debug, Clone, NomReader, BinWriter, Eq)]
+pub enum InternalOperationSum {
+    #[encoding(tag = 1)]
+    Transfer(InternalContentWithMetadata<TransferContent>),
+    #[encoding(tag = 2)]
+    Origination(InternalContentWithMetadata<OriginationContent>),
+    #[encoding(tag = 4)] // tag 3 is for delegation on L1
+    Event(InternalContentWithMetadata<EventContent>),
+}
+
+impl BalanceUpdate {
+    pub fn transfer(sender: Contract, destination: Contract, amount: u64) -> Vec<Self> {
+        let sender = Balance::Account(sender);
+        let destination = Balance::Account(destination);
+
+        let sender_update = Self {
+            balance: sender,
+            changes: -(amount as i64),
+            update_origin: UpdateOrigin::BlockApplication,
+        };
+        let destination_update = Self {
+            balance: destination,
+            changes: amount as i64,
+            update_origin: UpdateOrigin::BlockApplication,
+        };
+        vec![sender_update, destination_update]
+    }
+}
+
+impl InternalOperationSum {
+    /// Milligas consumed by this internal operation.
+    pub fn consumed_milligas(&self) -> U256 {
+        match self {
+            InternalOperationSum::Transfer(op_res) => op_res.result.consumed_milligas(),
+            InternalOperationSum::Origination(op_res) => {
+                op_res.result.consumed_milligas()
+            }
+            InternalOperationSum::Event(op_res) => op_res.result.consumed_milligas(),
+        }
+    }
+
+    pub fn transform_result_backtrack(&mut self) {
+        match self {
+            InternalOperationSum::Transfer(op_res) => {
+                op_res.result.backtrack_if_applied();
+            }
+            InternalOperationSum::Origination(op_res) => {
+                op_res.result.backtrack_if_applied();
+            }
+            InternalOperationSum::Event(op_res) => {
+                op_res.result.backtrack_if_applied();
+            }
+        }
+    }
+    pub fn is_applied(&self) -> bool {
+        match self {
+            InternalOperationSum::Transfer(op_res) => {
+                matches!(op_res.result, ContentResult::Applied(_))
+            }
+            InternalOperationSum::Origination(op_res) => {
+                matches!(op_res.result, ContentResult::Applied(_))
+            }
+            InternalOperationSum::Event(op_res) => {
+                matches!(op_res.result, ContentResult::Applied(_))
+            }
+        }
+    }
+    pub fn set_nonce(&mut self, nonce: u16) {
+        match self {
+            Self::Transfer(inner) => inner.nonce = nonce,
+            Self::Origination(inner) => inner.nonce = nonce,
+            Self::Event(inner) => inner.nonce = nonce,
+        }
+    }
+}
+
+#[derive(PartialEq, Debug, Eq)]
+pub enum OperationResultSum {
+    Reveal(OperationResult<RevealContent>),
+    Transfer(OperationResult<TransferContent>),
+    Origination(OperationResult<OriginationContent>),
+}
+
+impl OperationResultSum {
+    /// Milligas consumed by the operation, internal operations included.
+    pub fn consumed_milligas(&self) -> U256 {
+        match self {
+            OperationResultSum::Reveal(op_res) => op_res.consumed_milligas(),
+            OperationResultSum::Transfer(op_res) => op_res.consumed_milligas(),
+            OperationResultSum::Origination(op_res) => op_res.consumed_milligas(),
+        }
+    }
+
+    pub fn is_applied(&self) -> bool {
+        match self {
+            OperationResultSum::Reveal(op_res) => {
+                matches!(op_res.result, ContentResult::Applied(_))
+            }
+            OperationResultSum::Transfer(op_res) => {
+                matches!(op_res.result, ContentResult::Applied(_))
+            }
+            OperationResultSum::Origination(op_res) => {
+                matches!(op_res.result, ContentResult::Applied(_))
+            }
+        }
+    }
+
+    pub fn push_balance_update(&mut self, update: BalanceUpdate) {
+        match self {
+            OperationResultSum::Reveal(r) => r.balance_updates.push(update),
+            OperationResultSum::Transfer(r) => r.balance_updates.push(update),
+            OperationResultSum::Origination(r) => r.balance_updates.push(update),
+        };
+    }
+
+    pub fn transform_result_backtrack(&mut self) {
+        match self {
+            OperationResultSum::Transfer(op_result) => {
+                op_result.result.backtrack_if_applied();
+                op_result
+                    .internal_operation_results
+                    .iter_mut()
+                    .for_each(InternalOperationSum::transform_result_backtrack);
+            }
+            OperationResultSum::Reveal(op_result) => {
+                op_result.result.backtrack_if_applied();
+                op_result
+                    .internal_operation_results
+                    .iter_mut()
+                    .for_each(InternalOperationSum::transform_result_backtrack);
+            }
+            OperationResultSum::Origination(op_result) => {
+                op_result.result.backtrack_if_applied();
+                op_result
+                    .internal_operation_results
+                    .iter_mut()
+                    .for_each(InternalOperationSum::transform_result_backtrack);
+            }
+        }
+    }
+
+    /// Demotes the top-level `ContentResult::Applied` to `BackTracked`
+    /// carrying the supplied error trace, and cascade-demotes every
+    /// entry of `internal_operation_results`. No-op when the
+    /// top-level is already non-Applied.
+    pub fn transform_applied_into_backtracked_with_errors(
+        &mut self,
+        errors: ApplyOperationErrors,
+    ) {
+        match self {
+            OperationResultSum::Transfer(op_result) => {
+                op_result.result.backtrack_if_applied_with_errors(errors);
+                op_result
+                    .internal_operation_results
+                    .iter_mut()
+                    .for_each(InternalOperationSum::transform_result_backtrack);
+            }
+            OperationResultSum::Reveal(op_result) => {
+                op_result.result.backtrack_if_applied_with_errors(errors);
+                op_result
+                    .internal_operation_results
+                    .iter_mut()
+                    .for_each(InternalOperationSum::transform_result_backtrack);
+            }
+            OperationResultSum::Origination(op_result) => {
+                op_result.result.backtrack_if_applied_with_errors(errors);
+                op_result
+                    .internal_operation_results
+                    .iter_mut()
+                    .for_each(InternalOperationSum::transform_result_backtrack);
+            }
+        }
+    }
+}
+
+pub fn produce_skipped_receipt(
+    op: ManagerOperation<OperationContent>,
+    balance_updates: Vec<BalanceUpdate>,
+) -> OperationWithMetadata {
+    match &op.operation {
+        OperationContent::Reveal(_) => OperationWithMetadata {
+            content: op.into_manager_operation_content(),
+            receipt: OperationResultSum::Reveal(produce_skipped_result(balance_updates)),
+        },
+        OperationContent::Transfer(_) => OperationWithMetadata {
+            content: op.into_manager_operation_content(),
+            receipt: OperationResultSum::Transfer(produce_skipped_result(
+                balance_updates,
+            )),
+        },
+        OperationContent::Origination(_) => OperationWithMetadata {
+            content: op.into_manager_operation_content(),
+            receipt: OperationResultSum::Origination(produce_skipped_result(
+                balance_updates,
+            )),
+        },
+    }
+}
+
+fn produce_skipped_result<M: OperationKind>(
+    balance_updates: Vec<BalanceUpdate>,
+) -> OperationResult<M> {
+    OperationResult {
+        balance_updates,
+        result: ContentResult::Skipped,
+        internal_operation_results: vec![],
+    }
+}
+
+#[derive(PartialEq, Debug, NomReader, BinWriter, Eq)]
+pub enum OperationDataAndMetadata {
+    OperationWithMetadata(OperationBatchWithMetadata),
+}
+
+impl OperationDataAndMetadata {
+    /// Milligas consumed by every operation of the batch, internal operations
+    /// included.
+    pub fn consumed_milligas(&self) -> U256 {
+        let Self::OperationWithMetadata(batch) = self;
+        batch.operations.iter().fold(U256::zero(), |acc, op| {
+            acc.saturating_add(op.receipt.consumed_milligas())
+        })
+    }
+}
+
+#[derive(PartialEq, Debug, NomReader, BinWriter, Eq)]
+pub struct OperationBatchWithMetadata {
+    #[encoding(dynamic, list)]
+    pub operations: Vec<OperationWithMetadata>,
+    pub signature: UnknownSignature,
+}
+
+#[derive(PartialEq, Debug, Eq)]
+pub struct OperationWithMetadata {
+    pub content: ManagerOperationContent,
+    pub receipt: OperationResultSum,
+}
+
+impl NomReader<'_> for OperationWithMetadata {
+    fn nom_read(input: &'_ [u8]) -> tezos_nom::NomResult<'_, Self> {
+        let (input, content) = ManagerOperationContent::nom_read(input)?;
+        let (input, receipt) = match content {
+            ManagerOperationContent::Transaction(_) => {
+                let (input, receipt) =
+                    OperationResult::<TransferContent>::nom_read(input)?;
+                (input, OperationResultSum::Transfer(receipt))
+            }
+            ManagerOperationContent::Reveal(_) => {
+                let (input, receipt) = OperationResult::<RevealContent>::nom_read(input)?;
+                (input, OperationResultSum::Reveal(receipt))
+            }
+            ManagerOperationContent::Origination(_) => {
+                let (input, receipt) =
+                    OperationResult::<OriginationContent>::nom_read(input)?;
+                (input, OperationResultSum::Origination(receipt))
+            }
+            _ => {
+                return Err(nom::Err::Error(tezos_nom::error::DecodeError::invalid_tag(
+                    input,
+                    format!("{content:?}"),
+                )))
+            }
+        };
+        Ok((input, Self { content, receipt }))
+    }
+}
+
+impl BinWriter for OperationWithMetadata {
+    fn bin_write(&self, output: &mut Vec<u8>) -> tezos_enc::BinResult {
+        self.content.bin_write(output)?;
+        match &self.receipt {
+            OperationResultSum::Transfer(receipt) => receipt.bin_write(output),
+            OperationResultSum::Reveal(receipt) => receipt.bin_write(output),
+            OperationResultSum::Origination(receipt) => receipt.bin_write(output),
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::encoding_test_data_helper::test_helpers::fetch_generated_data;
+    use crate::operation::{
+        ManagerOperation, OriginationContent, Parameters, TransferContent,
+    };
+    use crate::protocol::TARGET_TEZOS_PROTOCOL;
+    use mir::ast::annotations::{Annotation, Annotations, NO_ANNS};
+    use mir::ast::micheline::Micheline;
+    use mir::ast::Entrypoint;
+    use mir::gas::Gas;
+    use mir::lexer::Prim;
+    use pretty_assertions::assert_eq;
+    use std::borrow::Cow;
+    use typed_arena::Arena;
+
+    fn dummy_failed_operation() -> OperationDataAndMetadata {
+        OperationDataAndMetadata::OperationWithMetadata (
+                OperationBatchWithMetadata {
+                    operations: vec![OperationWithMetadata {
+                        content: ManagerOperationContent::Transaction(
+                            ManagerOperation {
+                                source: PublicKeyHash::from_b58check("tz1KqTpEZ7Yob7QbPE4Hy4Wo8fHG8LhKxZSx").unwrap(),
+                                fee: 255.into(),
+                                counter: 1.into(),
+                                gas_limit: 0.into(),
+                                storage_limit: 0.into(),
+                                operation: TransferContent {
+                                    amount: 27942405962072064.into(),
+                                    destination: Contract::from_b58check("tz1gjaF81ZRRvdzjobyfVNsAeSC6PScjfQwN").unwrap(),
+                                    parameters: Parameters::default(),
+                                }
+                            }),
+                        receipt: OperationResultSum::Transfer(
+                                    OperationResult {
+                                        balance_updates: vec![],
+                                        result: ContentResult::Failed(
+                                            vec![
+                                                    ApplyOperationError::Transfer(
+                                                        TransferError::BalanceTooLow(
+                                                            BalanceTooLow {
+                                                                contract: Contract::from_b58check("tz1KqTpEZ7Yob7QbPE4Hy4Wo8fHG8LhKxZSx").unwrap(),
+                                                                balance: 10_u64.into(),
+                                                                amount: 21_u64.into()
+                                                            }
+                                                        )
+                                                    ),
+                                                    ApplyOperationError::Transfer(
+                                                        TransferError::BalanceTooLow(
+                                                            BalanceTooLow {
+                                                                contract: Contract::from_b58check("tz1gjaF81ZRRvdzjobyfVNsAeSC6PScjfQwN").unwrap(),
+                                                                balance: 55_u64.into(),
+                                                                amount: 1111_u64.into()
+                                                            }
+                                                        )
+                                                    )
+                                                ].into()),
+                                        internal_operation_results: vec![]
+                                    }
+                                )
+                    }],
+                    signature:  UnknownSignature::from_base58_check(
+                       "sigvVF2FguUHvZHytQ4AoRn4R6tSMteAt4nEHfYEbwQi3nXa3xvsgE93V1XYL99FYFUAH83iSpcAe7KxGaAeE1tLJ3M2jGJT"
+                    ).unwrap(),
+                }
+            )
+    }
+
+    /// A backtracked transaction whose preserved success body is a
+    /// successful tez transfer, plus a single-error trace. Mirrors the
+    /// L1 receipt shape produced when the storage-fees burn fails
+    /// after a successful execution: the success result is preserved,
+    /// `errors: Some(...)` carries the burn error.
+    fn dummy_backtracked_with_errors_operation() -> OperationDataAndMetadata {
+        OperationDataAndMetadata::OperationWithMetadata(
+            OperationBatchWithMetadata {
+                operations: vec![OperationWithMetadata {
+                    content: ManagerOperationContent::Transaction(ManagerOperation {
+                        source: PublicKeyHash::from_b58check("tz1KqTpEZ7Yob7QbPE4Hy4Wo8fHG8LhKxZSx").unwrap(),
+                        fee: 468.into(),
+                        counter: 1.into(),
+                        gas_limit: 2169.into(),
+                        storage_limit: 0.into(),
+                        operation: TransferContent {
+                            amount: 42000000.into(),
+                            destination: Contract::from_b58check("tz1gjaF81ZRRvdzjobyfVNsAeSC6PScjfQwN").unwrap(),
+                            parameters: Parameters::default(),
+                        }
+                    }),
+                    receipt: OperationResultSum::Transfer(OperationResult {
+                        balance_updates: vec![],
+                        result: ContentResult::BackTracked(BacktrackedResult {
+                            errors: Some(ApplyOperationErrors {
+                                errors: vec![
+                                    ApplyOperationError::CannotPayStorageFee(
+                                        BalanceTooLow {
+                                            contract: Contract::from_b58check("tz1KqTpEZ7Yob7QbPE4Hy4Wo8fHG8LhKxZSx").unwrap(),
+                                            balance: 10_u64.into(),
+                                            amount: 21_u64.into(),
+                                        }
+                                    ),
+                                ],
+                            }),
+                            result: TransferTarget::ToContract(TransferSuccess {
+                                storage: None,
+                                lazy_storage_diff: None,
+                                balance_updates: vec![
+                                    BalanceUpdate { balance: Balance::Account(Contract::Implicit(PublicKeyHash::from_b58check("tz1KqTpEZ7Yob7QbPE4Hy4Wo8fHG8LhKxZSx").unwrap())), changes: -42000000, update_origin: UpdateOrigin::BlockApplication },
+                                    BalanceUpdate { balance: Balance::Account(Contract::Implicit(PublicKeyHash::from_b58check("tz1gjaF81ZRRvdzjobyfVNsAeSC6PScjfQwN").unwrap())), changes: 42000000, update_origin: UpdateOrigin::BlockApplication },
+                                ],
+                                ticket_receipt: vec![],
+                                originated_contracts: vec![],
+                                consumed_milligas: 2169000.into(),
+                                storage_size: 0.into(),
+                                paid_storage_size_diff: 0.into(),
+                                allocated_destination_contract: false,
+                                address_registry_diff: vec![],
+                            }),
+                        }),
+                        internal_operation_results: vec![],
+                    }),
+                }],
+                signature: UnknownSignature::from_base58_check(
+                    "sigPc9gwEse2o5nsicnNeWLjLgoMbEGumXw7PErAkMMa1asXVKRq43RPd7TnUKYwuHmejxEu15XTyV1iKGiaa8akFHK7CCEF"
+                ).unwrap(),
+            }
+        )
+    }
+
+    fn dummy_test_result_operation() -> OperationDataAndMetadata {
+        OperationDataAndMetadata::OperationWithMetadata (
+                 OperationBatchWithMetadata {
+                    operations: vec![OperationWithMetadata {
+                        content: ManagerOperationContent::Transaction(ManagerOperation { source: PublicKeyHash::from_b58check("tz1KqTpEZ7Yob7QbPE4Hy4Wo8fHG8LhKxZSx").unwrap(), fee: 468.into(), counter: 1.into(), gas_limit: 2169.into(), storage_limit: 0.into(), operation: TransferContent {
+                            amount: 42000000.into(),
+                            destination: Contract::from_b58check("tz1gjaF81ZRRvdzjobyfVNsAeSC6PScjfQwN").unwrap(),
+                            parameters: Parameters::default(),
+                        } }),
+                        receipt: OperationResultSum::Transfer(OperationResult { balance_updates: vec![], result: ContentResult::Applied(
+                            TransferTarget::ToContract(
+                            TransferSuccess { storage: None, lazy_storage_diff: None, balance_updates: vec![
+                            BalanceUpdate { balance: Balance::Account(Contract::Implicit(PublicKeyHash::from_b58check("tz1KqTpEZ7Yob7QbPE4Hy4Wo8fHG8LhKxZSx").unwrap())), changes: -42000000,update_origin : UpdateOrigin::BlockApplication },
+                            BalanceUpdate { balance: Balance::Account(Contract::Implicit(PublicKeyHash::from_b58check("tz1gjaF81ZRRvdzjobyfVNsAeSC6PScjfQwN").unwrap())), changes: 42000000,update_origin : UpdateOrigin::BlockApplication}
+                            ], ticket_receipt: vec![], originated_contracts: vec![], consumed_milligas: 2169000.into(), storage_size: 0.into(), paid_storage_size_diff: 0.into(), allocated_destination_contract: false, address_registry_diff: vec![] }
+                            ))
+
+                        , internal_operation_results: vec![] })
+                    }],
+                    signature:  UnknownSignature::from_base58_check(
+                        "sigPc9gwEse2o5nsicnNeWLjLgoMbEGumXw7PErAkMMa1asXVKRq43RPd7TnUKYwuHmejxEu15XTyV1iKGiaa8akFHK7CCEF"
+                    ).unwrap(),
+                })
+    }
+
+    fn simple_origination_operation() -> OperationDataAndMetadata {
+        OperationDataAndMetadata::OperationWithMetadata(
+            OperationBatchWithMetadata {
+               operations: vec![OperationWithMetadata {
+                   content: ManagerOperationContent::Origination(ManagerOperation { source: PublicKeyHash::from_b58check("tz1KqTpEZ7Yob7QbPE4Hy4Wo8fHG8LhKxZSx").unwrap(), fee: 343.into(), counter: 1.into(), gas_limit: 679.into(), storage_limit: 323.into(),
+                   operation: OriginationContent {
+                    balance: 1000000_u64.into(),
+                    delegate: None,
+                    /*
+                    octez-client convert script "
+                              parameter string;
+                              storage string;
+                              code { CAR; NIL operation; PAIR }
+                            " from Michelson to binary
+                     */
+                    script: crate::operation::Script { code: hex::decode(
+                        "02000000170500036805010368050202000000080316053d036d0342",
+                    )
+                    .unwrap(), storage: hex::decode(
+                        "010000000568656c6c6f",
+                    )
+                    .unwrap() } } }),
+                   receipt:
+                    OperationResultSum::Origination(
+                        OperationResult {
+                            balance_updates:vec![BalanceUpdate { balance: Balance::Account(Contract::from_b58check("tz1KqTpEZ7Yob7QbPE4Hy4Wo8fHG8LhKxZSx").unwrap()) , changes: -343, update_origin: UpdateOrigin::BlockApplication }, BalanceUpdate { balance: Balance::BlockFees , changes: 343, update_origin: UpdateOrigin::BlockApplication }],
+                            result: ContentResult::Applied(
+                                OriginationSuccess{
+                                    balance_updates:vec![
+                                        BalanceUpdate { balance: Balance::Account(Contract::from_b58check("tz1KqTpEZ7Yob7QbPE4Hy4Wo8fHG8LhKxZSx").unwrap()) , changes: -11500, update_origin: UpdateOrigin::BlockApplication },
+                                        BalanceUpdate { balance: Balance::StorageFees, changes: 11500, update_origin: UpdateOrigin::BlockApplication },
+                                        BalanceUpdate { balance: Balance::Account(Contract::from_b58check("tz1KqTpEZ7Yob7QbPE4Hy4Wo8fHG8LhKxZSx").unwrap()) , changes: -64250, update_origin: UpdateOrigin::BlockApplication },
+                                        BalanceUpdate { balance: Balance::StorageFees, changes: 64250, update_origin: UpdateOrigin::BlockApplication },
+                                        BalanceUpdate { balance: Balance::Account(Contract::from_b58check("tz1KqTpEZ7Yob7QbPE4Hy4Wo8fHG8LhKxZSx").unwrap()) , changes: -1000000, update_origin: UpdateOrigin::BlockApplication },
+                                        BalanceUpdate { balance: Balance::Account(Contract::from_b58check("KT1WcSvmiwJqDUm6cKEFjGVizXVSMujq5Kfe").unwrap()) , changes: 1000000, update_origin: UpdateOrigin::BlockApplication },
+                                    ],
+                                    originated_contracts:vec![Originated {contract: ContractKt1Hash::from_base58_check("KT1WcSvmiwJqDUm6cKEFjGVizXVSMujq5Kfe").unwrap()}],
+                                    consumed_milligas:578755_u64.into(),
+                                    storage_size:46_u64.into(),
+                                    paid_storage_size_diff:46_u64.into(),
+                                    lazy_storage_diff: None,
+                                }),
+                            internal_operation_results: vec![]
+                        })
+                    }
+               ],
+               signature:  UnknownSignature::from_base58_check(
+                   "sigjUkDaz4jjfp7EvsPGryCBoGKZ1B3FiAn4kX9adpwmcKUEpobhkNJjbYqjxB1mgBe7wGGGQp4T8MPzithFpbBMCN2L5RUa"
+               ).unwrap(),
+           })
+    }
+
+    #[test]
+    fn test_operation_with_metadata_rlp_roundtrip() {
+        let operation_and_receipt = dummy_test_result_operation();
+        let mut output = vec![];
+        operation_and_receipt
+            .bin_write(&mut output)
+            .expect("Operation with metadata should be encodable");
+        let outputcpy = output.clone();
+        let (remaining, read_result) = OperationDataAndMetadata::nom_read(&outputcpy)
+            .expect("Operation with metadata should be decodable");
+
+        assert_eq!(
+            read_result, operation_and_receipt,
+            "Roundtrip failed on {:?}",
+            read_result
+        );
+        assert!(
+            remaining.is_empty(),
+            "There should be no remaining bytes after decoding"
+        );
+    }
+
+    #[test]
+    fn tezos_compatibility_for_successful_operation_with_metadata() {
+        let mut output = vec![];
+        dummy_test_result_operation()
+            .bin_write(output.as_mut())
+            .expect("Operation with metadata should be encodable");
+        let operation_and_receipt_bytes = fetch_generated_data(
+            TARGET_TEZOS_PROTOCOL,
+            "operation.data_and_metadata",
+            "tez_transfer",
+        );
+
+        assert_eq!(output, operation_and_receipt_bytes);
+    }
+
+    #[test]
+    fn tezos_compatibility_for_successful_origination_with_metadata() {
+        let mut output = vec![];
+        simple_origination_operation()
+            .bin_write(output.as_mut())
+            .expect("Operation with metadata should be encodable");
+        let operation_and_receipt_bytes = fetch_generated_data(
+            TARGET_TEZOS_PROTOCOL,
+            "operation.data_and_metadata",
+            "origination",
+        );
+
+        assert_eq!(output, operation_and_receipt_bytes);
+    }
+
+    #[test]
+    fn tezos_compatibility_for_failed_operation_with_metadata() {
+        let operation = dummy_failed_operation();
+        let output = operation
+            .to_bytes()
+            .expect("Operation with metadata should be encodable");
+        let operation_and_receipt_bytes = fetch_generated_data(
+            TARGET_TEZOS_PROTOCOL,
+            "operation.data_and_metadata",
+            "failed",
+        );
+
+        assert_eq!(output, operation_and_receipt_bytes);
+    }
+
+    #[test]
+    fn tezos_compatibility_for_backtracked_with_errors_operation_with_metadata() {
+        let operation = dummy_backtracked_with_errors_operation();
+        let output = operation
+            .to_bytes()
+            .expect("Operation with metadata should be encodable");
+        let operation_and_receipt_bytes = fetch_generated_data(
+            TARGET_TEZOS_PROTOCOL,
+            "operation.data_and_metadata",
+            "backtracked_with_errors",
+        );
+
+        assert_eq!(output, operation_and_receipt_bytes);
+    }
+
+    #[test]
+    fn test_backtracked_with_errors_roundtrip() {
+        let operation = dummy_backtracked_with_errors_operation();
+        let mut output = vec![];
+        operation
+            .bin_write(&mut output)
+            .expect("Operation with metadata should be encodable");
+        let outputcpy = output.clone();
+        let (remaining, read_result) = OperationDataAndMetadata::nom_read(&outputcpy)
+            .expect("Operation with metadata should be decodable");
+
+        assert!(
+            remaining.is_empty(),
+            "There should be no remaining bytes after decoding"
+        );
+
+        // The errors inside the trace decode to `PastError(bytes)`
+        // (cf. `ApplyOperationError::nom_read`), so the decoded
+        // structure is not bit-identical to the input. Re-encode the
+        // decoded value and assert byte equality with the original
+        // encoding — this exercises the full encode/decode/encode
+        // chain for the new `Some(ApplyOperationErrors)` shape.
+        let mut roundtrip_output = vec![];
+        read_result
+            .bin_write(&mut roundtrip_output)
+            .expect("Decoded operation should re-encode");
+        assert_eq!(output, roundtrip_output);
+    }
+
+    #[test]
+    fn tezos_compatibility_for_internal_operation_with_metadata() {
+        let operation = InternalOperationSum::Transfer(InternalContentWithMetadata {
+            content: TransferContent {
+                amount: 1000000.into(),
+                destination: Contract::from_b58check(
+                    "KT1RJ6PbjHpwc3M5rw5s2Nbmefwbuwbdxton",
+                )
+                .unwrap(),
+                parameters: Parameters::default(),
+            },
+            sender: Contract::from_b58check("tz1VSUr8wwNhLAzempoch5d6hLRiTh8Cjcjb")
+                .unwrap(),
+            nonce: 0,
+            result: ContentResult::Applied(TransferTarget::ToContract(TransferSuccess {
+                storage: None,
+                lazy_storage_diff: None,
+                balance_updates: vec![
+                    BalanceUpdate {
+                        balance: Balance::Account(
+                            Contract::from_b58check(
+                                "tz1VSUr8wwNhLAzempoch5d6hLRiTh8Cjcjb",
+                            )
+                            .unwrap(),
+                        ),
+                        changes: -1000000,
+                        update_origin: UpdateOrigin::BlockApplication,
+                    },
+                    BalanceUpdate {
+                        balance: Balance::Account(
+                            Contract::from_b58check(
+                                "KT1RJ6PbjHpwc3M5rw5s2Nbmefwbuwbdxton",
+                            )
+                            .unwrap(),
+                        ),
+                        changes: 1000000,
+                        update_origin: UpdateOrigin::BlockApplication,
+                    },
+                ],
+                ticket_receipt: vec![],
+                originated_contracts: vec![],
+                consumed_milligas: 100000.into(),
+                storage_size: 0.into(),
+                paid_storage_size_diff: 0.into(),
+                allocated_destination_contract: false,
+                address_registry_diff: vec![],
+            })),
+        });
+        let output = operation
+            .to_bytes()
+            .expect("Internal operation with metadata should be encodable");
+        let operation_and_receipt_bytes = fetch_generated_data(
+            TARGET_TEZOS_PROTOCOL,
+            "operation.internal_and_metadata",
+            "applied",
+        );
+        assert_eq!(output, operation_and_receipt_bytes);
+    }
+
+    #[test]
+    fn tezos_compatibility_for_internal_event_with_metadata() {
+        let arena = Arena::new();
+        let mut gas = Gas::default();
+
+        let source_bytes =
+            hex::decode("00005b9a5d6ff9b553b9fae37b844d7a907d8d59593e").unwrap();
+
+        let payload = Micheline::prim2(
+            &arena,
+            Prim::Pair,
+            Micheline::from(10_i128),
+            Micheline::from(source_bytes),
+            &mut gas,
+        )
+        .unwrap()
+        .encode(&mut Gas::default())
+        .unwrap()
+        .unwrap();
+
+        let add_amount_annots: Annotations =
+            Annotations::from([Annotation::Field(Cow::Borrowed("addAmount"))]);
+        let source_annots: Annotations =
+            Annotations::from([Annotation::Field(Cow::Borrowed("source"))]);
+
+        // Fixed-size array; see Note: alloc_extend.
+        #[allow(clippy::disallowed_methods)]
+        let ty = Micheline::App(
+            Prim::pair,
+            arena.alloc_extend([
+                Micheline::App(Prim::int, &[], add_amount_annots),
+                Micheline::App(Prim::address, &[], source_annots),
+            ]),
+            NO_ANNS,
+        )
+        .encode(&mut Gas::default())
+        .unwrap()
+        .unwrap();
+
+        let operation = InternalOperationSum::Event(InternalContentWithMetadata {
+            content: EventContent {
+                tag: Some(Entrypoint::from_string_unchecked("add".into())),
+                payload: Some(payload.into()),
+                ty: ty.into(),
+            },
+            sender: Contract::from_b58check("KT1SHrxmgUojs2hwe4hguExy6BqteeG1rDHi")
+                .unwrap(),
+            nonce: 0,
+            result: ContentResult::Applied(EventSuccess {
+                consumed_milligas: 100000.into(),
+            }),
+        });
+
+        let output = operation
+            .to_bytes()
+            .expect("Internal operation with metadata should be encodable");
+
+        let expected = fetch_generated_data(
+            TARGET_TEZOS_PROTOCOL,
+            "operation.internal_and_metadata",
+            "event",
+        );
+
+        assert_eq!(output, expected);
+    }
+
+    #[test]
+    fn test_backtracked_encoding() {
+        let operation = InternalOperationSum::Transfer(InternalContentWithMetadata {
+            content: TransferContent {
+                amount: 1000000.into(),
+                destination: Contract::from_b58check(
+                    "KT1RJ6PbjHpwc3M5rw5s2Nbmefwbuwbdxton",
+                )
+                .unwrap(),
+                parameters: Parameters::default(),
+            },
+            sender: Contract::from_b58check("tz1VSUr8wwNhLAzempoch5d6hLRiTh8Cjcjb")
+                .unwrap(),
+            nonce: 0,
+            result: ContentResult::BackTracked(BacktrackedResult {
+                errors: None,
+                result: TransferTarget::ToContract(TransferSuccess {
+                    storage: Some(MichelineExpr(
+                        hex::decode("010000000568656c6c6f").unwrap(),
+                    )),
+                    lazy_storage_diff: None,
+                    balance_updates: vec![
+                        BalanceUpdate {
+                            balance: Balance::Account(
+                                Contract::from_b58check(
+                                    "tz1VSUr8wwNhLAzempoch5d6hLRiTh8Cjcjb",
+                                )
+                                .unwrap(),
+                            ),
+                            changes: -1000000,
+                            update_origin: UpdateOrigin::BlockApplication,
+                        },
+                        BalanceUpdate {
+                            balance: Balance::Account(
+                                Contract::from_b58check(
+                                    "KT1RJ6PbjHpwc3M5rw5s2Nbmefwbuwbdxton",
+                                )
+                                .unwrap(),
+                            ),
+                            changes: 1000000,
+                            update_origin: UpdateOrigin::BlockApplication,
+                        },
+                    ],
+                    ticket_receipt: vec![],
+                    originated_contracts: vec![],
+                    consumed_milligas: 100000.into(),
+                    storage_size: 0.into(),
+                    paid_storage_size_diff: 0.into(),
+                    allocated_destination_contract: false,
+                    address_registry_diff: vec![],
+                }),
+            }),
+        });
+        let output = operation
+            .to_bytes()
+            .expect("Internal operation with metadata should be encodable");
+        let operation_and_receipt_bytes = fetch_generated_data(
+            TARGET_TEZOS_PROTOCOL,
+            "operation.internal_and_metadata",
+            "backtracked",
+        );
+        assert_eq!(output, operation_and_receipt_bytes);
+    }
+
+    fn tz1(b58: &str) -> Contract {
+        Contract::from_b58check(b58).unwrap()
+    }
+
+    fn encode_error(error: &ApplyOperationError) -> Vec<u8> {
+        let mut output = vec![];
+        error
+            .bin_write(&mut output)
+            .expect("Operation error should be encodable");
+        output
+    }
+
+    /// The bson object of `{kind, id, fields}`, prefixed by its size, as the
+    /// node expects one error of a list.
+    fn expected_object(kind: &str, id: &str, fields: &[(&str, &str)]) -> Vec<u8> {
+        let id = format!("proto.025-PsUshuai.{id}");
+        let mut elements: Vec<(&[u8], &[u8])> =
+            vec![(b"kind", kind.as_bytes()), (b"id", id.as_bytes())];
+        for (key, value) in fields {
+            elements.push((key.as_bytes(), value.as_bytes()));
+        }
+        let bson = elements_to_bson(&elements);
+        let mut out = (bson.len() as u32).to_be_bytes().to_vec();
+        out.extend_from_slice(&bson);
+        out
+    }
+
+    #[test]
+    fn balance_too_low_is_encoded_as_on_l1() {
+        let error =
+            ApplyOperationError::Transfer(TransferError::BalanceTooLow(BalanceTooLow {
+                contract: tz1("tz1KqTpEZ7Yob7QbPE4Hy4Wo8fHG8LhKxZSx"),
+                balance: 10_u64.into(),
+                amount: 21_u64.into(),
+            }));
+        let encoded = encode_error(&error);
+        assert_eq!(
+            encoded,
+            expected_object(
+                "temporary",
+                "contract.balance_too_low",
+                &[
+                    ("contract", "tz1KqTpEZ7Yob7QbPE4Hy4Wo8fHG8LhKxZSx"),
+                    ("balance", "10"),
+                    ("amount", "21"),
+                ],
+            )
+        );
+        assert_eq!(error.persisted_len(), encoded.len());
+    }
+
+    #[test]
+    fn cannot_pay_storage_fee_is_encoded_with_its_cause() {
+        let error = ApplyOperationError::CannotPayStorageFee(BalanceTooLow {
+            contract: tz1("tz1KqTpEZ7Yob7QbPE4Hy4Wo8fHG8LhKxZSx"),
+            balance: 10_u64.into(),
+            amount: 21_u64.into(),
+        });
+        let encoded = encode_error(&error);
+        let mut expected =
+            expected_object("temporary", "contract.cannot_pay_storage_fee", &[]);
+        expected.extend(expected_object(
+            "temporary",
+            "contract.balance_too_low",
+            &[
+                ("contract", "tz1KqTpEZ7Yob7QbPE4Hy4Wo8fHG8LhKxZSx"),
+                ("balance", "10"),
+                ("amount", "21"),
+            ],
+        ));
+        assert_eq!(encoded, expected);
+        assert_eq!(error.persisted_len(), encoded.len());
+
+        // Read back, each object is one error, re-encoded identically.
+        let errors = ApplyOperationErrors::from(error);
+        let mut bytes = vec![];
+        errors.bin_write(&mut bytes).unwrap();
+        let (remaining, decoded) = ApplyOperationErrors::nom_read(&bytes).unwrap();
+        assert!(remaining.is_empty());
+        assert_eq!(decoded.errors.len(), 2);
+        assert!(decoded
+            .errors
+            .iter()
+            .all(|e| matches!(e, ApplyOperationError::PastError(_))));
+        let mut reencoded = vec![];
+        decoded.bin_write(&mut reencoded).unwrap();
+        assert_eq!(reencoded, bytes);
+    }
+
+    #[test]
+    fn out_of_gas_is_encoded_as_on_l1() {
+        let expected = expected_object("temporary", "gas_exhausted.operation", &[]);
+        for error in [
+            ApplyOperationError::OutOfGas(gas::OutOfGas),
+            ApplyOperationError::Transfer(TransferError::OutOfGas(gas::OutOfGas)),
+            ApplyOperationError::Origination(OriginationError::OutOfGas(gas::OutOfGas)),
+            ApplyOperationError::Reveal(RevealError::OutOfGas),
+        ] {
+            assert_eq!(encode_error(&error), expected, "{error:?}");
+        }
+        assert_eq!(
+            encode_error(&ApplyOperationError::OperationQuotaExceeded),
+            expected_object("temporary", "storage_exhausted.operation", &[])
+        );
+    }
+
+    #[test]
+    fn errors_with_l1_counterparts_carry_their_fields() {
+        let source = tz1("tz1KqTpEZ7Yob7QbPE4Hy4Wo8fHG8LhKxZSx");
+        let public_key = PublicKey::from_b58check(
+            "edpkuBknW28nW72KG6RoHtYW7p12T6GKc7nAbwYX5m8Wd9sDVC9yav",
+        )
+        .unwrap();
+        let expected_hash =
+            PublicKeyHash::from_b58check("tz1KqTpEZ7Yob7QbPE4Hy4Wo8fHG8LhKxZSx").unwrap();
+        let computed_hash =
+            PublicKeyHash::from_b58check("tz1gjaF81ZRRvdzjobyfVNsAeSC6PScjfQwN").unwrap();
+        // (error, kind, id, fields)
+        type Case<'a> = (
+            ApplyOperationError,
+            &'a str,
+            &'a str,
+            Vec<(&'a str, String)>,
+        );
+        let cases: Vec<Case> = vec![
+            (
+                RevealError::PreviouslyRevealedKey(source.clone()).into(),
+                "branch",
+                "contract.previously_revealed_key",
+                vec![("contract", source.to_string())],
+            ),
+            (
+                RevealError::InconsistentPublicKey {
+                    public_key: public_key.clone(),
+                    expected_hash: expected_hash.clone(),
+                    computed_hash: computed_hash.clone(),
+                }
+                .into(),
+                "permanent",
+                "contract.manager.inconsistent_hash",
+                vec![
+                    ("public_key", public_key.to_b58check()),
+                    ("expected_hash", expected_hash.to_b58check()),
+                    ("provided_hash", computed_hash.to_b58check()),
+                ],
+            ),
+            (
+                RevealError::InconsistentHash {
+                    public_key: public_key.clone(),
+                    expected_hash: expected_hash.clone(),
+                    source_hash: computed_hash.clone(),
+                }
+                .into(),
+                "permanent",
+                "contract.manager.inconsistent_hash",
+                vec![
+                    ("public_key", public_key.to_b58check()),
+                    ("expected_hash", expected_hash.to_b58check()),
+                    ("provided_hash", computed_hash.to_b58check()),
+                ],
+            ),
+            (
+                TransferError::EmptyImplicitTransfer(source.clone()).into(),
+                "branch",
+                "contract.empty_transaction",
+                vec![("contract", source.to_string())],
+            ),
+            (
+                TransferError::ContractDoesNotExist(source.clone()).into(),
+                "temporary",
+                "contract.non_existing_contract",
+                vec![("contract", source.to_string())],
+            ),
+            (
+                TransferError::BadContractParameter(source.clone()).into(),
+                "permanent",
+                "michelson_v1.bad_contract_parameter",
+                vec![("contract", source.to_string())],
+            ),
+            (
+                TransferError::NoSuchEntrypoint(Entrypoint::try_from("foo").unwrap())
+                    .into(),
+                "permanent",
+                "michelson_v1.no_such_entrypoint",
+                vec![("entrypoint", "foo".to_string())],
+            ),
+            (
+                OriginationError::BalanceTooLow(BalanceTooLow {
+                    contract: source.clone(),
+                    balance: 1_u64.into(),
+                    amount: 2_u64.into(),
+                })
+                .into(),
+                "temporary",
+                "contract.balance_too_low",
+                vec![
+                    ("contract", source.to_string()),
+                    ("balance", "1".to_string()),
+                    ("amount", "2".to_string()),
+                ],
+            ),
+        ];
+        for (error, kind, id, fields) in cases {
+            let fields: Vec<(&str, &str)> =
+                fields.iter().map(|(k, v)| (*k, v.as_str())).collect();
+            let encoded = encode_error(&error);
+            assert_eq!(encoded, expected_object(kind, id, &fields), "{error:?}");
+            assert_eq!(error.persisted_len(), encoded.len(), "{error:?}");
+        }
+    }
+
+    #[test]
+    fn errors_without_l1_counterpart_carry_their_message() {
+        let interpret_error = TransferError::MichelsonContractInterpretError(
+            "failed with: Nat(1)".to_string(),
+        );
+        let error = ApplyOperationError::Transfer(interpret_error.clone());
+        let encoded = encode_error(&error);
+        assert_eq!(
+            encoded,
+            expected_object(
+                "temporary",
+                "tezosx_internal.transfer.michelson_contract_interpret_error",
+                &[(
+                    "error_message",
+                    "Failed interpreting the Michelson contract with failed with: Nat(1)"
+                )],
+            )
+        );
+        assert_eq!(error.persisted_len(), encoded.len());
+        assert_eq!(interpret_error.persisted_len(), encoded.len());
+        // Pins the size, which the persisted-error gas is charged on.
+        assert_eq!(encoded.len(), 203);
+
+        assert_eq!(
+            encode_error(&ApplyOperationError::InternalOperationReplay),
+            expected_object(
+                "permanent",
+                "tezosx_internal.internal_operation_replay",
+                &[("error_message", "Internal operation replay attempt")],
+            )
+        );
+    }
+
+    #[test]
+    fn mir_out_of_gas_is_reported_as_out_of_gas() {
+        use mir::ast::big_map::LazyStorageError;
+        use mir::interpreter::{ContractInterpretError, InterpretError};
+        use mir::typechecker::TcError;
+        assert_eq!(
+            TransferError::from(ContractInterpretError::InterpretError(
+                InterpretError::OutOfGas
+            )),
+            TransferError::OutOfGas(gas::OutOfGas)
+        );
+        assert_eq!(
+            TransferError::from(ContractInterpretError::TcError(TcError::OutOfGas(
+                gas::OutOfGas
+            ))),
+            TransferError::OutOfGas(gas::OutOfGas)
+        );
+        assert_eq!(
+            TransferError::from(TcError::OutOfGas(gas::OutOfGas)),
+            TransferError::OutOfGas(gas::OutOfGas)
+        );
+        assert_eq!(
+            TransferError::from(ContractInterpretError::LazyStorageError(
+                LazyStorageError::OutOfGasError(gas::OutOfGas)
+            )),
+            TransferError::OutOfGas(gas::OutOfGas)
+        );
+        assert_eq!(
+            TransferError::from(ContractInterpretError::InterpretError(
+                InterpretError::LazyStorageError(LazyStorageError::OutOfGasError(
+                    gas::OutOfGas
+                ))
+            )),
+            TransferError::OutOfGas(gas::OutOfGas)
+        );
+        // Running out of gas while comparing values, e.g. with COMPARE.
+        assert_eq!(
+            TransferError::from(ContractInterpretError::InterpretError(
+                InterpretError::CompareError(mir::gas::CompareError::OutOfGas(
+                    gas::OutOfGas
+                ))
+            )),
+            TransferError::OutOfGas(gas::OutOfGas)
+        );
+        // Running out of gas while typechecking during interpretation, e.g.
+        // with UNPACK or CONTRACT.
+        assert_eq!(
+            TransferError::from(ContractInterpretError::InterpretError(
+                InterpretError::TcError(TcError::OutOfGas(gas::OutOfGas))
+            )),
+            TransferError::OutOfGas(gas::OutOfGas)
+        );
+        assert_eq!(
+            TransferError::from(TcError::CompareError(mir::gas::CompareError::OutOfGas(
+                gas::OutOfGas
+            ))),
+            TransferError::OutOfGas(gas::OutOfGas)
+        );
+        assert_eq!(
+            TransferError::from(ContractInterpretError::InterpretError(
+                InterpretError::CostOverflow(mir::gas::CostOverflow)
+            )),
+            TransferError::OutOfGas(gas::OutOfGas)
+        );
+        // Comparing incomparable values is a type failure.
+        assert!(matches!(
+            TransferError::from(TcError::CompareError(
+                mir::gas::CompareError::Incomparable
+            )),
+            TransferError::MirTypecheckingError(_)
+        ));
+    }
+
+    #[test]
+    fn test_enc_dec_roundtrip_operation_error() {
+        let operation_error =
+            ApplyOperationError::Transfer(TransferError::BalanceTooLow(BalanceTooLow {
+                contract: Contract::from_b58check("tz1KqTpEZ7Yob7QbPE4Hy4Wo8fHG8LhKxZSx")
+                    .unwrap(),
+                balance: 10_u64.into(),
+                amount: 21_u64.into(),
+            }));
+        let mut output = vec![];
+        operation_error
+            .bin_write(&mut output)
+            .expect("Operation error should be encodable");
+        let outputcpy = output.clone();
+        let (remaining, read_result) = ApplyOperationError::nom_read(&outputcpy)
+            .expect("Operation error should be decodable");
+
+        // Should be a PastError
+        assert!(matches!(read_result, ApplyOperationError::PastError(_)));
+        assert_eq!(
+            remaining.len(),
+            0,
+            "There should be no remaining bytes after decoding"
+        );
+
+        // Encode the PastError back to bytes and decode it again to check if it's the same
+        let mut past_error_bytes = vec![];
+        read_result
+            .bin_write(&mut past_error_bytes)
+            .expect("Past error should be encodable");
+        let past_error_bytes_copy = past_error_bytes.clone();
+        let (remaining, past_error_read_result) =
+            ApplyOperationError::nom_read(&past_error_bytes_copy)
+                .expect("Past error should be decodable");
+
+        assert_eq!(
+            read_result, past_error_read_result,
+            "Past error should be the same after encoding and decoding"
+        );
+        assert_eq!(
+            remaining.len(),
+            0,
+            "There should be no remaining bytes after decoding the past error"
+        );
+    }
+
+    #[test]
+    fn transform_result_backtracked_cascades_to_internals() {
+        let payer =
+            Contract::from_b58check("tz1KqTpEZ7Yob7QbPE4Hy4Wo8fHG8LhKxZSx").unwrap();
+        let internal_applied =
+            InternalOperationSum::Transfer(InternalContentWithMetadata {
+                sender: payer.clone(),
+                nonce: 0,
+                content: TransferContent {
+                    amount: 0_u64.into(),
+                    destination: payer.clone(),
+                    parameters: Parameters::default(),
+                },
+                result: ContentResult::Applied(TransferTarget::ToContract(
+                    TransferSuccess::default(),
+                )),
+            });
+
+        let mut receipt = OperationResultSum::Transfer(OperationResult {
+            balance_updates: vec![],
+            result: ContentResult::Applied(TransferTarget::ToContract(
+                TransferSuccess::default(),
+            )),
+            internal_operation_results: vec![internal_applied],
+        });
+
+        receipt.transform_result_backtrack();
+
+        let OperationResultSum::Transfer(op) = &receipt else {
+            panic!("expected Transfer receipt");
+        };
+        assert!(
+            matches!(op.result, ContentResult::BackTracked(_)),
+            "top-level must demote to BackTracked, got {:?}",
+            op.result
+        );
+        let InternalOperationSum::Transfer(inner) = &op.internal_operation_results[0]
+        else {
+            panic!("expected internal Transfer");
+        };
+        assert!(
+            matches!(inner.result, ContentResult::BackTracked(_)),
+            "internal Applied must cascade-demote to BackTracked, got {:?}",
+            inner.result
+        );
+    }
+
+    /// `transform_applied_into_backtracked_with_errors` demotes the
+    /// top-level `Applied` to `BackTracked` carrying the supplied
+    /// error trace and cascades the demotion to every entry of
+    /// `internal_operation_results`.
+    #[test]
+    fn transform_applied_into_backtracked_with_errors_cascades_to_internals() {
+        let payer =
+            Contract::from_b58check("tz1KqTpEZ7Yob7QbPE4Hy4Wo8fHG8LhKxZSx").unwrap();
+        let internal_applied =
+            InternalOperationSum::Transfer(InternalContentWithMetadata {
+                sender: payer.clone(),
+                nonce: 0,
+                content: TransferContent {
+                    amount: 0_u64.into(),
+                    destination: payer.clone(),
+                    parameters: Parameters::default(),
+                },
+                result: ContentResult::Applied(TransferTarget::ToContract(
+                    TransferSuccess::default(),
+                )),
+            });
+
+        let mut receipt = OperationResultSum::Transfer(OperationResult {
+            balance_updates: vec![],
+            result: ContentResult::Applied(TransferTarget::ToContract(
+                TransferSuccess::default(),
+            )),
+            internal_operation_results: vec![internal_applied],
+        });
+
+        let errors = ApplyOperationErrors {
+            errors: vec![ApplyOperationError::CannotPayStorageFee(BalanceTooLow {
+                contract: Contract::from_b58check("tz1KqTpEZ7Yob7QbPE4Hy4Wo8fHG8LhKxZSx")
+                    .unwrap(),
+                balance: 10_u64.into(),
+                amount: 21_u64.into(),
+            })],
+        };
+        receipt.transform_applied_into_backtracked_with_errors(errors);
+
+        let OperationResultSum::Transfer(op) = &receipt else {
+            panic!("expected Transfer receipt");
+        };
+        assert!(
+            matches!(op.result, ContentResult::BackTracked(_)),
+            "top-level must demote to BackTracked, got {:?}",
+            op.result
+        );
+        let InternalOperationSum::Transfer(inner) = &op.internal_operation_results[0]
+        else {
+            panic!("expected internal Transfer");
+        };
+        assert!(
+            matches!(inner.result, ContentResult::BackTracked(_)),
+            "internal Applied must cascade-demote to BackTracked, got {:?}",
+            inner.result
+        );
+    }
+}

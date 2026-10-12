@@ -130,11 +130,11 @@ let run_benchmark ~lift_protocol_limits ~provided_tps_of_injection ~blocks_total
     Protocol.write_parameter_file
       ~base:(Either.right (protocol, Some protocol_constants))
       (if lift_protocol_limits then
-       [
-         (["hard_gas_limit_per_block"], `String_of_int 2147483647);
-         (["hard_gas_limit_per_operation"], `String_of_int 2147483647);
-       ]
-      else [])
+         [
+           (["hard_gas_limit_per_block"], `String_of_int 2147483647);
+           (["hard_gas_limit_per_operation"], `String_of_int 2147483647);
+         ]
+       else [])
   in
   (* It is important to use a good estimate of max possible TPS that is
      theoretically achievable. If we send operations with lower TPS than
@@ -182,7 +182,9 @@ let run_benchmark ~lift_protocol_limits ~provided_tps_of_injection ~blocks_total
   (* We want to give the extra bootstraps as little as possible, just enough
      to do their job. *)
   let default_accounts_balance =
-    (max_single_transaction_fee + Constants.gas_safety_margin) * blocks_total
+    Int64.of_int
+    @@ (max_single_transaction_fee + Constants.gas_safety_margin)
+       * blocks_total
   in
   let* node, client =
     Client.init_with_protocol
@@ -206,7 +208,7 @@ let run_benchmark ~lift_protocol_limits ~provided_tps_of_injection ~blocks_total
      give very little Tez to the extra bootstraps, the default bootstraps will
      dominate in terms of stake. *)
   let delegates = make_delegates Constants.default_bootstraps_count in
-  let _baker = Baker.init ~protocol ~delegates node client in
+  let _baker = Agnostic_baker.init ~delegates node client in
   Log.info "Originating smart contracts" ;
   let* () =
     Client.stresstest_originate_smart_contracts originating_bootstrap client
@@ -219,7 +221,7 @@ let run_benchmark ~lift_protocol_limits ~provided_tps_of_injection ~blocks_total
   let* _ = Node.wait_for_level node benchmark_starting_level in
   let bench_start = Unix.gettimeofday () in
   Log.info "The benchmark has been started" ;
-  let client_stresstest_process =
+  let* client_stresstest_process =
     Client.spawn_stresstest
       ~fee:regular_transaction_fee
       ~gas_limit:regular_transaction_gas_limit
@@ -293,9 +295,11 @@ let register () =
   Long_test.register
     ~__FILE__
     ~title:Dashboard.Test.benchmark_tps
+    ~team:Tag.layer1
     ~tags:[Dashboard.Test.benchmark_tps]
     ~timeout:(Long_test.Minutes 60)
     ~executors:Long_test.[x86_executor1]
+    ~uses:[Tezt_wrapper.Uses.octez_agnostic_baker]
     (fun () ->
       let lift_protocol_limits =
         Cli.get_bool ~default:false "lift-protocol-limits"

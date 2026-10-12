@@ -27,7 +27,7 @@ val sign :
   ( [`POST],
     unit,
     unit * Tezos_crypto.Signature.Public_key_hash.t,
-    Tezos_crypto.Signature.t option,
+    Tezos_crypto.Signature.t option * Signature.version option,
     Bytes.t,
     Tezos_crypto.Signature.t )
   Tezos_rpc.Service.t
@@ -75,4 +75,28 @@ val authorized_keys :
     unit,
     unit,
     Tezos_crypto.Signature.Public_key_hash.t list option )
+  Tezos_rpc.Service.t
+
+val known_keys :
+  ( [`GET],
+    unit,
+    unit,
+    unit,
+    unit,
+    Tezos_crypto.Signature.Public_key_hash.t list )
+  Tezos_rpc.Service.t
+
+(** The query carries the public key to override, when any, and the
+    authentication signature required by a signer started with
+    [--require-authentication]. See
+    {!Signer_messages.Bls_prove_possession.Request.to_sign} for the payload
+    that signature covers. *)
+val bls_prove_possession :
+  ( [`GET],
+    unit,
+    unit * Tezos_crypto.Signature.Public_key_hash.t,
+    Tezos_crypto.Signature.Bls.Public_key.t option
+    * Tezos_crypto.Signature.t option,
+    unit,
+    Tezos_crypto.Signature.Bls.t )
   Tezos_rpc.Service.t

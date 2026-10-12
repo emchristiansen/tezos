@@ -34,7 +34,7 @@ let updated_to_checkpoint =
     ~name:"updated_to_checkpoint"
     ~msg:"updated to checkpoint {block_hash} (running in mode {history_mode})"
     ~level:Notice
-    ~pp1:Block_hash.pp
+    ~pp1:Block_hash.pp_short
     ~pp2:History_mode.Legacy.pp
     ("block_hash", Block_hash.encoding)
     ("history_mode", History_mode.Legacy.encoding)
@@ -78,6 +78,7 @@ let loading_protocol =
 let bootstrapped =
   declare_0
     ~section
+    ~alternative_color:Internal_event.Cyan
     ~name:"bootstrapped"
     ~msg:"chain is bootstrapped"
     ~level:Notice
@@ -86,6 +87,7 @@ let bootstrapped =
 let synchronisation_status =
   declare_1
     ~section
+    ~alternative_color:Internal_event.Magenta
     ~name:"synchronisation_status"
     ~msg:"synchronisation status: {status}"
     ~level:Notice
@@ -96,7 +98,7 @@ let could_not_switch_testchain =
   declare_1
     ~section
     ~name:"could_not_switch_testchain"
-    ~msg:"error while switching testchina: {trace}"
+    ~msg:"error while switching testchain: {trace}"
     ~level:Error
     ~pp1:pp_print_top_error_of_trace
     ("trace", Error_monad.trace_encoding)
@@ -115,22 +117,26 @@ let request_failure =
     ("errors", Error_monad.trace_encoding)
 
 let notify_head =
-  declare_1
+  declare_2
     ~section
     ~name:"notify_head"
-    ~msg:"notify_head from {peer_id}"
+    ~msg:"head {block_hash} from {peer_id} processed"
     ~level:Debug
-    ~pp1:P2p_peer.Id.pp
+    ~pp1:P2p_peer.Id.pp_short
+    ~pp2:Block_hash.pp_short
     ("peer_id", P2p_peer.Id.encoding)
+    ("block_hash", Block_hash.encoding)
 
 let notify_branch =
-  declare_1
+  declare_2
     ~section
     ~name:"notify_branch"
-    ~msg:"notify branch from {peer_id}"
+    ~msg:"branch up to {head_hash} from {peer_id} processed"
     ~level:Info
-    ~pp1:P2p_peer.Id.pp
+    ~pp1:P2p_peer.Id.pp_short
+    ~pp2:Block_hash.pp_short
     ("peer_id", P2p_peer.Id.encoding)
+    ("head_hash", Block_hash.encoding)
 
 let connection =
   declare_1
@@ -165,7 +171,7 @@ let branch_switch =
   declare_2
     ~section
     ~name:"branch_switch"
-    ~msg:"switching branch to {view} ({level})"
+    ~msg:"switch branch to {view} ({level})"
     ~level:Notice
     ~pp1:Request.pp
     ~pp2:(fun fmt -> Format.fprintf fmt "%li")
@@ -183,12 +189,23 @@ let head_increment =
     ("view", Request.encoding)
     ("level", Data_encoding.int32)
 
+let bootstrap_head_increment =
+  declare_2
+    ~section
+    ~name:"bootstrap_time_remaining"
+    ~msg:"synchronizing: current head is {timediff} old (level: {level})"
+    ~level:Notice
+    ("level", Data_encoding.int32)
+    ~pp1:(fun fmt -> Format.fprintf fmt "%li")
+    ("timediff", Time.System.Span.encoding)
+    ~pp2:Time.System.Span.pp_hum
+
 let block_info =
   declare_2
     ~section
     ~name:"block_info"
     ~msg:"treated block has timestamp {timestamp} with fitness {fitness}"
-    ~level:Info
+    ~level:Debug
     ~pp1:Time.Protocol.pp_hum
     ~pp2:Fitness.pp
     ("timestamp", Time.Protocol.encoding)

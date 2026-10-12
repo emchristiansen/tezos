@@ -2,6 +2,7 @@
 (*                                                                           *)
 (* Open Source License                                                       *)
 (* Copyright (c) 2018 Dynamic Ledger Solutions, Inc. <contact@tezos.com>     *)
+(* Copyright (c) 2024 Trilitech <contact@trili.tech>                         *)
 (*                                                                           *)
 (* Permission is hereby granted, free of charge, to any person obtaining a   *)
 (* copy of this software and associated documentation files (the "Software"),*)
@@ -26,10 +27,10 @@
 open Protocol
 open Alpha_context
 
-module RawContractAlias : Client_aliases.Alias with type t = Contract.t
+module Raw_contract_alias : Client_aliases.Alias with type t = Contract.t
 
-(** Like [ContractAlias] below but restricted to originated contracts. *)
-module OriginatedContractAlias : sig
+(** Like [Contract_alias] below but restricted to originated contracts. *)
+module Originated_contract_alias : sig
   val find_destination :
     #Client_context.wallet -> string -> Contract_hash.t tzresult Lwt.t
 
@@ -46,7 +47,7 @@ module OriginatedContractAlias : sig
     (Contract_hash.t option, #Client_context.wallet) Tezos_clic.arg
 end
 
-module ContractAlias : sig
+module Contract_alias : sig
   val get_contract :
     #Client_context.wallet -> string -> Contract.t tzresult Lwt.t
 
@@ -79,18 +80,29 @@ module ContractAlias : sig
   val autocomplete : #Client_context.wallet -> string list tzresult Lwt.t
 end
 
+module Destination_alias : sig
+  val destination_parameter :
+    unit -> (Destination.t, #Client_context.wallet) Tezos_clic.parameter
+
+  val destination_param :
+    ?name:string ->
+    ?desc:string ->
+    ('a, (#Client_context.wallet as 'wallet)) Tezos_clic.params ->
+    (Destination.t -> 'a, 'wallet) Tezos_clic.params
+end
+
 (** [list_contracts cctxt] returns the concatenation of [contracts] and [accounts]
-    where [contracts] is the result of [RawContractAlias.load cctxt]
+    where [contracts] is the result of [Raw_contract_alias.load cctxt]
     and [accounts] the list of accounts (implicit contracts of identities)
 *)
 val list_contracts :
   #Client_context.wallet ->
-  (string * string * RawContractAlias.t) list tzresult Lwt.t
+  (string * string * Raw_contract_alias.t) list tzresult Lwt.t
 
-(** Calls {!Alpha_services.Contract.delegate_opt} *)
+(** Calls {!Plugin.Alpha_services.Contract.delegate_opt} *)
 val get_delegate :
   #Protocol_client_context.rpc_context ->
   chain:Shell_services.chain ->
   block:Shell_services.block ->
   Contract.t ->
-  public_key_hash option tzresult Lwt.t
+  Implicit_account_repr.t option tzresult Lwt.t

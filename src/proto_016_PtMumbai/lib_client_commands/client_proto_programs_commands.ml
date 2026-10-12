@@ -85,7 +85,7 @@ let commands () =
       ~default:"0.05"
   in
   let source_arg =
-    ContractAlias.destination_arg
+    Contract_alias.destination_arg
       ~name:"source"
       ~doc:"name of the source (i.e. SENDER) contract for the transaction"
       ()
@@ -97,7 +97,7 @@ let commands () =
       ()
   in
   let self_arg =
-    OriginatedContractAlias.destination_arg
+    Originated_contract_alias.destination_arg
       ~name:"self-address"
       ~doc:"address of the contract (i.e. SELF_ADDRESS) for the transaction"
       ()
@@ -136,7 +136,7 @@ let commands () =
   in
   let signature_parameter =
     parameter (fun _cctxt s ->
-        match Tezos_crypto.Signature.of_b58check_opt s with
+        match Signature.of_b58check_opt s with
         | Some s -> Lwt_result_syntax.return s
         | None -> failwith "Not given a valid signature")
   in
@@ -291,7 +291,8 @@ let commands () =
            program
            storage
            input
-           cctxt ->
+           cctxt
+         ->
         let open Lwt_result_syntax in
         let*? program = Micheline_parser.no_parsing_error program in
         let show_source = not no_print_source in
@@ -347,7 +348,8 @@ let commands () =
       (fun (emacs_mode, no_print_source, original_gas, legacy)
            program
            storage
-           cctxt ->
+           cctxt
+         ->
         let open Lwt_result_syntax in
         let setup = (emacs_mode, no_print_source) in
         let* original_gas = resolve_max_gas cctxt cctxt#block original_gas in
@@ -367,38 +369,78 @@ let commands () =
         return_unit);
     command
       ~group
-      ~desc:"Ask the node to typecheck a script."
-      (args5
+      ~desc:"Ask the node to typecheck one or several scripts."
+      (args6
          show_types_switch
          emacs_mode_switch
          no_print_source_flag
          run_gas_limit_arg
-         legacy_switch)
-      (prefixes ["typecheck"; "script"] @@ Program.source_param @@ stop)
-      (fun (show_types, emacs_mode, no_print_source, original_gas, legacy)
-           program
-           cctxt ->
+         legacy_switch
+         display_names_flag)
+      (prefixes ["typecheck"; "script"]
+      @@ seq_of_param @@ file_or_literal_param ())
+      (fun ( show_types,
+             emacs_mode,
+             no_print_source,
+             original_gas,
+             legacy,
+             display_names )
+           expr_strings
+           cctxt
+         ->
         let open Lwt_result_syntax in
         let setup = (emacs_mode, no_print_source) in
-        handle_parsing_error "types" cctxt setup program @@ fun program ->
-        let* original_gas = resolve_max_gas cctxt cctxt#block original_gas in
-        let*! res =
-          typecheck_program
-            cctxt
-            ~chain:cctxt#chain
-            ~block:cctxt#block
-            ~gas:original_gas
-            ~legacy
-            ~show_types
-            program
-        in
-        print_typecheck_result
-          ~emacs:emacs_mode
-          ~show_types
-          ~print_source_on_error:(not no_print_source)
-          program
-          res
-          cctxt);
+        match expr_strings with
+        | [] ->
+            let*! () =
+              cctxt#warning "No scripts were specified on the command line"
+            in
+            return_unit
+        | _ :: _ ->
+            let* _number_of_literal_scripts =
+              List.fold_left_es
+                (fun i (src, expr_string) ->
+                  let program =
+                    Michelson_v1_parser.parse_toplevel expr_string
+                  in
+                  let name, i =
+                    match src with
+                    | Some src -> (src, i)
+                    | None ->
+                        let i = i + 1 in
+                        ("Literal script " ^ string_of_int i, i)
+                  in
+                  let* () =
+                    handle_parsing_error "types" cctxt setup program
+                    @@ fun program ->
+                    let* original_gas =
+                      resolve_max_gas cctxt cctxt#block original_gas
+                    in
+                    let*! res =
+                      typecheck_program
+                        cctxt
+                        ~chain:cctxt#chain
+                        ~block:cctxt#block
+                        ~gas:original_gas
+                        ~legacy
+                        ~show_types
+                        program
+                    in
+                    print_typecheck_result
+                      ~emacs:emacs_mode
+                      ~show_types
+                      ~print_source_on_error:(not no_print_source)
+                      ~display_names
+                      ~name
+                      program
+                      res
+                      cctxt
+                  in
+                  return i)
+                0
+                expr_strings
+            in
+            return_unit);
     command
       ~group
       ~desc:"Ask the node to typecheck a data expression."
@@ -531,57 +573,63 @@ let commands () =
       (prefixes ["hash"; "script"] @@ seq_of_param @@ file_or_literal_param ())
       (fun (check, display_names, scriptable)
            expr_strings
-           (cctxt : Protocol_client_context.full) ->
+           (cctxt : Protocol_client_context.full)
+         ->
         let open Lwt_result_syntax in
-        if List.compare_length_with expr_strings 0 = 0 then
-          let*! () =
-            cctxt#warning "No scripts were specified on the command line"
-          in
-          return_unit
-        else
-          let* hash_name_rows =
-            List.mapi_ep
-              (fun i (src, expr_string) ->
-                let program =
-                  Michelson_v1_parser.parse_toplevel ~check expr_string
+        match expr_strings with
+        | [] ->
+            let*! () =
+              cctxt#warning "No scripts were specified on the command line"
+            in
+            return_unit
+        | _ :: _ ->
+            let* hash_name_rows_rev, _number_of_literal_scripts =
+              List.fold_left_es
+                (fun (l, i) (src, expr_string) ->
+                  let program =
+                    Michelson_v1_parser.parse_toplevel ~check expr_string
+                  in
+                  let*? program = Micheline_parser.no_parsing_error program in
+                  let code = program.expanded in
+                  let bytes =
+                    Data_encoding.Binary.to_bytes_exn
+                      Alpha_context.Script.expr_encoding
+                      code
+                  in
+                  let hash =
+                    Format.asprintf
+                      "%a"
+                      Script_expr_hash.pp
+                      (Script_expr_hash.hash_bytes [bytes])
+                  in
+                  let name, i =
+                    match src with
+                    | Some src -> (src, i)
+                    | None ->
+                        let i = i + 1 in
+                        ("Literal script " ^ string_of_int i, i)
+                  in
+                  return ((hash, name) :: l, i))
+                ([], 0)
+                expr_strings
+            in
+            let hash_name_rows = List.rev hash_name_rows_rev in
+            Tezos_clic_unix.Scriptable.output
+              scriptable
+              ~for_human:(fun () ->
+                let*! () =
+                  List.iter_s
+                    (fun (hash, name) ->
+                      if display_names then cctxt#answer "%s\t%s" hash name
+                      else cctxt#answer "%s" hash)
+                    hash_name_rows
                 in
-                let*? program = Micheline_parser.no_parsing_error program in
-                let code = program.expanded in
-                let bytes =
-                  Data_encoding.Binary.to_bytes_exn
-                    Alpha_context.Script.expr_encoding
-                    code
-                in
-                let hash =
-                  Format.asprintf
-                    "%a"
-                    Script_expr_hash.pp
-                    (Script_expr_hash.hash_bytes [bytes])
-                in
-                let name =
-                  Option.value
-                    src
-                    ~default:("Literal script " ^ string_of_int (i + 1))
-                in
-                return (hash, name))
-              expr_strings
-          in
-          Tezos_clic_unix.Scriptable.output
-            scriptable
-            ~for_human:(fun () ->
-              let*! () =
-                List.iter_s
+                return_unit)
+              ~for_script:(fun () ->
+                List.map
                   (fun (hash, name) ->
-                    if display_names then cctxt#answer "%s\t%s" hash name
-                    else cctxt#answer "%s" hash)
-                  hash_name_rows
-              in
-              return_unit)
-            ~for_script:(fun () ->
-              List.map
-                (fun (hash, name) ->
-                  if display_names then [hash; name] else [hash])
-                hash_name_rows));
+                    if display_names then [hash; name] else [hash])
+                  hash_name_rows));
     command
       ~group
       ~desc:
@@ -735,9 +783,7 @@ let commands () =
       (fun () bytes sk cctxt ->
         let open Lwt_result_syntax in
         let* signature = Client_keys.sign cctxt sk bytes in
-        let*! () =
-          cctxt#message "Signature: %a" Tezos_crypto.Signature.pp signature
-        in
+        let*! () = cctxt#message "Signature: %a" Signature.pp signature in
         return_unit);
     command
       ~group
@@ -759,7 +805,8 @@ let commands () =
            bytes
            (_, (key_locator, _))
            signature
-           (cctxt : #Protocol_client_context.full) ->
+           (cctxt : #Protocol_client_context.full)
+         ->
         let open Lwt_result_syntax in
         let* check = Client_keys.check key_locator signature bytes in
         if check then
@@ -859,11 +906,15 @@ let commands () =
       @@ file_or_literal_param () @@ prefix "from" @@ convert_input_format_param
       @@ prefix "to" @@ convert_output_format_param @@ stop)
       (fun (zero_loc, legacy, check)
-           (_, expr_string)
+           (origin, expr_string)
            from_format
            to_format
-           (cctxt : Protocol_client_context.full) ->
+           (cctxt : Protocol_client_context.full)
+         ->
         let open Lwt_result_syntax in
+        let name =
+          match origin with Some path -> path | None -> "Literal script"
+        in
         let* (expression : Alpha_context.Script.expr) =
           match from_format with
           | `Michelson ->
@@ -887,6 +938,8 @@ let commands () =
                       ~emacs:false
                       ~show_types:true
                       ~print_source_on_error:true
+                      ~display_names:false
+                      ~name
                       program
                       res
                       cctxt
@@ -945,7 +998,8 @@ let commands () =
            (_, data_string)
            from_format
            to_format
-           (cctxt : Protocol_client_context.full) ->
+           (cctxt : Protocol_client_context.full)
+         ->
         let open Lwt_result_syntax in
         let micheline_of_expr expr =
           Micheline_printer.printable
@@ -1048,7 +1102,7 @@ let commands () =
            ~desc:"the name of the view"
            entrypoint_parameter
       @@ prefixes ["on"; "contract"]
-      @@ OriginatedContractAlias.destination_param
+      @@ Originated_contract_alias.destination_param
            ~name:"contract"
            ~desc:"viewed contract"
       @@ prefixes ["with"; "input"]
@@ -1058,7 +1112,8 @@ let commands () =
            entrypoint
            contract
            input
-           cctxt ->
+           cctxt
+         ->
         let open Lwt_syntax in
         let* res =
           Client_proto_programs.run_view
@@ -1087,14 +1142,15 @@ let commands () =
       (prefixes ["run"; "view"]
       @@ param ~name:"view" ~desc:"the name of the view" string_parameter
       @@ prefixes ["on"; "contract"]
-      @@ OriginatedContractAlias.destination_param
+      @@ Originated_contract_alias.destination_param
            ~name:"contract"
            ~desc:"the contract containing the view"
       @@ stop)
       (fun (source, payer, gas, unlimited_gas, unparsing_mode, now, level)
            view
            contract
-           cctxt ->
+           cctxt
+         ->
         let open Lwt_result_syntax in
         let*? input =
           Micheline_parser.no_parsing_error
@@ -1128,7 +1184,7 @@ let commands () =
       (prefixes ["run"; "view"]
       @@ param ~name:"view" ~desc:"the name of the view" string_parameter
       @@ prefixes ["on"; "contract"]
-      @@ OriginatedContractAlias.destination_param
+      @@ Originated_contract_alias.destination_param
            ~name:"contract"
            ~desc:"the contract containing the view"
       @@ prefixes ["with"; "input"]
@@ -1141,7 +1197,8 @@ let commands () =
            view
            contract
            input
-           cctxt ->
+           cctxt
+         ->
         let open Lwt_syntax in
         let* res =
           Client_proto_programs.run_script_view

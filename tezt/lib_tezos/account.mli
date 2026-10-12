@@ -31,6 +31,7 @@ type secret_key =
   | Unencrypted of string
       (** The string does NOT contain the 'encrypted:' prefix *)
   | Encrypted of string
+  | Remote of string
 
 (** Keys associated to an account. For example:
 {[
@@ -52,24 +53,6 @@ type key = {
 (** A [Check.typ] for [key] *)
 val key_typ : key Check.typ
 
-(** Keys associated to an aggregatable account. For example:
-{[
-    {
-      aggregate_alias = "bls_account";
-      aggregate_public_key_hash = "tz4EECtMxAuJ9UDLaiMZH7G1GCFYUWsj8HZn";
-      aggregate_public_key =
-        "BLpk1yUiLJ7RezbyViD5ZvWTfQndM3TRRYmvYWkUfH2EJqsLFnzzvpJss6pbuz3U1DDMpk8v16nV";
-      aggregate_secret_key =
-        Unencrypted "BLsk1hKAHyGqY9qRbgoSVnjiSmDWpKGjFF3WNQ7BaiaMUA6RMA6Pfq";
-    }
-]} *)
-type aggregate_key = {
-  aggregate_alias : string;
-  aggregate_public_key_hash : string;
-  aggregate_public_key : string;
-  aggregate_secret_key : secret_key;
-}
-
 (** [sign_bytes ~watermark ~signer message] signs the bytes [message] with
     [signer]'s secret key. Returns the corresponding Tezos signature. This
     function can be used to sign transactions, blocks, etc. depending on
@@ -77,7 +60,7 @@ type aggregate_key = {
 
     Used for regular accounts. *)
 val sign_bytes :
-  watermark:Tezos_crypto.Signature.watermark ->
+  ?watermark:Tezos_crypto.Signature.watermark ->
   signer:key ->
   bytes ->
   Tezos_crypto.Signature.t
@@ -85,8 +68,11 @@ val sign_bytes :
 (** [require_unencrypted_secret_key ~__LOC__ key] returns [sk] if [key] is [Unencrypted sk], or fails. *)
 val require_unencrypted_secret_key : __LOC__:string -> secret_key -> string
 
-(** [uri_of_secret_key secret_key] returns [secret_key] as an URI. 
-    
+val require_unencrypted_or_remote_secret_key :
+  __LOC__:string -> secret_key -> unit
+
+(** [uri_of_secret_key secret_key] returns [secret_key] as an URI.
+
     The URI of a secret key is its contents prefixed [unencrypted:] respectively
     [encrypted:] if it is unencrypted respetively encrypted. *)
 val uri_of_secret_key : secret_key -> string
@@ -99,6 +85,18 @@ val secret_key_typ : secret_key Check.typ
    as importing all the keys manually  via [octez-client] but is
    faster. *)
 val write : key list -> base_dir:string -> unit
+
+(** [generate_new_key ~algo ~alias] generates a new key using the given [algo], and
+    the Tezos crypto library. Even though an [alias] is given, this key is not
+    registered in a client, and must be registered manually.
+    Typically, this can be used to generate keys for bootstrap accounts, and include
+    them in [overwrite_bootstrap_accounts] when calling [Protocol.write_parameter_file].
+    At this point it is possible to specify the delegate and consensus keys of an
+    arbitrary number of bootstrap accounts.
+    To use these keys in a client and start baking, it is necessary to include them using
+    [Client.import_secret_key] (which is usually not needed for the default
+    bootstrap accounts). *)
+val generate_new_key : algo:Tezos_crypto.Signature.algo -> alias:string -> key
 
 module Bootstrap : sig
   (** Standard name for a bootstrap account parameterised by an
@@ -120,15 +118,3 @@ v}
     and returns the corresponding key.
 *)
 val parse_client_output : alias:string -> client_output:string -> key
-
-(** [parse_client_output_aggregate ~alias ~client_output] extracts keys from
-    clients output that yields result of the form
-{v
-      Hash: tz4EECtMxAuJ9UDLaiMZH7G1GCFYUWsj8HZn
-      Public Key: BLpk1yUiLJ7RezbyViD5ZvWTfQndM3TRRYmvYWkUfH2EJqsLFnzzvpJss6pbuz3U1DDMpk8v16nV
-      Secret Key: aggregate_unencrypted:BLsk1hKAHyGqY9qRbgoSVnjiSmDWpKGjFF3WNQ7BaiaMUA6RMA6Pfq
-v}
-    and returns the corresponding key.
-*)
-val parse_client_output_aggregate :
-  alias:string -> client_output:string -> aggregate_key

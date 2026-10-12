@@ -24,46 +24,60 @@
 (*****************************************************************************)
 
 (** This modules handles all the validation/application/finalisation
-   of any operation related to the DAL. *)
+    of any operation related to the DAL. *)
 
 open Alpha_context
 
-(** [validate_attestation ctxt op] ensures that [op.attestation] is
-   valid and prevents an operation containing [op.attestation]
-   to be refused on top of [ctxt]. If an [Error _] is returned, the
-   [op.attestation] is not valid. *)
-val validate_attestation : t -> Dal.Attestation.operation -> unit tzresult
+(** [validate_attestations ctxt ~attestation_level consensus_key attestations]
+    checks whether the DAL attestations [attestations] emitted at the given
+    [attestation_level] by the attester with the given [consensus_key] is valid. 
+    If an [Error _] is returned, the [op] is not valid.
+    The checks made are:
+    * the attestations' size does not exceed the maximum;
+    * for all lags, the delegate is in the DAL committee if for a given lag it
+      attached a non-empty attestation.
 
-(** [apply_attestation ctxt op] applies [op.attestation] into the
-   [ctxt] assuming [op.attestor] issued those attestations. *)
-val apply_attestation : t -> Dal.Attestation.operation -> t tzresult
+    These are checks done for the DAL part alone, checks on other fields of an
+    attestation (like level, round) are done by the caller. *)
+val validate_attestations :
+  t ->
+  attestation_level:Raw_level.t ->
+  Consensus_key.pk ->
+  Dal.Attestations.t ->
+  unit tzresult
 
-(** [validate_publish_slot_header ctxt slot] ensures that [slot_header] is
+(** [apply_attestations ctxt ~current_level attestations ~tb_slot
+    ~committee_level_to_shard_count] records in the context that the given
+    [attestations] were issued by the delegate with initial Tenderbake slot
+    [tb_slot] and the corresponding attester has the for each relevant committee
+    level a number of assigned shards as given by
+    [committee_level_to_shard_count]. *)
+val apply_attestations :
+  t ->
+  delegate:Implicit_account_repr.t ->
+  attested_level:Raw_level.t ->
+  Dal.Attestations.t ->
+  tb_slot:Slot.t ->
+  committee_level_to_shard_count:int Raw_level.Map.t ->
+  t tzresult
+
+(** [validate_publish_commitment ctxt slot] ensures that [slot_header] is
    valid and prevents an operation containing [slot_header] to be
    refused on top of [ctxt]. If an [Error _] is returned, the [slot_header]
    is not valid. *)
-val validate_publish_slot_header :
-  t -> Dal.Operations.Publish_slot_header.t -> unit tzresult
+val validate_publish_commitment :
+  t -> Dal.Operations.Publish_commitment.t -> unit tzresult
 
-(** [apply_publish_slot_header ctxt slot_header] applies the publication of
-   slot header [slot_header] on top of [ctxt]. Fails if the slot contains
-   already a slot header. *)
-val apply_publish_slot_header :
-  t -> Dal.Operations.Publish_slot_header.t -> (t * Dal.Slot.Header.t) tzresult
+(** [apply_publish_commitment ctxt slot_header ~source] applies the publication
+    of slot header [slot_header] associated to [source] on top of [ctxt]. Fails
+    if the slot already contains a slot header. *)
+val apply_publish_commitment :
+  t ->
+  Dal.Operations.Publish_commitment.t ->
+  source:Contract.t ->
+  (t * Dal.Slot.Header.t) tzresult
 
-(** [finalisation ctxt] should be executed at block finalisation
-   time. A set of slots attested at level [ctxt.current_level - lag]
-   is returned encapsulated into the attestation data-structure.
-
-   [lag] is a parametric constant specific to the data-availability
-   layer.  *)
-val finalisation : t -> (t * Dal.Attestation.t option) tzresult Lwt.t
-
-(** [initialize ctxt ~level] should be executed at block
-   initialisation time. It allows to cache the committee for [level]
-   in memory so that every time we need to use this committee, there
-   is no need to recompute it again. *)
-val initialisation : t -> level:Level.t -> t tzresult Lwt.t
-
-(** [compute_committee ctxt level] computes the DAL committee for [level]. *)
-val compute_committee : t -> Level.t -> Dal.Attestation.committee tzresult Lwt.t
+(** [finalisation ctxt] should be executed at block finalisation time. A set of
+    slots attested at level [ctxt.current_level] is returned encapsulated into
+    the attestation data-structure. *)
+val finalisation : t -> (t * Dal.Slot_availability.t) tzresult Lwt.t

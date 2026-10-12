@@ -34,16 +34,40 @@
 
 type ('msg, 'peer, 'conn) t
 
+(* [create sock ~point_info ~peer_info msg_pipe canceler greylist callbacks
+   disable_peer_discovery version] creates a connection over [sock] with the
+   corresponding [point_info], [peer_info] and negotiated [version].
+
+   [msg_pipe] is the pipe where the received messages are read.
+   [canceler] is used to initiate or propagate the closure of the connection.
+   [greylist] is a callback to greylist the peer id of the connection.
+   [callback] is a record that contains the functions to call to handle each
+              kind of received messages.
+   If [disable_peer_discovery] is true, then the received [Advertise] and
+   [Bootstrap] messages are ignored. Requests to send a [Bootstrap] message are
+   ignored and requests to send an [Advertise] message fail.
+*)
 val create :
   conn:('msg P2p_message.t, 'conn) P2p_socket.t ->
   point_info:('msg, 'peer, 'conn) t P2p_point_state.Info.t option ->
   peer_info:(('msg, 'peer, 'conn) t, 'peer, 'conn) P2p_peer_state.Info.t ->
   messages:(int * 'msg) Lwt_pipe.Maybe_bounded.t ->
   canceler:Lwt_canceler.t ->
-  greylister:(unit -> unit) ->
+  greylister:(motive:string -> unit Lwt.t) ->
   callback:'msg P2p_answerer.t ->
+  disable_peer_discovery:bool ->
   Network_version.t ->
-  ('msg, 'peer, 'conn) t
+  ('msg, 'peer, 'conn) t tzresult Lwt.t
+
+(* TODO: https://gitlab.com/tezos/tezos/-/issues/4615
+   Properly document disconnect/close. Check they are properly used
+   and if we really need both. *)
+
+val disconnect :
+  ?wait:bool ->
+  reason:P2p_disconnection_reason.t ->
+  ('msg, 'peer, 'conn) t ->
+  unit Lwt.t
 
 val peer_id : ('msg, 'peer, 'conn) t -> P2p_peer.Id.t
 
@@ -63,6 +87,14 @@ val remote_metadata : ('msg, 'peer, 'conn) t -> 'conn
 
 (** [stat t] is a snapshot of current bandwidth usage for [t]. *)
 val stat : ('msg, 'peer, 'conn) t -> P2p_stat.t
+
+(** [wait_reader_closed t] is a promise that resolves when the TCP
+    read side of [t] fails. *)
+val wait_reader_closed : ('msg, 'peer, 'conn) t -> unit Lwt.t
+
+(** [wait_writer_closed t] is a promise that resolves when the TCP
+    write side of [t] fails. *)
+val wait_writer_closed : ('msg, 'peer, 'conn) t -> unit Lwt.t
 
 (** [read t] returns a message popped from [t]'s app message
     queue, or fails with [Connection_closed]. *)
@@ -113,13 +145,11 @@ val write_encoded_now :
 
 val equal_sock : ('msg, 'peer, 'conn) t -> ('msg, 'peer, 'conn) t -> bool
 
-(* TODO: https://gitlab.com/tezos/tezos/-/issues/4615
-   Properly document disconnect/close. Check they are properly used
-   and if we really need both. *)
+val disconnect_reason :
+  ('msg, 'peer, 'conn) t -> P2p_disconnection_reason.t option
 
-val disconnect : ?wait:bool -> ('msg, 'peer, 'conn) t -> unit Lwt.t
-
-val close : ('msg, 'peer, 'conn) t -> unit Lwt.t
+val close :
+  reason:P2p_disconnection_reason.t -> ('msg, 'peer, 'conn) t -> unit Lwt.t
 
 (** Returns the network version that will be used for this connection.
    This network version is the best version compatible with the versions

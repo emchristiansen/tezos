@@ -27,6 +27,116 @@
 open Data_encoding
 module Proof = Tezos_context_sigs.Context.Proof_types
 
+type version = Version_1 | Version_2
+
+let string_of_version = function Version_1 -> "1" | Version_2 -> "2"
+
+type version_informations = {
+  supported : version list;
+  latest : version;
+  default : version;
+}
+
+let mk_version_informations ~supported ~(latest : version) ~(default : version)
+    () =
+  assert (List.mem ~equal:( == ) latest supported) ;
+  assert (List.mem ~equal:( == ) default supported) ;
+  {supported; latest; default}
+
+let mk_version_1_informations =
+  mk_version_informations
+    ~supported:[Version_1]
+    ~latest:Version_1
+    ~default:Version_1
+
+let mk_version_2_informations =
+  mk_version_informations
+    ~supported:[Version_2]
+    ~latest:Version_2
+    ~default:Version_2
+
+let pp_supported_version fmt {supported; latest; default} =
+  let open Format in
+  (pp_print_list
+     ~pp_sep:(fun fmt () -> fprintf fmt ",")
+     (fun fmt version ->
+       fprintf
+         fmt
+         " version %S %s"
+         (string_of_version version)
+         (match (version = default, not (version = latest)) with
+         | true, true -> "(default but deprecated)"
+         | true, false -> "(default)"
+         | false, true -> "(deprecated)"
+         | false, false -> "")))
+    fmt
+    supported
+
+let unsupported_version_msg version supported =
+  Format.asprintf
+    "Unsupported version %s (supported versions %a)"
+    version
+    pp_supported_version
+    supported
+
+let is_supported_version (version : version) (supported : version list) =
+  List.exists (fun supported -> version == supported) supported
+
+let version_of_string version_informations version =
+  let open Result_syntax in
+  let* version_t =
+    match version with
+    | "1" -> Ok Version_1
+    | "2" -> Ok Version_2
+    | _ -> Error (unsupported_version_msg version version_informations)
+  in
+  if is_supported_version version_t version_informations.supported then
+    Ok version_t
+  else Error (unsupported_version_msg version version_informations)
+
+let version_arg supported =
+  let open Tezos_rpc.Arg in
+  make
+    ~descr:
+      (Format.asprintf
+         "Supported RPC versions are%a"
+         pp_supported_version
+         supported)
+    ~name:"version"
+    ~destruct:(version_of_string supported)
+    ~construct:string_of_version
+    ()
+
+(* This function creates an encoding that use the [latest_encoding] in binary
+   and that can use [latest_encoding] and any [old_encodings] in JSON. The
+   version value is only used to decide which encoding to use in JSON. *)
+let encoding_versioning ~encoding_name ~latest_encoding ~old_encodings =
+  let make_case ~version ~encoding =
+    case
+      ~title:
+        (Format.sprintf
+           "%s_encoding_v%s"
+           encoding_name
+           (string_of_version version))
+      Json_only
+      encoding
+      (function v, value when v == version -> Some value | _v, _value -> None)
+      (fun value -> (version, value))
+  in
+  let latest_version, latest_encoding = latest_encoding in
+  splitted
+    ~binary:
+      (conv
+         (fun (_, value) -> value)
+         (fun value -> (latest_version, value))
+         latest_encoding)
+    ~json:
+      (union
+         (make_case ~version:latest_version ~encoding:latest_encoding
+         :: List.map
+              (fun (version, encoding) -> make_case ~version ~encoding)
+              old_encodings))
+
 (* TODO: V2.Tree32 has been chosen arbitrarily ; maybe it's not the best option *)
 module Merkle_proof_encoding =
   Tezos_context_merkle_proof_encoding.Merkle_proof_encoding.V2.Tree32
@@ -198,11 +308,15 @@ let to_string = function
 let blocks_arg =
   let name = "block_id" in
   let descr =
-    "A block identifier. This is either a block hash in Base58Check notation, \
-     one the predefined aliases: 'genesis', 'head' or a block level (index in \
-     the chain). One might also use 'head~N' or '<hash>~N' where N is an \
-     integer to denote the Nth predecessor of the designated block.Also, \
-     '<hash>+N' denotes the Nth successor of a block."
+    "A block identifier. This can take one of the following values:\n\
+     \t1.Block-hash - Hash in Base58Check notation.\n\
+     \t2.Alias - One of the following:'genesis/ head/ caboose/ savepoint/ \
+     checkpoint'.\n\
+     \t3.Block-level - index(integer) in the chain.\n\
+     \tOne can also specify the relative positions of block with respect to \
+     above three block identifiers. For ex. 'checkpoint~N' or checkpoint+N, \
+     where N is an integer, denotes the Nth block before(~) or after (+) the \
+     checkpoint."
   in
   let construct = to_string in
   let destruct = parse_block in
@@ -375,7 +489,719 @@ let raw_protocol_encoding =
        (req "protocol" Protocol_hash.encoding)
        (req "next_protocol" Protocol_hash.encoding))
 
+module type S = sig
+  val path : (unit, chain_prefix * block) Tezos_rpc.Path.t
+
+  module Proto : PROTO
+
+  module Next_proto : PROTO
+
+  type raw_block_header = {
+    shell : Block_header.shell_header;
+    protocol_data : Proto.block_header_data;
+  }
+
+  type block_header = {
+    chain_id : Chain_id.t;
+    hash : Block_hash.t;
+    shell : Block_header.shell_header;
+    protocol_data : Proto.block_header_data;
+  }
+
+  type block_metadata = {
+    protocol_data : Proto.block_header_metadata;
+    test_chain_status : Test_chain_status.t;
+    max_operations_ttl : int;
+    max_operation_data_length : int;
+    max_block_header_length : int;
+    operation_list_quota : operation_list_quota list;
+  }
+
+  type operation_receipt =
+    | Empty
+    | Too_large
+    | Receipt of Proto.operation_receipt
+
+  type operation = {
+    chain_id : Chain_id.t;
+    hash : Operation_hash.t;
+    shell : Operation.shell_header;
+    protocol_data : Proto.operation_data;
+    receipt : operation_receipt;
+  }
+
+  type block_info = {
+    chain_id : Chain_id.t;
+    hash : Block_hash.t;
+    header : raw_block_header;
+    metadata : block_metadata option;
+    operations : operation list list;
+  }
+
+  val block_info_encoding : (version * block_info) Data_encoding.t
+
+  open Tezos_rpc.Context
+
+  val info :
+    #simple ->
+    ?version:version ->
+    ?force_metadata:bool ->
+    ?metadata:[`Always | `Never] ->
+    ?chain:chain ->
+    ?block:block ->
+    unit ->
+    block_info tzresult Lwt.t
+
+  val hash :
+    #simple ->
+    ?chain:chain ->
+    ?block:block ->
+    unit ->
+    Block_hash.t tzresult Lwt.t
+
+  val raw_header :
+    #simple -> ?chain:chain -> ?block:block -> unit -> Bytes.t tzresult Lwt.t
+
+  val header :
+    #simple ->
+    ?chain:chain ->
+    ?block:block ->
+    unit ->
+    block_header tzresult Lwt.t
+
+  val metadata :
+    #simple ->
+    ?version:version ->
+    ?chain:chain ->
+    ?block:block ->
+    unit ->
+    block_metadata tzresult Lwt.t
+
+  val metadata_hash :
+    #simple ->
+    ?chain:chain ->
+    ?block:block ->
+    unit ->
+    Block_metadata_hash.t tzresult Lwt.t
+
+  val resulting_context_hash :
+    #simple ->
+    ?chain:chain ->
+    ?block:block ->
+    unit ->
+    Context_hash.t tzresult Lwt.t
+
+  module Header : sig
+    val shell_header :
+      #simple ->
+      ?chain:chain ->
+      ?block:block ->
+      unit ->
+      Block_header.shell_header tzresult Lwt.t
+
+    val protocol_data :
+      #simple ->
+      ?chain:chain ->
+      ?block:block ->
+      unit ->
+      Proto.block_header_data tzresult Lwt.t
+
+    val raw_protocol_data :
+      #simple -> ?chain:chain -> ?block:block -> unit -> Bytes.t tzresult Lwt.t
+  end
+
+  module Operations : sig
+    val operations :
+      #simple ->
+      ?version:version ->
+      ?force_metadata:bool ->
+      ?metadata:[`Always | `Never] ->
+      ?chain:chain ->
+      ?block:block ->
+      unit ->
+      operation list list tzresult Lwt.t
+
+    val operations_in_pass :
+      #simple ->
+      ?version:version ->
+      ?force_metadata:bool ->
+      ?metadata:[`Always | `Never] ->
+      ?chain:chain ->
+      ?block:block ->
+      int ->
+      operation list tzresult Lwt.t
+
+    val operation :
+      #simple ->
+      ?version:version ->
+      ?force_metadata:bool ->
+      ?metadata:[`Always | `Never] ->
+      ?chain:chain ->
+      ?block:block ->
+      int ->
+      int ->
+      operation tzresult Lwt.t
+  end
+
+  module Operation_hashes : sig
+    val operation_hashes :
+      #simple ->
+      ?chain:chain ->
+      ?block:block ->
+      unit ->
+      Operation_hash.t list list tzresult Lwt.t
+
+    val operation_hashes_in_pass :
+      #simple ->
+      ?chain:chain ->
+      ?block:block ->
+      int ->
+      Operation_hash.t list tzresult Lwt.t
+
+    val operation_hash :
+      #simple ->
+      ?chain:chain ->
+      ?block:block ->
+      int ->
+      int ->
+      Operation_hash.t tzresult Lwt.t
+  end
+
+  module Operation_metadata_hashes : sig
+    val root :
+      #simple ->
+      ?chain:chain ->
+      ?block:block ->
+      unit ->
+      Operation_metadata_list_list_hash.t tzresult Lwt.t
+
+    val operation_metadata_hashes :
+      #simple ->
+      ?chain:chain ->
+      ?block:block ->
+      unit ->
+      Operation_metadata_hash.t list list tzresult Lwt.t
+
+    val operation_metadata_hashes_in_pass :
+      #simple ->
+      ?chain:chain ->
+      ?block:block ->
+      int ->
+      Operation_metadata_hash.t list tzresult Lwt.t
+
+    val operation_metadata_hash :
+      #simple ->
+      ?chain:chain ->
+      ?block:block ->
+      int ->
+      int ->
+      Operation_metadata_hash.t tzresult Lwt.t
+  end
+
+  module Context : sig
+    val read :
+      #simple ->
+      ?chain:chain ->
+      ?block:block ->
+      ?depth:int ->
+      string list ->
+      Proof.raw_context tzresult Lwt.t
+
+    val merkle_tree :
+      #simple ->
+      ?chain:chain ->
+      ?block:block ->
+      ?holey:bool ->
+      string list ->
+      Proof.tree Proof.t option tzresult Lwt.t
+  end
+
+  module Helpers : sig
+    module Forge : sig
+      val block_header :
+        #Tezos_rpc.Context.simple ->
+        ?chain:chain ->
+        ?block:block ->
+        Block_header.t ->
+        Bytes.t tzresult Lwt.t
+    end
+
+    module Preapply : sig
+      val block :
+        #simple ->
+        ?chain:chain ->
+        ?block:block ->
+        ?sort:bool ->
+        ?timestamp:Time.Protocol.t ->
+        protocol_data:Next_proto.block_header_data ->
+        Next_proto.operation list list ->
+        (Block_header.shell_header * error Preapply_result.t list) tzresult
+        Lwt.t
+
+      val operations :
+        #simple ->
+        ?chain:chain ->
+        ?block:block ->
+        ?version:version ->
+        Next_proto.operation list ->
+        (Next_proto.operation_data * Next_proto.operation_receipt) list tzresult
+        Lwt.t
+    end
+
+    val complete :
+      #simple ->
+      ?chain:chain ->
+      ?block:block ->
+      string ->
+      string list tzresult Lwt.t
+  end
+
+  module Mempool : sig
+    type t = {
+      validated : (Operation_hash.t * Next_proto.operation) list;
+      refused : (Next_proto.operation * error list) Operation_hash.Map.t;
+      outdated : (Next_proto.operation * error list) Operation_hash.Map.t;
+      branch_refused : (Next_proto.operation * error list) Operation_hash.Map.t;
+      branch_delayed : (Next_proto.operation * error list) Operation_hash.Map.t;
+      unprocessed : Next_proto.operation Operation_hash.Map.t;
+    }
+
+    (** Call RPC GET /chains/[chain]/mempool/pending_operations
+
+    - Default [version] is [0].
+    - Default [validated] is [true].
+    - Default [branch_delayed] is [true].
+    - Default [branch_refused] is [true].
+    - Default [refused] is [true].
+    - Default [outdated] is [true].
+    - Default [validation_passes] is [[]]
+    - Default [sources] is [[]]
+    - Default [operation_hash] is [[]]*)
+    val pending_operations :
+      #simple ->
+      ?chain:chain ->
+      ?version:version ->
+      ?validated:bool ->
+      ?branch_delayed:bool ->
+      ?branch_refused:bool ->
+      ?refused:bool ->
+      ?outdated:bool ->
+      ?validation_passes:int list ->
+      ?sources:string list ->
+      ?operation_hash:string list ->
+      unit ->
+      t tzresult Lwt.t
+
+    (** Call RPC POST /chains/[chain]/mempool/ban_operation *)
+    val ban_operation :
+      #simple ->
+      ?chain:chain ->
+      Operation_hash.t ->
+      unit Tezos_error_monad.Error_monad.tzresult Lwt.t
+
+    (** Call RPC POST /chains/[chain]/mempool/unban_operation *)
+    val unban_operation :
+      #simple ->
+      ?chain:chain ->
+      Operation_hash.t ->
+      unit Tezos_error_monad.Error_monad.tzresult Lwt.t
+
+    (** Call RPC POST /chains/[chain]/mempool/unban_all_operations *)
+    val unban_all_operations :
+      #simple ->
+      ?chain:chain ->
+      unit ->
+      unit Tezos_error_monad.Error_monad.tzresult Lwt.t
+
+    (** Call RPC GET /chains/[chain]/mempool/monitor_operations *)
+    val monitor_operations :
+      #streamed ->
+      ?chain:chain ->
+      ?version:version ->
+      ?validated:bool ->
+      ?branch_delayed:bool ->
+      ?branch_refused:bool ->
+      ?refused:bool ->
+      ?outdated:bool ->
+      ?validation_passes:int list ->
+      ?sources:string list ->
+      unit ->
+      (((Operation_hash.t * Next_proto.operation) * error trace option) list
+       Lwt_stream.t
+      * stopper)
+      tzresult
+      Lwt.t
+
+    (** Call RPC GET /chains/[chain]/mempool/filter *)
+    val get_filter :
+      #simple ->
+      ?chain:chain ->
+      ?include_default:bool ->
+      unit ->
+      Data_encoding.json tzresult Lwt.t
+
+    (** Call RPC POST /chains/[chain]/mempool/request_operations *)
+    val request_operations :
+      #simple ->
+      ?chain:chain ->
+      ?peer_id:P2p_peer.Id.t ->
+      unit ->
+      unit tzresult Lwt.t
+  end
+
+  val live_blocks :
+    #simple ->
+    ?chain:chain ->
+    ?block:block ->
+    unit ->
+    Block_hash.Set.t tzresult Lwt.t
+
+  module S : sig
+    val hash :
+      ([`GET], prefix, prefix, unit, unit, Block_hash.t) Tezos_rpc.Service.t
+
+    val info :
+      ( [`GET],
+        prefix,
+        prefix,
+        < version : version
+        ; force_metadata : bool
+        ; metadata : [`Always | `Never] option >,
+        unit,
+        version * block_info )
+      Tezos_rpc.Service.t
+
+    val header :
+      ([`GET], prefix, prefix, unit, unit, block_header) Tezos_rpc.Service.t
+
+    val raw_header :
+      ([`GET], prefix, prefix, unit, unit, Bytes.t) Tezos_rpc.Service.t
+
+    val metadata :
+      ( [`GET],
+        prefix,
+        prefix,
+        < version : version >,
+        unit,
+        version * block_metadata )
+      Tezos_rpc.Service.t
+
+    val metadata_hash :
+      ( [`GET],
+        prefix,
+        prefix,
+        unit,
+        unit,
+        Block_metadata_hash.t )
+      Tezos_rpc.Service.t
+
+    val protocols :
+      ([`GET], prefix, prefix, unit, unit, protocols) Tezos_rpc.Service.t
+
+    val resulting_context_hash :
+      ([`GET], prefix, prefix, unit, unit, Context_hash.t) Tezos_rpc.Service.t
+
+    module Header : sig
+      val shell_header :
+        ( [`GET],
+          prefix,
+          prefix,
+          unit,
+          unit,
+          Block_header.shell_header )
+        Tezos_rpc.Service.t
+
+      val protocol_data :
+        ( [`GET],
+          prefix,
+          prefix,
+          unit,
+          unit,
+          Proto.block_header_data )
+        Tezos_rpc.Service.t
+
+      val raw_protocol_data :
+        ([`GET], prefix, prefix, unit, unit, Bytes.t) Tezos_rpc.Service.t
+    end
+
+    module Operations : sig
+      val operations :
+        ( [`GET],
+          prefix,
+          prefix,
+          < version : version
+          ; force_metadata : bool
+          ; metadata : [`Always | `Never] option >,
+          unit,
+          version * operation list list )
+        Tezos_rpc.Service.t
+
+      val operations_in_pass :
+        ( [`GET],
+          prefix,
+          prefix * int,
+          < version : version
+          ; force_metadata : bool
+          ; metadata : [`Always | `Never] option >,
+          unit,
+          version * operation list )
+        Tezos_rpc.Service.t
+
+      val operation :
+        ( [`GET],
+          prefix,
+          (prefix * int) * int,
+          < version : version
+          ; force_metadata : bool
+          ; metadata : [`Always | `Never] option >,
+          unit,
+          version * operation )
+        Tezos_rpc.Service.t
+    end
+
+    module Operation_hashes : sig
+      val operation_hashes :
+        ( [`GET],
+          prefix,
+          prefix,
+          unit,
+          unit,
+          Operation_hash.t list list )
+        Tezos_rpc.Service.t
+
+      val operation_hashes_in_pass :
+        ( [`GET],
+          prefix,
+          prefix * int,
+          unit,
+          unit,
+          Operation_hash.t list )
+        Tezos_rpc.Service.t
+
+      val operation_hash :
+        ( [`GET],
+          prefix,
+          (prefix * int) * int,
+          unit,
+          unit,
+          Operation_hash.t )
+        Tezos_rpc.Service.t
+    end
+
+    module Operation_metadata_hashes : sig
+      val root :
+        ( [`GET],
+          prefix,
+          prefix,
+          unit,
+          unit,
+          Operation_metadata_list_list_hash.t )
+        Tezos_rpc.Service.t
+
+      val operation_metadata_hashes :
+        ( [`GET],
+          prefix,
+          prefix,
+          unit,
+          unit,
+          Operation_metadata_hash.t list list )
+        Tezos_rpc.Service.t
+
+      val operation_metadata_hashes_in_pass :
+        ( [`GET],
+          prefix,
+          prefix * int,
+          unit,
+          unit,
+          Operation_metadata_hash.t list )
+        Tezos_rpc.Service.t
+
+      val operation_metadata_hash :
+        ( [`GET],
+          prefix,
+          (prefix * int) * int,
+          unit,
+          unit,
+          Operation_metadata_hash.t )
+        Tezos_rpc.Service.t
+    end
+
+    module Context : sig
+      val read :
+        ( [`GET],
+          prefix,
+          prefix * string list,
+          < depth : int option >,
+          unit,
+          Proof.raw_context )
+        Tezos_rpc.Service.t
+
+      val merkle_tree :
+        ( [`GET],
+          prefix,
+          prefix * string list,
+          < holey : bool option >,
+          unit,
+          Proof.merkle_tree option )
+        Tezos_rpc.Service.t
+
+      val merkle_tree_v2 :
+        ( [`GET],
+          prefix,
+          prefix * string list,
+          < holey : bool option >,
+          unit,
+          Proof.tree Proof.t option )
+        Tezos_rpc.Service.t
+    end
+
+    module Helpers : sig
+      module Forge : sig
+        val block_header :
+          ( [`POST],
+            prefix,
+            prefix,
+            unit,
+            Block_header.t,
+            Bytes.t )
+          Tezos_rpc.Service.service
+      end
+
+      module Preapply : sig
+        type block_param = {
+          protocol_data : Next_proto.block_header_data;
+          operations : Next_proto.operation list list;
+        }
+
+        val block :
+          ( [`POST],
+            prefix,
+            prefix,
+            < sort_operations : bool ; timestamp : Time.Protocol.t option >,
+            block_param,
+            Block_header.shell_header * error Preapply_result.t list )
+          Tezos_rpc.Service.t
+
+        val operations :
+          ( [`POST],
+            prefix,
+            prefix,
+            < version : version >,
+            Next_proto.operation list,
+            version
+            * (Next_proto.operation_data * Next_proto.operation_receipt) list
+          )
+          Tezos_rpc.Service.t
+      end
+
+      val complete :
+        ( [`GET],
+          prefix,
+          prefix * string,
+          unit,
+          unit,
+          string list )
+        Tezos_rpc.Service.t
+    end
+
+    module Mempool : sig
+      (** Define RPC GET /chains/[chain]/mempool/pending_operations *)
+      val pending_operations :
+        ('a, 'b) Tezos_rpc.Path.t ->
+        ( [`GET],
+          'a,
+          'b,
+          < version : version
+          ; validated : bool
+          ; branch_delayed : bool
+          ; branch_refused : bool
+          ; refused : bool
+          ; outdated : bool
+          ; validation_passes : int list
+          ; sources : string list
+          ; operation_hash : string list >,
+          unit,
+          version * Mempool.t )
+        Tezos_rpc.Service.t
+
+      (** Define RPC POST /chains/[chain]/mempool/ban_operation *)
+      val ban_operation :
+        ('a, 'b) Tezos_rpc.Path.t ->
+        ([`POST], 'a, 'b, unit, Operation_hash.t, unit) Tezos_rpc.Service.t
+
+      (** Define RPC POST /chains/[chain]/mempool/unban_operation *)
+      val unban_operation :
+        ('a, 'b) Tezos_rpc.Path.t ->
+        ([`POST], 'a, 'b, unit, Operation_hash.t, unit) Tezos_rpc.Service.t
+
+      (** Define RPC POST /chains/[chain]/mempool/unban_all_operations *)
+      val unban_all_operations :
+        ('a, 'b) Tezos_rpc.Path.t ->
+        ([`POST], 'a, 'b, unit, unit, unit) Tezos_rpc.Service.t
+
+      (** Define RPC GET /chains/[chain]/mempool/monitor_operations *)
+      val monitor_operations :
+        ('a, 'b) Tezos_rpc.Path.t ->
+        ( [`GET],
+          'a,
+          'b,
+          < version : version
+          ; validated : bool
+          ; branch_delayed : bool
+          ; branch_refused : bool
+          ; refused : bool
+          ; outdated : bool
+          ; validation_passes : int list
+          ; sources : string list >,
+          unit,
+          version
+          * ((Operation_hash.t * Next_proto.operation) * error trace option)
+            list )
+        Tezos_rpc.Service.t
+
+      (** Define RPC GET /chains/[chain]/mempool/filter *)
+      val get_filter :
+        ('a, 'b) Tezos_rpc.Path.t ->
+        ( [`GET],
+          'a,
+          'b,
+          < include_default : bool >,
+          unit,
+          Data_encoding.json )
+        Tezos_rpc.Service.t
+
+      (** Define RPC POST /chains/[chain]/mempool/filter *)
+      val set_filter :
+        ('a, 'b) Tezos_rpc.Path.t ->
+        ( [`POST],
+          'a,
+          'b,
+          unit,
+          Data_encoding.json,
+          Data_encoding.json )
+        Tezos_rpc.Service.t
+
+      (** Define RPC POST /chains/[chain]/mempool/request_operations *)
+      val request_operations :
+        ('a, 'b) Tezos_rpc.Path.t ->
+        ( [`POST],
+          'a,
+          'b,
+          < peer_id : P2p_peer_id.t option >,
+          unit,
+          unit )
+        Tezos_rpc.Service.t
+    end
+
+    val live_blocks :
+      ([`GET], prefix, prefix, unit, unit, Block_hash.Set.t) Tezos_rpc.Service.t
+  end
+end
+
 module Make (Proto : PROTO) (Next_proto : PROTO) = struct
+  module Proto = Proto
+  module Next_proto = Next_proto
+
   let protocol_hash = Protocol_hash.to_b58check Proto.hash
 
   let next_protocol_hash = Protocol_hash.to_b58check Next_proto.hash
@@ -435,7 +1261,8 @@ module Make (Proto : PROTO) (Next_proto : PROTO) = struct
                 max_operation_data_length;
                 max_block_header_length;
                 operation_list_quota;
-              } ->
+              }
+            ->
            ( ( (),
                (),
                test_chain_status,
@@ -451,7 +1278,8 @@ module Make (Proto : PROTO) (Next_proto : PROTO) = struct
                   max_operation_data_length,
                   max_block_header_length,
                   operation_list_quota ),
-                protocol_data ) ->
+                protocol_data )
+            ->
            {
              protocol_data;
              test_chain_status;
@@ -499,6 +1327,10 @@ module Make (Proto : PROTO) (Next_proto : PROTO) = struct
   }
 
   let operation_data_encoding =
+    let operation_data_encoding = Proto.operation_data_encoding in
+    let operation_data_and_receipt_encoding =
+      Proto.operation_data_and_receipt_encoding
+    in
     let open Data_encoding in
     union
       ~tag_size:`Uint8
@@ -507,7 +1339,7 @@ module Make (Proto : PROTO) (Next_proto : PROTO) = struct
           ~title:"Operation with too large metadata"
           (Tag 0)
           (merge_objs
-             Proto.operation_data_encoding
+             operation_data_encoding
              (obj1 (req "metadata" (constant "too large"))))
           (function
             | operation_data, Too_large -> Some (operation_data, ()) | _ -> None)
@@ -515,13 +1347,13 @@ module Make (Proto : PROTO) (Next_proto : PROTO) = struct
         case
           ~title:"Operation without metadata"
           (Tag 1)
-          Proto.operation_data_encoding
+          operation_data_encoding
           (function operation_data, Empty -> Some operation_data | _ -> None)
           (fun operation_data -> (operation_data, Empty));
         case
           ~title:"Operation with metadata"
           (Tag 2)
-          Proto.operation_data_and_receipt_encoding
+          operation_data_and_receipt_encoding
           (function
             | operation_data, Receipt receipt -> Some (operation_data, receipt)
             | _ -> None)
@@ -569,6 +1401,12 @@ module Make (Proto : PROTO) (Next_proto : PROTO) = struct
          (opt "metadata" (dynamic_size block_metadata_encoding))
          (req "operations" (list (dynamic_size (list operation_encoding)))))
 
+  let block_info_encoding =
+    encoding_versioning
+      ~encoding_name:"block_info"
+      ~latest_encoding:(Version_1, block_info_encoding)
+      ~old_encodings:[]
+
   module S = struct
     let path : prefix Tezos_rpc.Path.context = Tezos_rpc.Path.open_root
 
@@ -593,10 +1431,31 @@ module Make (Proto : PROTO) (Next_proto : PROTO) = struct
         ~output:bytes
         Tezos_rpc.Path.(path / "header" / "raw")
 
+    let block_metadata_encoding =
+      encoding_versioning
+        ~encoding_name:"block_metadata_encoding"
+        ~latest_encoding:(Version_1, block_metadata_encoding)
+        ~old_encodings:[]
+
+    let metadata_versions = mk_version_1_informations ()
+
+    let metadata_query =
+      let open Tezos_rpc.Query in
+      query (fun version ->
+          object
+            method version = version
+          end)
+      |+ field
+           "version"
+           (version_arg metadata_versions)
+           metadata_versions.default
+           (fun t -> t#version)
+      |> seal
+
     let metadata =
       Tezos_rpc.Service.get_service
         ~description:"All the metadata associated to the block."
-        ~query:Tezos_rpc.Query.empty
+        ~query:metadata_query
         ~output:block_metadata_encoding
         Tezos_rpc.Path.(path / "metadata")
 
@@ -655,14 +1514,23 @@ module Make (Proto : PROTO) (Next_proto : PROTO) = struct
           Tezos_rpc.Path.(path / "protocol_data" / "raw")
     end
 
+    let operations_versions = mk_version_1_informations ()
+
     let force_operation_metadata_query =
       let open Tezos_rpc.Query in
-      query (fun force_metadata metadata ->
+      query (fun version force_metadata metadata ->
           object
+            method version = version
+
             method force_metadata = force_metadata
 
             method metadata = metadata
           end)
+      |+ field
+           "version"
+           (version_arg operations_versions)
+           operations_versions.default
+           (fun t -> t#version)
       |+ flag
            "force_metadata"
            ~descr:
@@ -685,10 +1553,17 @@ module Make (Proto : PROTO) (Next_proto : PROTO) = struct
       let path = Tezos_rpc.Path.(path / "operations")
 
       let operations =
+        let output =
+          encoding_versioning
+            ~encoding_name:"operations"
+            ~latest_encoding:
+              (Version_1, list (dynamic_size (list operation_encoding)))
+            ~old_encodings:[]
+        in
         Tezos_rpc.Service.get_service
           ~description:"All the operations included in the block."
           ~query:force_operation_metadata_query
-          ~output:(list (dynamic_size (list operation_encoding)))
+          ~output
           path
 
       let list_arg =
@@ -714,20 +1589,32 @@ module Make (Proto : PROTO) (Next_proto : PROTO) = struct
         Tezos_rpc.Arg.make ~name ~descr ~construct ~destruct ()
 
       let operations_in_pass =
+        let output =
+          encoding_versioning
+            ~encoding_name:"operations_in_pass"
+            ~latest_encoding:(Version_1, list operation_encoding)
+            ~old_encodings:[]
+        in
         Tezos_rpc.Service.get_service
           ~description:
             "All the operations included in `n-th` validation pass of the \
              block."
           ~query:force_operation_metadata_query
-          ~output:(list operation_encoding)
+          ~output
           Tezos_rpc.Path.(path /: list_arg)
 
       let operation =
+        let output =
+          encoding_versioning
+            ~encoding_name:"operation"
+            ~latest_encoding:(Version_1, operation_encoding)
+            ~old_encodings:[]
+        in
         Tezos_rpc.Service.get_service
           ~description:
             "The `m-th` operation in the `n-th` validation pass of the block."
           ~query:force_operation_metadata_query
-          ~output:operation_encoding
+          ~output
           Tezos_rpc.Path.(path /: list_arg /: offset_arg)
     end
 
@@ -818,6 +1705,8 @@ module Make (Proto : PROTO) (Next_proto : PROTO) = struct
       module Preapply = struct
         let path = Tezos_rpc.Path.(path / "preapply")
 
+        let preapply_operation_encoding = next_operation_encoding
+
         let block_result_encoding =
           obj2
             (req "shell_header" Block_header.shell_header_encoding)
@@ -845,7 +1734,7 @@ module Make (Proto : PROTO) (Next_proto : PROTO) = struct
                         (dynamic_size Next_proto.block_header_data_encoding))))
                (req
                   "operations"
-                  (list (dynamic_size (list next_operation_encoding)))))
+                  (list (dynamic_size (list preapply_operation_encoding)))))
 
         let block_query =
           let open Tezos_rpc.Query in
@@ -869,17 +1758,40 @@ module Make (Proto : PROTO) (Next_proto : PROTO) = struct
             ~output:block_result_encoding
             Tezos_rpc.Path.(path / "block")
 
+        let preapply_versions = mk_version_1_informations ()
+
+        let operations_query =
+          let open Tezos_rpc.Query in
+          query (fun version ->
+              object
+                method version = version
+              end)
+          |+ field
+               "version"
+               (version_arg preapply_versions)
+               preapply_versions.default
+               (fun t -> t#version)
+          |> seal
+
+        let preapplied_operations_encoding =
+          encoding_versioning
+            ~encoding_name:"preapplied_operations"
+            ~latest_encoding:
+              ( Version_1,
+                list
+                  (dynamic_size Next_proto.operation_data_and_receipt_encoding)
+              )
+            ~old_encodings:[]
+
         let operations =
           Tezos_rpc.Service.post_service
             ~description:
               "Simulate the application of the operations with the context of \
                the given block and return the result of each operation \
                application."
-            ~query:Tezos_rpc.Query.empty
-            ~input:(list next_operation_encoding)
-            ~output:
-              (list
-                 (dynamic_size Next_proto.operation_data_and_receipt_encoding))
+            ~query:operations_query
+            ~input:(list preapply_operation_encoding)
+            ~output:preapplied_operations_encoding
             Tezos_rpc.Path.(path / "operations")
       end
 
@@ -981,7 +1893,7 @@ module Make (Proto : PROTO) (Next_proto : PROTO) = struct
 
     module Mempool = struct
       type t = {
-        applied : (Operation_hash.t * Next_proto.operation) list;
+        validated : (Operation_hash.t * Next_proto.operation) list;
         refused : (Next_proto.operation * error list) Operation_hash.Map.t;
         outdated : (Next_proto.operation * error list) Operation_hash.Map.t;
         branch_refused :
@@ -991,80 +1903,7 @@ module Make (Proto : PROTO) (Next_proto : PROTO) = struct
         unprocessed : Next_proto.operation Operation_hash.Map.t;
       }
 
-      let version_0_encoding =
-        conv
-          (fun {
-                 applied;
-                 refused;
-                 outdated;
-                 branch_refused;
-                 branch_delayed;
-                 unprocessed;
-               } ->
-            ( applied,
-              refused,
-              outdated,
-              branch_refused,
-              branch_delayed,
-              unprocessed ))
-          (fun ( applied,
-                 refused,
-                 outdated,
-                 branch_refused,
-                 branch_delayed,
-                 unprocessed ) ->
-            {
-              applied;
-              refused;
-              outdated;
-              branch_refused;
-              branch_delayed;
-              unprocessed;
-            })
-          (obj6
-             (req
-                "applied"
-                (list
-                   (conv
-                      (fun (hash, (op : Next_proto.operation)) ->
-                        ((hash, op.shell), op.protocol_data))
-                      (fun ((hash, shell), protocol_data) ->
-                        (hash, {shell; protocol_data}))
-                      (merge_objs
-                         (merge_objs
-                            (obj1 (req "hash" Operation_hash.encoding))
-                            (dynamic_size Operation.shell_header_encoding))
-                         (dynamic_size Next_proto.operation_data_encoding)))))
-             (req
-                "refused"
-                (Operation_hash.Map.encoding
-                   (merge_objs
-                      (dynamic_size next_operation_encoding)
-                      (obj1 (req "error" Tezos_rpc.Error.encoding)))))
-             (req
-                "outdated"
-                (Operation_hash.Map.encoding
-                   (merge_objs
-                      (dynamic_size next_operation_encoding)
-                      (obj1 (req "error" Tezos_rpc.Error.encoding)))))
-             (req
-                "branch_refused"
-                (Operation_hash.Map.encoding
-                   (merge_objs
-                      (dynamic_size next_operation_encoding)
-                      (obj1 (req "error" Tezos_rpc.Error.encoding)))))
-             (req
-                "branch_delayed"
-                (Operation_hash.Map.encoding
-                   (merge_objs
-                      (dynamic_size next_operation_encoding)
-                      (obj1 (req "error" Tezos_rpc.Error.encoding)))))
-             (req
-                "unprocessed"
-                (Operation_hash.Map.encoding
-                   (dynamic_size next_operation_encoding))))
-
-      let version_1_encoding =
+      let pending_operations_encoding =
         let operations_with_error_encoding kind =
           req
             kind
@@ -1080,27 +1919,29 @@ module Make (Proto : PROTO) (Next_proto : PROTO) = struct
         in
         conv
           (fun {
-                 applied;
+                 validated;
                  refused;
                  outdated;
                  branch_refused;
                  branch_delayed;
                  unprocessed;
-               } ->
-            ( applied,
+               }
+             ->
+            ( validated,
               refused,
               outdated,
               branch_refused,
               branch_delayed,
               unprocessed ))
-          (fun ( applied,
+          (fun ( validated,
                  refused,
                  outdated,
                  branch_refused,
                  branch_delayed,
-                 unprocessed ) ->
+                 unprocessed )
+             ->
             {
-              applied;
+              validated;
               refused;
               outdated;
               branch_refused;
@@ -1109,7 +1950,7 @@ module Make (Proto : PROTO) (Next_proto : PROTO) = struct
             })
           (obj6
              (req
-                "applied"
+                "validated"
                 (list
                    (conv
                       (fun (hash, (op : Next_proto.operation)) ->
@@ -1136,28 +1977,26 @@ module Make (Proto : PROTO) (Next_proto : PROTO) = struct
                          (obj1 (req "hash" Operation_hash.encoding))
                          next_operation_encoding)))))
 
-      (* This encoding should be always the one by default. *)
-      let encoding = version_1_encoding
-
-      (* If you change this value, also change [encoding]. *)
-      let default_pending_operations_version = 1
+      let pending_operations_versions = mk_version_2_informations ()
 
       let pending_query =
         let open Tezos_rpc.Query in
         query
           (fun
             version
-            applied
+            validated
             refused
             outdated
             branch_refused
             branch_delayed
             validation_passes
+            sources
+            operation_hash
           ->
             object
               method version = version
 
-              method applied = applied
+              method validated = validated
 
               method refused = refused
 
@@ -1168,18 +2007,22 @@ module Make (Proto : PROTO) (Next_proto : PROTO) = struct
               method branch_delayed = branch_delayed
 
               method validation_passes = validation_passes
+
+              method sources = sources
+
+              method operation_hash = operation_hash
             end)
         |+ field
              "version"
-             Tezos_rpc.Arg.int
-             default_pending_operations_version
+             (version_arg pending_operations_versions)
+             pending_operations_versions.default
              (fun t -> t#version)
         |+ field
-             ~descr:"Include applied operations (true by default)"
-             "applied"
+             ~descr:"Include validated operations (true by default)"
+             "validated"
              Tezos_rpc.Arg.bool
              true
-             (fun t -> t#applied)
+             (fun t -> t#validated)
         |+ field
              ~descr:"Include refused operations (true by default)"
              "refused"
@@ -1210,45 +2053,23 @@ module Make (Proto : PROTO) (Next_proto : PROTO) = struct
              "validation_pass"
              Tezos_rpc.Arg.int
              (fun t -> t#validation_passes)
+        |+ multi_field
+             ~descr:"Include operations filtered by source (all by default)"
+             "source"
+             Tezos_rpc.Arg.string
+             (fun t -> t#sources)
+        |+ multi_field
+             ~descr:"Include operations filtered by hash (all by default)"
+             "operation_hash"
+             Tezos_rpc.Arg.string
+             (fun t -> t#operation_hash)
         |> seal
 
-      (* If you update this datatype, please update also [supported_version]. *)
-      type t_with_version = Version_0 of t | Version_1 of t
-
-      (* This value should be consistent with [t_with_version]. *)
-      let supported_version = [0; 1]
-
       let pending_operations_encoding =
-        union
-          [
-            case
-              ~title:"new_encoding_pending_operations"
-              (Tag 1)
-              version_1_encoding
-              (function
-                | Version_1 pending_operations -> Some pending_operations
-                | Version_0 _ -> None)
-              (fun pending_operations -> Version_1 pending_operations);
-            case
-              ~title:"old_encoding_pending_operations"
-              Json_only
-              version_0_encoding
-              (function
-                | Version_0 pending_operations -> Some pending_operations
-                | Version_1 _ -> None)
-              (fun pending_operations -> Version_0 pending_operations);
-          ]
-
-      let pending_operations_version_dispatcher ~version pending_operations =
-        if version = 0 then
-          Tezos_rpc.Answer.return (Version_0 pending_operations)
-        else if version = 1 then
-          Tezos_rpc.Answer.return (Version_1 pending_operations)
-        else
-          Tezos_rpc.Answer.fail
-            (Tezos_rpc.Error.bad_version
-               ~given:version
-               ~supported:supported_version)
+        encoding_versioning
+          ~encoding_name:"pending_operations"
+          ~latest_encoding:(Version_2, pending_operations_encoding)
+          ~old_encodings:[]
 
       let pending_operations path =
         Tezos_rpc.Service.get_service
@@ -1260,11 +2081,11 @@ module Make (Proto : PROTO) (Next_proto : PROTO) = struct
       let ban_operation path =
         Tezos_rpc.Service.post_service
           ~description:
-            "Remove an operation from the mempool if present, reverting its \
-             effect if it was applied. Add it to the set of banned operations \
-             to prevent it from being fetched/processed/injected in the \
-             future. Note: If the baker has already received the operation, \
-             then it's necessary to restart it to flush the operation from it."
+            "Remove an operation from the mempool if present. Also add it to \
+             the set of banned operations to prevent it from being \
+             fetched/processed/injected in the future. Note: If the baker has \
+             already received the operation, then it's necessary to restart it \
+             to flush the operation from it."
           ~query:Tezos_rpc.Query.empty
           ~input:Operation_hash.encoding
           ~output:unit
@@ -1288,19 +2109,25 @@ module Make (Proto : PROTO) (Next_proto : PROTO) = struct
           ~output:unit
           Tezos_rpc.Path.(path / "unban_all_operations")
 
-      let mempool_query =
+      let monitor_operations_versions = mk_version_1_informations ()
+
+      let monitor_operations_query =
         let open Tezos_rpc.Query in
         query
           (fun
-            applied
+            version
+            validated
             refused
             outdated
             branch_refused
             branch_delayed
             validation_passes
+            sources
           ->
             object
-              method applied = applied
+              method version = version
+
+              method validated = validated
 
               method refused = refused
 
@@ -1311,13 +2138,20 @@ module Make (Proto : PROTO) (Next_proto : PROTO) = struct
               method branch_delayed = branch_delayed
 
               method validation_passes = validation_passes
+
+              method sources = sources
             end)
         |+ field
-             ~descr:"Include applied operations (set by default)"
-             "applied"
+             "version"
+             (version_arg monitor_operations_versions)
+             monitor_operations_versions.default
+             (fun t -> t#version)
+        |+ field
+             ~descr:"Include validated operations (set by default)"
+             "validated"
              Tezos_rpc.Arg.bool
              true
-             (fun t -> t#applied)
+             (fun t -> t#validated)
         |+ field
              ~descr:"Include refused operations"
              "refused"
@@ -1348,22 +2182,34 @@ module Make (Proto : PROTO) (Next_proto : PROTO) = struct
              "validation_pass"
              Tezos_rpc.Arg.int
              (fun t -> t#validation_passes)
+        |+ multi_field
+             ~descr:"Include operations filtered by sources (all by default)"
+             "sources"
+             Tezos_rpc.Arg.string
+             (fun t -> t#sources)
         |> seal
 
       (* We extend the object so that the fields of 'next_operation'
          stay toplevel, for backward compatibility. *)
-      let processed_operation_encoding =
+
+      let monitor_operations_encoding =
         merge_objs
           (merge_objs
              (obj1 (req "hash" Operation_hash.encoding))
              next_operation_encoding)
           (obj1 (dft "error" Tezos_rpc.Error.opt_encoding None))
 
+      let processed_operation_encoding =
+        encoding_versioning
+          ~encoding_name:"monitor_operations"
+          ~latest_encoding:(Version_1, list monitor_operations_encoding)
+          ~old_encodings:[]
+
       let monitor_operations path =
         Tezos_rpc.Service.get_service
           ~description:"Monitor the mempool operations."
-          ~query:mempool_query
-          ~output:(list processed_operation_encoding)
+          ~query:monitor_operations_query
+          ~output:processed_operation_encoding
           Tezos_rpc.Path.(path / "monitor_operations")
 
       let get_filter_query =
@@ -1383,7 +2229,7 @@ module Make (Proto : PROTO) (Next_proto : PROTO) = struct
       let get_filter path =
         Tezos_rpc.Service.get_service
           ~description:
-            {|Get the configuration of the mempool filter. The minimal_fees are in mutez. Each field minimal_nanotez_per_xxx is a rational number given as a numerator and a denominator, e.g. "minimal_nanotez_per_gas_unit": [ "100", "1" ].|}
+            {|Get the configuration of the mempool's filter and bounds. Values of the form [ "21", "20" ] are rational numbers given as a numerator and a denominator, e.g. 21/20 = 1.05. The minimal_fees (in mutez), minimal_nanotez_per_gas_unit, and minimal_nanotez_per_byte are requirements that a manager operation must meet to be considered by the mempool. replace_by_fee_factor is how much better a manager operation must be to replace a previous valid operation **from the same manager** (both its fee and its fee/gas ratio must exceed the old operation's by at least this factor). max_operations and max_total_bytes are the bounds on respectively the number of valid operations in the mempool and the sum of their sizes in bytes.|}
           ~query:get_filter_query
           ~output:json
           Tezos_rpc.Path.(path / "filter")
@@ -1391,7 +2237,7 @@ module Make (Proto : PROTO) (Next_proto : PROTO) = struct
       let set_filter path =
         Tezos_rpc.Service.post_service
           ~description:
-            {|Set the configuration of the mempool filter. **If any of the fields is absent from the input JSON, then it is set to the default value for this field (i.e. its value in the default configuration), even if it previously had a different value.** If the input JSON does not describe a valid configuration, then the configuration is left unchanged. Also return the new configuration (which may differ from the input if it had omitted fields or was invalid). You may call [./octez-client rpc get '/chains/main/mempool/filter?include_default=true'] to see an example of JSON describing a valid configuration.|}
+            {|Set the configuration of the mempool's filter and bounds. **If any of the fields is absent from the input JSON, then it is set to the default value for this field (i.e. its value in the default configuration), even if it previously had a different value.** If the input JSON does not describe a valid configuration, then the configuration is left unchanged. This RPC also returns the new configuration of the mempool (which may differ from the input if the latter omits fields or is invalid). You may call [octez-client rpc get '/chains/main/mempool/filter?include_default=true'] to see an example of JSON describing a valid configuration. See the description of that RPC for details on each configurable value.|}
           ~query:Tezos_rpc.Query.empty
           ~input:json
           ~output:json
@@ -1457,9 +2303,20 @@ module Make (Proto : PROTO) (Next_proto : PROTO) = struct
     let f = make_call0 S.raw_header ctxt in
     fun ?(chain = `Main) ?(block = `Head 0) () -> f chain block () ()
 
-  let metadata ctxt =
+  let metadata ctxt ?(version = S.metadata_versions.default) =
+    let open Lwt_result_syntax in
     let f = make_call0 S.metadata ctxt in
-    fun ?(chain = `Main) ?(block = `Head 0) () -> f chain block () ()
+    fun ?(chain = `Main) ?(block = `Head 0) () ->
+      let* (Version_1 | Version_2), res =
+        f
+          chain
+          block
+          (object
+             method version = version
+          end)
+          ()
+      in
+      return res
 
   let metadata_hash ctxt =
     let f = make_call0 S.metadata_hash ctxt in
@@ -1490,49 +2347,68 @@ module Make (Proto : PROTO) (Next_proto : PROTO) = struct
   end
 
   module Operations = struct
-    module S = S.Operations
-
-    let operations ctxt ?(force_metadata = false) ?metadata =
-      let f = make_call0 S.operations ctxt in
+    let operations ctxt ?(version = S.operations_versions.default)
+        ?(force_metadata = false) ?metadata =
+      let open Lwt_result_syntax in
+      let f = make_call0 S.Operations.operations ctxt in
       fun ?(chain = `Main) ?(block = `Head 0) () ->
-        f
-          chain
-          block
-          (object
-             method force_metadata = force_metadata
+        let* (Version_1 | Version_2), operations =
+          f
+            chain
+            block
+            (object
+               method version = version
 
-             method metadata = metadata
-          end)
-          ()
+               method force_metadata = force_metadata
 
-    let operations_in_pass ctxt ?(force_metadata = false) ?metadata =
-      let f = make_call1 S.operations_in_pass ctxt in
+               method metadata = metadata
+            end)
+            ()
+        in
+        return operations
+
+    let operations_in_pass ctxt ?(version = S.operations_versions.default)
+        ?(force_metadata = false) ?metadata =
+      let open Lwt_result_syntax in
+      let f = make_call1 S.Operations.operations_in_pass ctxt in
       fun ?(chain = `Main) ?(block = `Head 0) n ->
-        f
-          chain
-          block
-          n
-          (object
-             method force_metadata = force_metadata
+        let* (Version_1 | Version_2), operations =
+          f
+            chain
+            block
+            n
+            (object
+               method version = version
 
-             method metadata = metadata
-          end)
-          ()
+               method force_metadata = force_metadata
 
-    let operation ctxt ?(force_metadata = false) ?metadata =
-      let f = make_call2 S.operation ctxt in
+               method metadata = metadata
+            end)
+            ()
+        in
+        return operations
+
+    let operation ctxt ?(version = S.operations_versions.default)
+        ?(force_metadata = false) ?metadata =
+      let open Lwt_result_syntax in
+      let f = make_call2 S.Operations.operation ctxt in
       fun ?(chain = `Main) ?(block = `Head 0) n m ->
-        f
-          chain
-          block
-          n
-          m
-          (object
-             method force_metadata = force_metadata
+        let* (Version_1 | Version_2), operation =
+          f
+            chain
+            block
+            n
+            m
+            (object
+               method version = version
 
-             method metadata = metadata
-          end)
-          ()
+               method force_metadata = force_metadata
+
+               method metadata = metadata
+            end)
+            ()
+        in
+        return operation
   end
 
   module Operation_hashes = struct
@@ -1621,7 +2497,8 @@ module Make (Proto : PROTO) (Next_proto : PROTO) = struct
             ?(sort = false)
             ?timestamp
             ~protocol_data
-            operations ->
+            operations
+          ->
           f
             chain
             block
@@ -1632,10 +2509,21 @@ module Make (Proto : PROTO) (Next_proto : PROTO) = struct
             end)
             {protocol_data; operations}
 
-      let operations ctxt =
-        let f = make_call0 S.operations ctxt in
-        fun ?(chain = `Main) ?(block = `Head 0) operations ->
-          f chain block () operations
+      let operations ctxt ?(chain = `Main) ?(block = `Head 0)
+          ?(version = S.preapply_versions.default) operations =
+        let open Lwt_result_syntax in
+        let* (Version_1 | Version_2), preapply_operations =
+          make_call0
+            S.operations
+            ctxt
+            chain
+            block
+            (object
+               method version = version
+            end)
+            operations
+        in
+        return preapply_operations
     end
 
     let complete ctxt =
@@ -1643,22 +2531,29 @@ module Make (Proto : PROTO) (Next_proto : PROTO) = struct
       fun ?(chain = `Main) ?(block = `Head 0) s -> f chain block s () ()
   end
 
-  let info ctxt ?(force_metadata = false) ?metadata =
+  let info ctxt ?(version = S.operations_versions.default)
+      ?(force_metadata = false) ?metadata =
+    let open Lwt_result_syntax in
     let f = make_call0 S.info ctxt in
     fun ?(chain = `Main) ?(block = `Head 0) () ->
-      f
-        chain
-        block
-        (object
-           method force_metadata = force_metadata
+      let* (Version_1 | Version_2), infos =
+        f
+          chain
+          block
+          (object
+             method version = version
 
-           method metadata = metadata
-        end)
-        ()
+             method force_metadata = force_metadata
+
+             method metadata = metadata
+          end)
+          ()
+      in
+      return infos
 
   module Mempool = struct
     type t = S.Mempool.t = {
-      applied : (Operation_hash.t * Next_proto.operation) list;
+      validated : (Operation_hash.t * Next_proto.operation) list;
       refused : (Next_proto.operation * error list) Operation_hash.Map.t;
       outdated : (Next_proto.operation * error list) Operation_hash.Map.t;
       branch_refused : (Next_proto.operation * error list) Operation_hash.Map.t;
@@ -1666,19 +2561,13 @@ module Make (Proto : PROTO) (Next_proto : PROTO) = struct
       unprocessed : Next_proto.operation Operation_hash.Map.t;
     }
 
-    type t_with_version = S.Mempool.t_with_version =
-      | Version_0 of t
-      | Version_1 of t
-
-    let pending_operations_version_dispatcher =
-      S.Mempool.pending_operations_version_dispatcher
-
     let pending_operations ctxt ?(chain = `Main)
-        ?(version = S.Mempool.default_pending_operations_version)
-        ?(applied = true) ?(branch_delayed = true) ?(branch_refused = true)
-        ?(refused = true) ?(outdated = true) ?(validation_passes = []) () =
+        ?(version = S.Mempool.pending_operations_versions.default)
+        ?(validated = true) ?(branch_delayed = true) ?(branch_refused = true)
+        ?(refused = true) ?(outdated = true) ?(validation_passes = [])
+        ?(sources = []) ?(operation_hash = []) () =
       let open Lwt_result_syntax in
-      let* v =
+      let* _version, pending_operations =
         Tezos_rpc.Context.make_call1
           (S.Mempool.pending_operations (mempool_path chain_path))
           ctxt
@@ -1686,7 +2575,7 @@ module Make (Proto : PROTO) (Next_proto : PROTO) = struct
           (object
              method version = version
 
-             method applied = applied
+             method validated = validated
 
              method refused = refused
 
@@ -1697,12 +2586,14 @@ module Make (Proto : PROTO) (Next_proto : PROTO) = struct
              method branch_delayed = branch_delayed
 
              method validation_passes = validation_passes
+
+             method sources = sources
+
+             method operation_hash = operation_hash
           end)
           ()
       in
-      match v with
-      | Version_1 pending_operations | Version_0 pending_operations ->
-          return pending_operations
+      return pending_operations
 
     let ban_operation ctxt ?(chain = `Main) op_hash =
       let s = S.Mempool.ban_operation (mempool_path chain_path) in
@@ -1716,26 +2607,59 @@ module Make (Proto : PROTO) (Next_proto : PROTO) = struct
       let s = S.Mempool.unban_all_operations (mempool_path chain_path) in
       Tezos_rpc.Context.make_call1 s ctxt chain () ()
 
-    let monitor_operations ctxt ?(chain = `Main) ?(applied = true)
-        ?(branch_delayed = true) ?(branch_refused = false) ?(refused = false)
-        ?(outdated = false) ?(validation_passes = []) () =
+    let monitor_operations ctxt ?(chain = `Main)
+        ?(version = S.Mempool.monitor_operations_versions.default)
+        ?(validated = true) ?(branch_delayed = true) ?(branch_refused = false)
+        ?(refused = false) ?(outdated = false) ?(validation_passes = [])
+        ?(sources = []) () =
+      let open Lwt_result_syntax in
       let s = S.Mempool.monitor_operations (mempool_path chain_path) in
-      Tezos_rpc.Context.make_streamed_call
+      let* stream, stopper =
+        Tezos_rpc.Context.make_streamed_call
+          s
+          ctxt
+          ((), chain)
+          (object
+             method version = version
+
+             method validated = validated
+
+             method refused = refused
+
+             method outdated = outdated
+
+             method branch_refused = branch_refused
+
+             method branch_delayed = branch_delayed
+
+             method validation_passes = validation_passes
+
+             method sources = sources
+          end)
+          ()
+      in
+      return
+        ( Lwt_stream.map
+            (fun ( ( Version_1
+                   | Version_2
+                     (* The same [version] type is used for versioning all the
+                        RPC. Even though this version is not supported for this
+                        RPC we need to handle it. We rely on the supported
+                        version list to fail at parsing for this version *)
+                     ),
+                   operations )
+               -> operations)
+            stream,
+          stopper )
+
+    let get_filter ctxt ?(chain = `Main) ?(include_default = true) () =
+      let s = S.Mempool.get_filter (mempool_path chain_path) in
+      Tezos_rpc.Context.make_call1
         s
         ctxt
-        ((), chain)
+        chain
         (object
-           method applied = applied
-
-           method refused = refused
-
-           method outdated = outdated
-
-           method branch_refused = branch_refused
-
-           method branch_delayed = branch_delayed
-
-           method validation_passes = validation_passes
+           method include_default = include_default
         end)
         ()
 
@@ -1791,11 +2715,10 @@ module Empty = Make (Fake_protocol) (Fake_protocol)
 
 let () =
   Printexc.register_printer (function
-      | ( Json_schema.Cannot_parse _ | Json_schema.Dangling_reference _
-        | Json_schema.Bad_reference _ | Json_schema.Unexpected _
-        | Json_schema.Duplicate_definition _ ) as exn ->
-          Some
-            (Format.asprintf "%a" (fun ppf -> Json_schema.print_error ppf) exn)
-      | _ -> None)
+    | ( Json_schema.Cannot_parse _ | Json_schema.Dangling_reference _
+      | Json_schema.Bad_reference _ | Json_schema.Unexpected _
+      | Json_schema.Duplicate_definition _ ) as exn ->
+        Some (Format.asprintf "%a" (fun ppf -> Json_schema.print_error ppf) exn)
+    | _ -> None)
 
 let protocols = Empty.protocols

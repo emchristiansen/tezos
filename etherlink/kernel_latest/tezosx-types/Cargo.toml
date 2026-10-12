@@ -1,0 +1,22 @@
+# SPDX-FileCopyrightText: 2026 Nomadic Labs <contact@nomadic-labs.com>
+#
+# SPDX-License-Identifier: MIT
+
+[package]
+name = "tezosx-types"
+version = "0.1.0"
+edition = "2021"
+license = "MIT"
+
+[dependencies]
+primitive-types.workspace = true
+tezos_data_encoding.workspace = true
+tezos-smart-rollup-host.workspace = true
+tezos-smart-rollup-keyspace.workspace = true
+tezosx-constants.workspace = true
+http.workspace = true
+nom.workspace = true
+thiserror.workspace = true
+
+[dev-dependencies]
+num-bigint.workspace = true

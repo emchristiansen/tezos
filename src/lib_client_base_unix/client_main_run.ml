@@ -3,6 +3,7 @@
 (* Open Source License                                                       *)
 (* Copyright (c) 2018 Dynamic Ledger Solutions, Inc. <contact@tezos.com>     *)
 (* Copyright (c) 2018 Nomadic Labs, <contact@nomadic-labs.com>               *)
+(* Copyright (c) 2025 Trilitech <contact@trili.tech>                         *)
 (*                                                                           *)
 (* Permission is hereby granted, free of charge, to any person obtaining a   *)
 (* copy of this software and associated documentation files (the "Software"),*)
@@ -62,6 +63,8 @@ module type M = sig
 
   val default_base_dir : string
 
+  val default_daily_logs_path : string option
+
   val default_media_type : Media_type.Command_line.t
 
   val other_registrations :
@@ -79,14 +82,18 @@ module type M = sig
     Tezos_client_base.Client_context.full Tezos_clic.command list
 
   val logger : RPC_client_unix.logger option
+
+  val advertise_log_levels : bool option
+
+  val version : string option
 end
 
-let setup_remote_signer (module C : M) client_config
-    (rpc_config : RPC_client_unix.config) parsed_config_file =
+let register_default_signer ?signing_version ?other_registrations ?logger
+    (cctxt : Client_context.io_wallet) =
   let module Remote_params = struct
     let authenticate pkhs payload =
       let open Lwt_result_syntax in
-      let* keys = Client_keys.list_keys client_config in
+      let* keys = Client_keys.list_keys cctxt in
       match
         List.filter_map
           (function
@@ -101,16 +108,26 @@ let setup_remote_signer (module C : M) client_config
             | _ -> None)
           keys
       with
-      | sk_uri :: _ -> Client_keys.sign client_config sk_uri payload
+      | sk_uri :: _ -> (
+          match signing_version with
+          | Some Signature.Version_0 ->
+              let* sign = Client_keys.V0.sign cctxt sk_uri payload in
+              return @@ Signature.V_latest.Of_V0.signature sign
+          | Some Signature.Version_1 ->
+              let* sign = Client_keys.V1.sign cctxt sk_uri payload in
+              return @@ Signature.V_latest.Of_V1.signature sign
+          | Some Signature.Version_2 ->
+              let* sign = Client_keys.V2.sign cctxt sk_uri payload in
+              return @@ Signature.V_latest.Of_V2.signature sign
+          | Some Signature.Version_3 -> Client_keys.V3.sign cctxt sk_uri payload
+          | None -> Client_keys.V_latest.sign cctxt sk_uri payload)
       | [] ->
           failwith
             "remote signer expects authentication signature, but no authorized \
              key was found in the wallet"
 
     let logger =
-      (* overriding the logger we might already have with the one from
-             module C *)
-      match C.logger with Some logger -> logger | None -> rpc_config.logger
+      Option.value ~default:RPC_client_unix.default_config.logger logger
   end in
   let module Http =
     Tezos_signer_backends.Http.Make (RPC_client_unix) (Remote_params)
@@ -121,27 +138,55 @@ let setup_remote_signer (module C : M) client_config
   let module Socket = Tezos_signer_backends_unix.Socket.Make (Remote_params) in
   Client_keys.register_signer
     (module Tezos_signer_backends.Encrypted.Make (struct
-      let cctxt = (client_config :> Client_context.io_wallet)
+      let scheme = Tezos_signer_backends.Encrypted.scheme
+
+      let cctxt = cctxt
     end)) ;
-  Client_keys.register_aggregate_signer
-    (module Tezos_signer_backends.Encrypted.Make_aggregate (struct
-      let cctxt = (client_config :> Client_context.io_wallet)
+  Client_keys.register_signer
+    (module Tezos_signer_backends.Encrypted.Make (struct
+      let scheme = Tezos_signer_backends.Encrypted.aggregate_scheme
+
+      let cctxt = cctxt
     end)) ;
   Client_keys.register_signer (module Tezos_signer_backends.Unencrypted) ;
-  Client_keys.register_aggregate_signer
-    (module Tezos_signer_backends.Unencrypted.Aggregate) ;
+  Client_keys.register_signer
+    (module struct
+      include Tezos_signer_backends.Unencrypted
+
+      let scheme = Tezos_signer_backends.Unencrypted.aggregate_scheme
+    end) ;
   Client_keys.register_signer
     (module Tezos_signer_backends_unix.Ledger.Signer_implementation) ;
   Client_keys.register_signer (module Socket.Unix) ;
   Client_keys.register_signer (module Socket.Tcp) ;
   Client_keys.register_signer (module Http) ;
   Client_keys.register_signer (module Https) ;
-  match parsed_config_file with
+  match other_registrations with
+  | Some other_registrations ->
+      other_registrations (module Remote_params : Client_config.Remote_params)
   | None -> ()
-  | Some parsed_config_file -> (
-      match C.other_registrations with
-      | Some r -> r parsed_config_file (module Remote_params)
-      | None -> ())
+
+let register_signer (module C : M) (cctxt : Client_context.io_wallet)
+    (rpc_config : RPC_client_unix.config) parsed_config_file =
+  let logger =
+    (* overriding the logger we might already have with the one from
+       module C *)
+    match C.logger with
+    | Some logger -> logger
+    | None -> rpc_config.logger
+  in
+  let other_registrations, signing_version =
+    match parsed_config_file with
+    | None -> (None, None)
+    | Some parsed_config_file -> (
+        let version =
+          parsed_config_file.Client_config.Cfg_file.signing_version
+        in
+        match C.other_registrations with
+        | Some r -> (Some (r parsed_config_file), version)
+        | None -> (None, version))
+  in
+  register_default_signer ?signing_version ?other_registrations ~logger cctxt
 
 (** Warn the user if there are duplicate URIs in the sources (may or may
     not be a misconfiguration). *)
@@ -381,8 +426,140 @@ let warn_if_argv0_name_not_octez () =
         expected_name
         executable_name
 
+let init_logging (module C : M) ?(parsed_args : Client_config.cli_args option)
+    ?parsed_config_file ~base_dir () =
+  let open Tezos_base_unix.Internal_event_unix in
+  let daily_logs_path =
+    C.default_daily_logs_path
+    |> Option.map Filename.Infix.(fun logdir -> base_dir // "logs" // logdir)
+  in
+  (* Update config with color logging switch and advertise levels *)
+  let default_log_cfg =
+    let colors =
+      match parsed_args with
+      | None -> None
+      | Some parsed_args -> parsed_args.log_coloring
+    in
+    Tezos_base_unix.Logs_simple_config.create_cfg
+      ?advertise_levels:C.advertise_log_levels
+      ?colors
+      ()
+  in
+  let log_cfg =
+    match parsed_config_file with
+    | Some parsed_config_file ->
+        Option.value
+          ~default:default_log_cfg
+          parsed_config_file.Client_config.Cfg_file.log
+    | None -> default_log_cfg
+  in
+  let config =
+    make_with_defaults ?enable_default_daily_logs_at:daily_logs_path ~log_cfg ()
+  in
+  match parsed_config_file with
+  | None -> init ~config ()
+  | Some cf -> (
+      match cf.Client_config.Cfg_file.internal_events with
+      | None -> init ~config ()
+      | Some config -> init ~config ())
+
+module Events = struct
+  include Internal_event.Simple
+
+  let section = ["client"]
+
+  let rand_seed_is_set =
+    declare_1
+      ~section
+      ~level:Warning
+      ~name:"rand_seed_is_set"
+      ~msg:
+        (Format.sprintf
+           "%s is set, using fixed random seed ({seed})"
+           Client_config.client_fixed_random_seed_env_var)
+      ~pp1:Format.pp_print_int
+      ("seed", Data_encoding.int31)
+
+  let rand_seed_is_not_an_int =
+    declare_1
+      ~section
+      ~level:Error
+      ~name:"rand_seed_is_not_an_int"
+      ~msg:
+        (Format.sprintf
+           "%s is set to a non-integer value ({seed}), using self init random \
+            seed instead"
+           Client_config.client_fixed_random_seed_env_var)
+      ~pp1:Format.pp_print_string
+      ("seed", Data_encoding.string)
+
+  let rand_seed_not_allowed =
+    declare_0
+      ~section
+      ~level:Error
+      ~name:"rand_seed_not_allowed"
+      ~msg:
+        (Format.sprintf
+           "%s is set, but fixed random seed is not allowed in the current \
+            configuration"
+           Client_config.client_fixed_random_seed_env_var)
+      ()
+end
+
+type error += Rand_seed_not_allowed
+
+let () =
+  register_error_kind
+    `Permanent
+    ~id:"client.randSeedNotAllowed"
+    ~title:"Random seed not allowed"
+    ~description:
+      "The environment variable for fixed random seed is set, but fixed random \
+       seed is not allowed in the current configuration."
+    ~pp:(fun ppf () ->
+      Format.fprintf
+        ppf
+        "The environment variable %s is set, but fixed random seed is not \
+         allowed in the current configuration."
+        Client_config.client_fixed_random_seed_env_var)
+    Data_encoding.unit
+    (function Rand_seed_not_allowed -> Some () | _ -> None)
+    (fun () -> Rand_seed_not_allowed)
+
+let parse_rpc_config parsed_config_file parsed_args default_media_type =
+  let rpc_config : RPC_client_unix.config =
+    match parsed_config_file with
+    | None -> RPC_client_unix.default_config
+    | Some cfg ->
+        {
+          RPC_client_unix.default_config with
+          media_type =
+            Option.value
+              cfg.Client_config.Cfg_file.media_type
+              ~default:default_media_type;
+          endpoint =
+            Option.value cfg.endpoint ~default:Client_config.default_endpoint;
+        }
+  in
+  match parsed_args with
+  | Some parsed_args ->
+      if parsed_args.Client_config.print_timings then
+        let gettimeofday = Unix.gettimeofday in
+        {
+          rpc_config with
+          logger =
+            RPC_client_unix.timings_logger ~gettimeofday Format.err_formatter;
+        }
+      else if parsed_args.Client_config.log_requests then
+        {
+          rpc_config with
+          logger = RPC_client_unix.full_logger Format.err_formatter;
+        }
+      else rpc_config
+  | None -> rpc_config
+
 (* Main (lwt) entry *)
-let main (module C : M) ~select_commands =
+let main (module C : M) ~select_commands ?(disable_logging = false) () =
   let open Lwt_result_syntax in
   let global_options = C.global_options () in
   let executable_name = Filename.basename Sys.executable_name in
@@ -399,24 +576,25 @@ let main (module C : M) ~select_commands =
     | _ :: args -> move_autocomplete_token_upfront [] args
     | [] -> ([], None)
   in
-  Random.self_init () ;
   ignore
     Tezos_clic.(
       setup_formatter
+        ~isatty:(Unix.isatty Unix.stdout)
         Format.std_formatter
-        (if Unix.isatty Unix.stdout then Ansi else Plain)
-        Short) ;
+        Details) ;
   ignore
     Tezos_clic.(
       setup_formatter
+        ~isatty:(Unix.isatty Unix.stderr)
         Format.err_formatter
-        (if Unix.isatty Unix.stderr then Ansi else Plain)
-        Short) ;
+        Details) ;
   warn_if_argv0_name_not_octez () ;
-  let*! () = Tezos_base_unix.Internal_event_unix.init () in
   let*! retcode =
     Lwt.catch
       (fun () ->
+        (* THIS MUST NOT BE MODIFIED, THIS CODE HAS TO BE COPIED PASTED IN THE
+           AGNOSTIC BAKER. IF YOU NEED TO MODIFY THIS, YOU NEED TO MODIFY
+           ACCORDINGLY THE COPIED CODE. *)
         let full =
           new unix_full
             ~chain:C.default_chain
@@ -429,9 +607,9 @@ let main (module C : M) ~select_commands =
         in
         let*! r =
           let* parsed, remaining = C.parse_config_args full original_args in
-          let parsed_config_file = parsed.Client_config.parsed_config_file
-          and parsed_args = parsed.Client_config.parsed_args
-          and config_commands = parsed.Client_config.config_commands in
+          let parsed_config_file = parsed.Client_config.parsed_config_file in
+          let parsed_args = parsed.Client_config.parsed_args in
+          let config_commands = parsed.Client_config.config_commands in
           let base_dir : string =
             match parsed.Client_config.base_dir with
             | Some p -> p
@@ -439,40 +617,56 @@ let main (module C : M) ~select_commands =
                 match parsed_config_file with
                 | None -> C.default_base_dir
                 | Some p -> p.Client_config.Cfg_file.base_dir)
-          and require_auth = parsed.Client_config.require_auth in
-          let rpc_config =
-            let rpc_config : RPC_client_unix.config =
-              match parsed_config_file with
-              | None -> RPC_client_unix.default_config
-              | Some cfg ->
-                  {
-                    RPC_client_unix.default_config with
-                    media_type =
-                      Option.value cfg.media_type ~default:C.default_media_type;
-                    endpoint =
-                      Option.value
-                        cfg.endpoint
-                        ~default:Client_config.default_endpoint;
-                  }
-            in
+          in
+          let require_auth = parsed.Client_config.require_auth in
+          let*! () =
+            if disable_logging then Lwt.return_unit
+            else
+              init_logging
+                (module C)
+                ?parsed_args
+                ?parsed_config_file
+                ~base_dir
+                ()
+          in
+
+          let* () =
             match parsed_args with
-            | Some parsed_args ->
-                if parsed_args.Client_config.print_timings then
-                  let gettimeofday = Unix.gettimeofday in
-                  {
-                    rpc_config with
-                    logger =
-                      RPC_client_unix.timings_logger
-                        ~gettimeofday
-                        Format.err_formatter;
-                  }
-                else if parsed_args.Client_config.log_requests then
-                  {
-                    rpc_config with
-                    logger = RPC_client_unix.full_logger Format.err_formatter;
-                  }
-                else rpc_config
-            | None -> rpc_config
+            | Some parsed_args -> (
+                (* check if fixed random seed is allowed and stop the program if
+                  not while the variable is set *)
+                let* _ =
+                  match
+                    Sys.getenv_opt
+                      Client_config.client_fixed_random_seed_env_var
+                  with
+                  | Some _ ->
+                      if not parsed_args.Client_config.allow_fixed_random_seed
+                      then
+                        let*! () = Events.(emit rand_seed_not_allowed) () in
+                        tzfail Rand_seed_not_allowed
+                      else return_unit
+                  | _ -> return_unit
+                in
+                (* Initialize RNG only after checking the gate. *)
+                match
+                  Sys.getenv_opt Client_config.client_fixed_random_seed_env_var
+                with
+                | None -> return @@ Random.self_init ()
+                | Some seed_str -> (
+                    match int_of_string_opt seed_str with
+                    | Some seed ->
+                        let*! () = Events.(emit rand_seed_is_set) seed in
+                        return @@ Random.init seed
+                    | None ->
+                        let*! () =
+                          Events.(emit rand_seed_is_not_an_int) seed_str
+                        in
+                        return @@ Random.self_init ()))
+            | None -> return_unit
+          in
+          let rpc_config =
+            parse_rpc_config parsed_config_file parsed_args C.default_media_type
           in
           let* client_config =
             setup_client_config
@@ -481,9 +675,9 @@ let main (module C : M) ~select_commands =
               base_dir
               rpc_config
           in
-          setup_remote_signer
+          register_signer
             (module C)
-            client_config
+            (client_config :> Client_context.io_wallet)
             rpc_config
             parsed_config_file ;
           let* other_commands =
@@ -499,7 +693,7 @@ let main (module C : M) ~select_commands =
               ~executable_name
               ~global_options
               (if Unix.isatty Unix.stdout then Tezos_clic.Ansi
-              else Tezos_clic.Plain)
+               else Tezos_clic.Plain)
               Format.std_formatter
               (C.clic_commands
                  ~base_dir
@@ -527,7 +721,11 @@ let main (module C : M) ~select_commands =
         match r with
         | Ok () -> Lwt.return 0
         | Error [Tezos_clic.Version] ->
-            let version = Tezos_version.Bin_version.version_string in
+            let version =
+              Option.value
+                C.version
+                ~default:Tezos_version_value.Bin_version.octez_version_string
+            in
             Format.printf "%s\n" version ;
             Lwt.return 0
         | Error [Tezos_clic.Help command] ->
@@ -565,7 +763,10 @@ let main (module C : M) ~select_commands =
   in
   Format.pp_print_flush Format.err_formatter () ;
   Format.pp_print_flush Format.std_formatter () ;
-  let*! () = Tezos_base_unix.Internal_event_unix.close () in
+  let*! () =
+    if disable_logging then Lwt.return_unit
+    else Tezos_base_unix.Internal_event_unix.close ()
+  in
   Lwt.return retcode
 
 (* Where all the user friendliness starts *)
@@ -574,5 +775,17 @@ let run (module M : M)
        RPC_client_unix.http_ctxt ->
        Client_config.cli_args ->
        Client_context.full Tezos_clic.command list tzresult Lwt.t) =
-  Stdlib.exit @@ Lwt_main.run @@ Lwt_exit.wrap_and_forward
-  @@ main (module M) ~select_commands
+  Lwt.Exception_filter.(set handle_all_except_runtime) ;
+  Stdlib.exit
+  @@ Tezos_base_unix.Event_loop.main_run ~process_name:"client"
+  @@ fun () -> Lwt_exit.wrap_and_forward @@ main (module M) ~select_commands ()
+
+let lwt_run (module M : M)
+    ~(select_commands :
+       RPC_client_unix.http_ctxt ->
+       Client_config.cli_args ->
+       Client_context.full Tezos_clic.command list tzresult Lwt.t)
+    ?disable_logging () =
+  Lwt.Exception_filter.(set handle_all_except_runtime) ;
+  Lwt_exit.wrap_and_forward
+  @@ main (module M) ~select_commands ?disable_logging ()

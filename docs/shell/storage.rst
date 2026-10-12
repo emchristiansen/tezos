@@ -4,8 +4,7 @@ The storage layer
 
 This document explains the inner workings of the storage layer of the
 Octez shell. The storage layer is responsible for aggregating blocks
-(along with their respective ledger state) and operations within
-blocks (along with their associated metadata). It is composed of two
+(along with their respective ledger state and :ref:`metadata <def_metadata>`) and operations within blocks. It is composed of two
 main components: a :ref:`store component <store_component>`
 providing storage abstractions for blockchain data such as blocks and operations; and the :ref:`context component <context_component>` providing storage abstractions for ledger states (also called contexts).
 
@@ -14,7 +13,7 @@ providing storage abstractions for blockchain data such as blocks and operations
 Store
 #####
 
-The store component is the :package:`tezos-store` package implemented in the :src:`src/lib_store` library. It handles the on-disk storage of static objects such as
+The store component is the :package-api:`Tezos_store <octez-shell-libs/Tezos_store/index.html>` module implemented in the :src:`src/lib_store` directory. It handles the on-disk storage of static objects such as
 blocks, operations, block's metadata, protocols and chain data. The
 store also handles the chain's current state: current head, invalid
 blocks, active test chains, etc. The store component is designed to
@@ -26,62 +25,59 @@ on disk. This is done by the :doc:`validation toolchain <validation>`.
 
 The store is initialized using a :doc:`history
 mode<../user/history_modes>` that can be either *Archive*, *Full* or
-*Rolling*. Depending on the chosen history mode, some data will be
+*Rolling*.
+
+In Archive mode, the storage keeps the complete history of all the blocks, up to the genesis block. The history of each block includes the block itself, the :ref:`context <def_context>` (ledger state) in which the block was applied, and :ref:`metadata <def_metadata>` such as the changes resulting of the block application.
+
+Depending on the chosen history mode, some data will be
 pruned while the chain is growing. In *Full* mode, all blocks that are
-part of the chain are kept but their associated metadata below a
-certain threshold are discarded. In *Rolling* mode, blocks under a
-certain threshold are discarded entirely. The thresholds of *Full* and *Rolling* modes may
+part of the chain are kept but their associated context and metadata below a
+certain threshold level are discarded. In *Rolling* mode, blocks under a
+certain threshold level are discarded entirely. The thresholds of *Full* and *Rolling* modes may
 be varied by specifying a number of :ref:`additional cycles to keep <History_mode_additional_cycles>`.
 
-The moments when data may be pruned are when a cycle is completed.
-When this happens, the store performs two operations.
+The moments when data may be pruned are when cycles complete.
+When this happens, the store performs three operations.
 First, the block history is linearized by trimming branches in the completed cycle.
-Secondly, the remaining blocks in the completed cycle (or just their metadata), and possibly their context (ledger state), can be pruned, according to the history mode.
-Both operations are explained next.
+Secondly, the cycle that just became un-reorganizable (with :ref:`Tenderbake <finality>`, this is the predecessor of the completed cycle) is archived, aka *cemented*. This process is called a **merge** and is performed asynchronously.
+Thirdly, blocks in the oldest cemented cycle (or just their context and metadata), can be pruned, according to the history mode.
+Trimming and pruning are further explained next.
 
 Trimming
 ********
 
-.. _lafl:
-
-To notice when a cycle has completed, the store uses the
-latest head's metadata that contains the **last allowed fork
-level**. This specifies the point under which the local chain cannot be
-reorganized. When a protocol validation operation returns a changed
-value for this point, it means that a cycle has completed. Then, the store
-retrieves all the blocks from ``(head-1).last_allowed_fork_level + 1``
-to ``head.last_allowed_fork_level``, which contain all the blocks of the
-completed cycle, that cannot be reorganized anymore, and trims the
-potential branches to yield a linear history.
+The protocol indicates to the shell, through some metadata present in
+the block application result, how much history is relevant to keep in
+order to preserve useful informations. If too much history is present,
+the storage layer triggers a clean-up mechanism which trims the
+chain's outdated history. Only the linear history that is part of the
+finalized chain will remain, discarding all the unreachable forks in
+the process. The resulting sequential interval of blocks that is
+returned represents a *cycle*.
 
 Pruning
 *******
 
-When the complete (hence, un-reorganizable) cycle is retrieved, it is
-archived with the *cemented cycles*. This process is
-called a **merge** and is performed asynchronously. Depending on which
-history mode is ran and on the amount of additional cycles, blocks
-and/or their associated metadata present in these cemented cycles may
+Depending on which
+history mode is ran and on the amount of additional cycles, blocks in cemented cycles
+and possibly their associated context and metadata may
 or may not be preserved. For instance, if the history mode is
-*Archive*, every block is preserved, with all its metadata. If it is
-*Full* with 5 additional cycles, all the cemented cycles will be
-present but only the 10 most recent cemented cycles will have some
-metadata kept (see details at :ref:`History_mode_additional_cycles`).
-Older metadata is pruned.
+*Archive*, every block is preserved, with its context and metadata. If it is
+*Full* with 5 additional cycles, no cemented block is pruned, but context and
+metadata will only be kept for the blocks in the 6 most recent cemented cycles
+(see details at :ref:`History_mode_additional_cycles`).
+Older contexts and metadata are pruned.
 
-Starting with Octez v15, the store also triggers *context pruning* when a cycle is completed, after finishing the store trimming and cementing.
-Thus, when pruning a block, its metadata and its context (ledger state associated to that block) are pruned as well.
+*Context pruning* has been introduced with Octez v15.0, before that only metadata was pruned, see :ref:`first_pruning`.
 
 Other features
 **************
 
-Note that after pruning metadata of some blocks, the store has the capability to reconstruct it
-by replaying every block and operation present and repopulating the
-context. Hence, it is possible to transform a `Full` store into an `Archive` one (see also :ref:`Switch_mode_restrictions`).
+It is possible to export a canonical representation of the chain for a given block, also known as a :doc:`snapshot <../user/snapshots>`, if that block is stored as a non-pruned one (that is a block from which we can read its header, metadata and associated context).
 
-It is also possible to retrieve a canonical representation of the
-store and context for a given block (provided that its metadata are
-present) as a :doc:`snapshot<../user/snapshots>`.
+Another notable feature is that after pruning the metadata and context of some blocks, the store has the capability to reconstruct them
+by replaying every block and operation present and repopulating the
+context. Hence, it is possible to transform a ``Full`` store into an ``Archive`` one (see also :ref:`Switch_mode_restrictions`).
 
 The store also writes on disk the sources of protocols no longer active.
 This allows to recompile them or even share them on the network if needed.
@@ -93,30 +89,32 @@ The store maintains two specific variables related to the pruned data, whose val
 history mode:
 
 - The *caboose*, which represents the oldest block known by the
-  store. The latter block may or may not have its metadata in
+  store. The latter block may or may not have its metadata and context in the
   store. In *Archive* and *Full* mode, this would always be the
   genesis block.
 
 - The *savepoint* which indicates the lowest block known by the store
-  that possesses metadata.
+  that possesses metadata and context.
 
-The *checkpoint* is another variable maintained by the store, that indicates one block that
-must be part of the chain. This special block may be in the future.
-Setting a future checkpoint on a fresh node before bootstrapping adds
-protection in case of eclipse attacks where a set of malicious peers
-will advertise a wrong chain. When the store reaches the level of a
-manually defined checkpoint, it will make sure that this is indeed the
-expected block or will stop the bootstrap. When the checkpoint is
-unspecified by the user, the store sets it to the :ref:`last allowed fork level <lafl>`, each time this latter is updated. In any case, the store will maintain the following invariant:
-``checkpoint ≥ head.last_allowed_fork_level``.
+.. _checkpoint:
+
+The *checkpoint* is another variable maintained by the store, that
+indicates one block that must be part of the chain. This special block
+may be in the future. Setting a future checkpoint on a fresh node
+before bootstrapping adds protection in case of eclipse attacks where
+a set of malicious peers will advertise a wrong chain. When the store
+reaches the level of a manually defined checkpoint, it will make sure
+that this is indeed the expected block or it will stop the
+bootstrap. When the checkpoint is unspecified by the user, the store
+sets it to the value provided by the protocol consensus.
 
 While the node is running, it is possible to
 call the following RPCs to access the values of all these variables:
 
-- the checkpoint: `GET /chains/<chain_id>/levels/checkpoint <http://tezos.gitlab.io/shell/rpc.html#get-chains-chain-id-levels-checkpoint>`__
-- the savepoint `GET /chains/<chain_id>/levels/savepoint <http://tezos.gitlab.io/shell/rpc.html#get-chains-chain-id-levels-savepoint>`__
-- the caboose: `GET /chains/<chain_id>/levels/caboose <http://tezos.gitlab.io/shell/rpc.html#get-chains-chain-id-levels-caboose>`__
-- the history mode: `GET /config/history_mode <http://tezos.gitlab.io/shell/rpc.html#get-config-history-mode>`__
+- the checkpoint: `GET /chains/<chain_id>/levels/checkpoint <./rpc.html#get-chains-chain-id-levels-checkpoint>`__
+- the savepoint `GET /chains/<chain_id>/levels/savepoint <./rpc.html#get-chains-chain-id-levels-savepoint>`__
+- the caboose: `GET /chains/<chain_id>/levels/caboose <./rpc.html#get-chains-chain-id-levels-caboose>`__
+- the history mode: `GET /config/history_mode <./rpc.html#get-config-history-mode>`__
 
 Files hierarchy
 ***************
@@ -163,9 +161,9 @@ The Store maintains data on disk in the
 Context
 #######
 
-The context component is the the :package:`tezos-context` package, implemented in the :src:`src/lib_context`
+The context component is the the :package-api:`tezos-context <octez-libs/Tezos_context/index.html>` package, implemented in the :src:`src/lib_context`
 library. It is a versioned key/value store that associates to each
-block a view of its ledger state. The :package-api:`on-disk context API <tezos-context/Tezos_context_disk/index.html>` exports versioning concepts similar
+block a view of its ledger state. The :package-api:`on-disk context API <octez-libs/Tezos_context_disk/index.html>` exports versioning concepts similar
 to `Git <https://git-scm.com/>`_. The current implementation is using
 `Irmin <https://github.com/mirage/irmin>`_ as a backend.
 
@@ -181,7 +179,7 @@ block is stored in its header. When validated, a block's announced
 the two context hashes are different, the block is considered invalid.
 
 The context of a block can be accessed using the protocols' RPCs such as
-`GET ../\<block_id\> <https://tezos.gitlab.io/active/rpc.html#get-block-id>`__, and more specifically by RPCs under the path ``../<block_id>/context``.
+`GET ../\<block_id\> <../active/rpc.html#get-block-id>`__, and more specifically by RPCs under the path ``../<block_id>/context``.
 
 The context of the blockchain is only modified by :doc:`blocks applications <../active/validation>`. Only the
 contexts resulting from the application of valid blocks is committed on disk, by the validation toolchain.
@@ -197,12 +195,12 @@ possible values for this variable: ``v`` for ``Info`` logging and
 ``vv`` for ``Debug`` logging (warning: the ``Debug`` mode is very
 talkative). Additionally, this environment variable allows to tweak,
 with care, the following context parameters (using the standard
-`TEZOS_CONTEXT="variable=value"` pattern, separating the items with
-commas such as `TEZOS_CONTEXT="v, variable=value"`):
+``TEZOS_CONTEXT="variable=value"`` pattern, separating the items with
+commas such as ``TEZOS_CONTEXT="v, variable=value"``):
 
-- "index-log-size": number of entries stored in the Irmin's index
-  (default `2_500_000`)
-- "auto-flush": number of tree mutations allowed before a disk flush
-  (default `10_000`)
-- "lru-size": number of entries stored in the Irmin's LRU cache
-  (default `5_000`)
+- ``index-log-size``: number of entries stored in the Irmin's index
+  (default ``2_500_000``)
+- ``auto-flush``: number of tree mutations allowed before a disk flush
+  (default ``10_000``)
+- ``lru-size``: number of entries stored in the Irmin's LRU cache
+  (default ``5_000``)

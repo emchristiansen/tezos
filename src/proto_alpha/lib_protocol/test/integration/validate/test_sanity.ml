@@ -1,40 +1,25 @@
 (*****************************************************************************)
 (*                                                                           *)
-(* Open Source License                                                       *)
-(* Copyright (c) 2022 Nomadic-Labs. <contact@nomadic-labs.com>               *)
-(*                                                                           *)
-(* Permission  is hereby granted, free of charge, to any person obtaining a  *)
-(* copy of this software and associated documentation files (the "Software"),*)
-(* to deal in the Software without restriction, including without limitation *)
-(* the rights to use, copy, modify, merge, publish, distribute, sublicense,  *)
-(* and/or sell copies of the Software, and to permit persons to whom the     *)
-(* Software is furnished to do so, subject to the following conditions:      *)
-(*                                                                           *)
-(* The above copyright notice and this permission notice shall be included   *)
-(* in all copies or substantial portions of the Software.                    *)
-(*                                                                           *)
-(* THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR*)
-(* IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,  *)
-(* FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL   *)
-(* THE AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER*)
-(* LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING   *)
-(* FROM, OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER       *)
-(* DEALINGS IN THE SOFTWARE.                                                 *)
+(* SPDX-License-Identifier: MIT                                              *)
+(* Copyright (c) 2022 Nomadic Labs, <contact@nomadic-labs.com>               *)
+(* Copyright (c) 2023 Marigold, <contact@marigold.dev>                       *)
 (*                                                                           *)
 (*****************************************************************************)
 
 (** Testing
     -------
     Component:  Protocol (validate manager)
-    Invocation: dune exec \
-                src/proto_alpha/lib_protocol/test/integration/validate/main.exe \
-                -- test "sanity checks"
+    Invocation: dune exec src/proto_alpha/lib_protocol/test/integration/validate/main.exe \
+                  -- --file test_sanity.ml
     Subject:    Validation of operation.
 *)
 
 open Protocol
 open Alpha_context
 open Manager_operation_helpers
+
+let register_test =
+  Tezt_helpers.register_test_es ~__FILE__ ~file_tags:["validation"; "operation"]
 
 (** The goal of this test is to ensure that [select_op] generate the
    wanted kind of manager operation
@@ -76,22 +61,18 @@ let ensure_kind infos kind =
       | Sc_rollup_timeout _, K_Sc_rollup_timeout
       | Sc_rollup_execute_outbox_message _, K_Sc_rollup_execute_outbox_message
       | Sc_rollup_recover_bond _, K_Sc_rollup_recover_bond
-      | Dal_publish_slot_header _, K_Dal_publish_slot_header
+      | Dal_publish_commitment _, K_Dal_publish_commitment
       | Zk_rollup_origination _, K_Zk_rollup_origination
       | Zk_rollup_publish _, K_Zk_rollup_publish
       | Zk_rollup_update _, K_Zk_rollup_update ->
           return_unit
       | ( ( Transaction _ | Origination _ | Register_global_constant _
           | Delegation _ | Set_deposits_limit _ | Update_consensus_key _
-          | Increase_paid_storage _ | Reveal _ | Tx_rollup_origination
-          | Tx_rollup_submit_batch _ | Tx_rollup_commit _
-          | Tx_rollup_return_bond _ | Tx_rollup_finalize_commitment _
-          | Tx_rollup_remove_commitment _ | Tx_rollup_dispatch_tickets _
-          | Transfer_ticket _ | Tx_rollup_rejection _ | Sc_rollup_originate _
-          | Sc_rollup_publish _ | Sc_rollup_cement _ | Sc_rollup_add_messages _
-          | Sc_rollup_refute _ | Sc_rollup_timeout _
+          | Increase_paid_storage _ | Reveal _ | Transfer_ticket _
+          | Sc_rollup_originate _ | Sc_rollup_publish _ | Sc_rollup_cement _
+          | Sc_rollup_add_messages _ | Sc_rollup_refute _ | Sc_rollup_timeout _
           | Sc_rollup_execute_outbox_message _ | Sc_rollup_recover_bond _
-          | Dal_publish_slot_header _ | Zk_rollup_origination _
+          | Dal_publish_commitment _ | Zk_rollup_origination _
           | Zk_rollup_publish _ | Zk_rollup_update _ ),
           _ ) ->
           assert false)
@@ -124,24 +105,27 @@ let covalidation_sanity () =
           failwith "no candidates was generated for kind '%a'" pp_op_kind kind
       | Some {protocol_data = Operation_data {contents; _}; _} -> (
           match (contents, kind) with
-          | Single (Preendorsement _), KPreendorsement -> return_unit
-          | Single (Preendorsement _), _ -> assert false
-          | Single (Endorsement _), KEndorsement -> return_unit
-          | Single (Endorsement _), _ -> assert false
-          | Single (Dal_attestation _), KDalattestation -> return_unit
-          | Single (Dal_attestation _), _ -> assert false
+          | Single (Preattestation _), KPreattestation -> return_unit
+          | Single (Preattestation _), _ -> assert false
+          | Single (Attestation _), KAttestation -> return_unit
+          | Single (Attestation _), _ -> assert false
+          | Single (Attestations_aggregate _), KAttestations_aggregate ->
+              return_unit
+          | Single (Attestations_aggregate _), _ -> assert false
+          | Single (Preattestations_aggregate _), KPreattestations_aggregate ->
+              return_unit
+          | Single (Preattestations_aggregate _), _ -> assert false
           | Single (Seed_nonce_revelation _), KNonce -> return_unit
           | Single (Seed_nonce_revelation _), _ -> assert false
           | Single (Vdf_revelation _), KVdf -> return_unit
           | Single (Vdf_revelation _), _ -> assert false
-          | Single (Double_endorsement_evidence _), KDbl_consensus ->
+          | Single (Double_consensus_operation_evidence _), KDbl_consensus ->
               return_unit
-          | Single (Double_endorsement_evidence _), _ -> assert false
-          | Single (Double_preendorsement_evidence _), KDbl_consensus ->
-              return_unit
-          | Single (Double_preendorsement_evidence _), _ -> assert false
+          | Single (Double_consensus_operation_evidence _), _ -> assert false
           | Single (Double_baking_evidence _), KDbl_baking -> return_unit
           | Single (Double_baking_evidence _), _ -> assert false
+          | Single (Dal_entrapment_evidence _), KEntrapment -> return_unit
+          | Single (Dal_entrapment_evidence _), _ -> assert false
           | Single (Activate_account _), KActivate -> return_unit
           | Single (Activate_account _), _ -> assert false
           | Single (Proposals _), KProposals -> return_unit
@@ -159,10 +143,9 @@ let covalidation_sanity () =
           | Single (Failing_noop _), _ -> assert false))
     all_kinds
 
-let tests =
-  List.map
-    (fun (name, f) -> Tztest.tztest name `Quick f)
-    [
-      ("manager operation coverage", ensure_manager_operation_coverage);
-      ("covalidation coverage", covalidation_sanity);
-    ]
+let () =
+  register_test
+    ~title:"manager operation coverage"
+    ensure_manager_operation_coverage
+
+let () = register_test ~title:"covalidation coverage" covalidation_sanity

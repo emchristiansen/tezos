@@ -359,28 +359,22 @@ let secrets =
 
 (** {3 Context Manipulations } *)
 
-let pick_two_endorsers ctxt =
+let pick_addr_attester ctxt =
+  let open Lwt_result_syntax in
   let module V = Plugin.RPC.Validators in
-  Context.get_endorsers ctxt >>=? function
-  | a :: b :: _ -> return (a.V.consensus_key, b.V.consensus_key)
-  | _ -> assert false
-
-let pick_addr_endorser ctxt =
-  let module V = Plugin.RPC.Validators in
-  Context.get_endorsers ctxt >>=? function
-  | a :: _ -> return a.V.consensus_key
-  | _ -> assert false
+  let* attesters = Context.get_attesters ctxt in
+  match attesters with a :: _ -> return a.V.consensus_key | _ -> assert false
 
 let init_params =
   Tezos_protocol_alpha_parameters.Default_parameters.parameters_of_constants
-    {Context.default_test_constants with consensus_threshold = 0}
+    {Context.default_test_constants with consensus_threshold_size = 0}
 
 let delegates_of_block block =
   let open Lwt_result_syntax in
-  let+ validators = Context.get_endorsers (B block) in
+  let+ validators = Context.get_attesters (B block) in
   List.map
-    (fun Plugin.RPC.Validators.{consensus_key; slots; _} ->
-      (consensus_key, slots))
+    (fun Plugin.RPC.Validators.{consensus_key; attestation_slot; _} ->
+      (consensus_key, attestation_slot))
     validators
 
 (** Sequential validation of an operation list. *)

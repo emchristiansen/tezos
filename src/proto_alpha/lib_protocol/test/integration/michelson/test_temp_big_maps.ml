@@ -26,43 +26,54 @@
 (** Testing
     -------
     Component:  Protocol (temporary big maps)
-    Invocation: cd src/proto_alpha/lib_protocol/test/integration/michelson \
-                && dune exec ./main.exe -- test "^temp big maps$"
+    Invocation: dune exec src/proto_alpha/lib_protocol/test/integration/michelson/main.exe \
+                  -- --file test_temp_big_maps.ml
     Subject:    On temporary big maps.
 *)
 
 open Protocol
 
 let to_raw_context (b : Block.t) =
-  Raw_context.prepare
-    b.context
-    ~level:b.header.shell.level
-    ~predecessor_timestamp:b.header.shell.timestamp
-    ~timestamp:b.header.shell.timestamp
-  >|= Environment.wrap_tzresult
+  let open Lwt_result_wrap_syntax in
+  let+@ ctxt =
+    Raw_context.prepare
+      b.context
+      ~level:b.header.shell.level
+      ~predecessor_timestamp:b.header.shell.timestamp
+      ~timestamp:b.header.shell.timestamp
+      ~all_bakers_attest_first_level:None
+  in
+  ctxt
 
 let check_no_dangling_temp_big_map b =
-  to_raw_context b >>=? fun ctxt ->
-  Storage.Big_map.fold ctxt ~init:() ~order:`Sorted ~f:(fun id () ->
-      assert (not (Lazy_storage_kind.Big_map.Id.is_temp id)) ;
-      Lwt.return_unit)
-  >>= fun () ->
-  Storage.Big_map.fold ctxt ~init:() ~order:`Undefined ~f:(fun id () ->
-      assert (not (Lazy_storage_kind.Big_map.Id.is_temp id)) ;
-      Lwt.return_unit)
-  >>= fun () -> return_unit
+  let open Lwt_result_syntax in
+  let* ctxt = to_raw_context b in
+  let*! () =
+    Storage.Big_map.fold ctxt ~init:() ~order:`Sorted ~f:(fun id () ->
+        assert (not (Lazy_storage_kind.Big_map.Id.is_temp id)) ;
+        Lwt.return_unit)
+  in
+  let*! () =
+    Storage.Big_map.fold ctxt ~init:() ~order:`Undefined ~f:(fun id () ->
+        assert (not (Lazy_storage_kind.Big_map.Id.is_temp id)) ;
+        Lwt.return_unit)
+  in
+  return_unit
 
 let call_the_contract b ~baker ~src contract param_left param_right =
+  let open Lwt_result_syntax in
   let fee = Alpha_context.Tez.one in
   let amount = Alpha_context.Tez.zero in
   let param = Printf.sprintf "Pair (%s) %s" param_left param_right in
   let parameters = Alpha_context.Script.lazy_expr (Expr.from_string param) in
-  Op.transaction ~fee (B b) src contract amount ~parameters
-  >>=? fun operation ->
-  Incremental.begin_construction ~policy:Block.(By_account baker) b
-  >>=? fun incr ->
-  Incremental.add_operation incr operation >>=? fun incr ->
+  let* operation = Op.transaction ~fee (B b) src contract amount ~parameters in
+  let* incr =
+    Incremental.begin_construction ~policy:Block.(By_account baker) b
+  in
+  let* incr = Incremental.add_operation incr operation in
   Incremental.finalize_block incr
+
+let path = project_root // Filename.dirname __FILE__
 
 (** Originates the contract at contracts/temp_big_maps.tz and calls it with
     the pair [(param_left, param_right)].
@@ -71,16 +82,18 @@ let call_the_contract b ~baker ~src contract param_left param_right =
     All combinations are exercised.
 *)
 let test_temp_big_maps_contract param_left param_right () =
-  Contract_helpers.init () >>=? fun (b, baker, src, _src2) ->
-  Contract_helpers.originate_contract
-    "contracts/temp_big_maps.tz"
-    "{}"
-    src
-    b
-    baker
-  >>=? fun (contract, b) ->
-  check_no_dangling_temp_big_map b >>=? fun () ->
-  call_the_contract b ~baker ~src contract param_left param_right >>=? fun b ->
+  let open Lwt_result_syntax in
+  let* b, baker, src, _src2 = Contract_helpers.init () in
+  let* contract, b =
+    Contract_helpers.originate_contract
+      (path // "contracts/temp_big_maps.tz")
+      "{}"
+      src
+      b
+      baker
+  in
+  let* () = check_no_dangling_temp_big_map b in
+  let* b = call_the_contract b ~baker ~src contract param_left param_right in
   check_no_dangling_temp_big_map b
 
 let param_left_values = ["Left True"; "Left False"; "Right {}"]
@@ -99,3 +112,7 @@ let tests =
                (test_temp_big_maps_contract param_left param_right))
            param_right_values)
        param_left_values)
+
+let () =
+  Alcotest_lwt.run ~__FILE__ Protocol.name [("temp big maps", tests)]
+  |> Lwt_main.run

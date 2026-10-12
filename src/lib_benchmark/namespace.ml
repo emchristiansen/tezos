@@ -51,11 +51,14 @@ let equal = List.equal String.equal
 
 let compare = List.compare String.compare
 
+let hash = Stdlib.Hashtbl.hash
+
 let of_string s =
   (if String.equal s root_name then [] else String.split_on_char sep s)
   |> List.rev
-  |> (function
-       | h :: t as l -> if String.(equal h empty) then t else l | [] -> [])
+  |> ( function
+  | h :: t as l -> if String.(equal h empty) then t else l
+  | [] -> [] )
   |> List.rev
 
 let append : t -> t -> t = List.append
@@ -69,17 +72,35 @@ let cons (l : t) (a : string) : t =
   | [_] -> [a]
   | _ ->
       Format.eprintf "Namespace.cons error: string contains %c: %s@." sep a ;
-      exit 1
+      assert false
 
 let encoding = Data_encoding.(list string)
 
 let to_list l = root_name :: l
+
+let of_list l =
+  let l = match l with x :: xs when x = root_name -> xs | _ -> l in
+  match List.find (fun s -> String.contains s sep) l with
+  | None -> l
+  | Some a ->
+      Format.eprintf
+        "Namespace.of_list error: list contains \"%s\" that contains '%c'@."
+        a
+        sep ;
+      assert false
 
 let name_match (pattern : t) (name : t) =
   let l, leftovers = List.combine_with_leftovers pattern name in
   match leftovers with
   | None | Some (Right _) -> List.for_all (fun (a, b) -> String.equal a b) l
   | _ -> false
+
+let to_filename ns =
+  String.concat "__"
+  @@
+  match to_list ns with
+  | hd :: ns when String.equal hd root_name -> ns
+  | ns -> ns
 
 module Hashtbl = Hashtbl.MakeSeeded (struct
   type nonrec t = t
@@ -97,6 +118,12 @@ module Hashtbl = Hashtbl.MakeSeeded (struct
 end)
 
 module Set = Set.Make (struct
+  type nonrec t = t
+
+  let compare = compare
+end)
+
+module Map = Map.Make (struct
   type nonrec t = t
 
   let compare = compare

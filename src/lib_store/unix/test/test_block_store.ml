@@ -23,8 +23,16 @@
 (*                                                                           *)
 (*****************************************************************************)
 
+(** Testing
+    _______
+
+    Component: Store
+    Invocation: dune exec src/lib_store/unix/test/main.exe \
+                -- --file test_block_store.ml
+    Subject: Store tests ( block storing and access )
+*)
+
 module Assert = Assert
-module Assert_lib = Lib_test_extra.Assert_lib
 open Test_utils
 open Block_store
 
@@ -134,7 +142,7 @@ let assert_cemented_bound block_store (lowest, highest) =
     "is 0 the lowest cemented level?"
     Compare.Int32.(lowest_cemented_level = lowest) ;
   Assert.assert_true
-    "is head's lafl the lowest cemented level?"
+    "is head's lpbl the lowest cemented level?"
     Compare.Int32.(highest_cemented_level = highest)
 
 let test_storing_and_access_predecessors block_store =
@@ -179,18 +187,18 @@ let test_storing_and_access_predecessors block_store =
   in
   return_unit
 
-let make_raw_block_list_with_lafl pred size ~lafl =
+let make_raw_block_list_with_lpbl pred size ~lpbl =
   let open Lwt_syntax in
   let* chunk, head = make_raw_block_list ~kind:`Full pred size in
-  let change_lafl block =
+  let change_lpbl block =
     let metadata =
       WithExceptions.Option.to_exn ~none:Not_found block.Block_repr.metadata
     in
     block.Block_repr.metadata <-
-      Some {metadata with last_allowed_fork_level = lafl} ;
+      Some {metadata with last_preserved_block_level = lpbl} ;
     block
   in
-  Lwt.return (List.map change_lafl chunk, change_lafl head)
+  Lwt.return (List.map change_lpbl chunk, change_lpbl head)
 
 let make_n_consecutive_cycles pred ~cycle_length ~nb_cycles =
   let open Lwt_syntax in
@@ -208,9 +216,9 @@ let make_n_consecutive_cycles pred ~cycle_length ~nb_cycles =
           if Block_hash.equal (fst pred) genesis_hash then cycle_length - 1
           else cycle_length
         in
-        let lafl = max 0l (snd pred) in
+        let lpbl = max 0l (snd pred) in
         let* chunk, head =
-          make_raw_block_list_with_lafl pred cycle_length ~lafl
+          make_raw_block_list_with_lpbl pred cycle_length ~lpbl
         in
         loop (chunk :: acc) (Block_repr.descriptor head) (n - 1)
   in
@@ -251,11 +259,12 @@ let test_simple_merge block_store =
       ~new_head:head
       ~new_head_metadata:head_metadata
       ~cementing_highwatermark:0l
+      ~disable_context_pruning:false
   in
   let*! () = Block_store.await_merging block_store in
   assert_cemented_bound
     block_store
-    (0l, Block_repr.last_allowed_fork_level head_metadata) ;
+    (0l, Block_repr.last_preserved_block_level head_metadata) ;
   return_unit
 
 let test_consecutive_concurrent_merges block_store =
@@ -275,22 +284,22 @@ let test_consecutive_concurrent_merges block_store =
   in
   let cycles_to_merge =
     List.fold_left
-      (fun (acc, pred_cycle_lafl) cycle ->
+      (fun (acc, pred_cycle_lpbl) cycle ->
         let block_in_cycle =
           List.hd cycle |> WithExceptions.Option.get ~loc:__LOC__
         in
-        let block_lafl =
+        let block_lpbl =
           Block_repr.metadata block_in_cycle
           |> WithExceptions.Option.get ~loc:__LOC__
-          |> Block_repr.last_allowed_fork_level
+          |> Block_repr.last_preserved_block_level
         in
-        ((cycle, pred_cycle_lafl) :: acc, block_lafl))
+        ((cycle, pred_cycle_lpbl) :: acc, block_lpbl))
       ([], 0l)
       cycles
     |> fst |> List.rev |> List.tl
     |> WithExceptions.Option.get ~loc:__LOC__
   in
-  let merge_cycle (cycle, previous_cycle_lafl) =
+  let merge_cycle (cycle, previous_cycle_lpbl) =
     let new_head =
       List.last_opt cycle |> WithExceptions.Option.get ~loc:__LOC__
     in
@@ -305,7 +314,8 @@ let test_consecutive_concurrent_merges block_store =
       ~history_mode:Archive
       ~new_head
       ~new_head_metadata
-      ~cementing_highwatermark:previous_cycle_lafl
+      ~cementing_highwatermark:previous_cycle_lpbl
+      ~disable_context_pruning:false
   in
   let threads = List.map merge_cycle cycles_to_merge in
   let*! res = Lwt.all threads in
@@ -320,7 +330,7 @@ let test_consecutive_concurrent_merges block_store =
   in
   assert_cemented_bound
     block_store
-    (0l, Block_repr.last_allowed_fork_level head_metadata) ;
+    (0l, Block_repr.last_preserved_block_level head_metadata) ;
   return_unit
 
 let test_ten_cycles_merge block_store =
@@ -350,6 +360,7 @@ let test_ten_cycles_merge block_store =
         (head |> Block_repr.metadata
         |> WithExceptions.Option.to_exn ~none:Not_found)
       ~cementing_highwatermark:0l
+      ~disable_context_pruning:false
   in
   let* () =
     assert_presence_in_block_store ~with_metadata:true block_store all_blocks
@@ -362,8 +373,8 @@ let test_ten_cycles_merge block_store =
 let test_merge_with_branches block_store =
   let open Lwt_result_syntax in
   (* make an initial chain of 2 cycles of 100 blocks with each
-     block's lafl pointing to the highest block of its preceding cycle.
-     i.e. 1st cycle's lafl = 0, 2nd cycle's lafl = 99 *)
+     block's lpbl pointing to the highest block of its preceding cycle.
+     i.e. 1st cycle's lpbl = 0, 2nd cycle's lpbl = 99 *)
   let*! cycles, head =
     make_n_initial_consecutive_cycles block_store ~cycle_length:100 ~nb_cycles:2
   in
@@ -383,19 +394,19 @@ let test_merge_with_branches block_store =
           |> WithExceptions.Option.get ~loc:__LOC__
         in
         let*! blocks, _head =
-          make_raw_block_list_with_lafl
-            ~lafl:0l
+          make_raw_block_list_with_lpbl
+            ~lpbl:0l
             (Block_repr.descriptor fork_root)
             50
         in
-        (* tweek lafl's to make them coherent *)
+        (* tweek lpbl's to make them coherent *)
         List.iter
           (fun block ->
             if Compare.Int32.(Block_repr.level block > 99l) then
               block.metadata <-
                 Option.map
                   (fun metadata ->
-                    {metadata with Block_repr.last_allowed_fork_level = 99l})
+                    {metadata with Block_repr.last_preserved_block_level = 99l})
                   block.metadata)
           blocks ;
         let* () =
@@ -415,19 +426,19 @@ let test_merge_with_branches block_store =
           |> WithExceptions.Option.get ~loc:__LOC__
         in
         let*! blocks, _head =
-          make_raw_block_list_with_lafl
-            ~lafl:99l
+          make_raw_block_list_with_lpbl
+            ~lpbl:99l
             (Block_repr.descriptor fork_root)
             50
         in
-        (* tweek lafl's to make them coherent *)
+        (* tweek lpbl's to make them coherent *)
         List.iter
           (fun block ->
             if Compare.Int32.(Block_repr.level block > 199l) then
               block.metadata <-
                 Option.map
                   (fun metadata ->
-                    {metadata with Block_repr.last_allowed_fork_level = 199l})
+                    {metadata with Block_repr.last_preserved_block_level = 199l})
                   block.metadata)
           blocks ;
         let* () =
@@ -451,6 +462,7 @@ let test_merge_with_branches block_store =
         (head |> Block_repr.metadata
         |> WithExceptions.Option.to_exn ~none:Not_found)
       ~cementing_highwatermark:0l
+      ~disable_context_pruning:false
   in
   let*! () = Block_store.await_merging block_store in
   let* () =
@@ -487,6 +499,7 @@ let perform_n_cycles_merge ?(cycle_length = 10) block_store history_mode
         (head |> Block_repr.metadata
         |> WithExceptions.Option.to_exn ~none:Not_found)
       ~cementing_highwatermark:0l
+      ~disable_context_pruning:false
   in
   let*! () = Block_store.await_merging block_store in
   return cycles
@@ -528,14 +541,14 @@ let test_full_0_merge block_store =
     (* hack: invert the reading order to clear the cache *)
   in
   let expected_savepoint_level =
-    ((nb_cycles - 1) * cycle_length) - 1 (* lafl *) - 1
-    (* lafl max_op_ttl *)
+    ((nb_cycles - 1) * cycle_length) - 1 (* lpbl *) - 1
+    (* lpbl max_op_ttl *)
   in
   let expected_pruned_blocks, expected_preserved_blocks =
     List.split_n
       (expected_savepoint_level - 1)
       (* the genesis block is not counted *) all_blocks
-    (* First 9 cycles shouldn't have metadata except for the lafl block
+    (* First 9 cycles shouldn't have metadata except for the lpbl block
        (i.e. the last one) *)
   in
   let* () =
@@ -619,15 +632,15 @@ let test_rolling_0_merge block_store =
   in
   let all_blocks = List.concat cycles in
   let expected_savepoint_level =
-    ((nb_cycles - 1) * cycle_length) - 1 (* lafl *) - 1
-    (* lafl max_op_ttl *)
+    ((nb_cycles - 1) * cycle_length) - 1 (* lpbl *) - 1
+    (* lpbl max_op_ttl *)
   in
   let expected_pruned_blocks, expected_preserved_blocks =
     List.split_n
       (expected_savepoint_level - 1)
       (* the genesis block is not counted *) all_blocks
-    (* First 9 cycles shouldn't have metadata except for the lafl block
-       (i.e. the last one) *)
+    (* First 9 cycles shouldn't have metadata except for the lpbl
+       block (i.e. the last one) *)
   in
   let* () = assert_absence_in_block_store block_store expected_pruned_blocks in
   let* () =
@@ -687,7 +700,7 @@ let test_rolling_2_merge block_store =
   Assert.Int32.equal ~msg:"caboose" expected_savepoint (snd caboose) ;
   return_unit
 
-let wrap_test ?(keep_dir = false) (name, g) =
+let wrap_test ?(keep_dir = true) (name, g) =
   let open Lwt_result_syntax in
   let f dir_path =
     let genesis_block =
@@ -698,7 +711,9 @@ let wrap_test ?(keep_dir = false) (name, g) =
     let store_dir = Naming.store_dir ~dir_path in
     let chain_dir = Naming.chain_dir store_dir Chain_id.zero in
     let*! () = Lwt_utils_unix.create_dir (Naming.dir_path chain_dir) in
-    let*! r = Block_store.create chain_dir ~genesis_block in
+    let*! r =
+      Block_store.create ~block_cache_limit:1 chain_dir ~genesis_block
+    in
     match r with
     | Error err ->
         Format.printf
@@ -753,8 +768,4 @@ let tests : string * unit Alcotest_lwt.test_case list =
   in
   ("block store", test_cases)
 
-let () =
-  let open Lwt_syntax in
-  Lwt_main.run
-    (let* () = Tezos_base_unix.Internal_event_unix.init () in
-     Alcotest_lwt.run "tezos-store" [tests])
+let () = Lwt_main.run (Alcotest_lwt.run ~__FILE__ "tezos-store" [tests])

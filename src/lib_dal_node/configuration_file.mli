@@ -1,0 +1,152 @@
+(*****************************************************************************)
+(*                                                                           *)
+(* Open Source License                                                       *)
+(* Copyright (c) 2023 Nomadic Labs, <contact@nomadic-labs.com>               *)
+(*                                                                           *)
+(* Permission is hereby granted, free of charge, to any person obtaining a   *)
+(* copy of this software and associated documentation files (the "Software"),*)
+(* to deal in the Software without restriction, including without limitation *)
+(* the rights to use, copy, modify, merge, publish, distribute, sublicense,  *)
+(* and/or sell copies of the Software, and to permit persons to whom the     *)
+(* Software is furnished to do so, subject to the following conditions:      *)
+(*                                                                           *)
+(* The above copyright notice and this permission notice shall be included   *)
+(* in all copies or substantial portions of the Software.                    *)
+(*                                                                           *)
+(* THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR*)
+(* IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,  *)
+(* FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL   *)
+(* THE AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER*)
+(* LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING   *)
+(* FROM, OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER       *)
+(* DEALINGS IN THE SOFTWARE.                                                 *)
+(*                                                                           *)
+(*****************************************************************************)
+
+type neighbor = {addr : string; port : int}
+
+(** The history mode decides for how long slot payloads are kept in the
+    store. Shards always follow their own (short) lifetime, given by
+    [Constants.shard_retention_period_in_levels], regardless of this
+    setting. *)
+type history_mode =
+  | Rolling of {blocks : [`Auto | `Some of int]}
+      (** [Rolling {blocks = `Some n}] keeps slot payloads for about [n]
+          blocks. [Rolling {blocks = `Auto}] infers the number of blocks
+          depending on the L1 parametric constants and the profile. *)
+  | Archive
+      (** [Archive] keeps slot payloads indefinitely. This is the default. *)
+
+(** The configuration of the validation of shards in batch mode.*)
+type batching_configuration =
+  | Disabled
+      (** [Disabled] enforces the validation of shards one by one at reception time. *)
+  | Enabled of {time_interval : int}
+      (** [Enabled {time_interval}] accumulates messages received during
+          [time_interval] milliseconds and verifies all shards related to the
+          same commitment in the same batch in one pass. *)
+
+(** Configuration settings for experimental features, with no backward
+    compatibility guarantees. *)
+type experimental_features = unit
+
+type publish_slots_regularly = {
+  frequency : int;
+  slot_index : int;
+  secret_key : Signature.Secret_key.t;
+}
+
+type t = {
+  data_dir : string;  (** The path to the DAL node data directory. *)
+  rpc_addr : P2p_point.Id.t;
+      (** The TCP address the DAL node's RPC server listens to. *)
+  listen_addr : P2p_point.Id.t;  (** The TCP address bound by the DAL node. *)
+  public_addr : P2p_point.Id.t;
+      (** The TCP address at which this instance can be reached. *)
+  peers : string list;
+      (** The list of P2P peers to connect to at startup, in addition to the
+          list given by L1 node's configuration parameter
+          dal_config.bootstrap_peers. *)
+  expected_pow : float;
+      (** The expected PoW difficulty level for the peers' identity. *)
+  endpoint : Uri.t;  (** The endpoint of a Tezos L1 node. *)
+  slots_backup_uris : Uri.t list;
+      (** Backup URIs to fetch slot data if missing and unrecoverable from shards. *)
+  trust_slots_backup_uris : bool;
+      (** Whether to trust the data downlaoded from the provided HTTP backup URIs. *)
+  metrics_addr : P2p_point.Id.t option;
+      (** The TCP address of the node's server used to export metrics. *)
+  profile : Profile_manager.unresolved_profile;
+      (** The profiles determining the topics of interest. *)
+  history_mode : history_mode;
+  version : int;  (** The version of the configuration. *)
+  service_name : string;  (** Name of the service provided by this node. *)
+  service_namespace : string;  (** Namespace for the service. *)
+  telemetry_env : string option; (* Running environment name for telemetry *)
+  experimental_features : experimental_features;  (** Experimental features.  *)
+  fetch_trusted_setup : bool;
+      (** Should the trusted setup be downloaded if not found or has invalid hash. *)
+  verbose : bool;
+      (** Whether to emit detailed events for frequently received control
+          messages from remote peers. *)
+  ignore_l1_config_peers : bool;
+      (** Ignore the boot(strap) peers provided by L1. *)
+  disable_amplification : bool;  (** Disable amplification. *)
+  banned_addrs : P2p_addr.t list;
+      (** List of IP addresses to ban at startup. Connections from/to these
+          addresses will be rejected by the P2P layer. *)
+  batching_configuration : batching_configuration;
+      (** The configuration of the batching of the shards.
+          The default is [Enabled{time_interval=100}]. *)
+  publish_slots_regularly : publish_slots_regularly option;
+  profiling : Tezos_profiler.Profiler.profiling_config option;
+  rpc_acl_policy : Tezos_rpc_http_server.RPC_server.Acl.policy;
+      (** Per-bind-address ACL overrides for the RPC server. When a configured
+          entry matches the bind address, its ACL replaces the default
+          [dal_secure] (public) / [allow_all] (loopback) policy. *)
+}
+
+(** [default] is the default configuration. *)
+val default : t
+
+(** [default_metrics_port] is the default network port opened for metrics *)
+val default_metrics_port : int
+
+(** [store_path config] returns a path for the store *)
+val store_path : t -> string
+
+(** [default_config_file data_dir] constructs a default configuration file path
+    from a data dir. *)
+val default_config_file : string -> string
+
+(** [save ~allow_overwrite ~config_file] writes config file in [config.data_dir] if it doesn't exists or allow_overwrite is true.
+
+    If the file exists and allow_overwrite is false, the function returns an error.
+*)
+val save :
+  allow_overwrite:bool -> config_file:string -> t -> unit tzresult Lwt.t
+
+(** [load ~on_file_not_found ~config_file ()] load config file from
+    [config.data_dir] if it exists. If not it calls the provided on_file_not_found function.
+    If no such function is provided, an error is returned.
+*)
+val load :
+  ?on_file_not_found:(unit -> t tzresult Lwt.t) ->
+  config_file:string ->
+  unit ->
+  t tzresult Lwt.t
+
+(* Helper to exit with a proper code when a configuration error occurs *)
+val exit_on_configuration_error :
+  emit:(error_trace:tztrace -> experimental_features Lwt.t) ->
+  'a tzresult Lwt.t ->
+  'a tzresult Lwt.t
+
+(** [identity_file config] returns the absolute path to the
+    "identity.json" file of the DAL node, based on the configuration
+    [config]. *)
+val identity_file : t -> string
+
+(** [peers_file config] returns the absolute path to the "peers.json"
+    file of the DAL node, based on the configuration [config]. *)
+val peers_file : t -> string

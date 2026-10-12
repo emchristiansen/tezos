@@ -3,6 +3,7 @@
 (* Open Source License                                                       *)
 (* Copyright (c) 2018 Dynamic Ledger Solutions, Inc. <contact@tezos.com>     *)
 (* Copyright (c) 2022 Nomadic Labs <contact@nomadic-labs.com>                *)
+(* Copyright (c) 2023 Marigold, <contact@marigold.dev>                       *)
 (*                                                                           *)
 (* Permission is hereby granted, free of charge, to any person obtaining a   *)
 (* copy of this software and associated documentation files (the "Software"),*)
@@ -36,6 +37,12 @@ open Alpha_context
 open Apply_operation_result
 open Apply_internal_results
 
+type double_signing_result = {
+  punished_delegate : Implicit_account_repr.t;
+  rewarded_delegate : Implicit_account_repr.t;
+  misbehaviour : Misbehaviour.t;
+}
+
 (** Result of applying a {!Operation.t}. Follows the same structure. *)
 type 'kind operation_metadata = {contents : 'kind contents_result_list}
 
@@ -58,39 +65,48 @@ and packed_contents_result_list =
 
 (** Result of applying an {!Operation.contents}. Follows the same structure. *)
 and 'kind contents_result =
-  | Preendorsement_result : {
+  | Preattestation_result : {
       balance_updates : Receipt.balance_updates;
-      delegate : Signature.public_key_hash;
+      delegate : Implicit_account_repr.t;
       consensus_key : Signature.public_key_hash;
-      preendorsement_power : int;
+      consensus_power : Attesting_power.result;
     }
-      -> Kind.preendorsement contents_result
-  | Endorsement_result : {
+      -> Kind.preattestation contents_result
+  | Attestation_result : {
       balance_updates : Receipt.balance_updates;
-      delegate : Signature.public_key_hash;
+      delegate : Implicit_account_repr.t;
       consensus_key : Signature.public_key_hash;
-      endorsement_power : int;
+      consensus_power : Attesting_power.result;
     }
-      -> Kind.endorsement contents_result
-  | Dal_attestation_result : {
-      delegate : Signature.Public_key_hash.t;
+      -> Kind.attestation contents_result
+  | Preattestations_aggregate_result : {
+      balance_updates : Receipt.balance_updates;
+      committee : (Consensus_key.t * Attesting_power.result) list;
+      total_consensus_power : Attesting_power.result;
     }
-      -> Kind.dal_attestation contents_result
+      -> Kind.preattestations_aggregate contents_result
+  | Attestations_aggregate_result : {
+      balance_updates : Receipt.balance_updates;
+      committee : (Consensus_key.t * Attesting_power.result) list;
+      total_consensus_power : Attesting_power.result;
+    }
+      -> Kind.attestations_aggregate contents_result
   | Seed_nonce_revelation_result :
       Receipt.balance_updates
       -> Kind.seed_nonce_revelation contents_result
   | Vdf_revelation_result :
       Receipt.balance_updates
       -> Kind.vdf_revelation contents_result
-  | Double_endorsement_evidence_result :
-      Receipt.balance_updates
-      -> Kind.double_endorsement_evidence contents_result
-  | Double_preendorsement_evidence_result :
-      Receipt.balance_updates
-      -> Kind.double_preendorsement_evidence contents_result
+  | Double_consensus_operation_evidence_result :
+      double_signing_result
+      -> Kind.double_consensus_operation_evidence contents_result
   | Double_baking_evidence_result :
-      Receipt.balance_updates
+      double_signing_result
       -> Kind.double_baking_evidence contents_result
+  | Dal_entrapment_evidence_result : {
+      balance_updates : Receipt.balance_updates;
+    }
+      -> Kind.dal_entrapment_evidence contents_result
   | Activate_account_result :
       Receipt.balance_updates
       -> Kind.activate_account contents_result
@@ -139,6 +155,7 @@ and _ successful_manager_operation_result =
       -> Kind.origination successful_manager_operation_result
   | Delegation_result : {
       consumed_gas : Gas.Arith.fp;
+      balance_updates : Receipt.balance_updates;
     }
       -> Kind.delegation successful_manager_operation_result
   | Register_global_constant_result : {
@@ -170,54 +187,10 @@ and _ successful_manager_operation_result =
     }
       -> Kind.increase_paid_storage successful_manager_operation_result
   | Update_consensus_key_result : {
+      kind : Operation_repr.consensus_key_kind;
       consumed_gas : Gas.Arith.fp;
     }
       -> Kind.update_consensus_key successful_manager_operation_result
-  | Tx_rollup_origination_result : {
-      balance_updates : Receipt.balance_updates;
-      consumed_gas : Gas.Arith.fp;
-      originated_tx_rollup : Tx_rollup.t;
-    }
-      -> Kind.tx_rollup_origination successful_manager_operation_result
-  | Tx_rollup_submit_batch_result : {
-      balance_updates : Receipt.balance_updates;
-      consumed_gas : Gas.Arith.fp;
-      paid_storage_size_diff : Z.t;
-    }
-      -> Kind.tx_rollup_submit_batch successful_manager_operation_result
-  | Tx_rollup_commit_result : {
-      balance_updates : Receipt.balance_updates;
-      consumed_gas : Gas.Arith.fp;
-    }
-      -> Kind.tx_rollup_commit successful_manager_operation_result
-  | Tx_rollup_return_bond_result : {
-      balance_updates : Receipt.balance_updates;
-      consumed_gas : Gas.Arith.fp;
-    }
-      -> Kind.tx_rollup_return_bond successful_manager_operation_result
-  | Tx_rollup_finalize_commitment_result : {
-      balance_updates : Receipt.balance_updates;
-      consumed_gas : Gas.Arith.fp;
-      level : Tx_rollup_level.t;
-    }
-      -> Kind.tx_rollup_finalize_commitment successful_manager_operation_result
-  | Tx_rollup_remove_commitment_result : {
-      balance_updates : Receipt.balance_updates;
-      consumed_gas : Gas.Arith.fp;
-      level : Tx_rollup_level.t;
-    }
-      -> Kind.tx_rollup_remove_commitment successful_manager_operation_result
-  | Tx_rollup_rejection_result : {
-      balance_updates : Receipt.balance_updates;
-      consumed_gas : Gas.Arith.fp;
-    }
-      -> Kind.tx_rollup_rejection successful_manager_operation_result
-  | Tx_rollup_dispatch_tickets_result : {
-      balance_updates : Receipt.balance_updates;
-      consumed_gas : Gas.Arith.fp;
-      paid_storage_size_diff : Z.t;
-    }
-      -> Kind.tx_rollup_dispatch_tickets successful_manager_operation_result
   | Transfer_ticket_result : {
       balance_updates : Receipt.balance_updates;
       ticket_receipt : Ticket_receipt.t;
@@ -225,11 +198,11 @@ and _ successful_manager_operation_result =
       paid_storage_size_diff : Z.t;
     }
       -> Kind.transfer_ticket successful_manager_operation_result
-  | Dal_publish_slot_header_result : {
+  | Dal_publish_commitment_result : {
       slot_header : Dal.Slot.Header.t;
       consumed_gas : Gas.Arith.fp;
     }
-      -> Kind.dal_publish_slot_header successful_manager_operation_result
+      -> Kind.dal_publish_commitment successful_manager_operation_result
   | Sc_rollup_originate_result : {
       balance_updates : Receipt.balance_updates;
       address : Sc_rollup.Address.t;
@@ -245,6 +218,7 @@ and _ successful_manager_operation_result =
   | Sc_rollup_cement_result : {
       consumed_gas : Gas.Arith.fp;
       inbox_level : Raw_level.t;
+      commitment_hash : Sc_rollup.Commitment.Hash.t;
     }
       -> Kind.sc_rollup_cement successful_manager_operation_result
   | Sc_rollup_publish_result : {
@@ -269,6 +243,7 @@ and _ successful_manager_operation_result =
   | Sc_rollup_execute_outbox_message_result : {
       balance_updates : Receipt.balance_updates;
       ticket_receipt : Ticket_receipt.t;
+      whitelist_update : Sc_rollup.Whitelist.update option;
       consumed_gas : Gas.Arith.fp;
       paid_storage_size_diff : Z.t;
     }
@@ -352,6 +327,12 @@ val kind_equal_list :
   'kind2 contents_result_list ->
   ('kind, 'kind2) eq option
 
+type attestations_result = {
+  consensus_committee : int64;
+  consensus_threshold : int64;
+  consensus_recorded_power : int64;
+}
+
 type block_metadata = {
   proposer : Consensus_key.t;
   baker : Consensus_key.t;
@@ -359,11 +340,14 @@ type block_metadata = {
   voting_period_info : Voting_period.info;
   nonce_hash : Nonce_hash.t option;
   consumed_gas : Gas.Arith.fp;
-  deactivated : Signature.Public_key_hash.t list;
+  deactivated : Implicit_account_repr.t list;
   balance_updates : Receipt.balance_updates;
-  liquidity_baking_toggle_ema : Liquidity_baking.Toggle_EMA.t;
+  liquidity_baking_toggle_ema : Per_block_votes.Liquidity_baking_toggle_EMA.t;
   implicit_operations_results : packed_successful_manager_operation_result list;
-  dal_attestation : Dal.Attestation.t option;
+  dal_slot_availability : Dal.Slot_availability.t;
+  abaab_activation_level : Level.t option;
+  attestations : attestations_result option;
+  preattestations : attestations_result option;
 }
 
 val block_metadata_encoding : block_metadata Data_encoding.encoding

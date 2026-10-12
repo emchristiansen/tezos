@@ -42,8 +42,20 @@ type transaction = {
   entrypoint : Entrypoint_repr.t;  (** Entrypoint of the destination. *)
 }
 
+(** A transaction from L2 to L1, with typed payload. *)
+type typed_transaction = {
+  unparsed_parameters : Script_repr.expr;  (** The payload. *)
+  unparsed_ty : Script_repr.expr;  (** The type of the payload. *)
+  destination : Contract_hash.t;  (** The recipient contract. *)
+  entrypoint : Entrypoint_repr.t;  (** Entrypoint of the destination. *)
+}
+
 (** A type representing messages from Layer 2 to Layer 1. *)
-type t = Atomic_transaction_batch of {transactions : transaction list}
+type t =
+  | Atomic_transaction_batch of {transactions : transaction list}
+  | Atomic_transaction_batch_typed of {transactions : typed_transaction list}
+  | Whitelist_update of Sc_rollup_whitelist_repr.t option
+  | Canonical_rollup_signal of string
 
 val encoding : t Data_encoding.t
 

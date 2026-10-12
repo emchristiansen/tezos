@@ -81,7 +81,7 @@ type ex_parameter_ty_and_entrypoints =
 type ex_stack_ty =
   | Ex_stack_ty : ('a, 's) Script_typed_ir.stack_ty -> ex_stack_ty
 
-type ex_script = Ex_script : ('a, 'b) Script_typed_ir.script -> ex_script
+type ex_script = Ex_script : ('a, 'b) Script_typed.script -> ex_script
 
 type toplevel = {
   code_field : Script.node;
@@ -90,21 +90,28 @@ type toplevel = {
   views : Script_typed_ir.view_map;
 }
 
+type ('arg, 'storage) implementation =
+      ('arg, 'storage) Script_typed.implementation =
+  | Lambda : {
+      code :
+        (('arg, 'storage) pair, (operation Script_list.t, 'storage) pair) lambda;
+      views : view_map;
+    }
+      -> ('arg, 'storage) implementation
+  | Native : {
+      kind : ('arg, 'storage) Script_native_types.kind;
+    }
+      -> ('arg, 'storage) implementation
+
 type ('arg, 'storage) code =
   | Code : {
-      code :
-        ( ('arg, 'storage) Script_typed_ir.pair,
-          ( Script_typed_ir.operation Script_list.t,
-            'storage )
-          Script_typed_ir.pair )
-        Script_typed_ir.lambda;
+      implementation : ('arg, 'storage) implementation;
       arg_type : ('arg, _) Script_typed_ir.ty;
       storage_type : ('storage, _) Script_typed_ir.ty;
-      views : Script_typed_ir.view_map;
       entrypoints : 'arg Script_typed_ir.entrypoints;
       code_size : Cache_memory_helpers.sint;
           (** This is an over-approximation of the value size in memory, in
-         bytes, of the contract's static part, that is its source
+         bytes, of the contract's static part, that is its
          code. This includes the code of the contract as well as the code
          of the views. The storage size is not taken into account by this
          field as it has a dynamic size. *)
@@ -180,7 +187,8 @@ val parse_comparable_data :
 val parse_data :
   elab_conf:Script_ir_translator_config.elab_config ->
   context ->
-  allow_forged:bool ->
+  allow_forged_tickets:bool ->
+  allow_forged_lazy_storage_id:bool ->
   ('a, _) Script_typed_ir.ty ->
   Script.node ->
   ('a * context) tzresult Lwt.t
@@ -297,7 +305,7 @@ val parse_ty :
   (ex_ty * context) tzresult
 
 val parse_toplevel :
-  context -> legacy:bool -> Script.expr -> (toplevel * context) tzresult Lwt.t
+  context -> Script.expr -> (toplevel * context) tzresult Lwt.t
 
 (** High-level function to typecheck a Michelson script. This function is not
     used for validating operations but only for the [typecheck_code] RPC.
@@ -317,10 +325,14 @@ val parse_code :
   code:Script.lazy_expr ->
   (ex_code * context) tzresult Lwt.t
 
+val get_typed_native_code :
+  t -> kind:Script.native_kind -> (ex_code * context) tzresult Lwt.t
+
 val parse_storage :
   elab_conf:Script_ir_translator_config.elab_config ->
   context ->
-  allow_forged:bool ->
+  allow_forged_tickets:bool ->
+  allow_forged_lazy_storage_id:bool ->
   ('storage, _) Script_typed_ir.ty ->
   storage:Script.lazy_expr ->
   ('storage * context) tzresult Lwt.t
@@ -329,19 +341,27 @@ val parse_storage :
 val parse_script :
   elab_conf:Script_ir_translator_config.elab_config ->
   context ->
-  allow_forged_in_storage:bool ->
+  allow_forged_tickets_in_storage:bool ->
+  allow_forged_lazy_storage_id_in_storage:bool ->
   Script.t ->
   (ex_script * context) tzresult Lwt.t
 
 (* Gas accounting may not be perfect in this function, as it is only called by RPCs. *)
-val parse_and_unparse_script_unaccounted :
+val parse_and_unparse_michelson_script_unaccounted :
   context ->
   legacy:bool ->
-  allow_forged_in_storage:bool ->
+  allow_forged_tickets_in_storage:bool ->
+  allow_forged_lazy_storage_id_in_storage:bool ->
   Script_ir_unparser.unparsing_mode ->
   normalize_types:bool ->
-  Script.t ->
-  (Script.t * context) tzresult Lwt.t
+  Script.michelson_with_storage ->
+  (Script.michelson_with_storage * context) tzresult Lwt.t
+
+val parse_originated_contract_parameter_type :
+  stack_depth:int ->
+  context ->
+  Contract_hash.t ->
+  (context * ex_parameter_ty_and_entrypoints option) tzresult Lwt.t
 
 val parse_contract_data :
   context ->

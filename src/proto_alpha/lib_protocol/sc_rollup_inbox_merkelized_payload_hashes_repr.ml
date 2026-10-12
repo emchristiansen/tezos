@@ -1,24 +1,7 @@
 (*****************************************************************************)
 (*                                                                           *)
-(* Open Source License                                                       *)
-(* Copyright (c) 2022 Nomadic Labs <contact@nomadic-labs.com>                *)
-(* Permission is hereby granted, free of charge, to any person obtaining a   *)
-(* copy of this software and associated documentation files (the "Software"),*)
-(* to deal in the Software without restriction, including without limitation *)
-(* the rights to use, copy, modify, merge, publish, distribute, sublicense,  *)
-(* and/or sell copies of the Software, and to permit persons to whom the     *)
-(* Software is furnished to do so, subject to the following conditions:      *)
-(*                                                                           *)
-(* The above copyright notice and this permission notice shall be included   *)
-(* in all copies or substantial portions of the Software.                    *)
-(*                                                                           *)
-(* THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR*)
-(* IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,  *)
-(* FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL   *)
-(* THE AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER*)
-(* LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING   *)
-(* FROM, OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER       *)
-(* DEALINGS IN THE SOFTWARE.                                                 *)
+(* SPDX-License-Identifier: MIT                                              *)
+(* Copyright (c) 2022 Nomadic Labs, <contact@nomadic-labs.com>               *)
 (*                                                                           *)
 (*****************************************************************************)
 
@@ -41,35 +24,8 @@ module Skip_list_parameters = struct
   let basis = 4
 end
 
-module Skip_list = Skip_list_repr.Make (Skip_list_parameters)
-
-(* 32 *)
-let hash_prefix = "\003\255\138\145\140" (* srib2(55) *)
-
-module Hash = struct
-  let prefix = "srib2"
-
-  let encoded_size = 55
-
-  module H =
-    Blake2B.Make
-      (Base58)
-      (struct
-        let name = "Smart_rollup_merkelized_payload_hashes_hash"
-
-        let title =
-          "The merkelized payload hashes' hash of the smart rollup inbox"
-
-        let b58check_prefix = hash_prefix
-
-        (* defaults to 32 *)
-        let size = None
-      end)
-
-  include H
-
-  let () = Base58.check_encoded_prefix b58check_encoding prefix encoded_size
-end
+module Skip_list = Skip_list.Make (Skip_list_parameters)
+module Hash = Smart_rollup.Merkelized_payload_hashes_hash
 
 type t = (Sc_rollup_inbox_message_repr.Hash.t, Hash.t) Skip_list.cell
 
@@ -149,24 +105,28 @@ let remember history merkelized payload =
   let prev_cell_ptr = hash merkelized in
   History.remember prev_cell_ptr {merkelized; payload} history
 
-let genesis history payload =
-  let open Result_syntax in
+let genesis_no_history payload =
   let payload_hash =
     Sc_rollup_inbox_message_repr.hash_serialized_message payload
   in
-  let merkelized = Skip_list.genesis payload_hash in
+  Skip_list.genesis payload_hash
+
+let genesis history payload =
+  let open Result_syntax in
+  let merkelized = genesis_no_history payload in
   let+ history = remember history merkelized payload in
   (history, merkelized)
 
+let add_payload_no_history prev_merkelized payload =
+  let prev_merkelized_ptr = hash prev_merkelized in
+  Skip_list.next
+    ~prev_cell:prev_merkelized
+    ~prev_cell_ptr:prev_merkelized_ptr
+    (Sc_rollup_inbox_message_repr.hash_serialized_message payload)
+
 let add_payload history prev_merkelized payload =
   let open Result_syntax in
-  let prev_merkelized_ptr = hash prev_merkelized in
-  let merkelized =
-    Skip_list.next
-      ~prev_cell:prev_merkelized
-      ~prev_cell_ptr:prev_merkelized_ptr
-      (Sc_rollup_inbox_message_repr.hash_serialized_message payload)
-  in
+  let merkelized = add_payload_no_history prev_merkelized payload in
   let* history = remember history merkelized payload in
   return (history, merkelized)
 
@@ -210,16 +170,16 @@ let verify_proof inclusion_proof =
   let open Result_syntax in
   let* cell =
     match inclusion_proof with
-    | cell :: _ -> ok cell
-    | [] -> error (Merkelized_payload_hashes_proof_error "proof is empty")
+    | cell :: _ -> return cell
+    | [] -> tzfail (Merkelized_payload_hashes_proof_error "proof is empty")
   in
   let rec aux (hash_map, ptr_list) = function
-    | [] -> error (Merkelized_payload_hashes_proof_error "proof is empty")
+    | [] -> tzfail (Merkelized_payload_hashes_proof_error "proof is empty")
     | [target] ->
         let target_ptr = hash target in
         let hash_map = Hash.Map.add target_ptr target hash_map in
         let ptr_list = List.rev (target_ptr :: ptr_list) in
-        ok (hash_map, ptr_list, target, target_ptr)
+        return (hash_map, ptr_list, target, target_ptr)
     | merkelized :: tail ->
         let ptr = hash merkelized in
         aux (Hash.Map.add ptr merkelized hash_map, ptr :: ptr_list) tail

@@ -45,8 +45,12 @@ struct
     | Deterministic_nonce_request
     | Deterministic_nonce_hash_request
 
-  let build_request pkh data signature = function
-    | Sign_request -> Request.Sign {Sign.Request.pkh; data; signature}
+  let build_request ?version (pkh : Tezos_crypto.Signature.public_key_hash) data
+      signature request =
+    match request with
+    | Sign_request ->
+        let pkh = request_pkh ?version pkh in
+        Request.Sign {Sign.Request.pkh; data; signature}
     | Deterministic_nonce_request ->
         Request.Deterministic_nonce
           {Deterministic_nonce.Request.pkh; data; signature}
@@ -54,7 +58,10 @@ struct
         Request.Deterministic_nonce_hash
           {Deterministic_nonce_hash.Request.pkh; data; signature}
 
-  let maybe_authenticate pkh msg conn =
+  (* [maybe_authenticate_payload to_sign conn] returns the authentication
+     signature over [to_sign], or [None] when the signer does not require
+     authentication. *)
+  let maybe_authenticate_payload to_sign conn =
     let open Lwt_result_syntax in
     let* () =
       Tezos_base_unix.Socket.send conn Request.encoding Request.Authorized_keys
@@ -68,17 +75,18 @@ struct
     match v with
     | No_authentication -> return_none
     | Authorized_keys authorized_keys ->
-        let* signature =
-          authenticate authorized_keys (Sign.Request.to_sign ~pkh ~data:msg)
-        in
+        let* signature = authenticate authorized_keys to_sign in
         return_some signature
 
-  let with_signer_operation path pkh msg request_type enc =
+  let maybe_authenticate pkh msg conn =
+    maybe_authenticate_payload (Sign.Request.to_sign ~pkh ~data:msg) conn
+
+  let with_signer_operation ?version path pkh msg request_type enc =
     let open Lwt_result_syntax in
     let f () =
       Tezos_base_unix.Socket.with_connection path (fun conn ->
           let* signature = maybe_authenticate pkh msg conn in
-          let req = build_request pkh msg signature request_type in
+          let req = build_request ?version pkh msg signature request_type in
           let* () = Tezos_base_unix.Socket.send conn Request.encoding req in
           Tezos_base_unix.Socket.recv conn (result_encoding enc))
     in
@@ -98,14 +106,20 @@ struct
     in
     loop 3
 
-  let sign ?watermark path pkh msg =
+  let sign ?version ?watermark path pkh msg =
     let msg =
       match watermark with
       | None -> msg
       | Some watermark ->
           Bytes.cat (Tezos_crypto.Signature.bytes_of_watermark watermark) msg
     in
-    with_signer_operation path pkh msg Sign_request Sign.Response.encoding
+    with_signer_operation
+      ?version
+      path
+      pkh
+      msg
+      Sign_request
+      Sign.Response.encoding
 
   let deterministic_nonce path pkh msg =
     with_signer_operation
@@ -139,6 +153,36 @@ struct
         in
         Lwt.return supported)
 
+  let list_known_keys path =
+    let open Lwt_result_syntax in
+    Tezos_base_unix.Socket.with_connection path (fun conn ->
+        let* () =
+          Tezos_base_unix.Socket.send conn Request.encoding Request.Known_keys
+        in
+        let encoding = result_encoding Known_keys.Response.encoding in
+        let* pkhs = Tezos_base_unix.Socket.recv conn encoding in
+        match pkhs with Error _ as e -> Lwt.return e | Ok pkhs -> return pkhs)
+
+  let bls_prove_possession path ?override_pk pkh =
+    let open Lwt_result_syntax in
+    Tezos_base_unix.Socket.with_connection path (fun conn ->
+        let* signature =
+          maybe_authenticate_payload
+            (Bls_prove_possession.Request.to_sign ~pkh ~override_pk)
+            conn
+        in
+        let* () =
+          Tezos_base_unix.Socket.send
+            conn
+            Request.encoding
+            (Request.Bls_prove_possession {pkh; override_pk; signature})
+        in
+        let encoding = result_encoding Bls_prove_possession.Response.encoding in
+        let* proof_of_possession = Tezos_base_unix.Socket.recv conn encoding in
+        match proof_of_possession with
+        | Error _ as e -> Lwt.return e
+        | Ok proof_of_possession -> return proof_of_possession)
+
   let public_key path pkh =
     let open Lwt_result_syntax in
     Tezos_base_unix.Socket.with_connection path (fun conn ->
@@ -163,14 +207,22 @@ struct
 
     include Client_keys.Signature_type
 
-    let parse uri =
+    let parse_aux uri =
       let open Result_syntax in
       assert (Uri.scheme uri = Some scheme) ;
+      return (Tezos_base_unix.Socket.Unix (Uri.path uri))
+
+    let parse uri =
+      let open Result_syntax in
       match Uri.get_query_param uri "pkh" with
       | None -> error_with "Missing the query parameter: 'pkh=tz1...'"
       | Some key ->
-          let+ key = Tezos_crypto.Signature.Public_key_hash.of_b58check key in
-          (Tezos_base_unix.Socket.Unix (Uri.path uri), key)
+          let* key = Tezos_crypto.Signature.Public_key_hash.of_b58check key in
+          let+ path = parse_aux uri in
+          (path, key)
+
+    let parse_aux uri =
+      parse_aux uri |> record_trace (Invalid_uri uri) |> Lwt.return
 
     let parse uri = parse uri |> record_trace (Invalid_uri uri) |> Lwt.return
 
@@ -191,10 +243,15 @@ struct
 
     let import_secret_key ~io:_ = public_key_hash
 
-    let sign ?watermark uri msg =
+    let list_known_keys uri =
+      let open Lwt_result_syntax in
+      let* path = parse_aux uri in
+      list_known_keys path
+
+    let sign ?version ?watermark uri msg =
       let open Lwt_result_syntax in
       let* path, pkh = parse (uri : sk_uri :> Uri.t) in
-      sign ?watermark path pkh msg
+      sign ?version ?watermark path pkh msg
 
     let deterministic_nonce uri msg =
       let open Lwt_result_syntax in
@@ -210,6 +267,11 @@ struct
       let open Lwt_result_syntax in
       let* path, pkh = parse (uri : sk_uri :> Uri.t) in
       supports_deterministic_nonces path pkh
+
+    let bls_prove_possession ?override_pk uri =
+      let open Lwt_result_syntax in
+      let* path, pkh = parse (uri : sk_uri :> Uri.t) in
+      bls_prove_possession path ?override_pk pkh
   end
 
   module Tcp = struct
@@ -223,23 +285,36 @@ struct
 
     include Client_keys.Signature_type
 
-    let parse uri =
+    let parse_aux uri =
       let open Result_syntax in
       assert (Uri.scheme uri = Some scheme) ;
       match (Uri.host uri, Uri.port uri) with
       | None, _ -> error_with "Missing host address"
       | _, None -> error_with "Missing host port"
       | Some path, Some port ->
-          let pkh = Uri.path uri in
-          let pkh = try String.(sub pkh 1 (length pkh - 1)) with _ -> "" in
-          let+ pkh = Tezos_crypto.Signature.Public_key_hash.of_b58check pkh in
           let tcp_socket =
             Tezos_base_unix.Socket.Tcp
               (path, string_of_int port, [Lwt_unix.AI_SOCKTYPE SOCK_STREAM])
           in
-          (tcp_socket, pkh)
+          return tcp_socket
+
+    let parse uri =
+      let open Result_syntax in
+      let* tcp_socket = parse_aux uri in
+      let pkh = Uri.path uri in
+      let pkh = try String.(sub pkh 1 (length pkh - 1)) with _ -> "" in
+      let+ pkh = Tezos_crypto.Signature.Public_key_hash.of_b58check pkh in
+      (tcp_socket, pkh)
+
+    let parse_aux uri =
+      parse_aux uri |> record_trace (Invalid_uri uri) |> Lwt.return
 
     let parse uri = parse uri |> record_trace (Invalid_uri uri) |> Lwt.return
+
+    let list_known_keys uri =
+      let open Lwt_result_syntax in
+      let* path = parse_aux uri in
+      list_known_keys path
 
     let public_key uri =
       let open Lwt_result_syntax in
@@ -258,10 +333,10 @@ struct
 
     let import_secret_key ~io:_ = public_key_hash
 
-    let sign ?watermark uri msg =
+    let sign ?version ?watermark uri msg =
       let open Lwt_result_syntax in
       let* path, pkh = parse (uri : sk_uri :> Uri.t) in
-      sign ?watermark path pkh msg
+      sign ?version ?watermark path pkh msg
 
     let deterministic_nonce uri msg =
       let open Lwt_result_syntax in
@@ -277,6 +352,11 @@ struct
       let open Lwt_result_syntax in
       let* path, pkh = parse (uri : sk_uri :> Uri.t) in
       supports_deterministic_nonces path pkh
+
+    let bls_prove_possession ?override_pk uri =
+      let open Lwt_result_syntax in
+      let* path, pkh = parse (uri : sk_uri :> Uri.t) in
+      bls_prove_possession path ?override_pk pkh
   end
 end
 

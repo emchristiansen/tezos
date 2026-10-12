@@ -302,28 +302,33 @@ let tez_param ~name ~desc next =
     (tez_parameter name)
     next
 
-let non_negative_z_parameter =
-  Tezos_clic.parameter (fun _ s ->
-      try
-        let v = Z.of_string s in
-        error_when Compare.Z.(v < Z.zero) (Forbidden_Negative_int s)
-        >>?= fun () -> return v
-      with _ -> failwith "Invalid number, must be a non negative number.")
+let non_negative_z_parser (cctxt : #Client_context.io) s =
+  match Z.of_string s with
+  | exception Invalid_argument _ -> cctxt#error "Expected number"
+  | v when Compare.Z.(v < Z.zero) ->
+      cctxt#error "Invalid number, must be a non negative number."
+  | v -> Lwt_result_syntax.return v
+
+let non_negative_z_parameter () = Tezos_clic.parameter non_negative_z_parser
 
 let non_negative_z_param ~name ~desc next =
-  Tezos_clic.param ~name ~desc non_negative_z_parameter next
+  Tezos_clic.param ~name ~desc (non_negative_z_parameter ()) next
 
 let counter_parameter =
-  Tezos_clic.parameter (fun _ s ->
+  Tezos_clic.parameter (fun (cctxt : #Client_context.full) s ->
       match Manager_counter.Internal_for_injection.of_string s with
-      | None -> failwith "Invalid counter, must be a non-negative number."
+      | None -> cctxt#error "Invalid counter, must be a non-negative number."
       | Some c -> return c)
 
-let non_negative_parameter =
-  Tezos_clic.parameter (fun _ s ->
-      match int_of_string_opt s with
-      | Some i when i >= 0 -> return i
-      | _ -> failwith "Parameter should be a non-negative integer literal")
+let non_negative_parser (cctxt : #Client_context.io) s =
+  match int_of_string_opt s with
+  | Some i when i >= 0 -> return i
+  | _ -> cctxt#error "Parameter should be a non-negative integer literal"
+
+let non_negative_parameter () = Tezos_clic.parameter non_negative_parser
+
+let non_negative_param ~name ~desc next =
+  Tezos_clic.param ~name ~desc (non_negative_parameter ()) next
 
 let fee_arg =
   Tezos_clic.arg
@@ -352,15 +357,19 @@ let level_arg =
     ~doc:"Set the level to be returned by the LEVEL instruction"
     level_kind
 
-let raw_level_parameter =
-  Tezos_clic.parameter (fun _ s ->
-      match Int32.of_string_opt s with
-      | Some i when i >= 0l ->
-          Lwt.return @@ Environment.wrap_tzresult (Raw_level.of_int32 i)
-      | _ ->
-          failwith
-            "'%s' is not a valid level (should be a non-negative int32 value)"
-            s)
+let raw_level_parser (cctxt : #Client_context.io) s =
+  match Int32.of_string_opt s with
+  | Some i when i >= 0l ->
+      Lwt.return @@ Environment.wrap_tzresult (Raw_level.of_int32 i)
+  | _ ->
+      cctxt#error
+        "'%s' is not a valid level (should be a non-negative int32 value)"
+        s
+
+let raw_level_parameter () = Tezos_clic.parameter raw_level_parser
+
+let raw_level_param ~name ~desc next =
+  Tezos_clic.param ~name ~desc (raw_level_parameter ()) next
 
 let timestamp_parameter =
   Tezos_clic.parameter (fun _ s ->
@@ -555,7 +564,7 @@ let no_confirmation =
 
 let signature_parameter =
   Tezos_clic.parameter (fun _cctxt s ->
-      match Tezos_crypto.Signature.of_b58check_opt s with
+      match Signature.of_b58check_opt s with
       | Some s -> return s
       | None -> failwith "Not given a valid signature")
 
@@ -903,15 +912,29 @@ module Tx_rollup = struct
 end
 
 module Sc_rollup_params = struct
+  let convert_address sc_rollup_address =
+    sc_rollup_address
+    |> Data_encoding.Binary.to_bytes_exn
+         Tezos_crypto.Hashed.Smart_rollup_address.encoding
+    |> Data_encoding.Binary.of_bytes_exn Sc_rollup.Address.encoding
+
   let sc_rollup_address_parameter =
-    Tezos_clic.parameter (fun _ s ->
-        match Alpha_context.Sc_rollup.Address.of_b58check_opt s with
-        | Some c -> return c
-        | None ->
-            failwith
-              "Parameter '%s' is an invalid smart rollup address encoded in a \
-               base58 string."
-              s)
+    Tezos_clic.map_parameter
+      (Smart_rollup_alias.Address.parameter ())
+      ~f:convert_address
+
+  let sc_rollup_address_param ?(name = "smart rollup address")
+      ?(desc = "the address of the targeted smart rollup") next =
+    let desc =
+      String.concat
+        "\n"
+        [
+          desc;
+          "Can be an alias or a literal (autodetected in order).\n\
+           Use 'alias:<name>' or 'text:<literal>' to force.";
+        ]
+    in
+    Tezos_clic.param ~name ~desc sc_rollup_address_parameter next
 
   let rollup_kind_parameter =
     Tezos_clic.parameter (fun _ name ->
@@ -1125,14 +1148,15 @@ let fee_parameter_args =
            | None -> failwith "Bad burn cap"))
   in
   Tezos_clic.map_arg
-    ~f:
-      (fun _cctxt
-           ( minimal_fees,
-             minimal_nanotez_per_byte,
-             minimal_nanotez_per_gas_unit,
-             force_low_fee,
-             fee_cap,
-             burn_cap ) ->
+    ~f:(fun
+        _cctxt
+        ( minimal_fees,
+          minimal_nanotez_per_byte,
+          minimal_nanotez_per_gas_unit,
+          force_low_fee,
+          fee_cap,
+          burn_cap )
+      ->
       return
         {
           Injection.minimal_fees;

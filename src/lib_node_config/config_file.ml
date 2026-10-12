@@ -3,6 +3,7 @@
 (* Open Source License                                                       *)
 (* Copyright (c) 2018 Dynamic Ledger Solutions, Inc. <contact@tezos.com>     *)
 (* Copyright (c) 2019-2020 Nomadic Labs, <contact@nomadic-labs.com>          *)
+(* Copyright (c) 2024 TriliTech <contact@trili.tech>                         *)
 (*                                                                           *)
 (* Permission is hereby granted, free of charge, to any person obtaining a   *)
 (* copy of this software and associated documentation files (the "Software"),*)
@@ -34,6 +35,9 @@ let default_data_dir = home // ".tezos-node"
 
 let default_rpc_port = 8732
 
+let default_max_active_rpc_connections =
+  RPC_server.Max_active_rpc_connections.default
+
 let default_metrics_port = 9932
 
 let default_p2p_port = 9732
@@ -53,12 +57,14 @@ type blockchain_network = {
   user_activated_upgrades : User_activated.upgrades;
   user_activated_protocol_overrides : User_activated.protocol_overrides;
   default_bootstrap_peers : string list;
+  dal_config : Tezos_crypto_dal.Cryptobox.Config.t;
 }
 
 let make_blockchain_network ~alias ~chain_name ?old_chain_name
     ?incompatible_chain_name ~sandboxed_chain_name
     ?(user_activated_upgrades = []) ?(user_activated_protocol_overrides = [])
-    ?(default_bootstrap_peers = []) ?genesis_parameters genesis =
+    ?(default_bootstrap_peers = []) ?genesis_parameters
+    ?(dal_config = Tezos_crypto_dal.Cryptobox.Config.default) genesis =
   let of_string = Distributed_db_version.Name.of_string in
   {
     alias = Some alias;
@@ -78,6 +84,7 @@ let make_blockchain_network ~alias ~chain_name ?old_chain_name
           (Protocol_hash.of_b58check_exn a, Protocol_hash.of_b58check_exn b))
         user_activated_protocol_overrides;
     default_bootstrap_peers;
+    dal_config;
   }
 
 (* The script in scripts/user_activated_upgrade.sh patches the following lines
@@ -87,6 +94,7 @@ let mainnet_user_activated_upgrades =
   [
     (28082l, "PsYLVpVvgbLhAhoqAkMFUo6gudkJ9weNXhUYCiLDzcUpFpkk8Wt");
     (204761l, "PsddFKi32cMJ2qPjf43Qv5GDWLDPZb3T3bF6fLKiF5HtvHNU7aP");
+    (5898241l, "PsParisCZo7KAh1Z1smVd9ZMZ1HHn5gkzbM94V3PLCpknFWhUAi");
   ]
 
 (* END_PATCHING_ZONE_FOR_MAINNET_USER_ACTIVATED_UPGRADES *)
@@ -121,9 +129,23 @@ let blockchain_network_mainnet =
           "PtEdo2ZkT9oKpimTah6x2embF25oss54njMuPzkJTEi5RqfdZFA" );
         ( "PtHangzHogokSuiMHemCuowEavgYTP8J5qQ9fQS793MHYFpCY3r",
           "PtHangz2aRngywmSRGGvrcTyMbbdpWdpFKuS4uMWxg2RaH9i1qx" );
+        ( "PtMumbaiiFFEGbew1rRjzSPyzRbA51Tm3RVZL5suHPxSZYDhCEc",
+          "PtMumbai2TmsJHNGRkD8v8YDbtao7BLUC3wjASn1inAKLFCjaH1" );
+        ( "PtParisBQscdCm6Cfow6ndeU6wKJyA3aV1j4D3gQBQMsTQyJCrz",
+          "PtParisBxoLz5gzMmn3d9WBQNoPSZakgnkMC2VNuQ3KXfUtUQeZ" );
       ]
     ~default_bootstrap_peers:
-      ["boot.tzbeta.net"; "boot.mainnet.oxheadhosted.com"]
+      ["boot.tzinit.org"; "boot.tzboot.net"; "boot.tzbeta.net"]
+    ~dal_config:
+      {
+        activated = true;
+        bootstrap_peers =
+          [
+            "dalboot.mainnet.tzinit.org";
+            "dalboot.mainnet.tzboot.net";
+            "mainnet.bootstrap.dal.nomadic-labs.com";
+          ];
+      }
 
 let blockchain_network_ghostnet =
   make_blockchain_network
@@ -156,25 +178,35 @@ let blockchain_network_ghostnet =
         (765952l, "PtJakart2xVj7pYXJBXrqHgd82rdkLey5ZeeGwDgPp9rhQUbSqY");
         (1191936l, "PtKathmankSpLLDALzWw7CGD2j2MtyveTwboEYokqUCP4a1LxMg");
         (1654784l, "PtLimaPtLMwfNinJi9rCfDPWea8dFgTZ1MeJ9f1m2SRic6ayiwW");
+        (6729729l, "PsParisCZo7KAh1Z1smVd9ZMZ1HHn5gkzbM94V3PLCpknFWhUAi");
       ]
     ~default_bootstrap_peers:
       [
-        "ghostnet.teztnets.xyz";
-        "ghostnet.smartpy.io";
+        "ghostnet.teztnets.com";
+        "ghostnet.tzinit.org";
+        "ghostnet.tzboot.net";
         "ghostnet.boot.ecadinfra.com";
-        "ghostnet.kaml.fr";
         "ghostnet.stakenow.de:9733";
-        "ghostnet.visualtez.com";
       ]
+    ~dal_config:
+      {
+        activated = true;
+        bootstrap_peers =
+          [
+            "dalboot.ghostnet.tzinit.org";
+            "dalboot.ghostnet.tzboot.net";
+            "ghostnet.bootstrap.dal.nomadic-labs.com";
+          ];
+      }
 
-let blockchain_network_limanet =
+let blockchain_network_shadownet =
   make_blockchain_network
-    ~alias:"limanet"
+    ~alias:"shadownet"
     {
-      time = Time.Protocol.of_notation_exn "2022-10-13T15:00:00Z";
+      time = Time.Protocol.of_notation_exn "2025-08-07T20:00:00Z";
       block =
         Block_hash.of_b58check_exn
-          "BL3LAGwnWoNFM2H5ZA3Mbd622CVWMe8Kzfkksws4roKDD9WwBmf";
+          "BMJTFWBgqGUzsvW4JLS1XuCYnpH18pBsLb5UvPCv2eiNC5vUeps";
       protocol =
         Protocol_hash.of_b58check_exn
           "Ps9mPmXaRzmzk35gbAYNCAw6UXdE2qoABTHbN2oEEc1qM7CwT9P";
@@ -186,49 +218,22 @@ let blockchain_network_limanet =
           `O
             [
               ( "genesis_pubkey",
-                `String "edpkuYLienS3Xdt5c1vfRX1ibMxQuvfM67ByhJ9nmRYYKGAAoTq1UC"
+                `String "edpktosVHk2f3Yrz9Jb6rMrk6uVy4sTxVhP2iyF39AdgzvsTWgbaLy"
               );
             ];
       }
-    ~chain_name:"TEZOS_LIMANET_2022-10-13T15:00:00Z"
+    ~chain_name:"TEZOS_SHADOWNET_2025-08-07T20:00:00Z"
     ~sandboxed_chain_name:"SANDBOXED_TEZOS"
-    ~user_activated_upgrades:
-      [(8192l, "PtLimaPtLMwfNinJi9rCfDPWea8dFgTZ1MeJ9f1m2SRic6ayiwW")]
-    ~default_bootstrap_peers:
-      [
-        "limanet.teztnets.xyz";
-        "limanet.boot.ecadinfra.com";
-        "limaboot.tzbeta.net";
-        "limanet.stakenow.de:9733";
-      ]
-
-let blockchain_network_mumbainet =
-  make_blockchain_network
-    ~alias:"mumbainet"
-    {
-      time = Time.Protocol.of_notation_exn "2023-01-19T15:00:00Z";
-      block =
-        Block_hash.of_b58check_exn
-          "BMVeyjhT4yd421XJAYcB54hm54CwGqkV6tCzkJ8VpHPVch6Mkx6";
-      protocol =
-        Protocol_hash.of_b58check_exn
-          "Ps9mPmXaRzmzk35gbAYNCAw6UXdE2qoABTHbN2oEEc1qM7CwT9P";
-    }
-    ~genesis_parameters:
+    ~default_bootstrap_peers:["shadownet.teztnets.com"; "shadownet.tzinit.org"]
+    ~dal_config:
       {
-        context_key = "sandbox_parameter";
-        values =
-          `O
-            [
-              ( "genesis_pubkey",
-                `String "edpkuYLienS3Xdt5c1vfRX1ibMxQuvfM67ByhJ9nmRYYKGAAoTq1UC"
-              );
-            ];
+        activated = true;
+        bootstrap_peers =
+          [
+            "dal.shadownet.teztnets.com:11732";
+            "shadownet.bootstrap.dal.nomadic-labs.com:11732";
+          ];
       }
-    ~chain_name:"TEZOS_MUMBAINET_2023-01-19T15:00:00Z"
-    ~sandboxed_chain_name:"SANDBOXED_TEZOS"
-    ~default_bootstrap_peers:
-      ["mumbainet.teztnets.xyz"; "mumbainet.visualtez.com"]
 
 let blockchain_network_sandbox =
   make_blockchain_network
@@ -258,6 +263,7 @@ let blockchain_network_sandbox =
     ~chain_name:"TEZOS"
     ~sandboxed_chain_name:"SANDBOXED_TEZOS"
     ~user_activated_upgrades:sandbox_user_activated_upgrades
+    ~dal_config:{activated = true; bootstrap_peers = []}
 
 let blockchain_network_encoding : blockchain_network Data_encoding.t =
   let open Data_encoding in
@@ -273,7 +279,9 @@ let blockchain_network_encoding : blockchain_network Data_encoding.t =
            user_activated_upgrades;
            user_activated_protocol_overrides;
            default_bootstrap_peers;
-         } ->
+           dal_config;
+         }
+       ->
       ( genesis,
         genesis_parameters,
         chain_name,
@@ -282,7 +290,8 @@ let blockchain_network_encoding : blockchain_network Data_encoding.t =
         sandboxed_chain_name,
         user_activated_upgrades,
         user_activated_protocol_overrides,
-        default_bootstrap_peers ))
+        default_bootstrap_peers,
+        dal_config ))
     (fun ( genesis,
            genesis_parameters,
            chain_name,
@@ -291,7 +300,9 @@ let blockchain_network_encoding : blockchain_network Data_encoding.t =
            sandboxed_chain_name,
            user_activated_upgrades,
            user_activated_protocol_overrides,
-           default_bootstrap_peers ) ->
+           default_bootstrap_peers,
+           dal_config )
+       ->
       {
         alias = None;
         genesis;
@@ -303,9 +314,10 @@ let blockchain_network_encoding : blockchain_network Data_encoding.t =
         user_activated_upgrades;
         user_activated_protocol_overrides;
         default_bootstrap_peers;
+        dal_config;
       })
     (let chain = Distributed_db_version.Name.encoding in
-     obj9
+     obj10
        (req "genesis" Genesis.encoding)
        (opt "genesis_parameters" Genesis.Parameters.encoding)
        (req "chain_name" chain)
@@ -322,15 +334,23 @@ let blockchain_network_encoding : blockchain_network Data_encoding.t =
           ~description:
             "List of hosts to use if p2p.bootstrap_peers is unspecified."
           (list string)
-          []))
+          [])
+       (dft
+          "dal_config"
+          ~description:
+            "USE FOR TESTING PURPOSE ONLY. Configuration for the \
+             data-availibility layer"
+          Tezos_crypto_dal.Cryptobox.Config.encoding
+          (* We use default config unless explicitly overridden via the config file.
+             Note that such override is expected to only be used in test networks. *)
+          Tezos_crypto_dal.Cryptobox.Config.default))
 
 let builtin_blockchain_networks_with_tags =
   [
     (1, blockchain_network_sandbox);
     (4, blockchain_network_mainnet);
     (19, blockchain_network_ghostnet);
-    (21, blockchain_network_limanet);
-    (22, blockchain_network_mumbainet);
+    (20, blockchain_network_shadownet);
   ]
   |> List.map (fun (tag, network) ->
          match network.alias with
@@ -379,12 +399,12 @@ type t = {
   disable_config_validation : bool;
   p2p : p2p;
   rpc : rpc;
-  log : Lwt_log_sink_unix.cfg;
-  internal_events : Internal_event_config.t;
+  log : Logs_simple_config.cfg;
+  internal_events : Internal_event_config.t option;
   shell : Shell_limits.limits;
   blockchain_network : blockchain_network;
   metrics_addr : string list;
-  dal : Tezos_crypto_dal.Cryptobox.Config.t;
+  profiling : Tezos_profiler.Profiler.profiling_config;
 }
 
 and p2p = {
@@ -398,15 +418,19 @@ and p2p = {
   disable_mempool : bool;
   enable_testchain : bool;
   reconnection_config : Tezos_p2p_services.Point_reconnection_config.t;
+  disable_peer_discovery : bool;
 }
 
 and rpc = {
   listen_addrs : string list;
+  external_listen_addrs : string list;
   cors_origins : string list;
   cors_headers : string list;
   tls : tls option;
   acl : RPC_server.Acl.policy;
   media_type : Media_type.Command_line.t;
+  max_active_rpc_connections : RPC_server.Max_active_rpc_connections.t;
+  enable_http_cache_headers : bool;
 }
 
 and tls = {cert : string; key : string}
@@ -423,16 +447,20 @@ let default_p2p =
     disable_mempool = false;
     enable_testchain = false;
     reconnection_config = Tezos_p2p_services.Point_reconnection_config.default;
+    disable_peer_discovery = false;
   }
 
 let default_rpc =
   {
     listen_addrs = [];
+    external_listen_addrs = [];
     cors_origins = [];
     cors_headers = [];
     tls = None;
     acl = RPC_server.Acl.empty_policy;
     media_type = Media_type.Command_line.Any;
+    max_active_rpc_connections = default_max_active_rpc_connections;
+    enable_http_cache_headers = false;
   }
 
 let default_disable_config_validation = false
@@ -442,13 +470,13 @@ let default_config =
     data_dir = default_data_dir;
     p2p = default_p2p;
     rpc = default_rpc;
-    log = Log_config.lwt_log_sink_default_cfg;
-    internal_events = Internal_event_config.empty;
+    log = Logs_simple_config.{default_cfg with advertise_levels = true};
+    internal_events = None;
     shell = Shell_limits.default_limits;
     blockchain_network = blockchain_network_mainnet;
     disable_config_validation = default_disable_config_validation;
     metrics_addr = [];
-    dal = Tezos_crypto_dal.Cryptobox.Config.default;
+    profiling = Tezos_profiler.Profiler.default_profiling_config;
   }
 
 let p2p =
@@ -465,27 +493,32 @@ let p2p =
            disable_mempool;
            enable_testchain;
            reconnection_config;
-         } ->
-      ( expected_pow,
-        bootstrap_peers,
-        listen_addr,
-        advertised_net_port,
-        discovery_addr,
-        private_mode,
-        limits,
-        disable_mempool,
-        enable_testchain,
-        reconnection_config ))
-    (fun ( expected_pow,
-           bootstrap_peers,
-           listen_addr,
-           advertised_net_port,
-           discovery_addr,
-           private_mode,
-           limits,
-           disable_mempool,
-           enable_testchain,
-           reconnection_config ) ->
+           disable_peer_discovery;
+         }
+       ->
+      ( ( expected_pow,
+          bootstrap_peers,
+          listen_addr,
+          advertised_net_port,
+          discovery_addr ),
+        ( private_mode,
+          limits,
+          disable_mempool,
+          enable_testchain,
+          reconnection_config,
+          disable_peer_discovery ) ))
+    (fun ( ( expected_pow,
+             bootstrap_peers,
+             listen_addr,
+             advertised_net_port,
+             discovery_addr ),
+           ( private_mode,
+             limits,
+             disable_mempool,
+             enable_testchain,
+             reconnection_config,
+             disable_peer_discovery ) )
+       ->
       {
         expected_pow;
         bootstrap_peers;
@@ -497,109 +530,142 @@ let p2p =
         disable_mempool;
         enable_testchain;
         reconnection_config;
+        disable_peer_discovery;
       })
-    (obj10
-       (dft
-          "expected-proof-of-work"
-          ~description:
-            "Floating point number between 0 and 256 that represents a \
-             difficulty, 24 signifies for example that at least 24 leading \
-             zeroes are expected in the hash."
-          float
-          default_p2p.expected_pow)
-       (opt
-          "bootstrap-peers"
-          ~description:
-            "List of hosts. Tezos can connect to both IPv6 and IPv4 hosts. If \
-             the port is not specified, default port 9732 will be assumed."
-          (list string))
-       (opt
-          "listen-addr"
-          ~description:
-            "Host to listen to. If the port is not specified, the default port \
-             9732 will be assumed."
-          string)
-       (opt
-          "advertised-net-port"
-          ~description:
-            "Alternative port advertised to other peers to connect to. If the \
-             port is not specified, the port from listen-addr will be assumed."
-          uint16)
-       (dft
-          "discovery-addr"
-          ~description:
-            "Host for local peer discovery. If the port is not specified, the \
-             default port 10732 will be assumed."
-          (option string)
-          default_p2p.discovery_addr)
-       (dft
-          "private-mode"
-          ~description:
-            "Specify if the node is in private mode or not. A node in private \
-             mode rejects incoming connections from untrusted peers and only \
-             opens outgoing connections to peers listed in 'bootstrap-peers' \
-             or provided with '--peer' option. Moreover, these peers will keep \
-             the identity and the address of the private node secret."
-          bool
-          default_p2p.private_mode)
-       (dft
-          "limits"
-          ~description:"Network limits"
-          Tezos_p2p_services.P2p_limits.encoding
-          Tezos_p2p_services.P2p_limits.default)
-       (dft
-          "disable_mempool"
-          ~description:
-            "If set to [true], the node will not participate in the \
-             propagation of pending operations (mempool). Default value is \
-             [false]. It can be used to decrease the memory and computation \
-             footprints of the node."
-          bool
-          default_p2p.disable_mempool)
-       (dft
-          "enable_testchain"
-          ~description:
-            "DEPRECATED. If set to [true], the node will spawn a testchain \
-             during the protocol's testing voting period. Default value is \
-             [false]. It is disabled to decrease the node storage usage and \
-             computation by dropping the validation of the test network \
-             blocks."
-          bool
-          default_p2p.enable_testchain)
-       (let open Tezos_p2p_services.Point_reconnection_config in
-       dft
-         "greylisting_config"
-         ~description:
-           "The reconnection policy regulates the frequency with which the \
-            node tries to reconnect to an old known peer."
-         encoding
-         default))
+    (merge_objs
+       (obj5
+          (dft
+             "expected-proof-of-work"
+             ~description:
+               "Floating point number between 0 and 256 that represents a \
+                difficulty, 24 signifies for example that at least 24 leading \
+                zeroes are expected in the hash."
+             float
+             default_p2p.expected_pow)
+          (opt
+             "bootstrap-peers"
+             ~description:
+               "List of hosts. Tezos can connect to both IPv6 and IPv4 hosts. \
+                If the port is not specified, default port 9732 will be \
+                assumed."
+             (list string))
+          (opt
+             "listen-addr"
+             ~description:
+               "Host to listen to. If the port is not specified, the default \
+                port 9732 will be assumed."
+             string)
+          (opt
+             "advertised-net-port"
+             ~description:
+               "Alternative port advertised to other peers to connect to. If \
+                the port is not specified, the port from listen-addr will be \
+                assumed."
+             uint16)
+          (dft
+             "discovery-addr"
+             ~description:
+               "Host for local peer discovery. If the port is not specified, \
+                the default port 10732 will be assumed."
+             (option string)
+             default_p2p.discovery_addr))
+       (obj6
+          (dft
+             "private-mode"
+             ~description:
+               "Specify if the node is in private mode or not. A node in \
+                private mode rejects incoming connections from untrusted peers \
+                and only opens outgoing connections to peers listed in \
+                'bootstrap-peers' or provided with '--peer' option. Moreover, \
+                these peers will keep the identity and the address of the \
+                private node secret."
+             bool
+             default_p2p.private_mode)
+          (dft
+             "limits"
+             ~description:"Network limits"
+             Tezos_p2p_services.P2p_limits.encoding
+             Tezos_p2p_services.P2p_limits.default)
+          (dft
+             "disable_mempool"
+             ~description:
+               "If set to [true], the node will not participate in the \
+                propagation of pending operations (mempool). Default value is \
+                [false]. It can be used to decrease the memory and computation \
+                footprints of the node."
+             bool
+             default_p2p.disable_mempool)
+          (dft
+             "enable_testchain"
+             ~description:
+               "DEPRECATED. If set to [true], the node will spawn a testchain \
+                during the protocol's testing voting period. Default value is \
+                [false]. It is disabled to decrease the node storage usage and \
+                computation by dropping the validation of the test network \
+                blocks."
+             bool
+             default_p2p.enable_testchain)
+          (let open Tezos_p2p_services.Point_reconnection_config in
+           dft
+             "greylisting_config"
+             ~description:
+               "The reconnection policy regulates the frequency with which the \
+                node tries to reconnect to an old known peer."
+             encoding
+             default)
+          (dft
+             "disable_peer_discovery"
+             ~description:
+               "This field should be used for testing purpose only. If set to \
+                [true], the node will not participate to the peer discovery \
+                mechanism. The node will not be able to find new peers to \
+                connect with."
+             bool
+             default_p2p.disable_peer_discovery)))
 
 let rpc : rpc Data_encoding.t =
   let open Data_encoding in
   conv
-    (fun {cors_origins; cors_headers; listen_addrs; tls; acl; media_type} ->
+    (fun {
+           cors_origins;
+           cors_headers;
+           listen_addrs;
+           external_listen_addrs;
+           tls;
+           acl;
+           media_type;
+           max_active_rpc_connections;
+           enable_http_cache_headers;
+         }
+       ->
       let cert, key =
         match tls with
         | None -> (None, None)
         | Some {cert; key} -> (Some cert, Some key)
       in
-      ( Some listen_addrs,
-        None,
-        cors_origins,
-        cors_headers,
-        cert,
-        key,
-        acl,
-        media_type ))
-    (fun ( listen_addrs,
-           legacy_listen_addr,
-           cors_origins,
-           cors_headers,
-           cert,
-           key,
-           acl,
-           media_type ) ->
+      let external_listen_addrs =
+        match external_listen_addrs with [] -> None | v -> Some v
+      in
+      ( (Some listen_addrs, external_listen_addrs, None, cors_origins),
+        ( cors_headers,
+          cert,
+          key,
+          acl,
+          media_type,
+          max_active_rpc_connections,
+          enable_http_cache_headers ) ))
+    (fun ( ( listen_addrs,
+             external_listen_addrs,
+             legacy_listen_addr,
+             cors_origins ),
+           ( cors_headers,
+             cert,
+             key,
+             acl,
+             media_type,
+             max_active_rpc_connections,
+             enable_http_cache_headers ) )
+       ->
       let tls =
         match (cert, key) with
         | None, _ | _, None -> None
@@ -615,44 +681,97 @@ let rpc : rpc Data_encoding.t =
               "Config file: Use only \"listen-addrs\" and not (legacy) \
                \"listen-addr\"."
       in
-      {listen_addrs; cors_origins; cors_headers; tls; acl; media_type})
-    (obj8
-       (opt
-          "listen-addrs"
-          ~description:
-            "Hosts to listen to. If the port is not specified, the default \
-             port 8732 will be assumed."
-          (list string))
-       (opt "listen-addr" ~description:"Legacy value: Host to listen to" string)
-       (dft
-          "cors-origin"
-          ~description:
-            "Cross Origin Resource Sharing parameters, see \
-             https://en.wikipedia.org/wiki/Cross-origin_resource_sharing."
-          (list string)
-          default_rpc.cors_origins)
-       (dft
-          "cors-headers"
-          ~description:
-            "Cross Origin Resource Sharing parameters, see \
-             https://en.wikipedia.org/wiki/Cross-origin_resource_sharing."
-          (list string)
-          default_rpc.cors_headers)
-       (opt
-          "crt"
-          ~description:"Certificate file (necessary when TLS is used)."
-          string)
-       (opt "key" ~description:"Key file (necessary when TLS is used)." string)
-       (dft
-          "acl"
-          ~description:"A list of RPC ACLs for specific listening addresses."
-          RPC_server.Acl.policy_encoding
-          default_rpc.acl)
-       (dft
-          "media-type"
-          ~description:"The media types supported by the server."
-          Media_type.Command_line.encoding
-          default_rpc.media_type))
+      let external_listen_addrs =
+        Option.value
+          external_listen_addrs
+          ~default:default_rpc.external_listen_addrs
+      in
+      {
+        listen_addrs;
+        external_listen_addrs;
+        cors_origins;
+        cors_headers;
+        tls;
+        acl;
+        media_type;
+        max_active_rpc_connections;
+        enable_http_cache_headers;
+      })
+    (merge_objs
+       (obj4
+          (opt
+             "listen-addrs"
+             ~description:
+               "Hosts to listen to. If the port is not specified, the default \
+                port 8732 will be assumed."
+             (list string))
+          (opt
+             "external-listen-addrs"
+             ~description:
+               "Hosts to listen to. If the port is not specified, the default \
+                port 8732 will be assumed."
+             (list string))
+          (opt
+             "listen-addr"
+             ~description:"Legacy value: Host to listen to"
+             string)
+          (dft
+             "cors-origin"
+             ~description:
+               "Cross Origin Resource Sharing parameters, see \
+                https://en.wikipedia.org/wiki/Cross-origin_resource_sharing."
+             (list string)
+             default_rpc.cors_origins))
+       (obj7
+          (dft
+             "cors-headers"
+             ~description:
+               "Cross Origin Resource Sharing parameters, see \
+                https://en.wikipedia.org/wiki/Cross-origin_resource_sharing."
+             (list string)
+             default_rpc.cors_headers)
+          (opt
+             "crt"
+             ~description:"Certificate file (necessary when TLS is used)."
+             string)
+          (opt
+             "key"
+             ~description:"Key file (necessary when TLS is used)."
+             string)
+          (dft
+             "acl"
+             ~description:"A list of RPC ACLs for specific listening addresses."
+             RPC_server.Acl.policy_encoding
+             default_rpc.acl)
+          (dft
+             "media-type"
+             ~description:"The media types supported by the server."
+             Media_type.Command_line.encoding
+             default_rpc.media_type)
+          (dft
+             "max_active_rpc_connections"
+             ~description:
+               "The maximum number of active connections per RPC endpoint."
+             RPC_server.Max_active_rpc_connections.encoding
+             default_rpc.max_active_rpc_connections)
+          (dft
+             "enable-http-cache-headers"
+             ~description:
+               "Enables HTTP cache headers in the RPC response. When enabled, \
+                'Cache-control' will be present with 'max-age' in the response \
+                header of relative queries (eg. head, head-n, head~n). The \
+                'max-age' value indicates the duration of which the returned \
+                response is cacheable. It is an estimate of the remaining \
+                duration of the current round based on when the block was \
+                forged. Enabling this feature adds a performance overhead to \
+                all queries hence you should only do so if you are running the \
+                RPC server behind a caching server. The feature is implemented \
+                based on RFC9111 hence useful for reverse proxies with \
+                auto-caching mechanism."
+             bool
+             default_rpc.enable_http_cache_headers)))
+
+let rpc_encoding = rpc
 
 let encoding =
   let open Data_encoding in
@@ -667,8 +786,9 @@ let encoding =
            shell;
            blockchain_network;
            metrics_addr;
-           dal;
-         } ->
+           profiling;
+         }
+       ->
       ( data_dir,
         disable_config_validation,
         rpc,
@@ -678,7 +798,7 @@ let encoding =
         shell,
         blockchain_network,
         metrics_addr,
-        dal ))
+        profiling ))
     (fun ( data_dir,
            disable_config_validation,
            rpc,
@@ -688,7 +808,8 @@ let encoding =
            shell,
            blockchain_network,
            metrics_addr,
-           dal ) ->
+           profiling )
+       ->
       {
         disable_config_validation;
         data_dir;
@@ -699,62 +820,62 @@ let encoding =
         shell;
         blockchain_network;
         metrics_addr;
-        dal;
+        profiling;
       })
     (obj10
        (dft
           "data-dir"
           ~description:"Location of the data dir on disk."
           string
-          default_data_dir)
+          default_config.data_dir)
        (dft
           "disable-config-validation"
           ~description:"Disable the node configuration validation."
           bool
-          default_disable_config_validation)
+          default_config.disable_config_validation)
        (dft
           "rpc"
           ~description:"Configuration of rpc parameters"
           rpc
-          default_rpc)
+          default_config.rpc)
        (dft
           "p2p"
           ~description:"Configuration of network parameters"
           p2p
-          default_p2p)
+          default_config.p2p)
        (dft
           "log"
           ~description:
             "Configuration of the Lwt-log sink (part of the logging framework)"
-          Lwt_log_sink_unix.cfg_encoding
-          Log_config.lwt_log_sink_default_cfg)
-       (dft
+          Logs_simple_config.cfg_encoding
+          default_config.log)
+       (opt
           "internal-events"
           ~description:"Configuration of the structured logging framework"
-          Internal_event_config.encoding
-          Internal_event_config.empty)
+          Internal_event_config.encoding)
        (dft
           "shell"
           ~description:"Configuration of network parameters"
           Shell_limits.limits_encoding
-          Shell_limits.default_limits)
+          default_config.shell)
        (dft
           "network"
           ~description:"Configuration of which network/blockchain to connect to"
           sugared_blockchain_network_encoding
-          blockchain_network_mainnet)
+          default_config.blockchain_network)
        (dft
           "metrics_addr"
           ~description:"Configuration of the Prometheus metrics endpoint"
           (list string)
           default_config.metrics_addr)
        (dft
-          "dal"
-          ~description:
-            "USE FOR TESTING PURPOSE ONLY. Configuration for the \
-             data-availibility layer"
-          Tezos_crypto_dal.Cryptobox.Config.encoding
-          Tezos_crypto_dal.Cryptobox.Config.default))
+          "profiling"
+          ~description:"Configuration of profiling output"
+          Tezos_profiler.Profiler.profiling_config_encoding
+          default_config.profiling))
+
+let () =
+  Data_encoding.Registration.register (Data_encoding.def "node-config" encoding)
 
 (* Abstract version of [Json_encoding.Cannot_destruct]: first argument is the
    string representation of the path, second argument is the error message
@@ -849,17 +970,20 @@ let update ?(disable_config_validation = false) ?data_dir ?min_connections
     ?expected_connections ?max_connections ?max_download_speed ?max_upload_speed
     ?binary_chunks_size ?peer_table_size ?expected_pow ?bootstrap_peers
     ?listen_addr ?advertised_net_port ?discovery_addr ?(rpc_listen_addrs = [])
-    ?(allow_all_rpc = []) ?(media_type = Media_type.Command_line.Any)
+    ?(external_rpc_listen_addrs = []) ?(allow_all_rpc = [])
+    ?(media_type = Media_type.Command_line.Any)
+    ?(max_active_rpc_connections = default_rpc.max_active_rpc_connections)
     ?(metrics_addr = []) ?operation_metadata_size_limit
     ?(private_mode = default_p2p.private_mode)
     ?(disable_p2p_maintenance =
       Option.is_none default_p2p.limits.maintenance_idle_time)
+    ?(disable_p2p_swap = Option.is_none default_p2p.limits.swap_linger)
     ?(disable_mempool = default_p2p.disable_mempool)
-    ?(disable_mempool_precheck =
-      Shell_limits.default_limits.prevalidator_limits.disable_precheck)
     ?(enable_testchain = default_p2p.enable_testchain) ?(cors_origins = [])
-    ?(cors_headers = []) ?rpc_tls ?log_output ?synchronisation_threshold
-    ?history_mode ?network ?latency cfg =
+    ?(cors_headers = []) ?rpc_tls ?log_output ?log_coloring
+    ?synchronisation_threshold ?history_mode ?network ?latency
+    ?enable_http_cache_headers ?disable_context_pruning
+    ?storage_maintenance_delay cfg =
   let open Lwt_result_syntax in
   let disable_config_validation =
     cfg.disable_config_validation || disable_config_validation
@@ -900,7 +1024,9 @@ let update ?(disable_config_validation = false) ?data_dir ?min_connections
       binary_chunks_size = Option.map (fun x -> x lsl 10) binary_chunks_size;
       maintenance_idle_time =
         (if disable_p2p_maintenance then None
-        else cfg.p2p.limits.maintenance_idle_time);
+         else cfg.p2p.limits.maintenance_idle_time);
+      swap_linger =
+        (if disable_p2p_swap then None else cfg.p2p.limits.swap_linger);
     }
   in
   let acl =
@@ -925,19 +1051,33 @@ let update ?(disable_config_validation = false) ?data_dir ?min_connections
       disable_mempool = cfg.p2p.disable_mempool || disable_mempool;
       enable_testchain = cfg.p2p.enable_testchain || enable_testchain;
       reconnection_config = cfg.p2p.reconnection_config;
+      disable_peer_discovery = cfg.p2p.disable_peer_discovery;
     }
   and rpc : rpc =
     {
       listen_addrs = unopt_list ~default:cfg.rpc.listen_addrs rpc_listen_addrs;
+      external_listen_addrs =
+        unopt_list
+          ~default:cfg.rpc.external_listen_addrs
+          external_rpc_listen_addrs;
       cors_origins = unopt_list ~default:cfg.rpc.cors_origins cors_origins;
       cors_headers = unopt_list ~default:cfg.rpc.cors_headers cors_headers;
       tls = Option.either rpc_tls cfg.rpc.tls;
       acl;
       media_type;
+      max_active_rpc_connections;
+      enable_http_cache_headers =
+        Option.value
+          ~default:cfg.rpc.enable_http_cache_headers
+          enable_http_cache_headers;
     }
   and metrics_addr = unopt_list ~default:cfg.metrics_addr metrics_addr
-  and log : Lwt_log_sink_unix.cfg =
-    {cfg.log with output = Option.value ~default:cfg.log.output log_output}
+  and log : Logs_simple_config.cfg =
+    {
+      cfg.log with
+      colors = Option.value ~default:cfg.log.colors log_coloring;
+      output = Option.value ~default:cfg.log.output log_output;
+    }
   and shell =
     Shell_limits.
       {
@@ -951,13 +1091,7 @@ let update ?(disable_config_validation = false) ?data_dir ?min_connections
                   cfg.shell.block_validator_limits.operation_metadata_size_limit
                 operation_metadata_size_limit;
           };
-        prevalidator_limits =
-          {
-            cfg.shell.prevalidator_limits with
-            disable_precheck =
-              cfg.shell.prevalidator_limits.disable_precheck
-              || disable_mempool_precheck;
-          };
+        prevalidator_limits = cfg.shell.prevalidator_limits;
         chain_validator_limits =
           (let synchronisation : synchronisation_limits =
              {
@@ -975,6 +1109,14 @@ let update ?(disable_config_validation = false) ?data_dir ?min_connections
            in
            {synchronisation});
         history_mode = Option.either history_mode cfg.shell.history_mode;
+        disable_context_pruning =
+          Option.either
+            disable_context_pruning
+            cfg.shell.disable_context_pruning;
+        storage_maintenance_delay =
+          Option.either
+            storage_maintenance_delay
+            cfg.shell.storage_maintenance_delay;
       }
   in
   (* If --network is specified it overrides the "network" entry of the
@@ -993,22 +1135,8 @@ let update ?(disable_config_validation = false) ?data_dir ?min_connections
       shell;
       blockchain_network;
       metrics_addr;
+      profiling = cfg.profiling;
     }
-
-type Error_monad.error += Failed_to_parse_address of (string * string)
-
-let () =
-  (* Parsing of an address failed with an explanation *)
-  Error_monad.register_error_kind
-    `Permanent
-    ~id:"config_file.parsing_address_failed"
-    ~title:"Parsing of an address failed"
-    ~description:"Parsing an address failed with an explanation."
-    ~pp:(fun ppf (addr, explanation) ->
-      Format.fprintf ppf "Failed to parse address '%s': %s@." addr explanation)
-    Data_encoding.(obj2 (req "addr" string) (req "explanation" string))
-    (function Failed_to_parse_address s -> Some s | _ -> None)
-    (fun s -> Failed_to_parse_address s)
 
 let to_ipv4 ipv6_l =
   let open Lwt_syntax in
@@ -1024,99 +1152,45 @@ let to_ipv4 ipv6_l =
   in
   List.filter_map_s convert_or_warn ipv6_l
 
-(* Parse an address.
-
-   - [peer] is a string representing the peer.
-
-   - if [no_peer_id_expected] is true, then parsing a representation
-   containing a peer id will result in an error.
-
-   - [default_addr] is the used if no hostname or IP is given or if
-   the hostname "_" is used.
-
-   - [default_port] is the used if port is given. *)
-let resolve_addr ~default_addr ?(no_peer_id_expected = true) ?default_port
-    ?(passive = false) peer :
-    (P2p_point.Id.t * P2p_peer.Id.t option) list tzresult Lwt.t =
-  let open Lwt_result_syntax in
-  match P2p_point.Id.parse_addr_port_id peer with
-  | (Error (P2p_point.Id.Bad_id_format _) | Ok {peer_id = Some _; _})
-    when no_peer_id_expected ->
-      tzfail
-        (Failed_to_parse_address
-           (peer, "no peer identity should be specified here"))
-  | Error err ->
-      tzfail
-        (Failed_to_parse_address (peer, P2p_point.Id.string_of_parsing_error err))
-  | Ok {addr; port; peer_id} ->
-      let service_port =
-        match (port, default_port) with
-        | Some port, _ -> port
-        | None, Some default_port -> default_port
-        | None, None -> default_p2p_port
-      in
-      let service = string_of_int service_port in
-      let node = if addr = "" || addr = "_" then default_addr else addr in
-      let*! l = Lwt_utils_unix.getaddrinfo ~passive ~node ~service in
-      return (List.map (fun point -> (point, peer_id)) l)
-
-let resolve_addrs ?default_port ?passive ?no_peer_id_expected ~default_addr
-    addrs =
-  List.concat_map_es
-    (resolve_addr ~default_addr ?default_port ?passive ?no_peer_id_expected)
-    addrs
-
 let resolve_discovery_addrs discovery_addr =
   let open Lwt_result_syntax in
-  let* addrs =
-    resolve_addr
+  let* points =
+    P2p_resolve.resolve_addr
       ~default_addr:Ipaddr.V4.(to_string broadcast)
       ~default_port:default_discovery_port
       ~passive:true
       discovery_addr
   in
-  let*! addrs = to_ipv4 (List.map fst addrs) in
-  return addrs
+  let*! points = to_ipv4 points in
+  return points
 
 let resolve_listening_addrs listen_addr =
-  let open Lwt_result_syntax in
-  let+ addrs =
-    resolve_addr
-      ~default_addr:"::"
-      ~default_port:default_p2p_port
-      ~passive:true
-      listen_addr
-  in
-  List.map fst addrs
+  P2p_resolve.resolve_addr
+    ~default_addr:"::"
+    ~default_port:default_p2p_port
+    ~passive:true
+    listen_addr
 
 let resolve_rpc_listening_addrs listen_addr =
-  let open Lwt_result_syntax in
-  let+ addrs =
-    resolve_addr
-      ~default_addr:"localhost"
-      ~default_port:default_rpc_port
-      ~passive:true
-      listen_addr
-  in
-  List.map fst addrs
+  P2p_resolve.resolve_addr
+    ~default_addr:"localhost"
+    ~default_port:default_rpc_port
+    ~passive:true
+    listen_addr
 
 let resolve_metrics_addrs ?(default_metrics_port = default_metrics_port)
     metrics_addr =
-  let open Lwt_result_syntax in
-  let+ addrs =
-    resolve_addr
-      ~default_addr:"localhost"
-      ~default_port:default_metrics_port
-      ~passive:true
-      metrics_addr
-  in
-  List.map fst addrs
+  P2p_resolve.resolve_addr
+    ~default_addr:"localhost"
+    ~default_port:default_metrics_port
+    ~passive:true
+    metrics_addr
 
 let resolve_bootstrap_addrs peers =
-  resolve_addrs
-    ~no_peer_id_expected:false
-    ~default_addr:"::"
-    ~default_port:default_p2p_port
+  List.concat_map_es
+    (P2p_resolve.resolve_addr_with_peer_id
+       ~default_addr:"::"
+       ~default_port:default_p2p_port)
     peers
 
 let bootstrap_peers config =

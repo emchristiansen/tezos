@@ -2,6 +2,7 @@
 (*                                                                           *)
 (* Open Source License                                                       *)
 (* Copyright (c) 2022 Nomadic Labs <contact@nomadic-labs.com>                *)
+(* Copyright (c) 2023 Marigold, <contact@marigold.dev>                       *)
 (*                                                                           *)
 (* Permission is hereby granted, free of charge, to any person obtaining a   *)
 (* copy of this software and associated documentation files (the "Software"),*)
@@ -47,50 +48,55 @@ let operation_conflict_encoding =
           (req "existing" Operation_hash.encoding)
           (req "new_operation" Operation_hash.encoding))
 
+let pp_option pp fmt = function
+  | None -> Format.fprintf fmt "none"
+  | Some v -> Format.fprintf fmt "%a" pp v
+
 module Consensus = struct
-  type error += Zero_frozen_deposits of Signature.Public_key_hash.t
+  type error += Forbidden_delegate of Implicit_account_repr.t
 
   let () =
     register_error_kind
       `Permanent
-      ~id:"validate.zero_frozen_deposits"
-      ~title:"Zero frozen deposits"
-      ~description:"The delegate has zero frozen deposits."
+      ~id:"validate.temporarily_forbidden_delegate"
+      ~title:"Temporarily forbidden delegate"
+      ~description:"The delegate has committed too many misbehaviours."
       ~pp:(fun ppf delegate ->
         Format.fprintf
           ppf
-          "Delegate %a has zero frozen deposits; it is not allowed to \
-           bake/preendorse/endorse."
-          Signature.Public_key_hash.pp
+          "Delegate %a has committed too many misbehaviours; it is temporarily \
+           not allowed to bake/preattest/attest."
+          Implicit_account_repr.pp
           delegate)
-      Data_encoding.(obj1 (req "delegate" Signature.Public_key_hash.encoding))
-      (function Zero_frozen_deposits delegate -> Some delegate | _ -> None)
-      (fun delegate -> Zero_frozen_deposits delegate)
+      Data_encoding.(obj1 (req "delegate" Implicit_account_repr.encoding))
+      (function Forbidden_delegate delegate -> Some delegate | _ -> None)
+      (fun delegate -> Forbidden_delegate delegate)
 
   (** This type is only used in consensus operation errors to make
       them more informative. *)
   type consensus_operation_kind =
-    | Preendorsement
-    | Endorsement
-    | Grandparent_endorsement
-    | Dal_attestation
+    | Preattestation
+    | Attestation
+    | Attestations_aggregate
+    | Preattestations_aggregate
 
   let consensus_operation_kind_encoding =
     Data_encoding.string_enum
       [
-        ("Preendorsement", Preendorsement);
-        ("Endorsement", Endorsement);
-        ("Grandparent_endorsement", Grandparent_endorsement);
-        ("Dal_attestation", Dal_attestation);
+        ("Preattestation", Preattestation);
+        ("Attestation", Attestation);
+        ("Attestations_aggregate", Attestations_aggregate);
+        ("Preattestations_aggregate", Preattestations_aggregate);
       ]
 
   let consensus_operation_kind_pp fmt = function
-    | Preendorsement -> Format.fprintf fmt "Preendorsement"
-    | Endorsement -> Format.fprintf fmt "Endorsement"
-    | Grandparent_endorsement -> Format.fprintf fmt "Grandparent endorsement"
-    | Dal_attestation -> Format.fprintf fmt "Dal_attestation"
+    | Preattestation -> Format.fprintf fmt "Preattestation"
+    | Attestation -> Format.fprintf fmt "Attestation"
+    | Attestations_aggregate -> Format.fprintf fmt "Attestations_aggregate"
+    | Preattestations_aggregate ->
+        Format.fprintf fmt "Preattestations_aggregate"
 
-  (** Errors for preendorsements and endorsements. *)
+  (** Errors for preattestation and attestation. *)
   type error +=
     | Consensus_operation_for_old_level of {
         kind : consensus_operation_kind;
@@ -117,9 +123,9 @@ module Consensus = struct
         expected : Block_payload_hash.t;
         provided : Block_payload_hash.t;
       }
-    | Unexpected_preendorsement_in_block
-    | Unexpected_endorsement_in_block
-    | Preendorsement_round_too_high of {
+    | Unexpected_preattestation_in_block
+    | Unexpected_attestation_in_block
+    | Preattestation_round_too_high of {
         block_round : Round.t;
         provided : Round.t;
       }
@@ -131,6 +137,16 @@ module Consensus = struct
         conflict : operation_conflict;
       }
     | Consensus_operation_not_allowed
+    | Missing_companion_key_for_bls_dal of Consensus_key.t
+    | Aggregate_in_mempool
+    | Aggregate_not_implemented
+    | Non_bls_key_in_aggregate
+    | Public_key_aggregation_failure
+    | Unaggregated_eligible_operation of {
+        kind : consensus_operation_kind;
+        hash : Operation_hash.t;
+      }
+    | Empty_aggregation_committee
 
   let () =
     register_error_kind
@@ -269,32 +285,32 @@ module Consensus = struct
         Wrong_payload_hash_for_consensus_operation {kind; expected; provided}) ;
     register_error_kind
       `Permanent
-      ~id:"validate.unexpected_preendorsement_in_block"
-      ~title:"Unexpected preendorsement in block"
-      ~description:"Unexpected preendorsement in block."
+      ~id:"validate.unexpected_preattestation_in_block"
+      ~title:"Unexpected preattestation in block"
+      ~description:"Unexpected preattestation in block."
       ~pp:(fun ppf () ->
-        Format.fprintf ppf "Unexpected preendorsement in block.")
+        Format.fprintf ppf "Unexpected preattestation in block.")
       Data_encoding.empty
-      (function Unexpected_preendorsement_in_block -> Some () | _ -> None)
-      (fun () -> Unexpected_preendorsement_in_block) ;
+      (function Unexpected_preattestation_in_block -> Some () | _ -> None)
+      (fun () -> Unexpected_preattestation_in_block) ;
     register_error_kind
       `Permanent
-      ~id:"validate.unexpected_endorsement_in_block"
-      ~title:"Unexpected endorsement in block"
-      ~description:"Unexpected endorsement in block."
-      ~pp:(fun ppf () -> Format.fprintf ppf "Unexpected endorsement in block.")
+      ~id:"validate.unexpected_attestation_in_block"
+      ~title:"Unexpected attestation in block"
+      ~description:"Unexpected attestation in block."
+      ~pp:(fun ppf () -> Format.fprintf ppf "Unexpected attestation in block.")
       Data_encoding.empty
-      (function Unexpected_endorsement_in_block -> Some () | _ -> None)
-      (fun () -> Unexpected_endorsement_in_block) ;
+      (function Unexpected_attestation_in_block -> Some () | _ -> None)
+      (fun () -> Unexpected_attestation_in_block) ;
     register_error_kind
       `Permanent
-      ~id:"validate.preendorsement_round_too_high"
-      ~title:"Preendorsement round too high"
-      ~description:"Preendorsement round too high."
+      ~id:"validate.preattestation_round_too_high"
+      ~title:"Preattestation round too high"
+      ~description:"Preattestation round too high."
       ~pp:(fun ppf (block_round, provided) ->
         Format.fprintf
           ppf
-          "Preendorsement round too high (block_round: %a, provided: %a)."
+          "Preattestation round too high (block_round: %a, provided: %a)."
           Round.pp
           block_round
           Round.pp
@@ -302,16 +318,16 @@ module Consensus = struct
       Data_encoding.(
         obj2 (req "block_round" Round.encoding) (req "provided" Round.encoding))
       (function
-        | Preendorsement_round_too_high {block_round; provided} ->
+        | Preattestation_round_too_high {block_round; provided} ->
             Some (block_round, provided)
         | _ -> None)
       (fun (block_round, provided) ->
-        Preendorsement_round_too_high {block_round; provided}) ;
+        Preattestation_round_too_high {block_round; provided}) ;
     register_error_kind
       `Permanent
       ~id:"validate.wrong_slot_for_consensus_operation"
       ~title:"Wrong slot for consensus operation"
-      ~description:"Wrong slot used for a preendorsement or endorsement."
+      ~description:"Wrong slot used for a preattestation or attestation."
       ~pp:(fun ppf kind ->
         Format.fprintf
           ppf
@@ -356,7 +372,89 @@ module Consensus = struct
         Format.fprintf ppf "Validation of consensus operation if forbidden ")
       Data_encoding.empty
       (function Consensus_operation_not_allowed -> Some () | _ -> None)
-      (fun () -> Consensus_operation_not_allowed)
+      (fun () -> Consensus_operation_not_allowed) ;
+    register_error_kind
+      `Permanent
+      ~id:"validate.missing_companion_key_for_bls_dal"
+      ~title:"Missing companion key for DAL attestation with BLS"
+      ~description:
+        "The consensus key is a BLS key but is missing a companion key, so it \
+         cannot issue a DAL attestation"
+      Data_encoding.(obj1 (req "consensus_key" Consensus_key.encoding))
+      (function Missing_companion_key_for_bls_dal x -> Some x | _ -> None)
+      (fun x -> Missing_companion_key_for_bls_dal x) ;
+    register_error_kind
+      `Permanent
+      ~id:"validate.aggregate_operation_not_allowed_in_mempool"
+      ~title:"Aggregate operation not allowed in mempool"
+      ~description:"Aggregate operations are not allowed in a mempool"
+      ~pp:(fun ppf () ->
+        Format.fprintf ppf "Aggregate operations are not allowed in a mempool")
+      Data_encoding.empty
+      (function Aggregate_in_mempool -> Some () | _ -> None)
+      (fun () -> Aggregate_in_mempool) ;
+    register_error_kind
+      `Permanent
+      ~id:"validate.aggregate_not_implemented"
+      ~title:"Aggregate operations not implemented"
+      ~description:"Aggregate operations are not implemented yet"
+      ~pp:(fun ppf () ->
+        Format.fprintf ppf "Aggregate operations are not implemented yet")
+      Data_encoding.empty
+      (function Aggregate_not_implemented -> Some () | _ -> None)
+      (fun () -> Aggregate_not_implemented) ;
+    register_error_kind
+      `Permanent
+      ~id:"validate.non_bls_key_in_aggregate"
+      ~title:"Non BLS key in aggregate"
+      ~description:"Non Bls key in a consensus aggregate operation"
+      ~pp:(fun ppf () ->
+        Format.fprintf
+          ppf
+          "Ill-formed aggregation : a slot owner doesn't own a BLS key")
+      Data_encoding.empty
+      (function Non_bls_key_in_aggregate -> Some () | _ -> None)
+      (fun () -> Non_bls_key_in_aggregate) ;
+    register_error_kind
+      `Permanent
+      ~id:"validate.public_key_aggregation_failure"
+      ~title:"Public key aggregation failure"
+      ~description:"Public key aggregation failed"
+      ~pp:(fun ppf () -> Format.fprintf ppf "Public key aggregation failed")
+      Data_encoding.empty
+      (function Public_key_aggregation_failure -> Some () | _ -> None)
+      (fun () -> Public_key_aggregation_failure) ;
+    register_error_kind
+      `Permanent
+      ~id:"validate.unaggregated_eligible_attestation"
+      ~title:"Unaggregated eligible attestation"
+      ~description:"An eligible attestation was found unaggregated"
+      ~pp:(fun ppf (kind, hash) ->
+        Format.fprintf
+          ppf
+          "%a %a should have been aggregated."
+          consensus_operation_kind_pp
+          kind
+          Operation_hash.pp
+          hash)
+      Data_encoding.(
+        obj2
+          (req "kind" consensus_operation_kind_encoding)
+          (req "hash" Operation_hash.encoding))
+      (function
+        | Unaggregated_eligible_operation {kind; hash} -> Some (kind, hash)
+        | _ -> None)
+      (fun (kind, hash) -> Unaggregated_eligible_operation {kind; hash}) ;
+    register_error_kind
+      `Permanent
+      ~id:"validate.empty_aggregation_committee"
+      ~title:"Empty aggregation committee"
+      ~description:"The aggregation committee is empty"
+      ~pp:(fun ppf () ->
+        Format.fprintf ppf "The aggregation committee is empty.")
+      Data_encoding.empty
+      (function Empty_aggregation_committee -> Some () | _ -> None)
+      (fun () -> Empty_aggregation_committee)
 end
 
 module Voting = struct
@@ -378,14 +476,14 @@ module Voting = struct
     | Too_many_proposals of {previous_count : int; operation_count : int}
     | Conflicting_proposals of operation_conflict
     | Testnet_dictator_multiple_proposals
-    | Proposals_from_unregistered_delegate of Signature.Public_key_hash.t
+    | Proposals_from_unregistered_delegate of Implicit_account_repr.t
     | (* Ballot errors *)
         Ballot_for_wrong_proposal of {
         current : Protocol_hash.t;
         submitted : Protocol_hash.t;
       }
     | Already_submitted_a_ballot
-    | Ballot_from_unregistered_delegate of Signature.Public_key_hash.t
+    | Ballot_from_unregistered_delegate of Implicit_account_repr.t
     | Conflicting_ballot of operation_conflict
 
   let () =
@@ -553,9 +651,9 @@ module Voting = struct
           ppf
           "Cannot submit proposals with public key hash %a (unregistered \
            delegate)."
-          Signature.Public_key_hash.pp
+          Implicit_account_repr.pp
           c)
-      Data_encoding.(obj1 (req "delegate" Signature.Public_key_hash.encoding))
+      Data_encoding.(obj1 (req "delegate" Implicit_account_repr.encoding))
       (function Proposals_from_unregistered_delegate c -> Some c | _ -> None)
       (fun c -> Proposals_from_unregistered_delegate c) ;
 
@@ -605,9 +703,9 @@ module Voting = struct
         Format.fprintf
           ppf
           "Cannot cast a ballot for public key hash %a (unregistered delegate)."
-          Signature.Public_key_hash.pp
+          Implicit_account_repr.pp
           c)
-      Data_encoding.(obj1 (req "delegate" Signature.Public_key_hash.encoding))
+      Data_encoding.(obj1 (req "delegate" Implicit_account_repr.encoding))
       (function Ballot_from_unregistered_delegate c -> Some c | _ -> None)
       (fun c -> Ballot_from_unregistered_delegate c) ;
     register_error_kind
@@ -680,21 +778,12 @@ module Anonymous = struct
         | _ -> None)
       (fun (edpkh, conflict) -> Conflicting_activation {edpkh; conflict})
 
-  type denunciation_kind = Preendorsement | Endorsement | Block
-
-  let denunciation_kind_encoding =
-    let open Data_encoding in
-    string_enum
-      [
-        ("preendorsement", Preendorsement);
-        ("endorsement", Endorsement);
-        ("block", Block);
-      ]
+  type denunciation_kind = Misbehaviour.kind
 
   let pp_denunciation_kind fmt : denunciation_kind -> unit = function
-    | Preendorsement -> Format.fprintf fmt "preendorsement"
-    | Endorsement -> Format.fprintf fmt "endorsement"
-    | Block -> Format.fprintf fmt "block"
+    | Double_preattesting -> Format.fprintf fmt "preattestation"
+    | Double_attesting -> Format.fprintf fmt "attestation"
+    | Double_baking -> Format.fprintf fmt "block"
 
   type error +=
     | Invalid_double_baking_evidence of {
@@ -708,12 +797,12 @@ module Anonymous = struct
     | Invalid_denunciation of denunciation_kind
     | Inconsistent_denunciation of {
         kind : denunciation_kind;
-        delegate1 : Signature.Public_key_hash.t;
-        delegate2 : Signature.Public_key_hash.t;
+        delegate1 : Implicit_account_repr.t;
+        delegate2 : Implicit_account_repr.t;
       }
     | Already_denounced of {
         kind : denunciation_kind;
-        delegate : Signature.Public_key_hash.t;
+        delegate : Implicit_account_repr.t;
         level : Level.t;
       }
     | Conflicting_denunciation of {
@@ -730,6 +819,7 @@ module Anonymous = struct
         level : Raw_level.t;
         last_cycle : Cycle.t;
       }
+    | Aggregate_denunciation_not_implemented
 
   let () =
     register_error_kind
@@ -778,7 +868,7 @@ module Anonymous = struct
           "Malformed double-%a evidence"
           pp_denunciation_kind
           kind)
-      Data_encoding.(obj1 (req "kind" denunciation_kind_encoding))
+      Data_encoding.(obj1 (req "kind" Misbehaviour.kind_encoding))
       (function Invalid_denunciation kind -> Some kind | _ -> None)
       (fun kind -> Invalid_denunciation kind) ;
     register_error_kind
@@ -793,15 +883,15 @@ module Anonymous = struct
           "Inconsistent double-%a evidence (distinct delegate: %a and %a)"
           pp_denunciation_kind
           kind
-          Signature.Public_key_hash.pp_short
+          Implicit_account_repr.pp_short
           delegate1
-          Signature.Public_key_hash.pp_short
+          Implicit_account_repr.pp_short
           delegate2)
       Data_encoding.(
         obj3
-          (req "kind" denunciation_kind_encoding)
-          (req "delegate1" Signature.Public_key_hash.encoding)
-          (req "delegate2" Signature.Public_key_hash.encoding))
+          (req "kind" Misbehaviour.kind_encoding)
+          (req "delegate1" Implicit_account_repr.encoding)
+          (req "delegate2" Implicit_account_repr.encoding))
       (function
         | Inconsistent_denunciation {kind; delegate1; delegate2} ->
             Some (kind, delegate1, delegate2)
@@ -817,16 +907,16 @@ module Anonymous = struct
         Format.fprintf
           ppf
           "Delegate %a at level %a has already been denounced for a double %a."
-          pp_denunciation_kind
-          kind
-          Signature.Public_key_hash.pp
+          Implicit_account_repr.pp
           delegate
           Level.pp
-          level)
+          level
+          pp_denunciation_kind
+          kind)
       Data_encoding.(
         obj3
-          (req "denunciation_kind" denunciation_kind_encoding)
-          (req "delegate" Signature.Public_key_hash.encoding)
+          (req "denunciation_kind" Misbehaviour.kind_encoding)
+          (req "delegate" Implicit_account_repr.encoding)
           (req "level" Level.encoding))
       (function
         | Already_denounced {kind; delegate; level} ->
@@ -851,7 +941,7 @@ module Anonymous = struct
           existing)
       Data_encoding.(
         obj2
-          (req "denunciation_kind" denunciation_kind_encoding)
+          (req "denunciation_kind" Misbehaviour.kind_encoding)
           (req "conflict" operation_conflict_encoding))
       (function
         | Conflicting_denunciation {kind; conflict} -> Some (kind, conflict)
@@ -861,12 +951,12 @@ module Anonymous = struct
       `Temporary
       ~id:"validate.operation.block.too_early_denunciation"
       ~title:"Too early denunciation"
-      ~description:"A denunciation is too far in the future"
+      ~description:"A denunciation is for a future level"
       ~pp:(fun ppf (kind, level, current) ->
         Format.fprintf
           ppf
-          "A double-%a denunciation is too far in the future (current level: \
-           %a, given level: %a)"
+          "A double-%a denunciation is for a future level (current level: %a, \
+           given level: %a)"
           pp_denunciation_kind
           kind
           Raw_level.pp
@@ -875,7 +965,7 @@ module Anonymous = struct
           level)
       Data_encoding.(
         obj3
-          (req "kind" denunciation_kind_encoding)
+          (req "kind" Misbehaviour.kind_encoding)
           (req "level" Raw_level.encoding)
           (req "current" Raw_level.encoding))
       (function
@@ -902,7 +992,7 @@ module Anonymous = struct
           level)
       Data_encoding.(
         obj3
-          (req "kind" denunciation_kind_encoding)
+          (req "kind" Misbehaviour.kind_encoding)
           (req "level" Raw_level.encoding)
           (req "last" Cycle.encoding))
       (function
@@ -910,7 +1000,555 @@ module Anonymous = struct
             Some (kind, level, last_cycle)
         | _ -> None)
       (fun (kind, level, last_cycle) ->
-        Outdated_denunciation {kind; level; last_cycle})
+        Outdated_denunciation {kind; level; last_cycle}) ;
+    register_error_kind
+      `Permanent
+      ~id:"operations.validation.aggregate_denunciation_not_implemented"
+      ~title:"Aggregate denunciation not implemented"
+      ~description:"Denunciation of aggregate operations is not yet implemented"
+      ~pp:(fun ppf () ->
+        Format.fprintf
+          ppf
+          "Denunciation of aggregate operations is not yet implemented")
+      Data_encoding.empty
+      (function Aggregate_denunciation_not_implemented -> Some () | _ -> None)
+      (fun () -> Aggregate_denunciation_not_implemented)
+
+  type error +=
+    | Invalid_accusation_inconsistent_consensus_slot
+    | Invalid_accusation_of_preattestation
+    | Too_early_dal_denunciation of {level : Raw_level.t; current : Raw_level.t}
+    | Outdated_dal_denunciation of {level : Raw_level.t; last_cycle : Cycle.t}
+    | Invalid_shard_index of {given : int; min : int; max : int}
+    | Invalid_lag_index of {given : int; min : int; max : int}
+    | Dal_already_denounced of {
+        delegate : Implicit_account_repr.t;
+        level : Raw_level.t;
+      }
+    | Invalid_accusation_no_dal_content of {
+        tb_slot : Slot.t;
+        level : Raw_level.t;
+        slot_index : Dal.Slot_index.t;
+        lag_index_opt : int option;
+      }
+    | Invalid_accusation_unexpected_lag_index of {
+        tb_slot : Slot.t;
+        level : Raw_level.t;
+        slot_index : Dal.Slot_index.t;
+        lag_index_opt : int option;
+      }
+    | Invalid_accusation_slot_not_attested of {
+        tb_slot : Slot.t;
+        level : Raw_level.t;
+        slot_index : Dal.Slot_index.t;
+        lag_index_opt : int option;
+      }
+    | Invalid_accusation_shard_is_not_trap of {
+        delegate : Implicit_account_repr.t;
+        level : Raw_level.t;
+        slot_index : Dal.Slot_index.t;
+        lag_index_opt : int option;
+        shard_index : int;
+      }
+    | Invalid_accusation_wrong_shard_owner of {
+        delegate : Implicit_account_repr.t;
+        level : Raw_level.t;
+        slot_index : Dal.Slot_index.t;
+        lag_index_opt : int option;
+        shard_index : int;
+        shard_owner : Implicit_account_repr.t;
+      }
+    | Invalid_accusation_slot_not_published of {
+        delegate : Implicit_account_repr.t;
+        level : Raw_level.t;
+        slot_index : Dal.Slot_index.t;
+        lag_index_opt : int option;
+      }
+    | Accusation_validity_error_cannot_get_slot_headers of {
+        delegate : Implicit_account_repr.t;
+        level : Raw_level.t;
+        slot_index : Dal.Slot_index.t;
+        lag_index_opt : int option;
+      }
+    | Accusation_validity_error_levels_mismatch of {
+        delegate : Implicit_account_repr.t;
+        level : Raw_level.t;
+        slot_index : Dal.Slot_index.t;
+        lag_index_opt : int option;
+        accusation_published_level : Raw_level.t;
+        store_published_level : Raw_level.t;
+      }
+    | Conflicting_dal_entrapment of operation_conflict
+
+  let () =
+    let open Data_encoding in
+    register_error_kind
+      `Permanent
+      ~id:"validate.operation.invalid_accusation_inconsistent_consensus_slot"
+      ~title:"Invalid DAL denunciation: inconsistent consensus slot"
+      ~description:
+        "The denounced attestation must be either a standalone attestation for \
+         the denounced consensus slot, or an attestations aggregate whose \
+         committee includes the denounced consensus slot."
+      empty
+      (function
+        | Invalid_accusation_inconsistent_consensus_slot -> Some () | _ -> None)
+      (fun () -> Invalid_accusation_inconsistent_consensus_slot) ;
+    register_error_kind
+      `Permanent
+      ~id:"validate.operation.invalid_accusation_of_preattestation"
+      ~title:"Invalid DAL denunciation of preattestation"
+      ~description:
+        "DAL denunciations cannot target preattestations, since they have no \
+         DAL content."
+      empty
+      (function Invalid_accusation_of_preattestation -> Some () | _ -> None)
+      (fun () -> Invalid_accusation_of_preattestation) ;
+    register_error_kind
+      `Temporary
+      ~id:"validate.operation.block.too_early_dal_denunciation"
+      ~title:"Too early DAL denunciation"
+      ~description:"A DAL denunciation is for a future level"
+      ~pp:(fun ppf (level, current) ->
+        Format.fprintf
+          ppf
+          "A DAL entrapment denunciation is for a future level (current level: \
+           %a, given level: %a)"
+          Raw_level.pp
+          current
+          Raw_level.pp
+          level)
+      (obj2 (req "level" Raw_level.encoding) (req "current" Raw_level.encoding))
+      (function
+        | Too_early_dal_denunciation {level; current} -> Some (level, current)
+        | _ -> None)
+      (fun (level, current) -> Too_early_dal_denunciation {level; current}) ;
+    register_error_kind
+      `Permanent
+      ~id:"validate.operation.block.outdated_dal_denunciation"
+      ~title:"Outdated DAL denunciation"
+      ~description:"A DAL denunciation is outdated."
+      ~pp:(fun ppf (level, last_cycle) ->
+        Format.fprintf
+          ppf
+          "A DAL entrapment denunciation is outdated (last acceptable cycle: \
+           %a, given level: %a)."
+          Cycle.pp
+          last_cycle
+          Raw_level.pp
+          level)
+      (obj2 (req "level" Raw_level.encoding) (req "last" Cycle.encoding))
+      (function
+        | Outdated_dal_denunciation {level; last_cycle} ->
+            Some (level, last_cycle)
+        | _ -> None)
+      (fun (level, last_cycle) -> Outdated_dal_denunciation {level; last_cycle}) ;
+    register_error_kind
+      `Permanent
+      ~id:"validate.operation.block.invalid_dal_shard_index"
+      ~title:"Invalid DAL shard index"
+      ~description:
+        "The given shard index is out of range of representable shard indices"
+      ~pp:(fun ppf (given, min, max) ->
+        Format.fprintf
+          ppf
+          "The given shard index %d is out of range of representable shard \
+           indices [%d, %d]"
+          given
+          min
+          max)
+      (obj3 (req "given" int31) (req "min" int31) (req "max" int31))
+      (function
+        | Invalid_shard_index {given; min; max} -> Some (given, min, max)
+        | _ -> None)
+      (fun (given, min, max) -> Invalid_shard_index {given; min; max}) ;
+    register_error_kind
+      `Permanent
+      ~id:"validate.operation.block.invalid_dal_lag_index"
+      ~title:"Invalid DAL lag index"
+      ~description:
+        "The given lag index is out of range of representable lag indices"
+      ~pp:(fun ppf (given, min, max) ->
+        Format.fprintf
+          ppf
+          "The given lag index %d is out of range of representable lag indices \
+           [%d, %d]"
+          given
+          min
+          max)
+      (obj3 (req "given" int31) (req "min" int31) (req "max" int31))
+      (function
+        | Invalid_lag_index {given; min; max} -> Some (given, min, max)
+        | _ -> None)
+      (fun (given, min, max) -> Invalid_lag_index {given; min; max}) ;
+    register_error_kind
+      `Branch
+      ~id:"validate.operation.already_dal_denounced"
+      ~title:"Already denounced for DAL entrapement"
+      ~description:"The same DAL denunciation has already been validated."
+      ~pp:(fun ppf (delegate, level) ->
+        Format.fprintf
+          ppf
+          "Delegate %a at level %a has already been denounced for a DAL \
+           entrapment."
+          Implicit_account_repr.pp
+          delegate
+          Raw_level.pp
+          level)
+      (obj2
+         (req "delegate" Implicit_account_repr.encoding)
+         (req "level" Raw_level.encoding))
+      (function
+        | Dal_already_denounced {delegate; level} -> Some (delegate, level)
+        | _ -> None)
+      (fun (delegate, level) -> Dal_already_denounced {delegate; level}) ;
+
+    register_error_kind
+      `Permanent
+      ~id:"validate.operation.invalid_accusation_no_dal_content"
+      ~title:"Invalid accusation: no DAL content"
+      ~description:
+        "Invalid accusation: the attestation operation has no DAL content for \
+         the denounced consensus slot."
+      ~pp:(fun ppf (tb_slot, level, slot_index, lag_index_opt) ->
+        Format.fprintf
+          ppf
+          "Invalid accusation for consensus slot %a, level %a, lag_index %a, \
+           and DAL slot index %a: the attestation operation has no DAL content \
+           for this consensus slot."
+          Slot.pp
+          tb_slot
+          Raw_level.pp
+          level
+          (pp_option Format.pp_print_int)
+          lag_index_opt
+          Dal.Slot_index.pp
+          slot_index)
+      (obj4
+         (req "TB_slot" Slot.encoding)
+         (req "level" Raw_level.encoding)
+         (req "slot_index" Dal.Slot_index.encoding)
+         (opt "lag_index" Data_encoding.uint8))
+      (function
+        | Invalid_accusation_no_dal_content
+            {tb_slot; level; slot_index; lag_index_opt} ->
+            Some (tb_slot, level, slot_index, lag_index_opt)
+        | _ -> None)
+      (fun (tb_slot, level, slot_index, lag_index_opt) ->
+        Invalid_accusation_no_dal_content
+          {tb_slot; level; slot_index; lag_index_opt}) ;
+    register_error_kind
+      `Permanent
+      ~id:"validate.operation.invalid_accusation_unexpected_lag_index"
+      ~title:"Invalid accusation: unexpected lag index presence/absence"
+      ~description:"Invalid accusation: unexpected lag index presence/absence."
+      ~pp:(fun ppf (tb_slot, level, slot_index, lag_index_opt) ->
+        Format.fprintf
+          ppf
+          "Invalid accusation for validator slot %a, level %a, lag_index %a, \
+           and DAL slot index %a. The lag index's %s is unexpected."
+          Slot.pp
+          tb_slot
+          Raw_level.pp
+          level
+          (pp_option Format.pp_print_int)
+          lag_index_opt
+          Dal.Slot_index.pp
+          slot_index
+          (match lag_index_opt with None -> "absence" | Some _ -> "presence"))
+      (obj4
+         (req "TB_slot" Slot.encoding)
+         (req "level" Raw_level.encoding)
+         (req "slot_index" Dal.Slot_index.encoding)
+         (opt "lag_index" Data_encoding.uint8))
+      (function
+        | Invalid_accusation_unexpected_lag_index
+            {tb_slot; level; slot_index; lag_index_opt} ->
+            Some (tb_slot, level, slot_index, lag_index_opt)
+        | _ -> None)
+      (fun (tb_slot, level, slot_index, lag_index_opt) ->
+        Invalid_accusation_unexpected_lag_index
+          {tb_slot; level; slot_index; lag_index_opt}) ;
+    register_error_kind
+      `Permanent
+      ~id:"validate.operation.invalid_accusation_slot_not_attested"
+      ~title:"Invalid accusation: the delegate did not attest the DAL slot"
+      ~description:
+        "Invalid accusation: the delegate did not attest the DAL slot."
+      ~pp:(fun ppf (tb_slot, level, slot_index, lag_index_opt) ->
+        Format.fprintf
+          ppf
+          "Invalid accusation for validator slot %a, level %a, lag_index %a, \
+           and DAL slot index %a: the delegate did not attest the DAL slot."
+          Slot.pp
+          tb_slot
+          Raw_level.pp
+          level
+          (pp_option Format.pp_print_int)
+          lag_index_opt
+          Dal.Slot_index.pp
+          slot_index)
+      (obj4
+         (req "TB_slot" Slot.encoding)
+         (req "level" Raw_level.encoding)
+         (req "slot_index" Dal.Slot_index.encoding)
+         (opt "lag_index" Data_encoding.uint8))
+      (function
+        | Invalid_accusation_slot_not_attested
+            {tb_slot; level; slot_index; lag_index_opt} ->
+            Some (tb_slot, level, slot_index, lag_index_opt)
+        | _ -> None)
+      (fun (tb_slot, level, slot_index, lag_index_opt) ->
+        Invalid_accusation_slot_not_attested
+          {tb_slot; level; slot_index; lag_index_opt}) ;
+    register_error_kind
+      `Permanent
+      ~id:"validate.operation.invalid_accusation_shard_is_not_trap"
+      ~title:"Invalid accusation: the provided shard is not a trap"
+      ~description:"Invalid accusation: the provided shard is not a trap."
+      ~pp:(fun ppf (delegate, level, slot_index, lag_index_opt, shard_index) ->
+        Format.fprintf
+          ppf
+          "Invalid accusation for delegate %a, level %a, DAL slot index %a, \
+           lag_index %a, and shard index %d: the provided shard is not a trap."
+          Implicit_account_repr.pp
+          delegate
+          Raw_level.pp
+          level
+          Dal.Slot_index.pp
+          slot_index
+          (pp_option Format.pp_print_int)
+          lag_index_opt
+          shard_index)
+      (obj5
+         (req "delegate" Implicit_account_repr.encoding)
+         (req "level" Raw_level.encoding)
+         (req "slot_index" Dal.Slot_index.encoding)
+         (opt "lag_index" Data_encoding.uint8)
+         (req "shard_index" int31))
+      (function
+        | Invalid_accusation_shard_is_not_trap
+            {delegate; level; slot_index; lag_index_opt; shard_index} ->
+            Some (delegate, level, slot_index, lag_index_opt, shard_index)
+        | _ -> None)
+      (fun (delegate, level, slot_index, lag_index_opt, shard_index) ->
+        Invalid_accusation_shard_is_not_trap
+          {delegate; level; slot_index; lag_index_opt; shard_index}) ;
+    register_error_kind
+      `Permanent
+      ~id:"validate.operation.invalid_accusation_wrong_shard_owner"
+      ~title:
+        "Invalid accusation: the provided shard is not assigned to the attester"
+      ~description:
+        "Invalid accusation: the provided shard is not assigned to the \
+         attester."
+      ~pp:(fun
+          ppf
+          (delegate, level, slot_index, lag_index_opt, shard_index, shard_owner)
+        ->
+        Format.fprintf
+          ppf
+          "Invalid accusation for delegate %a, level %a, DAL slot index %a, \
+           lag_index %a, and shard index %d: the shard is assigned to %a, not \
+           the attester."
+          Implicit_account_repr.pp
+          delegate
+          Raw_level.pp
+          level
+          Dal.Slot_index.pp
+          slot_index
+          (pp_option Format.pp_print_int)
+          lag_index_opt
+          shard_index
+          Implicit_account_repr.pp
+          shard_owner)
+      (obj6
+         (req "delegate" Implicit_account_repr.encoding)
+         (req "level" Raw_level.encoding)
+         (req "slot_index" Dal.Slot_index.encoding)
+         (opt "lag_index" Data_encoding.uint8)
+         (req "shard_index" Data_encoding.int31)
+         (req "shard_owner" Implicit_account_repr.encoding))
+      (function
+        | Invalid_accusation_wrong_shard_owner
+            {
+              delegate;
+              level;
+              slot_index;
+              lag_index_opt;
+              shard_index;
+              shard_owner;
+            } ->
+            Some
+              ( delegate,
+                level,
+                slot_index,
+                lag_index_opt,
+                shard_index,
+                shard_owner )
+        | _ -> None)
+      (fun (delegate, level, slot_index, lag_index_opt, shard_index, shard_owner)
+         ->
+        Invalid_accusation_wrong_shard_owner
+          {delegate; level; slot_index; lag_index_opt; shard_index; shard_owner}) ;
+    register_error_kind
+      `Permanent
+      ~id:"validate.operation.invalid_accusation_slot_not_published"
+      ~title:"Invalid accusation: DAL slot not published"
+      ~description:"Invalid accusation: the DAL slot was not published."
+      ~pp:(fun ppf (delegate, level, slot_index, lag_index_opt) ->
+        Format.fprintf
+          ppf
+          "Invalid accusation for delegate %a, level %a, lag_index %a, and DAL \
+           slot index %a: the DAL slot was not published."
+          Implicit_account_repr.pp
+          delegate
+          Raw_level.pp
+          level
+          (pp_option Format.pp_print_int)
+          lag_index_opt
+          Dal.Slot_index.pp
+          slot_index)
+      (obj4
+         (req "delegate" Implicit_account_repr.encoding)
+         (req "level" Raw_level.encoding)
+         (req "slot_index" Dal.Slot_index.encoding)
+         (opt "lag_index" Data_encoding.uint8))
+      (function
+        | Invalid_accusation_slot_not_published
+            {delegate; level; slot_index; lag_index_opt} ->
+            Some (delegate, level, slot_index, lag_index_opt)
+        | _ -> None)
+      (fun (delegate, level, slot_index, lag_index_opt) ->
+        Invalid_accusation_slot_not_published
+          {delegate; level; slot_index; lag_index_opt}) ;
+    register_error_kind
+      `Permanent
+      ~id:"validate.operation.accusation_validity_error_cannot_get_slot_headers"
+      ~title:"Accusation validity error: cannot get slot headers"
+      ~description:
+        "Accusation validity internal error: unable to retrieve the required \
+         DAL slot headers."
+      ~pp:(fun ppf (delegate, level, slot_index, lag_index_opt) ->
+        Format.fprintf
+          ppf
+          "Accusation validity internal error for delegate %a, level %a, \
+           lag_index %a, and DAL slot index %a: unable to retrieve the \
+           required slot headers."
+          Implicit_account_repr.pp
+          delegate
+          Raw_level.pp
+          level
+          (pp_option Format.pp_print_int)
+          lag_index_opt
+          Dal.Slot_index.pp
+          slot_index)
+      (obj4
+         (req "delegate" Implicit_account_repr.encoding)
+         (req "level" Raw_level.encoding)
+         (req "slot_index" Dal.Slot_index.encoding)
+         (opt "lag_index" Data_encoding.uint8))
+      (function
+        | Accusation_validity_error_cannot_get_slot_headers
+            {delegate; level; slot_index; lag_index_opt} ->
+            Some (delegate, level, slot_index, lag_index_opt)
+        | _ -> None)
+      (fun (delegate, level, slot_index, lag_index_opt) ->
+        Accusation_validity_error_cannot_get_slot_headers
+          {delegate; level; slot_index; lag_index_opt}) ;
+    register_error_kind
+      `Permanent
+      ~id:"validate.operation.accusation_validity_error_levels_mismatch"
+      ~title:"Accusation validity internal error: levels mismatch"
+      ~description:
+        "Accusation validity internal error: mismatch between published levels \
+         in storage and evidence."
+      ~pp:(fun
+          ppf
+          ( delegate,
+            level,
+            slot_index,
+            lag_index_opt,
+            accusation_published_level,
+            store_published_level )
+        ->
+        Format.fprintf
+          ppf
+          "Accusation validity error for delegate %a, level %a, lag_index %a, \
+           and DAL slot index %a: mismatch between published levels in \
+           evidence (%a) and storage (%a)."
+          Implicit_account_repr.pp
+          delegate
+          Raw_level.pp
+          level
+          (pp_option Format.pp_print_int)
+          lag_index_opt
+          Dal.Slot_index.pp
+          slot_index
+          Raw_level.pp
+          accusation_published_level
+          Raw_level.pp
+          store_published_level)
+      (obj6
+         (req "delegate" Implicit_account_repr.encoding)
+         (req "level" Raw_level.encoding)
+         (req "slot_index" Dal.Slot_index.encoding)
+         (opt "lag_index" Data_encoding.uint8)
+         (req "accusation_published_level" Raw_level.encoding)
+         (req "store_published_level" Raw_level.encoding))
+      (function
+        | Accusation_validity_error_levels_mismatch
+            {
+              delegate;
+              level;
+              slot_index;
+              lag_index_opt;
+              accusation_published_level;
+              store_published_level;
+            } ->
+            Some
+              ( delegate,
+                level,
+                slot_index,
+                lag_index_opt,
+                accusation_published_level,
+                store_published_level )
+        | _ -> None)
+      (fun ( delegate,
+             level,
+             slot_index,
+             lag_index_opt,
+             accusation_published_level,
+             store_published_level )
+         ->
+        Accusation_validity_error_levels_mismatch
+          {
+            delegate;
+            level;
+            slot_index;
+            lag_index_opt;
+            accusation_published_level;
+            store_published_level;
+          }) ;
+    register_error_kind
+      `Branch
+      ~id:"validate.operation.conflicting_dal_entrapment"
+      ~title:"Conflicting DAL entrapment in the current validation state)."
+      ~description:
+        "A DAL entrapment evidence for the same level and a larger DAL \
+         attestation has already been validated for the current validation \
+         state."
+      ~pp:(fun ppf (Operation_conflict {existing; _}) ->
+        Format.fprintf
+          ppf
+          "This DAL entrapment evidence is conflicting with an existing \
+           entrapment evidence %a"
+          Operation_hash.pp
+          existing)
+      (obj1 (req "conflict" operation_conflict_encoding))
+      (function
+        | Conflicting_dal_entrapment conflict -> Some conflict | _ -> None)
+      (fun conflict -> Conflicting_dal_entrapment conflict)
 
   type error += Conflicting_nonce_revelation of operation_conflict
 
@@ -955,21 +1593,21 @@ module Anonymous = struct
       (fun conflict -> Conflicting_vdf_revelation conflict)
 
   type error +=
-    | Drain_delegate_on_unregistered_delegate of Signature.Public_key_hash.t
+    | Drain_delegate_on_unregistered_delegate of Implicit_account_repr.t
     | Invalid_drain_delegate_inactive_key of {
-        delegate : Signature.Public_key_hash.t;
+        delegate : Implicit_account_repr.t;
         consensus_key : Signature.Public_key_hash.t;
         active_consensus_key : Signature.Public_key_hash.t;
       }
-    | Invalid_drain_delegate_no_consensus_key of Signature.Public_key_hash.t
-    | Invalid_drain_delegate_noop of Signature.Public_key_hash.t
+    | Invalid_drain_delegate_no_consensus_key of Implicit_account_repr.t
+    | Invalid_drain_delegate_noop of Implicit_account_repr.t
     | Invalid_drain_delegate_insufficient_funds_for_burn_or_fees of {
-        delegate : Signature.Public_key_hash.t;
-        destination : Signature.Public_key_hash.t;
+        delegate : Implicit_account_repr.t;
+        destination : Implicit_account_repr.t;
         min_amount : Tez.t;
       }
     | Conflicting_drain_delegate of {
-        delegate : Signature.Public_key_hash.t;
+        delegate : Implicit_account_repr.t;
         conflict : operation_conflict;
       }
 
@@ -983,9 +1621,9 @@ module Anonymous = struct
         Format.fprintf
           ppf
           "Cannot drain an unregistered delegate %a."
-          Signature.Public_key_hash.pp
+          Implicit_account_repr.pp
           c)
-      Data_encoding.(obj1 (req "delegate" Signature.Public_key_hash.encoding))
+      Data_encoding.(obj1 (req "delegate" Implicit_account_repr.encoding))
       (function
         | Drain_delegate_on_unregistered_delegate c -> Some c | _ -> None)
       (fun c -> Drain_delegate_on_unregistered_delegate c) ;
@@ -1001,13 +1639,13 @@ module Anonymous = struct
            The active consensus key is %a."
           Signature.Public_key_hash.pp
           consensus_key
-          Signature.Public_key_hash.pp
+          Implicit_account_repr.pp
           delegate
           Signature.Public_key_hash.pp
           active_consensus_key)
       Data_encoding.(
         obj3
-          (req "delegate" Signature.Public_key_hash.encoding)
+          (req "delegate" Implicit_account_repr.encoding)
           (req "consensus_key" Signature.Public_key_hash.encoding)
           (req "active_consensus_key" Signature.Public_key_hash.encoding))
       (function
@@ -1027,9 +1665,9 @@ module Anonymous = struct
         Format.fprintf
           ppf
           "There is no active consensus key for delegate %a."
-          Signature.Public_key_hash.pp
+          Implicit_account_repr.pp
           delegate)
-      Data_encoding.(obj1 (req "delegate" Signature.Public_key_hash.encoding))
+      Data_encoding.(obj1 (req "delegate" Implicit_account_repr.encoding))
       (function
         | Invalid_drain_delegate_no_consensus_key c -> Some c | _ -> None)
       (fun c -> Invalid_drain_delegate_no_consensus_key c) ;
@@ -1043,9 +1681,9 @@ module Anonymous = struct
           ppf
           "The destination of a drain operation cannot be the delegate itself \
            (%a)."
-          Signature.Public_key_hash.pp
+          Implicit_account_repr.pp
           delegate)
-      Data_encoding.(obj1 (req "delegate" Signature.Public_key_hash.encoding))
+      Data_encoding.(obj1 (req "delegate" Implicit_account_repr.encoding))
       (function Invalid_drain_delegate_noop c -> Some c | _ -> None)
       (fun c -> Invalid_drain_delegate_noop c) ;
     register_error_kind
@@ -1060,16 +1698,16 @@ module Anonymous = struct
           ppf
           "Cannot drain delegate from %a to %a: not enough funds for the drain \
            fees in the delegate account (minimum balance required: %a)."
-          Signature.Public_key_hash.pp
+          Implicit_account_repr.pp
           delegate
-          Signature.Public_key_hash.pp
+          Implicit_account_repr.pp
           destination
           Tez.pp
           min_amount)
       Data_encoding.(
         obj3
-          (req "delegate" Signature.Public_key_hash.encoding)
-          (req "destination" Signature.Public_key_hash.encoding)
+          (req "delegate" Implicit_account_repr.encoding)
+          (req "destination" Implicit_account_repr.encoding)
           (req "min_amount" Tez.encoding))
       (function
         | Invalid_drain_delegate_insufficient_funds_for_burn_or_fees
@@ -1091,11 +1729,11 @@ module Anonymous = struct
           "This drain operation conflicts with operation %a for the delegate %a"
           Operation_hash.pp
           existing
-          Signature.Public_key_hash.pp
+          Implicit_account_repr.pp
           delegate)
       Data_encoding.(
         obj2
-          (req "delegate" Signature.Public_key_hash.encoding)
+          (req "delegate" Implicit_account_repr.encoding)
           (req "conflict" operation_conflict_encoding))
       (function
         | Conflicting_drain_delegate {delegate; conflict} ->
@@ -1108,18 +1746,50 @@ end
 module Manager = struct
   type error +=
     | Manager_restriction of {
-        source : Signature.Public_key_hash.t;
+        source : Implicit_account_repr.t;
         conflict : operation_conflict;
       }
-    | Inconsistent_sources
-    | Inconsistent_counters
+    | Inconsistent_sources of {
+        expected_source : Implicit_account_repr.t;
+        source : Implicit_account_repr.t;
+      }
+    | Inconsistent_counters of {
+        source : Implicit_account_repr.t;
+        previous_counter : Manager_counter.t;
+        counter : Manager_counter.t;
+      }
     | Incorrect_reveal_position
+    | Missing_bls_proof of {
+        kind : Operation_repr.public_key_kind;
+        source : Implicit_account_repr.t;
+        public_key : public_key;
+      }
+    | Incorrect_bls_proof of {
+        kind : Operation_repr.public_key_kind;
+        public_key : public_key;
+        proof : Bls.t;
+      }
+    | Unused_bls_proof of {
+        kind : Operation_repr.public_key_kind;
+        source : Implicit_account_repr.t;
+        public_key : public_key;
+      }
+    | Update_companion_key_not_tz4 of {
+        source : Implicit_account_repr.t;
+        public_key : public_key;
+      }
     | Insufficient_gas_for_manager
     | Gas_quota_exceeded_init_deserialize
-    | Tx_rollup_feature_disabled
-    | Sc_rollup_feature_disabled
     | Sc_rollup_arith_pvm_disabled
+    | Sc_rollup_riscv_pvm_disabled
     | Zk_rollup_feature_disabled
+    | Tz5_account_disabled
+    | Sc_rollup_refutation_game_start_too_early of {
+        current_level : Raw_level.t;
+        earliest_start_level : Raw_level.t;
+        conflict_inbox_level : Raw_level.t;
+        commitment_period_in_blocks : int;
+      }
 
   let () =
     register_error_kind
@@ -1133,45 +1803,63 @@ module Manager = struct
         Format.fprintf
           ppf
           "Manager %a already has the operation %a in the current block."
-          Signature.Public_key_hash.pp
+          Implicit_account_repr.pp
           source
           Operation_hash.pp
           existing)
       Data_encoding.(
         obj2
-          (req "source" Signature.Public_key_hash.encoding)
+          (req "source" Implicit_account_repr.encoding)
           (req "conflict" operation_conflict_encoding))
       (function
         | Manager_restriction {source; conflict} -> Some (source, conflict)
         | _ -> None)
       (fun (source, conflict) -> Manager_restriction {source; conflict}) ;
-    let inconsistent_sources_description =
-      "The operation batch includes operations from different sources."
-    in
     register_error_kind
       `Permanent
       ~id:"validate.operation.inconsistent_sources"
       ~title:"Inconsistent sources in operation batch"
-      ~description:inconsistent_sources_description
-      ~pp:(fun ppf () ->
-        Format.fprintf ppf "%s" inconsistent_sources_description)
-      Data_encoding.empty
-      (function Inconsistent_sources -> Some () | _ -> None)
-      (fun () -> Inconsistent_sources) ;
-    let inconsistent_counters_description =
-      "Inconsistent counters in operation. Counters of an operation must be \
-       successive."
-    in
+      ~description:
+        "Inconsistent sources in operation batch. All operations in a batch \
+         must have the same source."
+      Data_encoding.(
+        obj2
+          (req "first_source" Implicit_account_repr.encoding)
+          (req "unexpected_source" Implicit_account_repr.encoding))
+      (function
+        | Inconsistent_sources {expected_source; source} ->
+            Some (expected_source, source)
+        | _ -> None)
+      (fun (expected_source, source) ->
+        Inconsistent_sources {expected_source; source}) ;
     register_error_kind
       `Permanent
       ~id:"validate.operation.inconsistent_counters"
       ~title:"Inconsistent counters in operation"
-      ~description:inconsistent_counters_description
-      ~pp:(fun ppf () ->
-        Format.fprintf ppf "%s" inconsistent_counters_description)
-      Data_encoding.empty
-      (function Inconsistent_counters -> Some () | _ -> None)
-      (fun () -> Inconsistent_counters) ;
+      ~description:
+        "Inconsistent counters in operation batch. Counters must be increasing \
+         and consecutive."
+      ~pp:(fun ppf (source, previous_counter, counter) ->
+        Format.fprintf
+          ppf
+          "Non-consecutive counters for source %a: jumped from %a to %a."
+          Implicit_account_repr.pp
+          source
+          Manager_counter.pp
+          previous_counter
+          Manager_counter.pp
+          counter)
+      Data_encoding.(
+        obj3
+          (req "source" Implicit_account_repr.encoding)
+          (req "previous_counter" Manager_counter.encoding_for_errors)
+          (req "wrong_counter" Manager_counter.encoding_for_errors))
+      (function
+        | Inconsistent_counters {source; previous_counter; counter} ->
+            Some (source, previous_counter, counter)
+        | _ -> None)
+      (fun (source, previous_counter, counter) ->
+        Inconsistent_counters {source; previous_counter; counter}) ;
     let incorrect_reveal_description =
       "Incorrect reveal operation position in batch: only allowed in first \
        position."
@@ -1185,6 +1873,119 @@ module Manager = struct
       Data_encoding.empty
       (function Incorrect_reveal_position -> Some () | _ -> None)
       (fun () -> Incorrect_reveal_position) ;
+    register_error_kind
+      `Permanent
+      ~id:"validate.operation.missing_bls_proof"
+      ~title:"Proof of possession is required for tz4 key"
+      ~description:
+        "Revealing tz4 public keys and updating consensus and companion keys \
+         with tz4 require a proof of possession."
+      ~pp:(fun ppf (kind, source, pk) ->
+        Format.fprintf
+          ppf
+          "%s a BLS %a key %a from %a should contain a proof of possession."
+          (match (kind : Operation_repr.public_key_kind) with
+          | Manager_pk -> "Reveal of"
+          | _ -> "Update to")
+          Operation_repr.pp_public_key_kind
+          kind
+          Signature.Public_key.pp
+          pk
+          Implicit_account_repr.pp
+          source)
+      Data_encoding.(
+        obj3
+          (req "kind" Operation_repr.public_key_kind_encoding)
+          (req "source" Implicit_account_repr.encoding)
+          (req "public_key" Signature.Public_key.encoding))
+      (function
+        | Missing_bls_proof {kind; source; public_key} ->
+            Some (kind, source, public_key)
+        | _ -> None)
+      (fun (kind, source, public_key) ->
+        Missing_bls_proof {kind; source; public_key}) ;
+    register_error_kind
+      `Permanent
+      ~id:"validate.operation.incorrect_bls_proof"
+      ~title:"Incorrect proof of possession for tz4 key"
+      ~description:"Incorrect proof of possession for tz4 key."
+      ~pp:(fun ppf (kind, pk, proof) ->
+        Format.fprintf
+          ppf
+          "%s a BLS %a key %a contains an incorrect proof of possession %a."
+          (match (kind : Operation_repr.public_key_kind) with
+          | Manager_pk -> "Reveal of"
+          | _ -> "Update to")
+          Operation_repr.pp_public_key_kind
+          kind
+          Signature.Public_key.pp
+          pk
+          Bls.pp
+          proof)
+      Data_encoding.(
+        obj3
+          (req "kind" Operation_repr.public_key_kind_encoding)
+          (req "public_key" Signature.Public_key.encoding)
+          (req "proof" Bls.encoding))
+      (function
+        | Incorrect_bls_proof {kind; public_key; proof} ->
+            Some (kind, public_key, proof)
+        | _ -> None)
+      (fun (kind, public_key, proof) ->
+        Incorrect_bls_proof {kind; public_key; proof}) ;
+    register_error_kind
+      `Permanent
+      ~id:"validate.operation.unused_bls_proof"
+      ~title:"Proof of possession is only required for tz4 keys"
+      ~description:"Proof of possession is only required for tz4 keys"
+      ~pp:(fun ppf (kind, source, pk) ->
+        Format.fprintf
+          ppf
+          "%s %a key of %a from %a contains an unused proof of possession."
+          (match (kind : Operation_repr.public_key_kind) with
+          | Manager_pk -> "Reveal of"
+          | _ -> "Update to")
+          Operation_repr.pp_public_key_kind
+          kind
+          Signature.Public_key.pp
+          pk
+          Implicit_account_repr.pp
+          source)
+      Data_encoding.(
+        obj3
+          (req "kind" Operation_repr.public_key_kind_encoding)
+          (req "source" Implicit_account_repr.encoding)
+          (req "public_key" Signature.Public_key.encoding))
+      (function
+        | Unused_bls_proof {kind; source; public_key} ->
+            Some (kind, source, public_key)
+        | _ -> None)
+      (fun (kind, source, public_key) ->
+        Unused_bls_proof {kind; source; public_key}) ;
+    register_error_kind
+      `Permanent
+      ~id:"validate.operation.update_companion_key_not_tz4"
+      ~title:"update companion key without a tz4 key"
+      ~description:"Update to a tz4 companion key without providing a tz4 key"
+      ~pp:(fun ppf (source, pk) ->
+        Format.fprintf
+          ppf
+          "Update to the BLS companion key of %a with key %a that should be a \
+           tz4."
+          Implicit_account_repr.pp
+          source
+          Signature.Public_key.pp
+          pk)
+      Data_encoding.(
+        obj2
+          (req "source" Implicit_account_repr.encoding)
+          (req "public_key" Signature.Public_key.encoding))
+      (function
+        | Update_companion_key_not_tz4 {source; public_key} ->
+            Some (source, public_key)
+        | _ -> None)
+      (fun (source, public_key) ->
+        Update_companion_key_not_tz4 {source; public_key}) ;
     register_error_kind
       `Permanent
       ~id:"validate.operation.insufficient_gas_for_manager"
@@ -1212,29 +2013,6 @@ module Manager = struct
       Data_encoding.empty
       (function Gas_quota_exceeded_init_deserialize -> Some () | _ -> None)
       (fun () -> Gas_quota_exceeded_init_deserialize) ;
-    register_error_kind
-      `Permanent
-      ~id:"validate.operation.tx_rollup_is_disabled"
-      ~title:"Tx rollup is disabled"
-      ~description:"Cannot originate a tx rollup as it is disabled."
-      ~pp:(fun ppf () ->
-        Format.fprintf
-          ppf
-          "Cannot apply a tx rollup operation as it is disabled. This feature \
-           will be enabled in a future proposal")
-      Data_encoding.unit
-      (function Tx_rollup_feature_disabled -> Some () | _ -> None)
-      (fun () -> Tx_rollup_feature_disabled) ;
-    let scoru_disabled_description = "Smart rollups are disabled." in
-    register_error_kind
-      `Permanent
-      ~id:"validate.operation.smart_rollup_disabled"
-      ~title:"Smart rollups are disabled"
-      ~description:scoru_disabled_description
-      ~pp:(fun ppf () -> Format.fprintf ppf "%s" scoru_disabled_description)
-      Data_encoding.unit
-      (function Sc_rollup_feature_disabled -> Some () | _ -> None)
-      (fun () -> Sc_rollup_feature_disabled) ;
 
     let scoru_arith_pvm_disabled_description =
       "Arith PVM is disabled in this network."
@@ -1249,6 +2027,19 @@ module Manager = struct
       Data_encoding.unit
       (function Sc_rollup_arith_pvm_disabled -> Some () | _ -> None)
       (fun () -> Sc_rollup_arith_pvm_disabled) ;
+    let scoru_riscv_pvm_disabled_description =
+      "RISCV PVM is disabled in this network."
+    in
+    register_error_kind
+      `Permanent
+      ~id:"operation.riscv_pvm_disabled"
+      ~title:"The RISCV PVM is disabled"
+      ~description:scoru_riscv_pvm_disabled_description
+      ~pp:(fun ppf () ->
+        Format.fprintf ppf "%s" scoru_riscv_pvm_disabled_description)
+      Data_encoding.unit
+      (function Sc_rollup_riscv_pvm_disabled -> Some () | _ -> None)
+      (fun () -> Sc_rollup_riscv_pvm_disabled) ;
     let zkru_disabled_description =
       "ZK rollups will be enabled in a future proposal."
     in
@@ -1260,7 +2051,80 @@ module Manager = struct
       ~pp:(fun ppf () -> Format.fprintf ppf "%s" zkru_disabled_description)
       Data_encoding.unit
       (function Zk_rollup_feature_disabled -> Some () | _ -> None)
-      (fun () -> Zk_rollup_feature_disabled)
+      (fun () -> Zk_rollup_feature_disabled) ;
+    let tz5_account_disabled_description =
+      "tz5 ML-DSA-44 accounts are disabled"
+    in
+    register_error_kind
+      `Permanent
+      ~id:"validate.operation.tz5_account_disabled"
+      ~title:"tz5 ML-DSA-44 accounts are disabled"
+      ~description:tz5_account_disabled_description
+      ~pp:(fun ppf () ->
+        Format.fprintf ppf "%s" tz5_account_disabled_description)
+      Data_encoding.unit
+      (function Tz5_account_disabled -> Some () | _ -> None)
+      (fun () -> Tz5_account_disabled)
+
+  let () =
+    register_error_kind
+      `Temporary
+      ~id:"validate.operation.sc_rollup_refutation_game_start_too_early"
+      ~title:"Refutation game starts too early"
+      ~description:
+        "The refutation game cannot be started yet. The protocol requires a \
+         delay of one commitment period to ensure sufficient time has passed \
+         since the commitment being challenged was published."
+      ~pp:(fun
+          ppf
+          ( current_level,
+            earliest_start_level,
+            conflict_inbox_level,
+            commitment_period_in_blocks )
+        ->
+        Format.fprintf
+          ppf
+          "Cannot start refutation game at level %a. Earliest start level is \
+           %a (= conflict inbox level %a + commitment period %d)."
+          Raw_level.pp
+          current_level
+          Raw_level.pp
+          earliest_start_level
+          Raw_level.pp
+          conflict_inbox_level
+          commitment_period_in_blocks)
+      Data_encoding.(
+        obj4
+          (req "current_level" Raw_level.encoding)
+          (req "earliest_start_level" Raw_level.encoding)
+          (req "conflict_inbox_level" Raw_level.encoding)
+          (req "commitment_period_in_blocks" int31))
+      (function
+        | Sc_rollup_refutation_game_start_too_early
+            {
+              current_level;
+              earliest_start_level;
+              conflict_inbox_level;
+              commitment_period_in_blocks;
+            } ->
+            Some
+              ( current_level,
+                earliest_start_level,
+                conflict_inbox_level,
+                commitment_period_in_blocks )
+        | _ -> None)
+      (fun ( current_level,
+             earliest_start_level,
+             conflict_inbox_level,
+             commitment_period_in_blocks )
+         ->
+        Sc_rollup_refutation_game_start_too_early
+          {
+            current_level;
+            earliest_start_level;
+            conflict_inbox_level;
+            commitment_period_in_blocks;
+          })
 end
 
 type error += Failing_noop_error
@@ -1278,33 +2142,46 @@ let () =
     (fun () -> Failing_noop_error)
 
 module Block = struct
+  (* All block errors are permanent. *)
   type error +=
-    | Not_enough_endorsements of {required : int; provided : int}
+    | Not_enough_attestations of {required : int64; provided : int64}
     | Inconsistent_validation_passes_in_block of {
         expected : int;
         provided : int;
+      }
+    | Invalid_payload_hash of {
+        expected : Block_payload_hash.t;
+        provided : Block_payload_hash.t;
+      }
+    | Locked_round_after_block_round of {
+        locked_round : Round.t;
+        round : Round.t;
+      }
+    | Insufficient_locked_round_evidence of {
+        total_attesting_power : int64;
+        consensus_threshold : int64;
       }
 
   let () =
     register_error_kind
       `Permanent
-      ~id:"validate.block.not_enough_endorsements"
-      ~title:"Not enough endorsements"
+      ~id:"validate.block.not_enough_attestations"
+      ~title:"Not enough attestations"
       ~description:
         "The block being validated does not include the required minimum \
-         number of endorsements."
+         number of attestations."
       ~pp:(fun ppf (required, provided) ->
         Format.fprintf
           ppf
-          "Wrong number of endorsements (%i), at least %i are expected"
+          "Wrong number of attestations (%Li), at least %Li are expected"
           provided
           required)
-      Data_encoding.(obj2 (req "required" int31) (req "provided" int31))
+      Data_encoding.(obj2 (req "required" int64) (req "provided" int64))
       (function
-        | Not_enough_endorsements {required; provided} ->
+        | Not_enough_attestations {required; provided} ->
             Some (required, provided)
         | _ -> None)
-      (fun (required, provided) -> Not_enough_endorsements {required; provided}) ;
+      (fun (required, provided) -> Not_enough_attestations {required; provided}) ;
     register_error_kind
       `Permanent
       ~id:"validate.block.inconsistent_validation_passes_in_block"
@@ -1326,5 +2203,73 @@ module Block = struct
             Some (expected, provided)
         | _ -> None)
       (fun (expected, provided) ->
-        Inconsistent_validation_passes_in_block {expected; provided})
+        Inconsistent_validation_passes_in_block {expected; provided}) ;
+    register_error_kind
+      `Permanent
+      ~id:"validate.block.invalid_payload_hash"
+      ~title:"Invalid payload hash"
+      ~description:"Invalid payload hash."
+      ~pp:(fun ppf (expected, provided) ->
+        Format.fprintf
+          ppf
+          "Invalid payload hash (expected: %a, provided: %a)."
+          Block_payload_hash.pp_short
+          expected
+          Block_payload_hash.pp_short
+          provided)
+      Data_encoding.(
+        obj2
+          (req "expected" Block_payload_hash.encoding)
+          (req "provided" Block_payload_hash.encoding))
+      (function
+        | Invalid_payload_hash {expected; provided} -> Some (expected, provided)
+        | _ -> None)
+      (fun (expected, provided) -> Invalid_payload_hash {expected; provided}) ;
+    () ;
+    register_error_kind
+      `Permanent
+      ~id:"validate.block.locked_round_after_block_round"
+      ~title:"Locked round after block round"
+      ~description:"Locked round after block round."
+      ~pp:(fun ppf (locked_round, round) ->
+        Format.fprintf
+          ppf
+          "Locked round (%a) is after the block round (%a)."
+          Round.pp
+          locked_round
+          Round.pp
+          round)
+      Data_encoding.(
+        obj2 (req "locked_round" Round.encoding) (req "round" Round.encoding))
+      (function
+        | Locked_round_after_block_round {locked_round; round} ->
+            Some (locked_round, round)
+        | _ -> None)
+      (fun (locked_round, round) ->
+        Locked_round_after_block_round {locked_round; round}) ;
+    () ;
+    register_error_kind
+      `Permanent
+      ~id:"validate.block.insufficient_locked_round_evidence"
+      ~title:"Insufficient locked round evidence"
+      ~description:"Insufficient locked round evidence."
+      ~pp:(fun ppf (total_attesting_power, consensus_threshold) ->
+        Format.fprintf
+          ppf
+          "The provided locked round evidence is not sufficient: provided %Ld \
+           total attesting power but was expecting at least %Ld."
+          total_attesting_power
+          consensus_threshold)
+      Data_encoding.(
+        obj2
+          (req "total_attesting_power" int64)
+          (req "consensus_threshold" int64))
+      (function
+        | Insufficient_locked_round_evidence
+            {total_attesting_power; consensus_threshold} ->
+            Some (total_attesting_power, consensus_threshold)
+        | _ -> None)
+      (fun (total_attesting_power, consensus_threshold) ->
+        Insufficient_locked_round_evidence
+          {total_attesting_power; consensus_threshold})
 end

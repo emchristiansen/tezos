@@ -756,8 +756,8 @@ let stat_on_exit (cctxt : Protocol_client_context.full) state =
          included). Note that the operations injected during the last block \
          are ignored because they should not be currently included."
         (if Int.equal injected_ops_count 0 then "N/A"
-        else
-          Format.sprintf "%d%%" (included_ops_count * 100 / injected_ops_count))
+         else
+           Format.sprintf "%d%%" (included_ops_count * 100 / injected_ops_count))
         injected_ops_count
         included_ops_count
     in
@@ -813,7 +813,7 @@ let launch (cctxt : Protocol_client_context.full) (parameters : parameters)
       let*! () = save_injected_operations cctxt state in
       stat_on_exit cctxt state
     else
-      let start = Mtime_clock.elapsed () in
+      let start = Mtime_clock.counter () in
       let*! () =
         log Debug (fun () ->
             cctxt#message "launch.loop: invoke sample_transfer")
@@ -827,8 +827,7 @@ let launch (cctxt : Protocol_client_context.full) (parameters : parameters)
       in
       let* () = inject_transfer cctxt parameters state transfer in
       incr injected ;
-      let stop = Mtime_clock.elapsed () in
-      let elapsed = Mtime.Span.(to_s stop -. to_s start) in
+      let elapsed = Time.Monotonic.Span.to_float_s (Mtime_clock.count start) in
       let remaining = dt -. elapsed in
       let*! () =
         if remaining <= 0.0 then
@@ -1140,7 +1139,8 @@ let generate_random_transactions =
            verbose_flag,
            debug_flag )
          sources_json
-         (cctxt : Protocol_client_context.full) ->
+         (cctxt : Protocol_client_context.full)
+       ->
       let open Lwt_result_syntax in
       (verbosity :=
          match (debug_flag, verbose_flag) with
@@ -1316,8 +1316,8 @@ let estimate_transaction_cost ?smart_contracts
   | Single_result (Manager_operation_result {operation_result; _}) -> (
       match operation_result with
       | Applied
-          (Transaction_result
-            (Transaction_to_contract_result {consumed_gas; _})) ->
+          (Transaction_result (Transaction_to_contract_result {consumed_gas; _}))
+        ->
           return (Gas.Arith.ceil consumed_gas)
       | _ ->
           (match operation_result with
@@ -1801,7 +1801,8 @@ let fund_accounts_from_source : Protocol_client_context.full Tezos_clic.command
            storage_limit,
            fee_parameter )
          source_pkh
-         (cctxt : Protocol_client_context.full) ->
+         (cctxt : Protocol_client_context.full)
+       ->
       let open Lwt_result_syntax in
       let* source_pk, source_sk =
         let* _, src_pk, src_sk = Client_keys_v0.get_key cctxt source_pkh in
@@ -1971,4 +1972,12 @@ let commands =
   ]
 
 let commands network () =
-  match network with Some `Mainnet -> [] | Some `Testnet | None -> commands
+  (* Stresstest should not be used on mainnet. If the client is running with
+     the yes-crypto activated, operations won't be considered valid and should
+     not endanger the network nor the users funds. *)
+  match Sys.getenv_opt Tezos_crypto.Helpers.yes_crypto_environment_variable with
+  | Some _ -> commands
+  | None -> (
+      match network with
+      | Some `Mainnet -> []
+      | Some `Testnet | None -> commands)

@@ -1,57 +1,48 @@
+.. TODO #2170: search shifted protocol name/number & adapt
+
 Protocol Alpha
 ==============
 
 This page documents the changes brought by protocol Alpha with respect
-to Mumbai (see :ref:`naming_convention`).
+to Ushuaia (see :ref:`naming_convention`).
+
+For changes brought by Ushuaia with respect to Tallinn, see :doc:`../protocols/025_ushuaia`.
 
 The code can be found in directory :src:`src/proto_alpha` of the ``master``
 branch of Octez.
 
-.. contents::
+Environment Version
+-------------------
 
-New Environment Version (V9)
-----------------------------
 
-This protocol requires a different protocol environment version than Mumbai.
-It requires protocol environment V9, compared to V8 for Mumbai. (MR :gl:`!7178`)
 
 Smart Rollups
 -------------
 
-- Update gas model for decoding output proofs. (MR :gl:`!7116`)
+- The protocol can now designate a canonical rollup per chain, which
+  can send signals to activate rollup-specific features without
+  requiring a protocol amendment. The first supported signal,
+  ``WASM_PVM_ENABLE_NEW_DURABLE_STORAGE``, enables the WASM PVM to use
+  a new backend for its durable storage. (MR :gl:`!21634`)
 
-- Improve readability of ``assert_commitment_not_too_far_ahead``.
-  (MR :gl:`!7231`)
+Data Availability Layer
+-----------------------
 
-- Improve readability of ``assert_commitment_is_not_past_curfew``.
-  (MR :gl:`!7230`)
+Enshrined Liquid Staking
+------------------------
 
-- Remove dead code: legacy Internal for Tests signatures (MR :gl:`!7234`)
+- Updated allocation agorithm of sTEZ rights at cycle end. The algorithm
+  greedily allocates to bakers in increasing fee order. In case of a tie, the
+  rights are distributed proportionally to their available space for the bakers
+  with equal fees. (MR :gl:`!21994`)
 
-- Prefer hex over b58check to encode filenames. (MR :gl:`!7181`)
 
-- Code quality improvements. (MR :gl:`!7287`)
+Adaptive Issuance
+-----------------
 
-- Fix error raised when no commitment can be cemented. (MR :gl:`!7286`)
 
-- Use ``Ticket_transfer`` module in ``sc_rollup_operations``. (MR :gl:`!7438`)
-
-- Refactor WASM PVM to enable breaking changes such as new host functions and
-  parameterization of maximum call depth. (MRs :gl:`!7724`, :gl:`!7726`)
-
-Zero Knowledge Rollups (ongoing)
---------------------------------
-
-Rollups supporting cryptographic proofs of correct execution. (MRs :gl:`!7342`)
-
-Data Availability Layer (ongoing)
----------------------------------
-
-Distribution of rollup operations data off-chain. (MRs :gl:`!7074`, :gl:`!7102`,
-:gl:`!7103`, :gl:`!7140`, :gl:`!7182`, :gl:`!7192`, :gl:`!7242`, :gl:`!7315`,
-:gl:`!7407`, :gl:`!7566`, :gl:`!7606`, :gl:`!7541`)
-
-Distribution of rollups data through reveal data channel. (MRs :gl:`!7571`)
+Gas improvements
+----------------
 
 Breaking Changes
 ----------------
@@ -62,28 +53,37 @@ RPC Changes
 Operation receipts
 ------------------
 
+
+Errors
+------
+
+
+Protocol parameters
+-------------------
+
+- Added ``smart_rollup_canonical_rollup_address``, identifying the
+  canonical rollup for the current chain. (MR :gl:`!21634`)
+
+- Removed ``allow_tz4_delegate_enable`` and ``aggregate_attestation`` from the
+  parametric constants. Both feature flags had been ``true`` since their
+  introduction (in protocols 022 and 023 respectively) and the conditional
+  logic they gated was dead code. (MR :gl:`!21007`)
+
 Bug Fixes
 ---------
 
-- Fix consensus watermark encoding roundtrip. (MR :gl:`!7210`)
+- Included the block round in the protocol cache nonce computed by
+  ``cache_nonce_from_block_header``, so that two blocks sharing the same
+  payload but baked at different rounds obtain distinct nonces. (MR
+  :gl:`!22462`)
+
+- Rejected ``stake`` operations from an external staker whose amount is too
+  small to mint any staking pseudotoken at the delegate's current
+  tez/pseudotoken rate, with a new ``stake_amount_too_small`` error. (MR
+  :gl:`!XXXXX`)
 
 Minor Changes
 -------------
 
-- Adapt new mempool with proto add_operation. (MR :gl:`!6749`)
-
-- Relax (pre)endorsements branch condition and allow denunciations of
-  a same endorsement on different branches. (MR :gl:`!7828`)
-
 Internal
 --------
-
-- Update migration for Mumbai. (MR :gl:`!7428`)
-
-- Michelson: add a forgotten tailcall annotation (MR :gl:`!7656`)
-
-- Michelson: the Michelson type "or", previously referred to as ``union`` internally,
-  is now referred to as ``or`` if there is no clash with the OCaml keyword "or".
-  Otherwise it is referred to as ``or_``. (MR :gl:`!7546`)
-
-- Refactor and simplify consensus operation validation. (MR :gl:`!7720`)

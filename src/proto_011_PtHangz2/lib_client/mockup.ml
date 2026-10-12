@@ -129,7 +129,8 @@ module Protocol_constants_overrides = struct
                    liquidity_baking_subsidy,
                    liquidity_baking_sunset_level,
                    liquidity_baking_escape_ema_threshold ),
-                 (chain_id, timestamp) ) ) ) ->
+                 (chain_id, timestamp) ) ) )
+         ->
         {
           preserved_cycles;
           blocks_per_cycle;
@@ -492,11 +493,11 @@ module Protocol_constants_overrides = struct
              Option.is_some override_value)
     in
     (if fields_with_override <> [] then
-     cctxt#message
-       "@[<v>mockup client uses protocol overrides:@,%a@]@?"
-       (pp_print_list field_pp)
-       fields_with_override
-    else Lwt.return_unit)
+       cctxt#message
+         "@[<v>mockup client uses protocol overrides:@,%a@]@?"
+         (pp_print_list field_pp)
+         fields_with_override
+     else Lwt.return_unit)
     >>= fun () ->
     return
       ({
@@ -714,7 +715,8 @@ module Protocol_parameters = struct
       (fun ( initial_timestamp,
              bootstrap_accounts,
              bootstrap_contracts,
-             constants ) ->
+             constants )
+         ->
         {initial_timestamp; bootstrap_accounts; bootstrap_contracts; constants})
       (obj4
          (req "initial_timestamp" Time.Protocol.encoding)
@@ -885,8 +887,8 @@ let mem_init :
   let default = parameters.initial_timestamp in
   let timestamp = Option.value ~default protocol_overrides.timestamp in
   (if not @@ Time.Protocol.equal default timestamp then
-   cctxt#message "@[<h>initial_timestamp: %a@]" Time.Protocol.pp_hum timestamp
-  else Lwt.return_unit)
+     cctxt#message "@[<h>initial_timestamp: %a@]" Time.Protocol.pp_hum timestamp
+   else Lwt.return_unit)
   >>= fun () ->
   let shell_header =
     Forge.make_shell

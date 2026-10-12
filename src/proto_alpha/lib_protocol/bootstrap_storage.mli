@@ -28,16 +28,23 @@
     delay initial rewarding, typically when waiting for more bakers to join the
     network. *)
 
+type error += Unrevealed_public_key of Implicit_account_repr.t
+
+type error += Delegator_with_consensus_key of Implicit_account_repr.t
+
 val init :
   Raw_context.t ->
-  typecheck:
+  typecheck_smart_contract:
     (Raw_context.t ->
     Script_repr.t ->
     ((Script_repr.t * Lazy_storage_diff.diffs option) * Raw_context.t) tzresult
     Lwt.t) ->
+  typecheck_smart_rollup:
+    (Raw_context.t -> Script_repr.expr -> Raw_context.t tzresult) ->
   ?no_reward_cycles:int ->
   Parameters_repr.bootstrap_account list ->
   Parameters_repr.bootstrap_contract list ->
+  Parameters_repr.bootstrap_smart_rollup list ->
   (Raw_context.t * Receipt_repr.balance_updates) tzresult Lwt.t
 
 val cycle_end : Raw_context.t -> Cycle_repr.t -> Raw_context.t tzresult Lwt.t

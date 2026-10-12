@@ -30,12 +30,17 @@
    Subject: Regression tests of Michelson script hashing
 *)
 
+let team = Tag.layer1
+
 let test_script_hash_regression =
   Protocol.register_regression_test
     ~__FILE__
     ~title:"Test script hash regression"
-    ~tags:["script"; "michelson"; "hash"]
+    ~tags:[team; "script"; "michelson"; "hash"; Tag.add_new_script]
+    ~uses:(fun _protocol -> [Constant.michelson_test_scripts])
+    ~uses_node:false
   @@ fun protocol ->
+  let _ = Uses.path Constant.michelson_test_scripts in
   let hooks =
     (* We don't care about the actual command invoked, only script hashes. *)
     let on_spawn _cmd _args = () in

@@ -1,7 +1,7 @@
 (*****************************************************************************)
 (*                                                                           *)
 (* Open Source License                                                       *)
-(* Copyright (c) 2022 Nomadic Labs <contact@nomadic-labs.com>                *)
+(* Copyright (c) 2022-2024 Nomadic Labs <contact@nomadic-labs.com>           *)
 (*                                                                           *)
 (* Permission is hereby granted, free of charge, to any person obtaining a   *)
 (* copy of this software and associated documentation files (the "Software"),*)
@@ -24,8 +24,6 @@
 (*****************************************************************************)
 
 type t = int
-
-let max_value = 255
 
 let encoding = Data_encoding.uint8
 
@@ -56,31 +54,68 @@ let () =
       | _ -> None)
     (fun (given, min, max) -> Invalid_slot_index {given; min; max})
 
-let check_is_in_range slot_index =
+let check_is_in_range ~number_of_slots slot_index =
   error_unless
-    Compare.Int.(slot_index >= zero && slot_index <= max_value)
-    (Invalid_slot_index {given = slot_index; min = zero; max = max_value})
+    Compare.Int.(slot_index >= zero && slot_index < number_of_slots)
+    (Invalid_slot_index
+       {given = slot_index; min = zero; max = number_of_slots - 1})
 
-let of_int slot_index =
+let of_int ~number_of_slots slot_index =
   let open Result_syntax in
-  let* () = check_is_in_range slot_index in
+  let* () = check_is_in_range ~number_of_slots slot_index in
   return slot_index
 
-let of_int_opt slot_index = Option.of_result @@ of_int slot_index
+let of_int_opt ~number_of_slots slot_index =
+  Option.of_result @@ of_int ~number_of_slots slot_index
 
 let to_int slot_index = slot_index [@@ocaml.inline always]
 
 let to_int_list l = l [@@ocaml.inline always]
 
-let compare = Compare.Int.compare
+include Compare.Make (struct
+  type nonrec t = t
 
-let equal = Compare.Int.equal
+  let compare = Compare.Int.compare
+end)
 
-let slots_range ~lower ~upper =
+module Set = Set.Make (Compare.Int)
+module Map = Map.Make (Compare.Int)
+
+let slots_range ~number_of_slots ~lower ~upper =
   let open Result_syntax in
-  let* () = check_is_in_range lower in
-  let* () = check_is_in_range upper in
+  let* () = check_is_in_range ~number_of_slots lower in
+  let* () = check_is_in_range ~number_of_slots upper in
   return Misc.(lower --> upper)
 
-let slots_range_opt ~lower ~upper =
-  Option.of_result @@ slots_range ~lower ~upper
+let slots_range_opt ~number_of_slots ~lower ~upper =
+  Option.of_result @@ slots_range ~number_of_slots ~lower ~upper
+
+let all_slots ~number_of_slots = Misc.(0 --> (number_of_slots - 1))
+
+let is_succ t ~succ = Compare.Int.(t + 1 = succ)
+
+module Index = struct
+  type t = int
+
+  let path_length = 1
+
+  let to_path slot_index l = string_of_int slot_index :: l
+
+  let of_path = function [s] -> int_of_string_opt s | _ -> None
+
+  let rpc_arg =
+    let construct slot_index = string_of_int slot_index in
+    let destruct str =
+      int_of_string_opt str |> Option.to_result ~none:"Cannot parse slot index"
+    in
+    RPC_arg.make
+      ~descr:"A slot index"
+      ~name:"dal_slot_index"
+      ~construct
+      ~destruct
+      ()
+
+  let encoding = encoding
+
+  let compare = compare
+end

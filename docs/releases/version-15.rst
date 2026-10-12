@@ -21,7 +21,7 @@ block without prechecking it first, when the active protocol is Lima.
 
   The nature of this bug would prevent the correct operation of the Lima protocol
   (due to activate on Tezos Mainnet on block
-  `#2,981,889 <https://tzstats.com/2981889>`__)
+  `#2,981,889 <https://tzkt.io/2981889>`__)
   with earlier Octez versions, including Octez v15.0.
 
   As a result, we **strongly recommend** to upgrade to Octez v15.1 or later instead.
@@ -45,7 +45,9 @@ block without prechecking it first, when the active protocol is Lima.
 Update Instructions
 -------------------
 
-To update from sources::
+To update from sources:
+
+.. code-block:: shell
 
   git fetch
   git checkout v15.1
@@ -56,23 +58,26 @@ To update from sources::
 
 If you are using Docker instead, use the ``v15.1`` Docker images of Tezos.
 
-Then upgrade your storage by following the instructions in `Context Pruning Requirements`_.
+Then upgrade your storage by following the instructions in :ref:`first_pruning`.
 
-Context Pruning Requirements
-----------------------------
+.. _first_pruning:
+
+Context Pruning Requirements and Optimizations
+----------------------------------------------
+
+Context pruning is enabled automatically.
+However, data directories that have been created by Octez
+versions 12.4 or earlier do not support context pruning. If you run a
+node on such a data directory you will get a warning. The solution is
+to import a fresh snapshot before running the Octez 15.0 node
+for the first time, to ensure that the context can be pruned.
 
 The first pruning operation for nodes that have been running for a
 long time can take a while and use a significant amount of memory. To
-avoid this, it is recommended to import a fresh snapshot before
+avoid this, it is also recommended to import a fresh snapshot before
 running the Octez 15.0 node for the first time. You can refer to
 :ref:`the snapshot documentation <importing_a_snapshot>` to get
 instructions regarding the snapshot import command.
-
-Also, note that data directories that have been created by Octez
-versions 12.4 or earlier do not support context pruning. If you run a
-node on such a data directory you will get a warning. This is another
-reason to import a fresh snapshot before running the Octez 15.0 node
-for the first time, to ensure that the context can be pruned.
 
 Changelog
 ---------

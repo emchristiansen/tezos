@@ -1,0 +1,103 @@
+#!/bin/sh
+set -eu
+
+# Mandatory variables
+DISTRIBUTION=${DISTRIBUTION:?You must specify a distribution}
+RELEASE=${RELEASE:?You must specify a release}
+TESTFILE=${1:?You must specify a test file to run}
+DOCKERFILE=${2:?You must specify a dockerfile}
+
+# CI variables with defaults from the local git repository
+CI_COMMIT_SHORT_SHA=${CI_COMMIT_SHORT_SHA:-$(git rev-parse --short HEAD)}
+CI_COMMIT_REF_SLUG=${CI_COMMIT_REF_SLUG:-$(git rev-parse --abbrev-ref HEAD)}
+CI_COMMIT_REF_NAME=${CI_COMMIT_REF_NAME:-$(git symbolic-ref --short HEAD)}
+CI_COMMIT_TAG=${CI_COMMIT_TAG:-}
+CI_COMMIT_REF_PROTECTED=${CI_COMMIT_REF_PROTECTED:-"false"}
+
+PREFIX=${PREFIX:-""}
+CI_PROJECT_NAMESPACE=${CI_PROJECT_NAMESPACE:-tezos}
+# Resolved here, on the host, and handed to the container as PACKAGES_BUCKET.
+. scripts/ci/packages_bucket.inc.sh
+
+#shellcheck disable=SC2236
+if [ ! -z ${DEP_IMAGE+x} ]; then
+  IMAGE="$DEP_IMAGE"
+  echo "Attempting to pull $IMAGE"
+  docker pull "$IMAGE"
+  echo "Using $IMAGE"
+else
+  # for local execution, we assume the image name is "systemd"
+  IMAGE="systemd"
+  docker rm -f $IMAGE || true
+  docker rmi $IMAGE || true
+  echo "Image $IMAGE does not exist locally."
+  echo "Building or updating the local image for you"
+  docker build --build-arg IMAGE="$DISTRIBUTION:$RELEASE" -f "$DOCKERFILE" . -t systemd
+fi
+
+# Trap signals (EXIT, INT, TERM) and perform cleanup. The image is removed only
+# on the local path (DEP_IMAGE unset), where we tagged it "systemd" ourselves;
+# a pulled DEP_IMAGE keeps its registry name, so removing "systemd" would error.
+trap 'echo "Stopping and removing container systemd"
+  docker rm -f systemd || true
+  if [ -z "${DEP_IMAGE+x}" ]; then docker rmi systemd || true; fi' INT TERM EXIT
+
+# Run the container in the background and capture the PID of the background process
+# Mount the test file and its parent directory so sub-scripts are available,
+# plus the shared tests-common.inc.sh helper.
+TESTDIR=$(dirname "$TESTFILE")
+# Unprotected refs publish to a bucket used with GCP identity.
+# Protected refs publish to a bucket used over https.
+REPO_MOUNT=""
+OCTEZ_REPO_DIR=""
+if [ "$CI_COMMIT_REF_PROTECTED" != "true" ]; then
+  . scripts/packaging/tests/tests-common.inc.sh
+  gcs_mirror "gs://$PACKAGES_BUCKET/$CI_COMMIT_REF_NAME/$DISTRIBUTION" "$PWD/octez-repo"
+  OCTEZ_REPO_DIR=/octez-repo
+  REPO_MOUNT="-v $PWD/octez-repo:$OCTEZ_REPO_DIR"
+fi
+
+screen -d -m /bin/sh -c "docker run -i --rm --privileged --name systemd -v $PWD/$TESTDIR:/$TESTDIR -v $PWD/$TESTFILE:/$TESTFILE -v $PWD/scripts/packaging/tests/tests-common.inc.sh:/scripts/packaging/tests/tests-common.inc.sh $REPO_MOUNT $IMAGE"
+
+timeout=30
+elapsed=0
+while ! docker inspect -f '{{.State.Running}}' systemd 2> /dev/null | grep -q true; do
+  if [ $elapsed -ge $timeout ]; then
+    echo "Container did not start within $timeout seconds."
+    exit 1
+  fi
+  sleep 1
+  elapsed=$((elapsed + 1))
+done
+
+ARGS=""
+if [ -n "${DATADIR:-}" ]; then
+  ARGS="$ARGS --data-dir $DATADIR"
+fi
+if [ -n "${AGNOSTIC_BAKER:-}" ]; then
+  ARGS="$ARGS --agnostic-baker $AGNOSTIC_BAKER"
+fi
+
+# Execute the command inside the container
+docker exec \
+  -e "PREFIX=$PREFIX" \
+  -e "DISTRIBUTION=$DISTRIBUTION" \
+  -e "RELEASE=$RELEASE" \
+  -e "CI_COMMIT_REF_NAME=$CI_COMMIT_REF_NAME" \
+  -e "CI_COMMIT_TAG=$CI_COMMIT_TAG" \
+  -e "CI_COMMIT_REF_PROTECTED=$CI_COMMIT_REF_PROTECTED" \
+  -e "CI_PROJECT_NAMESPACE=$CI_PROJECT_NAMESPACE" \
+  -e "CI_COMMIT_SHORT_SHA=$CI_COMMIT_SHORT_SHA" \
+  -e "PACKAGES_BUCKET=$PACKAGES_BUCKET" \
+  -e "OCTEZ_REPO_DIR=$OCTEZ_REPO_DIR" \
+  -i systemd \
+  /bin/sh -c "$TESTFILE $DISTRIBUTION $RELEASE $ARGS"
+
+# Capture exit status
+EXIT=$?
+
+killall screen
+docker rm -f systemd || true
+
+# Exit with the captured status
+exit $EXIT

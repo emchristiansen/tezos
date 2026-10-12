@@ -3,6 +3,7 @@
 (* Open Source License                                                       *)
 (* Copyright (c) 2018 Dynamic Ledger Solutions, Inc. <contact@tezos.com>     *)
 (* Copyright (c) 2019-2021 Nomadic Labs, <contact@nomadic-labs.com>          *)
+(* Copyright (c) 2024 TriliTech <contact@trili.tech>                         *)
 (*                                                                           *)
 (* Permission is hereby granted, free of charge, to any person obtaining a   *)
 (* copy of this software and associated documentation files (the "Software"),*)
@@ -49,24 +50,30 @@ type t = {
   advertised_net_port : int option;
   discovery_addr : string option;
   rpc_listen_addrs : string list;
+  external_rpc_listen_addrs : string list;
   private_mode : bool;
   disable_p2p_maintenance : bool;
+  disable_p2p_swap : bool;
   disable_mempool : bool;
-  disable_mempool_precheck : bool;
   enable_testchain : bool;
   cors_origins : string list;
   cors_headers : string list;
   rpc_tls : Config_file.tls option;
-  log_output : Lwt_log_sink_unix.Output.t option;
+  log_output : Logs_simple_config.Output.t option;
+  log_coloring : bool option;
   bootstrap_threshold : int option;
   history_mode : History_mode.t option;
   synchronisation_threshold : int option;
   latency : int option;
   allow_all_rpc : P2p_point.Id.addr_port_id list;
   media_type : Media_type.Command_line.t;
+  max_active_rpc_connections : RPC_server.Max_active_rpc_connections.t;
   metrics_addr : string list;
   operation_metadata_size_limit :
     Shell_limits.operation_metadata_size_limit option;
+  enable_http_cache_headers : bool option;
+  disable_context_pruning : bool option;
+  storage_maintenance_delay : Storage_maintenance.delay option;
 }
 
 type error +=
@@ -109,6 +116,37 @@ let () =
       | Network_http_error (status, body) -> Some (status, body) | _ -> None)
     (fun (status, body) -> Network_http_error (status, body))
 
+module Event = struct
+  include Internal_event.Simple
+
+  let section = ["node"; "main"]
+
+  let disabled_bootstrap_peers =
+    Internal_event.Simple.declare_0
+      ~section
+      ~name:"disabled_bootstrap_peers"
+      ~msg:"disabled bootstrap peers"
+      ()
+
+  let testchain_is_deprecated =
+    Internal_event.Simple.declare_0
+      ~section
+      ~level:Warning
+      ~name:"enable_testchain_is_deprecated"
+      ~msg:"The command-line option `--enable-testchain` is deprecated."
+      ()
+
+  let overriding_config_file_arg =
+    declare_1
+      ~section
+      ~name:"overriding_config_file_arg"
+      ~msg:
+        "the data directory from the --config-file argument was overridden by \
+         the given --data-dir path: {path}"
+      ~level:Warning
+      ("path", Data_encoding.string)
+end
+
 let decode_net_config source json =
   let open Result_syntax in
   match
@@ -148,14 +186,19 @@ let load_net_config =
       let*? net_config = decode_net_config filename netconfig in
       return net_config
 
+let load_config_from_url url = load_net_config (Url url)
+
 let wrap data_dir config_file network connections max_download_speed
     max_upload_speed binary_chunks_size peer_table_size listen_addr
     advertised_net_port discovery_addr peers no_bootstrap_peers
-    bootstrap_threshold private_mode disable_p2p_maintenance disable_mempool
-    disable_mempool_precheck enable_testchain expected_pow rpc_listen_addrs
-    rpc_tls cors_origins cors_headers log_output history_mode
-    synchronisation_threshold latency disable_config_validation allow_all_rpc
-    media_type metrics_addr operation_metadata_size_limit =
+    bootstrap_threshold private_mode disable_p2p_maintenance disable_p2p_swap
+    disable_mempool enable_testchain expected_pow rpc_listen_addrs
+    external_rpc_listen_addrs rpc_tls cors_origins cors_headers log_output
+    log_coloring history_mode synchronisation_threshold latency
+    disable_config_validation allow_all_rpc media_type
+    max_active_rpc_connections metrics_addr operation_metadata_size_limit
+    enable_http_cache_headers disable_context_pruning storage_maintenance_delay
+    =
   let actual_data_dir =
     Option.value ~default:Config_file.default_data_dir data_dir
   in
@@ -166,6 +209,12 @@ let wrap data_dir config_file network connections max_download_speed
   in
   let rpc_tls =
     Option.map (fun (cert, key) -> {Config_file.cert; key}) rpc_tls
+  in
+  let enable_http_cache_headers =
+    if enable_http_cache_headers then Some true else None
+  in
+  let disable_context_pruning =
+    if disable_context_pruning then Some true else None
   in
   {
     disable_config_validation;
@@ -183,15 +232,17 @@ let wrap data_dir config_file network connections max_download_speed
     advertised_net_port;
     discovery_addr;
     rpc_listen_addrs;
+    external_rpc_listen_addrs;
     private_mode;
     disable_p2p_maintenance;
+    disable_p2p_swap;
     disable_mempool;
-    disable_mempool_precheck;
     enable_testchain;
     cors_origins;
     cors_headers;
     rpc_tls;
     log_output;
+    log_coloring;
     peer_table_size;
     bootstrap_threshold;
     history_mode;
@@ -199,12 +250,20 @@ let wrap data_dir config_file network connections max_download_speed
     latency;
     allow_all_rpc;
     media_type;
+    max_active_rpc_connections;
     metrics_addr;
     operation_metadata_size_limit;
+    enable_http_cache_headers;
+    disable_context_pruning;
+    storage_maintenance_delay;
   }
 
 let process_command run =
-  match Lwt_main.run @@ Lwt_exit.wrap_and_exit run with
+  Lwt.Exception_filter.(set handle_all_except_runtime) ;
+  match
+    Tezos_base_unix.Event_loop.main_run ~process_name:"node config" @@ fun () ->
+    Lwt_exit.wrap_and_exit run
+  with
   | Ok () -> `Ok ()
   | Error err -> `Error (false, Format.asprintf "%a" pp_print_trace err)
 
@@ -226,10 +285,10 @@ end
 module Term = struct
   let log_output_converter =
     ( (fun s ->
-        match Lwt_log_sink_unix.Output.of_string s with
+        match Logs_simple_config.Output.of_string s with
         | Some res -> `Ok res
         | None -> `Error s),
-      Lwt_log_sink_unix.Output.pp )
+      Logs_simple_config.Output.pp )
 
   let history_mode_converter =
     let open History_mode in
@@ -288,14 +347,14 @@ module Term = struct
     let parse_error s =
       Error
         (`Msg
-          (Format.asprintf
-             "invalid value '%s', expected one of '%a', a URL or an existing \
-              filename"
-             s
-             (Format.pp_print_list
-                ~pp_sep:(fun ppf () -> Format.fprintf ppf ", ")
-                Format.pp_print_string)
-             (List.map fst Config_file.builtin_blockchain_networks)))
+           (Format.asprintf
+              "invalid value '%s', expected one of '%a', a URL or an existing \
+               filename"
+              s
+              (Format.pp_print_list
+                 ~pp_sep:(fun ppf () -> Format.fprintf ppf ", ")
+                 Format.pp_print_string)
+              (List.map fst Config_file.builtin_blockchain_networks)))
     in
     let parser s =
       let ( <||> ) = Option.either_f
@@ -346,6 +405,13 @@ module Term = struct
       value
       & opt (some log_output_converter) None
       & info ~docs ~docv:"OUTPUT" ~doc ["log-output"])
+
+  let log_coloring =
+    let doc =
+      "Enable or disable light coloring in default stdout logs. Coloring is \
+       enabled by default."
+    in
+    Arg.(value & opt (some bool) None & info ~docs ~doc ["log-coloring"])
 
   let data_dir =
     let doc =
@@ -481,9 +547,7 @@ module Term = struct
       & info ~docs ~doc ~docv:"NUM" ["peer-table-size"])
 
   let listen_addr =
-    let doc =
-      "The TCP address and port at which this instance can be reached."
-    in
+    let doc = "The URL at which this instance can be reached." in
     Arg.(
       value
       & opt (some string) None
@@ -516,7 +580,7 @@ module Term = struct
 
   let bootstrap_threshold =
     let doc =
-      "[DEPRECATED: use synchronisation_threshold instead] The number of peers \
+      "[DEPRECATED: use synchronisation-threshold instead] The number of peers \
        to synchronize with before declaring the node bootstrapped."
     in
     Arg.(
@@ -557,6 +621,14 @@ module Term = struct
     in
     Arg.(value & flag & info ~docs ~doc ["disable-p2p-maintenance"])
 
+  let disable_p2p_swap =
+    let doc =
+      "Disable p2p connection swaps. This option should be used for testing \
+       purposes only. The node will neither try to initiate a swap of \
+       connections with one of its neighbor nor answer to a swap request."
+    in
+    Arg.(value & flag & info ~docs ~doc ["disable-p2p-swap"])
+
   let disable_mempool =
     let doc =
       "If set to [true], the node will not participate in the propagation of \
@@ -564,17 +636,6 @@ module Term = struct
        to decrease the memory and computation footprints of the node."
     in
     Arg.(value & flag & info ~docs ~doc ["disable-mempool"])
-
-  let disable_mempool_precheck =
-    let doc =
-      "If set to [true], the node's prevalidator will fully execute operations \
-       before gossiping valid operations over the network. Default value is \
-       [false], in which case the node's prevalidator only performs a fast \
-       check over operations before gossiping them. If set to [true], this \
-       option can slow down your node and should be used for testing or \
-       debugging purposes."
-    in
-    Arg.(value & flag & info ~docs ~doc ["disable-mempool-precheck"])
 
   let enable_testchain =
     let doc =
@@ -612,10 +673,20 @@ module Term = struct
 
   let rpc_listen_addrs =
     let doc =
-      "The TCP socket address at which this RPC server instance can be reached."
+      "The URL at which this RPC server instance can be reached. Note that: as \
+       a local RPC server is handled by the node itself, calling computational \
+       intensive RPCs can affect the performances of the node."
     in
     Arg.(
       value & opt_all string [] & info ~docs ~doc ~docv:"ADDR:PORT" ["rpc-addr"])
+
+  let external_rpc_listen_addrs =
+    let doc =
+      "The URL at which this external RPC server instance can be reached."
+    in
+    Arg.(
+      value & opt_all string []
+      & info ~docs ~doc ~docv:"ADDR:PORT" ["external-rpc-addr"])
 
   let rpc_tls =
     let doc =
@@ -671,6 +742,58 @@ module Term = struct
           Media_type.Command_line.Any
       & info ~docs ~doc ~docv:"MEDIATYPE" ["media-type"])
 
+  let max_active_rpc_connections =
+    let open RPC_server.Max_active_rpc_connections in
+    let doc = "Sets the maximum number of active connections per RPC server." in
+    let get_max_active_connections str =
+      match int_of_string_opt str with
+      | Some max_active_rpc_connections when max_active_rpc_connections >= 0 ->
+          `Ok (Limited max_active_rpc_connections)
+      | Some _ | None ->
+          if String.equal str "unlimited" then `Ok Unlimited
+          else
+            `Error
+              "max-active-rpc-connection must be a non-negative integer or \
+               \"unlimited\""
+    in
+    Arg.(
+      value
+      & opt
+          (get_max_active_connections, pp_parameter)
+          Config_file.default_max_active_rpc_connections
+      & info ~docs ~doc ~docv:"NUM" ["max-active-rpc-connections"])
+
+  let enable_http_cache_headers =
+    let doc = "Enables HTTP cache headers in the RPC response" in
+    Arg.(value & flag & info ~docs ~doc ["enable-http-cache-headers"])
+
+  let disable_context_pruning =
+    let doc = "Disables the storage maintenance of the context" in
+    Arg.(value & flag & info ~docs ~doc ["disable-context-pruning"])
+
+  let storage_maintenance_delay =
+    let open Storage_maintenance in
+    let doc = "Configures the storage maintenance delays" in
+    let delay_converter =
+      let parse_storage_maintenance_delay_arg str =
+        match str with
+        | "disabled" -> `Ok Disabled
+        | "auto" -> `Ok Auto
+        | _ -> (
+            match Int32.of_string_opt str with
+            | Some delay -> `Ok (Custom delay)
+            | None ->
+                `Error
+                  "delayed-storage-maintenance only supports \"disabled\" or \
+                   \"<int>\" mode")
+      in
+      (parse_storage_maintenance_delay_arg, pp_delay)
+    in
+    Arg.(
+      value
+      & opt (some delay_converter) None
+      & info ~docs ~doc ["storage-maintenance-delay"])
+
   (* Args. *)
 
   let args =
@@ -679,11 +802,14 @@ module Term = struct
     $ max_download_speed $ max_upload_speed $ binary_chunks_size
     $ peer_table_size $ listen_addr $ advertised_net_port $ discovery_addr
     $ peers $ no_bootstrap_peers $ bootstrap_threshold $ private_mode
-    $ disable_p2p_maintenance $ disable_mempool $ disable_mempool_precheck
-    $ enable_testchain $ expected_pow $ rpc_listen_addrs $ rpc_tls
-    $ cors_origins $ cors_headers $ log_output $ history_mode
-    $ synchronisation_threshold $ latency $ disable_config_validation
-    $ allow_all_rpc $ media_type $ metrics_addr $ operation_metadata_size_limit
+    $ disable_p2p_maintenance $ disable_p2p_swap $ disable_mempool
+    $ enable_testchain $ expected_pow $ rpc_listen_addrs
+    $ external_rpc_listen_addrs $ rpc_tls $ cors_origins $ cors_headers
+    $ log_output $ log_coloring $ history_mode $ synchronisation_threshold
+    $ latency $ disable_config_validation $ allow_all_rpc $ media_type
+    $ max_active_rpc_connections $ metrics_addr $ operation_metadata_size_limit
+    $ enable_http_cache_headers $ disable_context_pruning
+    $ storage_maintenance_delay
 end
 
 let read_config_file args =
@@ -691,12 +817,44 @@ let read_config_file args =
   if Sys.file_exists args.config_file then Config_file.read args.config_file
   else return Config_file.default_config
 
-let read_data_dir args =
+let resolve_data_dir_and_config_file ?data_dir ?config_file () =
   let open Lwt_result_syntax in
-  let* cfg = read_config_file args in
-  let {data_dir; _} = args in
-  let data_dir = Option.value ~default:cfg.data_dir data_dir in
-  return data_dir
+  let config_file_arg = Option.is_some config_file in
+  let actual_data_dir =
+    Option.value ~default:Config_file.default_data_dir data_dir
+  in
+  let config_file =
+    Option.value
+      ~default:
+        Filename.Infix.(
+          actual_data_dir // Data_version.default_config_file_name)
+      config_file
+  in
+  let* node_config = Config_file.read config_file in
+  (* Returns true if the given paths are equal, after removing the
+     potential trailing slash. *)
+  let paths_equals p1 p2 =
+    let f x =
+      List.filter (fun s -> s <> String.empty) (String.split_on_char '/' x)
+    in
+    f p1 = f p2
+  in
+  let*! data_dir =
+    (* The --data-dir argument overrides the potentially given
+       configuration file. *)
+    match data_dir with
+    | Some data_dir ->
+        let*! () =
+          if
+            (not (paths_equals data_dir node_config.data_dir))
+            && config_file_arg
+          then Event.(emit overriding_config_file_arg) data_dir
+          else Lwt.return_unit
+        in
+        Lwt.return data_dir
+    | None -> Lwt.return node_config.data_dir
+  in
+  return (data_dir, node_config)
 
 type error +=
   | Network_configuration_mismatch of {
@@ -755,25 +913,6 @@ let () =
     (function Invalid_command_line_arguments x -> Some x | _ -> None)
     (fun explanation -> Invalid_command_line_arguments explanation)
 
-module Event = struct
-  include Internal_event.Simple
-
-  let disabled_bootstrap_peers =
-    Internal_event.Simple.declare_0
-      ~section:["node"; "main"]
-      ~name:"disabled_bootstrap_peers"
-      ~msg:"disabled bootstrap peers"
-      ()
-
-  let testchain_is_deprecated =
-    Internal_event.Simple.declare_0
-      ~section:["node"; "main"]
-      ~level:Warning
-      ~name:"enable_testchain_is_deprecated"
-      ~msg:"The command-line option `--enable-testchain` is deprecated."
-      ()
-end
-
 let patch_network ?(cfg = Config_file.default_config) blockchain_network =
   let open Lwt_result_syntax in
   return {cfg with blockchain_network}
@@ -797,14 +936,16 @@ let patch_config ?(may_override_network = false) ?(emit = Event.emit)
     private_mode;
     discovery_addr;
     disable_p2p_maintenance;
+    disable_p2p_swap;
     disable_mempool;
-    disable_mempool_precheck;
     enable_testchain;
     rpc_listen_addrs;
+    external_rpc_listen_addrs;
     rpc_tls;
     cors_origins;
     cors_headers;
     log_output;
+    log_coloring;
     bootstrap_threshold;
     history_mode;
     network = network_arg;
@@ -813,8 +954,12 @@ let patch_config ?(may_override_network = false) ?(emit = Event.emit)
     latency;
     allow_all_rpc;
     media_type;
+    max_active_rpc_connections;
     metrics_addr;
     operation_metadata_size_limit;
+    enable_http_cache_headers;
+    disable_context_pruning;
+    storage_maintenance_delay;
   } =
     args
   in
@@ -850,7 +995,7 @@ let patch_config ?(may_override_network = false) ?(emit = Event.emit)
              the data directory was never used to run an node.
              Thus, the network configuration can be reset. *)
           let*! context_dir =
-            Lwt_unix.file_exists @@ Data_version.context_dir
+            Lwt_unix.file_exists @@ Tezos_context_ops.Context_ops.context_dir
             @@ Option.value ~default:cfg.data_dir args.data_dir
           in
           let*! store_dir =
@@ -953,22 +1098,28 @@ let patch_config ?(may_override_network = false) ?(emit = Event.emit)
     ?advertised_net_port
     ?discovery_addr
     ~rpc_listen_addrs
+    ~external_rpc_listen_addrs
     ~allow_all_rpc
     ~media_type
+    ~max_active_rpc_connections
     ~metrics_addr
     ?operation_metadata_size_limit
     ~private_mode
     ~disable_p2p_maintenance
+    ~disable_p2p_swap
     ~disable_mempool
-    ~disable_mempool_precheck
     ~enable_testchain
     ~cors_origins
     ~cors_headers
     ?rpc_tls
     ?log_output
+    ?log_coloring
     ?synchronisation_threshold
     ?history_mode
     ?latency
+    ?enable_http_cache_headers
+    ?disable_context_pruning
+    ?storage_maintenance_delay
     cfg
 
 let read_and_patch_config_file ?may_override_network ?emit

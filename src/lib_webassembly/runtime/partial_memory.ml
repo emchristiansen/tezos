@@ -50,7 +50,7 @@ let reraise = function
   | Chunked_byte_vector.Bounds | Lazy_vector.Bounds -> raise Bounds
   | Chunked_byte_vector.SizeOverflow | Lazy_vector.SizeOverflow ->
       raise SizeOverflow
-  | exn -> raise exn
+  | exn -> Lwt.reraise exn
 
 type memory = {mutable ty : memory_type; content : Chunked.t}
 
@@ -109,18 +109,23 @@ let load_byte mem i =
 let store_byte mem i b =
   Lwt.catch (fun () -> Chunked.store_byte mem.content i b) reraise
 
-(* Copied from [Memory] module *)
-let load_bytes mem a n =
+let load_bytes_to_bytes mem a n =
   let a = I64_convert.extend_i32_u a in
   let open Lwt.Syntax in
-  let buf = Buffer.create n in
+  let buf = Bytes.create n in
   let+ () =
     List.init n (fun i ->
         let+ c = load_byte mem Int64.(add a (of_int i)) in
-        Buffer.add_char buf (Char.chr c))
+        Bytes.set buf i (Char.chr c))
     |> Lwt.join
   in
-  Buffer.contents buf
+  buf
+
+(* Copied from [Memory] module *)
+let load_bytes mem a n =
+  let open Lwt.Syntax in
+  let+ buf = load_bytes_to_bytes mem a n in
+  Bytes.unsafe_to_string buf
 
 (* Copied from [Memory] module *)
 let store_bytes mem a bs =

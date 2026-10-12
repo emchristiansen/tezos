@@ -11,6 +11,12 @@ combinators.
 Examples/Tutorial
 -----------------
 
+The following is a very brief introduction to the data-encoding library.
+
+.. note::
+
+    A more complete documentation, including a full tutorial with many examples and a reference of all available combinators, is available in `data-encoding's API documentation <https://nomadic-labs.gitlab.io/data-encoding/data-encoding/tutorial.html>`__.
+
 Encoding an integer
 ~~~~~~~~~~~~~~~~~~~
 
@@ -37,7 +43,7 @@ For example, an encoding that represents a 31 bit integer has type
 Encoding an object
 ~~~~~~~~~~~~~~~~~~
 
-Encoding a single integer is fairly uninteresting. The `Data_encoding`
+Encoding a single integer is fairly uninteresting. The data-encoding
 library provides a number of combinators that can be used to build more
 complicated objects. Consider the type that represents an interval from
 the first number to the second:
@@ -54,7 +60,7 @@ We can define an encoding for this type as:
       Data_encoding.(obj2 (req "min" int64) (req "max" int64))
 
 In the example above we construct a new value ``interval_encoding`` by
-combining two `int64` integers using the ``obj2`` (object with two fields)
+combining two ``int64`` integers using the ``obj2`` (object with two fields)
 constructor.
 
 The library provides different constructors, i.e. for objects that have

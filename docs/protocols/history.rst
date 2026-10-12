@@ -6,8 +6,52 @@ The following pages describe the former Tezos protocols (i.e., which have been u
 .. toctree::
    :maxdepth: 1
 
-   014_kathmandu
+   024_tallinn
 
+.. toctree::
+   :maxdepth: 1
+
+   023_seoul
+
+.. toctree::
+   :maxdepth: 1
+
+   022_rio
+
+.. toctree::
+   :maxdepth: 1
+
+   021_quebec
+
+.. toctree::
+   :maxdepth: 1
+
+   020_paris
+
+.. toctree::
+   :maxdepth: 1
+
+   018_oxford
+
+.. toctree::
+   :maxdepth: 1
+
+   017_nairobi
+
+.. toctree::
+   :maxdepth: 1
+
+   016_mumbai
+
+.. toctree::
+   :maxdepth: 1
+
+   015_lima
+
+.. toctree::
+   :maxdepth: 1
+
+   014_kathmandu
 
 .. toctree::
    :maxdepth: 1
@@ -74,6 +118,6 @@ See Also
 
 More details on the history of Tezos protocols, including their activation dates or the salient features they brought, can be found in the following places:
 
-- https://tzstats.com/protocols (or on other block explores in :ref:`Tezos community <tezos_community>`)
+- https://tzkt.io/protocols (or on other :ref:`Tezos block explorers <block_explorers>`
+- https://docs.tezos.com/architecture/governance/amendment-history
 - https://opentezos.com/tezos-basics/history-of-amendments/
-- https://wiki.tezosagora.org/learn/governance/past-tezos-amendments

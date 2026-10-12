@@ -1,0 +1,14 @@
+(*****************************************************************************)
+(*                                                                           *)
+(* SPDX-License-Identifier: MIT                                              *)
+(* SPDX-FileCopyrightText: 2025 Nomadic Labs <contact@nomadic-labs.com>      *)
+(*                                                                           *)
+(*****************************************************************************)
+
+val add_rpc_directory :
+  Evm_ro_context.t ->
+  l2_chain_id:L2_types.chain_id ->
+  add_operation:(bytes -> Ethereum_types.hash tzresult Lwt.t) ->
+  unit Tezos_rpc.Directory.t ->
+  Tezosx.runtime ->
+  unit Tezos_rpc.Directory.t

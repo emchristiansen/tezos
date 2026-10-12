@@ -25,7 +25,7 @@
 (** Testing
     -------
     Component:    Crypto
-    Invocation:   dune build @src/lib_crypto/runtest
+    Invocation:   dune exec src/lib_crypto/test/main.exe
     Dependencies: src/lib_crypto/test/roundtrips.ml
     Subject:      Checking Base58 key encodings
 *)
@@ -39,7 +39,8 @@ module type B58CHECK = sig
 end
 
 module Make_tests
-    (P : Intfs.SIGNATURE) (T : sig
+    (P : Intfs.SIGNATURE)
+    (T : sig
       val name : string
 
       val pkh_vectors : (string * string) list
@@ -47,8 +48,8 @@ module Make_tests
       val key_encoding_vectors : (string * string * string * string) list
     end) =
 struct
-  let test_b58check_roundtrip :
-      type t. (module B58CHECK with type t = t) -> string -> t -> unit =
+  let test_b58check_roundtrip : type t.
+      (module B58CHECK with type t = t) -> string -> t -> unit =
    fun m msg input ->
     let module M = (val m) in
     let testable =

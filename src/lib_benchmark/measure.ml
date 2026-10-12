@@ -27,19 +27,19 @@
 open Stats
 
 type options = {
-  seed : int option;
+  seed : int;
   nsamples : int;
   bench_number : int;
   minor_heap_size : [`words of int];
   config_file : string option;
 }
 
-type 'workload timed_workload = {
-  workload : 'workload;  (** Workload associated to the measurement *)
-  measures : Maths.vector;  (** Collected measurements *)
+type 'workload measured_workload = {
+  workload : 'workload;
+  measures : Maths.vector;
 }
 
-type 'workload workload_data = 'workload timed_workload list
+type 'workload workload_data = 'workload measured_workload list
 
 type 'workload measurement = {
   bench_opts : options;
@@ -58,31 +58,13 @@ type serialized_workload = {
 }
 
 type workloads_stats = {
-  max_time : float;
-  min_time : float;
-  mean_time : float;
+  max : float;
+  min : float;
+  mean : float;
   variance : float;
 }
 
 (* ------------------------------------------------------------------------- *)
-
-let flush_cache_encoding : [`Cache_megabytes of int | `Dont] Data_encoding.t =
-  let open Data_encoding in
-  union
-    [
-      case
-        ~title:"cache_megabytes"
-        (Tag 0)
-        Benchmark_helpers.int_encoding
-        (function `Cache_megabytes i -> Some i | `Dont -> None)
-        (fun i -> `Cache_megabytes i);
-      case
-        ~title:"dont"
-        (Tag 1)
-        unit
-        (function `Cache_megabytes _ -> None | `Dont -> Some ())
-        (fun () -> `Dont);
-    ]
 
 let heap_size_encoding : [`words of int] Data_encoding.t =
   let open Data_encoding in
@@ -101,7 +83,7 @@ let options_encoding =
        (fun (seed, nsamples, bench_number, minor_heap_size, config_file) ->
          {seed; nsamples; bench_number; minor_heap_size; config_file})
        (obj5
-          (req "seed" (option Benchmark_helpers.int_encoding))
+          (req "seed" Benchmark_helpers.int_encoding)
           (req "samples_per_bench" Benchmark_helpers.int_encoding)
           (req "bench_number" Benchmark_helpers.int_encoding)
           (req "minor_heap_size" heap_size_encoding)
@@ -129,63 +111,10 @@ let rfc3339_encoding =
     (fun str -> to_tm str)
     Data_encoding.string
 
-(* Encoding for workload data files for compatabilty *)
-let unix_tm_encoding : Unix.tm Data_encoding.encoding =
-  let to_tuple tm =
-    let open Unix in
-    ( tm.tm_sec,
-      tm.tm_min,
-      tm.tm_hour,
-      tm.tm_mday,
-      tm.tm_mon,
-      tm.tm_year,
-      tm.tm_wday,
-      tm.tm_yday,
-      tm.tm_isdst )
-  in
-  let of_tuple
-      ( tm_sec,
-        tm_min,
-        tm_hour,
-        tm_mday,
-        tm_mon,
-        tm_year,
-        tm_wday,
-        tm_yday,
-        tm_isdst ) =
-    let open Unix in
-    {
-      tm_sec;
-      tm_min;
-      tm_hour;
-      tm_mday;
-      tm_mon;
-      tm_year;
-      tm_wday;
-      tm_yday;
-      tm_isdst;
-    }
-  in
-  let open Data_encoding in
-  def "unix_tm_encoding"
-  @@ conv
-       to_tuple
-       of_tuple
-       (tup9
-          Benchmark_helpers.int_encoding
-          Benchmark_helpers.int_encoding
-          Benchmark_helpers.int_encoding
-          Benchmark_helpers.int_encoding
-          Benchmark_helpers.int_encoding
-          Benchmark_helpers.int_encoding
-          Benchmark_helpers.int_encoding
-          Benchmark_helpers.int_encoding
-          bool)
-
 let vec_encoding : Maths.vector Data_encoding.t =
   Data_encoding.(conv Maths.vector_to_array Maths.vector_of_array (array float))
 
-let timed_workload_encoding workload_encoding =
+let measured_workload_encoding workload_encoding =
   let open Data_encoding in
   conv
     (fun {workload; measures} -> (workload, measures))
@@ -193,7 +122,7 @@ let timed_workload_encoding workload_encoding =
     (obj2 (req "workload" workload_encoding) (req "measures" vec_encoding))
 
 let workload_data_encoding workload_encoding =
-  Data_encoding.list (timed_workload_encoding workload_encoding)
+  Data_encoding.list (measured_workload_encoding workload_encoding)
 
 let measurement_encoding workload_encoding =
   let open Data_encoding in
@@ -222,11 +151,7 @@ let serialized_workload_encoding =
 (* Pp *)
 
 let pp_options fmtr (options : options) =
-  let seed =
-    match options.seed with
-    | None -> "self-init"
-    | Some seed -> string_of_int seed
-  in
+  let seed = match options.seed with seed -> string_of_int seed in
   let nsamples = string_of_int options.nsamples in
   let config_file = Option.value options.config_file ~default:"None" in
   let bench_number = string_of_int options.bench_number in
@@ -245,25 +170,24 @@ let pp_options fmtr (options : options) =
     config_file
 
 let pp_stats : Format.formatter -> workloads_stats -> unit =
- fun fmtr {max_time; min_time; mean_time; variance} ->
+ fun fmtr {max; min; mean; variance} ->
   Format.fprintf
     fmtr
-    "@[{ max_time = %f ; min_time = %f ; mean_time = %f ; sigma = %f }@]"
-    max_time
-    min_time
-    mean_time
+    "@[{ max = %f ; min = %f ; mean = %f ; sigma = %f }@]"
+    max
+    min
+    mean
     (sqrt variance)
 
 (* ------------------------------------------------------------------------- *)
 (* Saving/loading workload data *)
 
-let save :
-    type c t.
+let save : type c t.
     filename:string ->
     options:options ->
     bench:(c, t) Benchmark.poly ->
     workload_data:t workload_data ->
-    unit =
+    packed_measurement =
  fun ~filename ~options ~bench ~workload_data ->
   let (module Bench) = bench in
   let date = Unix.gmtime (Unix.time ()) in
@@ -300,7 +224,7 @@ let save :
   let _nwritten =
     Lwt_main.run @@ Tezos_stdlib_unix.Lwt_utils_unix.create_file filename str
   in
-  ()
+  Measurement (bench, measurement)
 
 let packed_measurement_save_json measurement_packed output_path =
   let (Measurement (bench, measurement)) = measurement_packed in
@@ -314,11 +238,14 @@ let packed_measurement_save_json measurement_packed output_path =
   in
   let data = Data_encoding.Json.construct encoding (Bench.name, measurement) in
   let json = Data_encoding.Json.to_string data in
-  Out_channel.with_open_text output_path (fun oc ->
-      Printf.fprintf oc "%s\n" json) ;
-  Format.eprintf
-    "Measure.packed_measurement_save_json: saved to %s@."
-    output_path
+  match output_path with
+  | Some output_path ->
+      Out_channel.with_open_text output_path (fun oc ->
+          Printf.fprintf oc "%s\n" json) ;
+      Format.eprintf
+        "Measure.packed_measurement_save_json: saved to %s@."
+        output_path
+  | None -> Printf.printf "%s\n" json
 
 let load : filename:string -> packed_measurement =
  fun ~filename ->
@@ -347,8 +274,7 @@ let load : filename:string -> packed_measurement =
           | Ok m -> Measurement (bench, m)))
   | Error err -> cant_load err
 
-let to_csv :
-    type c t.
+let to_csv : type c t.
     filename:string ->
     bench:(c, t) Benchmark.poly ->
     workload_data:t workload_data ->
@@ -357,7 +283,7 @@ let to_csv :
   let (module Bench) = bench in
   let lines =
     List.map
-      (fun {workload; measures} ->
+      (fun {workload; measures; _} ->
         (Bench.workload_to_vector workload, measures))
       workload_data
   in
@@ -391,18 +317,11 @@ let to_csv :
   Csv.export ~filename csv
 
 (* ------------------------------------------------------------------------- *)
-(* Stats on execution times *)
+(* Stats on measures *)
 
 let fmin (x : float) (y : float) = if x < y then x else y
 
 let fmax (x : float) (y : float) = if x > y then x else y
-
-let farray_min (arr : float array) =
-  let minimum = ref max_float in
-  for i = 0 to Array.length arr - 1 do
-    minimum := fmin !minimum arr.(i)
-  done ;
-  !minimum
 
 let farray_min_max (arr : float array) =
   let maximum = ref @@ ~-.max_float in
@@ -415,17 +334,17 @@ let farray_min_max (arr : float array) =
 
 let collect_stats : 'a workload_data -> workloads_stats =
  fun workload_data ->
-  let time_dist_data =
+  let dist_data =
     List.rev_map
       (fun {measures; _} -> Array.of_seq (Maths.vector_to_seq measures))
       workload_data
     |> Array.concat
   in
-  let min, max = farray_min_max time_dist_data in
-  let dist = Emp.of_raw_data time_dist_data in
+  let min, max = farray_min_max dist_data in
+  let dist = Emp.of_raw_data dist_data in
   let mean = Emp.Float.empirical_mean dist in
   let var = Emp.Float.empirical_variance dist in
-  {max_time = max; min_time = min; mean_time = mean; variance = var}
+  {max; min; mean; variance = var}
 
 (* ------------------------------------------------------------------------- *)
 (* Benchmarking *)
@@ -433,7 +352,11 @@ let collect_stats : 'a workload_data -> workloads_stats =
 module Time = struct
   external get_time_ns : unit -> (int64[@unboxed])
     = "caml_clock_gettime_byte" "caml_clock_gettime"
-    [@@noalloc]
+  [@@noalloc]
+
+  external clock_getres : unit -> (int64[@unboxed])
+    = "caml_clock_getres_byte" "caml_clock_getres"
+  [@@noalloc]
 
   let measure f =
     let bef = get_time_ns () in
@@ -441,7 +364,16 @@ module Time = struct
     let aft = get_time_ns () in
     let dt = Int64.(to_float (sub aft bef)) in
     dt
-    [@@inline always]
+  [@@inline always]
+
+  let measure_lwt f =
+    let open Lwt.Syntax in
+    let bef = get_time_ns () in
+    let+ res = f () in
+    let aft = get_time_ns () in
+    let dt = Int64.(to_float (sub aft bef)) in
+    (dt, res)
+  [@@inline always]
 
   let measure_and_return f =
     let bef = get_time_ns () in
@@ -449,7 +381,18 @@ module Time = struct
     let aft = get_time_ns () in
     let dt = Int64.(to_float (sub aft bef)) in
     (dt, x)
-    [@@inline always]
+  [@@inline always]
+
+  let check_timer_resolution () =
+    let ns = clock_getres () in
+    if ns = 1L then ()
+    else if ns = 0L then
+      Stdlib.failwith "Snoop: cannot work without a proper clock"
+    else
+      Format.eprintf
+        "WARNING: This machine's clock reslution is %Ldns, which is too large \
+         for Snoop benchmarks!@."
+        ns
 end
 
 let compute_empirical_timing_distribution :
@@ -468,27 +411,14 @@ let compute_empirical_timing_distribution :
   done ;
   let shape = Linalg.Tensor.Int.rank_one nsamples in
   Linalg.Vec.Float.make shape (fun i -> buffer.{i + start})
- [@@ocaml.inline]
+[@@ocaml.inline]
 
 let seed_init_from_options (options : options) =
-  match options.seed with
-  | None -> Random.State.make_self_init ()
-  | Some seed -> Random.State.make [|seed|]
-
-let gc_init_from_options (options : options) =
-  match options.minor_heap_size with
-  | `words words -> Gc.set {(Gc.get ()) with minor_heap_size = words}
-
-let set_gc_increment () =
-  let stats = Gc.stat () in
-  let words = stats.Gc.heap_words in
-  let minimal_increment = 8 * 1024 * 1024 in
-  let ratio = float minimal_increment /. float words in
-  if ratio < 0.15 then Gc.set {(Gc.get ()) with major_heap_increment = 15}
-  else Gc.set {(Gc.get ()) with major_heap_increment = minimal_increment}
+  Random.State.make [|options.seed|]
 
 let perform_benchmark (type c t) (options : options)
     (bench : (c, t) Benchmark.poly) : t workload_data =
+  Time.check_timer_resolution () ;
   let (module Bench) = bench in
   let config =
     Config.parse_config ~print:Stdlib.stderr bench options.config_file
@@ -505,7 +435,6 @@ let perform_benchmark (type c t) (options : options)
   let benchmarks =
     Bench.create_benchmarks ~rng_state ~bench_num:options.bench_number config
   in
-  gc_init_from_options options ;
   let progress =
     Benchmark_helpers.make_progress_printer
       Format.err_formatter
@@ -516,18 +445,24 @@ let perform_benchmark (type c t) (options : options)
     List.fold_left
       (fun workload_data benchmark_fun ->
         progress () ;
-        set_gc_increment () ;
-        Gc.compact () ;
-        match benchmark_fun () with
-        | Generator.Plain {workload; closure} ->
-            let measures =
-              compute_empirical_timing_distribution
-                ~closure
-                ~nsamples:options.nsamples
-                ~buffer
-                ~index
-            in
+        let bench = benchmark_fun () in
+        let measure_plain_benchmark workload closure =
+          let measures =
+            compute_empirical_timing_distribution
+              ~closure
+              ~nsamples:options.nsamples
+              ~buffer
+              ~index
+          in
+          {workload; measures} :: workload_data
+        in
+        match bench with
+        | Generator.Calculated {workload; measure} ->
+            let measures = Array.init options.nsamples (fun _ -> measure ()) in
+            let measures = Maths.vector_of_array measures in
             {workload; measures} :: workload_data
+        | Generator.Plain {workload; closure} ->
+            measure_plain_benchmark workload closure
         | Generator.With_context {workload; closure; with_context} ->
             with_context (fun context ->
                 let measures =
@@ -577,3 +512,20 @@ let make_timing_probe (type t) (module O : Compare.COMPARABLE with type t = t) =
       (fun () -> Stdlib.Hashtbl.to_seq_keys table |> Set.of_seq |> Set.elements);
     get = (fun aspect -> Stdlib.Hashtbl.find_all table aspect);
   }
+
+let get_free_variable_set measurement =
+  let (Measurement ((module Bench), m)) = measurement in
+  let open Free_variable.Set in
+  List.fold_left
+    (fun acc (_local_model_name, model) ->
+      let fvs =
+        List.fold_left
+          (fun acc {workload; _} ->
+            let fvs = Model.get_free_variable_set_applied model workload in
+            union fvs acc)
+          empty
+          m.workload_data
+      in
+      union acc fvs)
+    empty
+    Bench.models

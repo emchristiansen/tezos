@@ -39,12 +39,13 @@ let test_big_map_arity =
     ~__FILE__
     ~title:"Test EMPTY_BIG_MAP arity error"
     ~tags:["client"; "michelson"; "typechecking"]
+    ~uses_node:false
   @@ fun protocol ->
   let* client = Client.init_mockup ~protocol () in
   let script =
     Michelson_script.(find ["ill_typed"; "big_map_arity"] protocol |> path)
   in
-  let process = Client.spawn_typecheck_script ~script client in
+  let process = Client.spawn_typecheck_script ~scripts:[script] client in
   Process.check_error ~exit_code:1 ~msg:expected_msg process
 
 let register ~protocols = test_big_map_arity protocols

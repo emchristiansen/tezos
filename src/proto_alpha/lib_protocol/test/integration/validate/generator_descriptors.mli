@@ -29,22 +29,20 @@ open Validate_helpers
 
 (** {2 Generation state} *)
 
-(** The state to generate valid double pre- and endorsement evidence
+(** The state to generate valid double pre- and attestation evidence
    contains a temporary state for making the slashable evidence, and
    the lists of slashables operations, one for each kind:
-   preendorsement and endorsement. *)
-type dbl_endorsement_state = {
+   preattestation and attestation. *)
+type dbl_attestation_state = {
   temporary : (Block.t * Block.t) option;
-  slashable_preend :
-    (Kind.preendorsement operation * Kind.preendorsement operation) list;
-  slashable_end : (Kind.endorsement operation * Kind.endorsement operation) list;
+  slashable_preattestations :
+    (Kind.preattestation operation * Kind.preattestation operation) list;
+  slashable_attestations :
+    (Kind.attestation operation * Kind.attestation operation) list;
 }
 
 (** Generic generation state collecting
     information to generate any kind of operation.
-
-    For example, {!Manager.infos} for manager
-    or voters (Contract.t list) for voting operations...
 
    When adding a new operation kind, [state] might be extended if a
    new kind of information is required for this new kind valid
@@ -52,22 +50,19 @@ type dbl_endorsement_state = {
 type state = {
   block : Block.t;
   pred : Block.t option;
-  bootstraps : public_key_hash list;
-  delegates : (public_key_hash * public_key_hash option) list;
-  voters : Contract.t list;
+  bootstraps : Implicit_account_repr.t list;
+  delegates : (Implicit_account_repr.t * Implicit_account_repr.t option) list;
   seed_nonce_to_reveal : (Raw_level.t * Nonce_hash.t) list;
   commitments : secret_account list;
   protocol_hashes : Protocol_hash.t list;
   slashable_bakes : (block_header * block_header) list;
   vdf : bool;
-  dbl_endorsement : dbl_endorsement_state;
+  dbl_attestation : dbl_attestation_state;
   manager : Manager.infos;
 }
 
-(** The initialization of a [state] requires the [voters] contracts --
-    the contracts allowed to vote -- and the [bootstraps] contracts. *)
-val init_state :
-  Block.t -> voters:Contract.t list -> bootstraps:Contract.t list -> state
+(** The initialization of a [state] requires the [bootstraps] contracts. *)
+val init_state : Block.t -> bootstraps:Contract.t list -> state
 
 (** {2 Descriptor for valid operations generation} *)
 
@@ -120,9 +115,10 @@ type descriptor = {
   [non_exclusive_kinds]. Otherwise, see, for example, how voting
   operation op_kinds are handled in {! test_covalidity.tests}. *)
 type op_kind =
-  | KEndorsement
-  | KPreendorsement
-  | KDalattestation
+  | KAttestation
+  | KPreattestation
+  | KAttestations_aggregate
+  | KPreattestations_aggregate
   | KBallotExp
   | KBallotProm
   | KProposals
@@ -131,6 +127,7 @@ type op_kind =
   | KActivate
   | KDbl_consensus
   | KDbl_baking
+  | KEntrapment
   | KDrain
   | KManager
 

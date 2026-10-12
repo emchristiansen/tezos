@@ -6,13 +6,14 @@
  (instrumentation (backend bisect_ppx))
  (libraries
   tezt.core
-  tezos-base
-  tezos-base.unix
-  tezos-stdlib
-  tezos-error-monad
-  tezos-crypto
-  tezos-client-base
-  tezos-signer-backends
+  bls12-381.archive
+  octez-libs.base
+  octez-libs.base.unix
+  octez-libs.stdlib
+  octez-libs.error-monad
+  octez-libs.crypto
+  octez-shell-libs.client-base
+  octez-shell-libs.signer-backends
   octez-alcotezt
   uri)
  (library_flags (:standard -linkall))
@@ -30,7 +31,9 @@
 
 (executable
  (name main)
+ (instrumentation (backend bisect_ppx --bisect-sigterm))
  (libraries
+  octez-rustzcash-deps
   src_lib_signer_backends_test_tezt_lib
   tezt)
  (link_flags
@@ -39,9 +42,10 @@
  (modules main))
 
 (rule
- (alias runtezt)
- (package tezos-signer-backends)
- (action (run %{dep:./main.exe})))
+ (alias runtest)
+ (package octez-shell-libs)
+ (enabled_if (<> false %{env:RUNTEZTALIAS=true}))
+ (action (run %{dep:./main.exe} /flaky /ci_disabled)))
 
 (rule
  (targets main.ml)

@@ -1,30 +1,13 @@
 (*****************************************************************************)
 (*                                                                           *)
-(* Open Source License                                                       *)
-(* Copyright (c) 2022 Nomadic Labs <contact@nomadic-labs.com>                *)
-(* Permission is hereby granted, free of charge, to any person obtaining a   *)
-(* copy of this software and associated documentation files (the "Software"),*)
-(* to deal in the Software without restriction, including without limitation *)
-(* the rights to use, copy, modify, merge, publish, distribute, sublicense,  *)
-(* and/or sell copies of the Software, and to permit persons to whom the     *)
-(* Software is furnished to do so, subject to the following conditions:      *)
-(*                                                                           *)
-(* The above copyright notice and this permission notice shall be included   *)
-(* in all copies or substantial portions of the Software.                    *)
-(*                                                                           *)
-(* THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR*)
-(* IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,  *)
-(* FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL   *)
-(* THE AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER*)
-(* LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING   *)
-(* FROM, OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER       *)
-(* DEALINGS IN THE SOFTWARE.                                                 *)
+(* SPDX-License-Identifier: MIT                                              *)
+(* Copyright (c) 2022 Nomadic Labs, <contact@nomadic-labs.com>               *)
 (*                                                                           *)
 (*****************************************************************************)
 
 type error += Merkelized_payload_hashes_proof_error of string
 
-module Hash : S.HASH
+module Hash : S.HASH with type t = Smart_rollup.Merkelized_payload_hashes_hash.t
 
 (** A type representing the head of a merkelized list of
     {!Sc_rollup_inbox_message_repr.serialized} message. It contains the hash of
@@ -70,6 +53,10 @@ val remember :
   Sc_rollup_inbox_message_repr.serialized ->
   History.t tzresult
 
+(** [genesis_no_history payload] is the initial merkelized payload hashes with
+    index 0. *)
+val genesis_no_history : Sc_rollup_inbox_message_repr.serialized -> t
+
 (** [genesis history payload] is the initial merkelized payload hashes with
     index 0. It is remembered in [history] using [remember]. *)
 val genesis :
@@ -77,9 +64,13 @@ val genesis :
   Sc_rollup_inbox_message_repr.serialized ->
   (History.t * t) tzresult
 
-(** [add_payload history merkelized payload] creates a new {!t} with [payload]
+(** [add_payload_no_history merkelized payload] creates a new {!t} with [payload]
     and [merkelized] as ancestor (i.e. [index = succ (get_index
-    merkelized)]). [merkelized] is remembered in [history] with [remember]. *)
+    merkelized)]). *)
+val add_payload_no_history : t -> Sc_rollup_inbox_message_repr.serialized -> t
+
+(** [add_payload] is identical to {!add_payload_no_history} but the resulting
+    [merkelized] is remembered in [history] with [remember]. *)
 val add_payload :
   History.t ->
   t ->

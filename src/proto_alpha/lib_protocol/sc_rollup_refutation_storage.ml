@@ -206,19 +206,22 @@ let get_conflict_point ctxt rollup staker1 staker2 =
     current_level
     commitment_period
 
-let get_game ctxt rollup stakers =
+let find_game ctxt rollup stakers =
   let open Lwt_result_syntax in
   let open Sc_rollup_game_repr.Index in
   let* ctxt, game_index =
     Store.Game.find ((ctxt, rollup), stakers.alice) stakers.bob
   in
   match game_index with
+  | None -> return (ctxt, None)
+  | Some game_hash -> Store.Game_info.find (ctxt, rollup) game_hash
+
+let get_game ctxt rollup stakers =
+  let open Lwt_result_syntax in
+  let* ctxt, game = find_game ctxt rollup stakers in
+  match game with
   | None -> tzfail Sc_rollup_no_game
-  | Some game_hash -> (
-      let* ctxt, game = Store.Game_info.find (ctxt, rollup) game_hash in
-      match game with
-      | Some game -> return (game, ctxt)
-      | None -> tzfail Sc_rollup_no_game)
+  | Some game -> return (game, ctxt)
 
 let create_game ctxt rollup stakers game =
   let open Lwt_result_syntax in
@@ -253,16 +256,6 @@ let remove_game ctxt rollup stakers =
   in
   return ctxt
 
-(** [check_conflict_point ctxt rollup ~refuter ~refuter_commitment_hash
-    ~defender ~defender_commitment_hash] checks that the refuter is staked on
-    [commitment] with hash [refuter_commitment_hash], res. for [defender] and
-    [defender_commitment] with hash [defender_commitment_hash]. Fails with
-    {!Sc_rollup_errors.Sc_rollup_wrong_staker_for_conflict_commitment}.
-
-    It also verifies that both are pointing to the same predecessor and thus are
-    in conflict, fails with
-    {!Sc_rollup_errors.Sc_rollup_not_first_conflict_between_stakers} otherwise.
-*)
 let check_conflict_point ctxt rollup ~refuter ~refuter_commitment_hash ~defender
     ~defender_commitment_hash =
   let open Lwt_result_syntax in
@@ -359,6 +352,7 @@ let check_staker_availability ctxt rollup staker =
     {li [Sc_rollup_not_first_conflict_between_stakers] if the provided
     commitments are not the first commitments in conflict between
     [player] and [opponent].}
+   }
 *)
 let start_game ctxt rollup ~player:(player, player_commitment_hash)
     ~opponent:(opponent, opponent_commitment_hash) =
@@ -443,23 +437,40 @@ let game_move ctxt rollup ~player ~opponent ~step ~choice =
       Sc_rollup_wrong_turn
   in
   let* ctxt, metadata = Sc_rollup_storage.get_metadata ctxt rollup in
-  let dal = (Constants_storage.parametric ctxt).dal in
+  let constants = Constants_storage.parametric ctxt in
+  let dal = constants.dal in
+  let dal_activation_level =
+    if dal.feature_enable then
+      Some constants.sc_rollup.reveal_activation_level.dal_parameters
+    else None
+  in
+  let dal_attested_slots_validity_lag =
+    constants.sc_rollup.reveal_activation_level.dal_attested_slots_validity_lag
+  in
   let* check_result, ctxt = check_stakes ctxt rollup stakers in
   match check_result with
   | Some game_result -> return (Some game_result, ctxt)
   | None -> (
       let play_cost = Sc_rollup_game_repr.cost_play ~step ~choice in
       let*? ctxt = Raw_context.consume_gas ctxt play_cost in
+      let* signals = Sc_rollup_storage.signals ctxt in
+
       let* move_result =
         Sc_rollup_game_repr.play
           kind
-          dal.cryptobox_parameters
-          ~dal_attestation_lag:dal.attestation_lag
+          ~config:
+            (List.map (fun (s, l) -> (s, Raw_level_repr.to_int32 l)) signals)
+          ~dal_activation_level
+          ~find_dal_parameters:(Dal_storage.parameters ctxt)
           ~stakers
           metadata
           game
           ~step
           ~choice
+          ~is_reveal_enabled:
+            (Sc_rollup_PVM_sig.is_reveal_enabled_predicate
+               (Constants_storage.sc_rollup_reveal_activation_level ctxt))
+          ~dal_attested_slots_validity_lag
       in
       match move_result with
       | Either.Left game_result -> return (Some game_result, ctxt)
@@ -539,7 +550,7 @@ let apply_game_result ctxt rollup (stakers : Sc_rollup_game_repr.Index.t)
         let losing_staker = loser in
         let winning_staker =
           let Sc_rollup_game_repr.Index.{alice; bob} = stakers in
-          if Signature.Public_key_hash.(alice = loser) then bob else alice
+          if Implicit_account_repr.(alice = loser) then bob else alice
         in
         let* ctxt = remove_game ctxt rollup stakers in
         let* ctxt, balance_updates_loser =
@@ -557,11 +568,12 @@ let apply_game_result ctxt rollup (stakers : Sc_rollup_game_repr.Index.t)
         let balances_updates = balance_updates_loser @ balance_updates_winner in
         return (ctxt, balances_updates)
     | Draw ->
+        let* ctxt = remove_game ctxt rollup stakers in
         let* ctxt, balances_updates_alice =
-          Stake_storage.remove_staker ctxt rollup stakers.alice
+          remove_if_staker_is_still_there ctxt rollup stakers.alice
         in
         let* ctxt, balances_updates_bob =
-          Stake_storage.remove_staker ctxt rollup stakers.bob
+          remove_if_staker_is_still_there ctxt rollup stakers.bob
         in
         return (ctxt, balances_updates_alice @ balances_updates_bob)
   in
@@ -619,3 +631,28 @@ let conflicting_stakers_uncarbonated ctxt rollup staker =
       | Error _ -> return conflicts)
     []
     stakers
+
+let migrate_clean_refutation_games ctxt =
+  let open Lwt_result_syntax in
+  let remove_unstaked_games rollup =
+    List.fold_left_es
+      (fun ctxt (Sc_rollup_game_repr.Index.{alice; bob} as stakers) ->
+        let* ctxt, alice_active =
+          Sc_rollup_staker_index_storage.is_staker ctxt rollup alice
+        in
+        let* ctxt, bob_active =
+          Sc_rollup_staker_index_storage.is_staker ctxt rollup bob
+        in
+        if (not alice_active) && not bob_active then
+          remove_game ctxt rollup stakers
+        else return ctxt)
+  in
+  let* rollups = Sc_rollup_storage.list_unaccounted ctxt in
+  List.fold_left_es
+    (fun ctxt rollup ->
+      let*! players =
+        Storage.Sc_rollup.Game_info.keys_unaccounted (ctxt, rollup)
+      in
+      remove_unstaked_games rollup ctxt players)
+    ctxt
+    rollups

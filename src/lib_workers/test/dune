@@ -6,12 +6,13 @@
  (instrumentation (backend bisect_ppx))
  (libraries
   tezt.core
-  tezos-stdlib
-  tezos-stdlib-unix
-  tezos-base
-  tezos-workers
-  tezos-test-helpers
-  tezos-base-test-helpers
+  bls12-381.archive
+  octez-libs.stdlib
+  octez-libs.stdlib-unix
+  octez-libs.base
+  octez-libs.tezos-workers
+  octez-libs.test-helpers
+  octez-libs.base-test-helpers
   octez-alcotezt)
  (library_flags (:standard -linkall))
  (flags
@@ -31,15 +32,17 @@
 
 (executable
  (name main)
+ (instrumentation (backend bisect_ppx --bisect-sigterm))
  (libraries
   src_lib_workers_test_tezt_lib
   tezt)
  (modules main))
 
 (rule
- (alias runtezt)
- (package tezos-workers)
- (action (run %{dep:./main.exe})))
+ (alias runtest)
+ (package octez-libs)
+ (enabled_if (<> false %{env:RUNTEZTALIAS=true}))
+ (action (run %{dep:./main.exe} /flaky /ci_disabled)))
 
 (rule
  (targets main.ml)

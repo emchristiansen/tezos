@@ -27,18 +27,7 @@
 (* -------------------------------------------------------------------------- *)
 (* Initiate necromantic rite *)
 
-let handle_python_error msg closure =
-  match closure () with
-  | result -> result
-  | exception Py.E (x, y) ->
-      let s =
-        Printf.sprintf
-          "%s\n%s\n%s\n"
-          msg
-          (Py.Object.to_string x)
-          (Py.Object.to_string y)
-      in
-      Stdlib.failwith s
+open Pytools
 
 let pyinit () =
   if not (Py.is_initialized ()) then (
@@ -68,6 +57,16 @@ let sklearn_metrics () =
   pyinit () ;
   handle_python_error "While initializing sklearn.metrics" @@ fun () ->
   Py.Import.import_module "sklearn.metrics"
+
+let statsmodels_api () =
+  pyinit () ;
+  handle_python_error "While initializing statsmodels.api" @@ fun () ->
+  Py.Import.import_module "statsmodels.api"
+
+let statsmodels_stats () =
+  pyinit () ;
+  handle_python_error "While initializing statsmodels.stats" @@ fun () ->
+  Py.Import.import_module "statsmodels.stats"
 
 let%expect_test "pyinit can be called twice without failing" =
   (* Paths are environment specific, do not leak into tests *)

@@ -48,9 +48,10 @@ let () =
       title = "Long Tezts";
       description = "Measurements from tests in tezt/long_tests.";
       panels =
-        Prt_client.grafana_panels @ Block_validation.grafana_panels
-        @ Tenderbake.grafana_panels @ Logging.grafana_panels
-        @ Pipelining.grafana_panels;
+        Prt_client.grafana_panels @ Executable_size.grafana_panels
+        @ Block_validation.grafana_panels @ Tenderbake.grafana_panels
+        @ Logging.grafana_panels @ Pipelining.grafana_panels
+        @ Tezt_load_time.grafana_panels @ Dal.grafana_panels;
     }
 
 (* Executor for tests that don't take that long to run.
@@ -64,12 +65,16 @@ let () =
   Prt_client.register ~executors:default_executors ~protocols:[Alpha] ;
   Sc_rollup.register ~executors:default_executors ~protocols:[Alpha] ;
   Script_cache.register ~executors:default_executors ~protocols:[Alpha] ;
+  Dal.register ~executors:default_executors ~protocols:[Alpha] ;
   Block_validation.register ~executors:default_executors () ;
   Block_validation.register_semantic_regression_test
     ~executors:[Long_test.block_replay_executor]
     () ;
   Tenderbake.register ~executors:default_executors () ;
   Logging.register ~executors:default_executors () ;
+  Mempool_benchmarks.register ~executors:default_executors () ;
   Pipelining.register ~executors:default_executors () ;
+  Tezt_load_time.register ~executors:default_executors () ;
+  Executable_size.register ~executors:default_executors () ;
   (* [Test.run] must be the last function to be called. *)
   Test.run ()

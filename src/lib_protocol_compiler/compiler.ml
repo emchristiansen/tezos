@@ -27,8 +27,6 @@ let default_warnings = Defaults.warnings
 
 let default_warn_error = "-a+8"
 
-let () = Clflags.unsafe_string := false
-
 (** Override the default 'Env.Persistent_signature.load'
     with a lookup in locally defined hashtable.
 *)
@@ -36,19 +34,19 @@ let () = Clflags.unsafe_string := false
 let preloaded_cmis : Persistent_env.Persistent_signature.t String.Hashtbl.t =
   String.Hashtbl.create ~random:true 42
 
-let default_load = !Persistent_env.Persistent_signature.load
-
 (* Set hook *)
 let () =
-  Persistent_env.Persistent_signature.load :=
-    fun ~unit_name ->
-      String.Hashtbl.find preloaded_cmis (String.capitalize_ascii unit_name)
+  Compiler_libs.override_persistent_signature_loader
+  @@ fun ~allow_hidden:_ ~unit_name ->
+  String.Hashtbl.find preloaded_cmis (String.capitalize_ascii unit_name)
 
 let load_cmi_from_file file =
   String.Hashtbl.add
     preloaded_cmis
     (String.capitalize_ascii Filename.(basename (chop_extension file)))
-    {filename = file; cmi = Cmi_format.read_cmi file}
+    (Compiler_libs.make_persistent_signature
+       ~filename:file
+       ~cmi:(Cmi_format.read_cmi file))
 
 let load_embedded_cmi (unit_name, content) =
   let content = Bytes.of_string content in
@@ -69,18 +67,17 @@ let load_embedded_cmi (unit_name, content) =
   String.Hashtbl.add
     preloaded_cmis
     (String.capitalize_ascii unit_name)
-    {
-      filename = unit_name ^ ".cmi";
-      cmi = {cmi_name; cmi_sign; cmi_crcs; cmi_flags};
-    }
+    (Compiler_libs.make_persistent_signature
+       ~filename:(unit_name ^ ".cmi")
+       ~cmi:{cmi_name; cmi_sign; cmi_crcs; cmi_flags})
 
 let load_embedded_cmis cmis = List.iter load_embedded_cmi cmis
 
 (** Compilation environment.
 
-    [tezos_protocol_env] defines the list of [cmi] available while compiling
-    the protocol version. The [cmi] are packed into the [tezos-node]
-    binary by using [ocp-ocamlres], see the Makefile.
+    [tezos_protocol_env] defines the list of [cmi] available while
+    compiling the protocol version. The [cmi] are packed into the
+    [octez-node] binary by using [ocp-ocamlres], see the Makefile.
 
     [register_env] defines a complementary list of [cmi] available
     while compiling the generated [register.ml] file (that register
@@ -140,7 +137,19 @@ type driver = {
 let parse_options errflag s =
   Option.iter Location.(prerr_alert none) (Warnings.parse_options errflag s)
 
-let main {compile_ml; pack_objects; link_shared} =
+let pp_protocol_hash_result ppf (computed_hash, stored_hash_opt) =
+  match stored_hash_opt with
+  | Some stored_hash when not (Protocol_hash.equal stored_hash computed_hash) ->
+      Format.fprintf
+        ppf
+        "%a as %a"
+        Protocol_hash.pp
+        stored_hash
+        Protocol_hash.pp
+        computed_hash
+  | None | Some _ -> Protocol_hash.pp ppf computed_hash
+
+let main {compile_ml; pack_objects; link_shared} version =
   Random.self_init () ;
   parse_options false default_warnings ;
   parse_options true default_warn_error ;
@@ -151,6 +160,7 @@ let main {compile_ml; pack_objects; link_shared} =
   and output_file = ref None
   and output_dep = ref false
   and hash_only = ref false
+  and dump_only = ref false
   and check_protocol_hash = ref true in
   let args_spec =
     [
@@ -158,6 +168,9 @@ let main {compile_ml; pack_objects; link_shared} =
       ( "-hash-only",
         Arg.Set hash_only,
         " Only display the hash of the protocol and don't compile" );
+      ( "-dump-only",
+        Arg.Set dump_only,
+        " Only dump bytes of the protocol and don't compile" );
       ( "-no-hash-check",
         Arg.Clear check_protocol_hash,
         " Don't check that TEZOS_PROTOCOL declares the expected protocol hash \
@@ -173,7 +186,7 @@ let main {compile_ml; pack_objects; link_shared} =
       ( "--version",
         Unit
           (fun () ->
-            Format.printf "%s\n" Tezos_version.Bin_version.version_string ;
+            Format.printf "%s\n" version ;
             Stdlib.exit 0),
         " Display version information" );
       ( "-warning",
@@ -204,6 +217,9 @@ let main {compile_ml; pack_objects; link_shared} =
         Format.eprintf "Failed to read TEZOS_PROTOCOL: %a" pp_print_trace err ;
         exit 2
   in
+  if !dump_only then (
+    Format.printf "%s" (Bytes.to_string (Protocol.to_bytes protocol)) ;
+    exit 0) ;
   let computed_hash = Protocol.hash protocol in
   if !hash_only then (
     Format.printf "%a@." Protocol_hash.pp computed_hash ;
@@ -213,7 +229,10 @@ let main {compile_ml; pack_objects; link_shared} =
     | None -> computed_hash
     | Some stored_hash
       when !check_protocol_hash
-           && not (Protocol_hash.equal computed_hash stored_hash) ->
+           && not
+                (Protocol_hash_representative.equivalent
+                   computed_hash
+                   stored_hash) ->
         Format.eprintf
           "Inconsistent hash for protocol in TEZOS_PROTOCOL.@\n\
            Computed hash: %a@\n\
@@ -303,4 +322,7 @@ let main {compile_ml; pack_objects; link_shared} =
     Format.printf "let src_digest = %S ;;\n" (Digest.to_hex dsrc) ;
     Format.printf "let impl_digest = %S ;;\n" (Digest.to_hex dimpl) ;
     Format.printf "let intf_digest = %S ;;\n" (Digest.to_hex dintf)) ;
-  Format.printf "Success: %a.@." Protocol_hash.pp hash
+  Format.printf
+    "Success: %a.@."
+    pp_protocol_hash_result
+    (computed_hash, stored_hash_opt)

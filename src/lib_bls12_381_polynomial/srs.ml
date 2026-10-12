@@ -100,6 +100,8 @@ module type S = sig
 
   (* TODO just for pack *)
   val to_array : ?len:int -> t -> elt array
+
+  val of_array : elt array -> t
 end
 
 module Make (Elt : GElt_sig) = struct
@@ -122,7 +124,7 @@ module Make (Elt : GElt_sig) = struct
   let of_array caml_array =
     Carray.of_array (Array.map G.affine_of_jacobian caml_array)
 
-  let empty = Bigstringaf.empty
+  let empty = Carray.empty
 
   let generate_insecure d x =
     let xi = ref G.one in
@@ -156,7 +158,10 @@ module Make (Elt : GElt_sig) = struct
           with _ ->
             Error
               (`End_of_file
-                (Format.sprintf "found only %d elements of the required %d" i n))
+                 (Format.sprintf
+                    "found only %d elements of the required %d"
+                    i
+                    n))
         in
         let code = Elt.uncompress point buf in
         let* () = if code <> 0 then Error (`Invalid_point i) else Ok () in
@@ -184,7 +189,9 @@ module Make (Elt : GElt_sig) = struct
                 offset
                 poly_length) ;
       let res = G.(copy zero) in
-      let return_code = Elt.pippenger res srs poly offset len in
+      let return_code =
+        Elt.pippenger res (Carray.to_bigstring srs) poly offset len
+      in
       assert (return_code = 0) ;
       res
 end
@@ -198,12 +205,16 @@ module Elt_g1 = struct
 
   let allocate () = G.(affine_of_jacobian zero)
 
+  let zero = G.(affine_of_jacobian zero)
+
+  let eq a b = G.eq (G.jacobian_of_affine a) (G.jacobian_of_affine b)
+
   external uncompress : t -> bytes -> int = "caml_blst_p1_uncompress_stubs"
-    [@@noalloc]
+  [@@noalloc]
 
   external pippenger : G.t -> Bigstringaf.t -> Polynomial.t -> int -> int -> int
-    = "caml_bls12_381_polynomial_internal_srs_g1_pippenger_stubs"
-    [@@noalloc]
+    = "caml_bls12_381_polynomial_srs_g1_pippenger_stubs"
+  [@@noalloc]
 end
 
 module Elt_g2 = struct
@@ -215,13 +226,17 @@ module Elt_g2 = struct
 
   let allocate () = G.(affine_of_jacobian zero)
 
+  let zero = G.(affine_of_jacobian zero)
+
+  let eq a b = G.eq (G.jacobian_of_affine a) (G.jacobian_of_affine b)
+
   external uncompress : G.affine -> bytes -> int
     = "caml_blst_p2_uncompress_stubs"
-    [@@noalloc]
+  [@@noalloc]
 
   external pippenger : G.t -> Bigstringaf.t -> Polynomial.t -> int -> int -> int
-    = "caml_blst_g2_pippenger_contiguous_affine_array_stubs"
-    [@@noalloc]
+    = "caml_bls12_381_polynomial_srs_g2_pippenger_stubs"
+  [@@noalloc]
 end
 
 module Srs_g1 :
@@ -287,11 +302,4 @@ module Srs = struct
       Srs_g2.generate_insecure (1 lsl log_g2) x )
 
   let check = Checks.pairings
-end
-
-(* testing only *)
-module type S_unsafe = sig
-  include S
-
-  val of_array : elt array -> t
 end

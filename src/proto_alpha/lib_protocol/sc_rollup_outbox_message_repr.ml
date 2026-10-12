@@ -60,8 +60,6 @@ type transaction = {
   entrypoint : Entrypoint_repr.t;  (** Entrypoint of the destination. *)
 }
 
-type t = Atomic_transaction_batch of {transactions : transaction list}
-
 let transaction_encoding =
   let open Data_encoding in
   conv
@@ -73,6 +71,69 @@ let transaction_encoding =
        (req "parameters" Script_repr.expr_encoding)
        (req "destination" Contract_repr.originated_encoding)
        Entrypoint_repr.(dft "entrypoint" simple_encoding default)
+
+let pp_untyped_transaction fmt {destination; entrypoint; unparsed_parameters} =
+  let json =
+    Data_encoding.Json.construct Script_repr.expr_encoding unparsed_parameters
+  in
+  Format.fprintf
+    fmt
+    "@[<2>destination: %a@, entrypoint: %a@, unparsed_parameters: %a@]"
+    Contract_hash.pp
+    destination
+    Entrypoint_repr.pp
+    entrypoint
+    Data_encoding.Json.pp
+    json
+
+type typed_transaction = {
+  unparsed_parameters : Script_repr.expr;
+  unparsed_ty : Script_repr.expr;
+  destination : Contract_hash.t;
+  entrypoint : Entrypoint_repr.t;
+}
+
+let typed_transaction_encoding =
+  let open Data_encoding in
+  conv
+    (fun {unparsed_parameters; unparsed_ty; destination; entrypoint} ->
+      (unparsed_parameters, unparsed_ty, destination, entrypoint))
+    (fun (unparsed_parameters, unparsed_ty, destination, entrypoint) ->
+      {unparsed_parameters; unparsed_ty; destination; entrypoint})
+  @@ obj4
+       (req "parameters" Script_repr.expr_encoding)
+       (req "parameters_ty" Script_repr.expr_encoding)
+       (req "destination" Contract_repr.originated_encoding)
+       Entrypoint_repr.(dft "entrypoint" simple_encoding default)
+
+let pp_typed_transaction fmt
+    {destination; entrypoint; unparsed_parameters; unparsed_ty} =
+  let json_param =
+    Data_encoding.Json.construct Script_repr.expr_encoding unparsed_parameters
+  in
+  let json_ty =
+    Data_encoding.Json.construct Script_repr.expr_encoding unparsed_ty
+  in
+  Format.fprintf
+    fmt
+    "@[<v2>destination: %a@,\
+     entrypoint: %a@,\
+     unparsed_ty: %a@,\
+     unparsed_parameters: %a@]"
+    Contract_hash.pp
+    destination
+    Entrypoint_repr.pp
+    entrypoint
+    Data_encoding.Json.pp
+    json_ty
+    Data_encoding.Json.pp
+    json_param
+
+type t =
+  | Atomic_transaction_batch of {transactions : transaction list}
+  | Atomic_transaction_batch_typed of {transactions : typed_transaction list}
+  | Whitelist_update of Sc_rollup_whitelist_repr.t option
+  | Canonical_rollup_signal of string
 
 let encoding =
   let open Data_encoding in
@@ -88,31 +149,62 @@ let encoding =
          case
            (Tag 0)
            ~title:"Atomic_transaction_batch"
-           (obj1 (req "transactions" (list transaction_encoding)))
-           (fun (Atomic_transaction_batch {transactions}) -> Some transactions)
-           (fun transactions -> Atomic_transaction_batch {transactions});
+           (obj2
+              (req "transactions" (list transaction_encoding))
+              (req "kind" (constant "untyped")))
+           (function
+             | Atomic_transaction_batch {transactions} -> Some (transactions, ())
+             | _ -> None)
+           (fun (transactions, ()) -> Atomic_transaction_batch {transactions});
+         case
+           (Tag 1)
+           ~title:"Atomic_transaction_batch_typed"
+           (obj2
+              (req "transactions" (list typed_transaction_encoding))
+              (req "kind" (constant "typed")))
+           (function
+             | Atomic_transaction_batch_typed {transactions} ->
+                 Some (transactions, ())
+             | _ -> None)
+           (fun (transactions, ()) ->
+             Atomic_transaction_batch_typed {transactions});
+         case
+           (Tag 2)
+           ~title:"Whitelist_update"
+           (obj2
+              (opt "whitelist" Sc_rollup_whitelist_repr.encoding)
+              (req "kind" (constant "whitelist_update")))
+           (function
+             | Whitelist_update whitelist_opt -> Some (whitelist_opt, ())
+             | _ -> None)
+           (fun (whitelist_opt, ()) -> Whitelist_update whitelist_opt);
+         case
+           (Tag 3)
+           ~title:"Canonical_rollup_signal"
+           (obj2
+              (req "payload" (string Plain))
+              (req "kind" (constant "canonical_rollup_signal")))
+           (function
+             | Canonical_rollup_signal signal -> Some (signal, ()) | _ -> None)
+           (fun (signal, ()) -> Canonical_rollup_signal signal);
        ])
 
-let pp_transaction fmt {destination; entrypoint; unparsed_parameters} =
-  let json =
-    Data_encoding.Json.construct Script_repr.expr_encoding unparsed_parameters
-  in
-  Format.fprintf
-    fmt
-    "@[%a@;%a@;%a@]"
-    Contract_hash.pp
-    destination
-    Entrypoint_repr.pp
-    entrypoint
-    Data_encoding.Json.pp
-    json
-
-let pp fmt (Atomic_transaction_batch {transactions}) =
-  Format.pp_print_list
-    ~pp_sep:Format.pp_print_space
-    pp_transaction
-    fmt
-    transactions
+let pp fmt = function
+  | Atomic_transaction_batch {transactions} ->
+      Format.pp_print_list
+        ~pp_sep:Format.pp_print_space
+        pp_untyped_transaction
+        fmt
+        transactions
+  | Atomic_transaction_batch_typed {transactions} ->
+      Format.pp_print_list
+        ~pp_sep:Format.pp_print_space
+        pp_typed_transaction
+        fmt
+        transactions
+  | Whitelist_update whitelist_opt ->
+      Format.pp_print_option Sc_rollup_whitelist_repr.pp fmt whitelist_opt
+  | Canonical_rollup_signal signal -> Format.fprintf fmt "Signal %s" signal
 
 type serialized = string
 

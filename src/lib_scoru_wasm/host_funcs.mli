@@ -23,27 +23,44 @@
 (*                                                                           *)
 (*****************************************************************************)
 
-(** [lookup name] retrieves or instantiates a host function by the given [name].
-    Currently dispatches [read_input] to {!read_input} using host function global
-    names as registered by {!register_host_funcs}.
-    Used to plug host function wrappers in the WASN interpreter linker. *)
+(** [lookup ~version name] retrieves or instantiates a host function
+    by the given [name].
+
+    Used to plug host function wrappers in the WASM interpreter linker.
+    NDS host functions are gated purely on the PVM [version] (V6 and
+    above): the [nds_host_functions_enabled] feature flag is enforced
+    at runtime by {!registry}, not at link time, so a kernel importing
+    NDS on V6+ always links successfully. *)
 val lookup :
+  version:Wasm_pvm_state.version ->
   Tezos_webassembly_interpreter.Ast.name ->
   Tezos_webassembly_interpreter.Instance.extern
 
-(** [lookup_opt name] is exactly [lookup name] but returns an option instead of
-      raising `Not_found`. *)
+(** [lookup_opt ~version name] is exactly [lookup] but returns an
+    option instead of raising [Not_found]. *)
 val lookup_opt :
+  version:Wasm_pvm_state.version ->
   Tezos_webassembly_interpreter.Ast.name ->
   Tezos_webassembly_interpreter.Instance.extern option
 
-(** [all] represents all registered host functions that are important for the
-      SCORU WASM PVM. *)
-val all : Tezos_webassembly_interpreter.Host_funcs.registry
+(** [registry ~version ~write_debug ?nds_host_functions_enabled]
+    returns the host functions registry for the expected PVM
+    [version], with the expected implementation for [write_debug].
 
-(** [all_debug] contains the same functions as [all], with the alternative
-    implementation of [write_debug]. *)
-val all_debug :
+    NDS host functions (registered as [Nds_host_func] for V6 and
+    above) receive the [New_durable_storage.t] threaded through
+    [Eval.step].  When [nds] is absent ([Durable_only] storage),
+    the interpreter raises a crash error (unreachable in normal
+    operation since NDS functions require Dual storage).
+
+    [nds_host_functions_enabled] gates the runtime behaviour of NDS
+    host functions: when [false], every [nds_*] call becomes a no-op
+    returning [I32 0l] with the same tick cost as a successful real
+    call — no NDS state is read or mutated. Pre-V6 versions are
+    unaffected by this flag. *)
+val registry :
+  version:Wasm_pvm_state.version ->
+  nds_host_functions_enabled:bool ->
   write_debug:Builtins.write_debug ->
   Tezos_webassembly_interpreter.Host_funcs.registry
 
@@ -68,8 +85,6 @@ module Error : sig
               out of bounds of a value. Has code `-4`. *)
     | Store_value_size_exceeded
         (** Writing a value has exceeded 2^31 bytes. Has code `-5`. *)
-    | Store_invalid_subkey_index
-        (** Trying to get the nth subkey, where n is too big. *)
     | Memory_invalid_access
         (** An address is out of bound of the memory. Has code `-6`. *)
     | Input_output_too_large
@@ -84,6 +99,24 @@ module Error : sig
             Has code `-10`. *)
     | Full_outbox
         (** The outbox is full an cannot accept new messages at this level. Has code `-11`. *)
+    | Store_invalid_subkey_index
+        (** Trying to get the nth subkey, where n is too big. Has code `-12`. *)
+    | Store_value_already_exists
+        (** Trying to create a value at a key that already has an associated
+            value. Has code `-13`. *)
+    | Nds_database_out_of_bounds
+        (** NDS-only: the registry has fewer databases than the [db_index]
+            requested. Distinct from {!Store_not_a_node}, which refers to
+            the classic tree storage. Has code `-14`. *)
+    | Nds_resize_invalid
+        (** NDS-only: the requested registry resize is invalid — either
+            the requested delta is larger than one database, it
+            would shrink the registry below zero, or would overflow the maximum number of databases (2^31). Has code `-15`. *)
+    | Nds_not_enabled
+        (** NDS-only: an NDS host function was invoked while the
+            [nds_host_functions_enabled] runtime flag is off. Lets the
+            kernel distinguish "feature disabled" from a successful
+            zero-byte result. Has code `-16`. *)
 
   (** [code error] returns the error code associated to the error. *)
   val code : t -> int32
@@ -98,7 +131,14 @@ module type Memory_access = sig
 
   val store_bytes : t -> addr -> string -> unit Lwt.t
 
+  (** [store_bytes_from_bytes mem addr data] is {!store_bytes} from a
+      [bytes] without going through an intermediate [string], saving one
+      copy on the hot write path. *)
+  val store_bytes_from_bytes : t -> addr -> bytes -> unit Lwt.t
+
   val load_bytes : t -> addr -> size -> string Lwt.t
+
+  val load_bytes_to_bytes : t -> addr -> size -> bytes Lwt.t
 
   val store_num :
     t -> addr -> addr -> Tezos_webassembly_interpreter.Values.num -> unit Lwt.t
@@ -123,6 +163,22 @@ module Aux : sig
         adress. *)
     val load_bytes :
       memory:memory -> addr:int32 -> size:int32 -> (string, int32) result Lwt.t
+
+    (** [load_raw_bytes ~memory ~addr ~size] is {!load_bytes} followed by
+        [Bytes.of_string]. *)
+    val load_raw_bytes :
+      memory:memory -> addr:int32 -> size:int32 -> (bytes, int32) result Lwt.t
+
+    (** [store_bytes ~memory ~addr ~data] writes [data] into [memory] at
+        [addr]. Returns [Error.Memory_invalid_access] (as an [int32]
+        error code) on out-of-bounds writes rather than raising. *)
+    val store_bytes :
+      memory:memory -> addr:int32 -> data:string -> (unit, int32) result Lwt.t
+
+    (** [store_bytes_from_bytes ~memory ~addr ~data] is {!store_bytes}
+        from a [bytes] without going through an intermediate [string]. *)
+    val store_bytes_from_bytes :
+      memory:memory -> addr:int32 -> data:bytes -> (unit, int32) result Lwt.t
 
     (** [aux_write_output ~input_buffer ~output_buffer ~module_inst ~src
      ~num_bytes] reads num_bytes from the memory of module_inst starting at
@@ -152,6 +208,14 @@ module Aux : sig
       max_bytes:int32 ->
       int32 Lwt.t
 
+    (** @since 2.0.0~r2 *)
+    val store_exists :
+      durable:Durable.t ->
+      memory:memory ->
+      key_offset:int32 ->
+      key_length:int32 ->
+      int32 Lwt.t
+
     val store_has :
       durable:Durable.t ->
       memory:memory ->
@@ -159,7 +223,17 @@ module Aux : sig
       key_length:int32 ->
       int32 Lwt.t
 
-    val store_delete :
+    (** [generic_store_delete ~kind ~durable ~memory ~key_offset ~key_length]
+        either removes the value if [kind = Value] or the complete directory if
+        [kind = Directory] at the given key.
+
+        [store_delete] from version 2.0.0 is actually [generic_store_delete
+        ~kind:Durable.Directory].
+
+        @since 2.0.0~r1
+    *)
+    val generic_store_delete :
+      kind:Durable.kind ->
       durable:Durable.t ->
       memory:memory ->
       key_offset:int32 ->
@@ -182,6 +256,24 @@ module Aux : sig
       from_key_length:int32 ->
       to_key_offset:int32 ->
       to_key_length:int32 ->
+      (Durable.t * int32) Lwt.t
+
+    (** [store_create ~durable ~memory ~key_offset ~key_length ~size] allocates
+        a new value under the given [key] if it doesn't exist. Returns [0] if
+        the new value has been allocated, and [Error.code
+        Store_value_already_exists] (`-13`) if there was already a value. The
+        function is tick safe: allocating won't write the data itself, hence the
+        [size] is not limited by the maximum size of an IO. It is limited to the
+        maximum size of values, which is 2GB (`Int32.max_int`).
+
+        @since 2.0.0~r1
+    *)
+    val store_create :
+      durable:Durable.t ->
+      memory:memory ->
+      key_offset:int32 ->
+      key_length:int32 ->
+      size:int32 ->
       (Durable.t * int32) Lwt.t
 
     val store_value_size :
@@ -218,12 +310,28 @@ module Aux : sig
       key_length:int32 ->
       (Durable.t * int64) Lwt.t
 
+    (** The current implementation of [store_get_nth_key] is not deterministic,
+        and should not be used in kernel development. It cannot be removed from
+        the PVM for backward compatibility reason, but it should not be used in
+        any new kernel development.
+
+        See issue https://gitlab.com/tezos/tezos/-/issues/5301
+    *)
     val store_get_nth_key :
       durable:Durable.t ->
       memory:memory ->
       key_offset:int32 ->
       key_length:int32 ->
       index:int64 ->
+      dst:int32 ->
+      max_size:int32 ->
+      int32 Lwt.t
+
+    val store_get_hash :
+      durable:Durable.t ->
+      memory:memory ->
+      key_offset:int32 ->
+      key_length:int32 ->
       dst:int32 ->
       max_size:int32 ->
       int32 Lwt.t
@@ -298,6 +406,156 @@ module Tick_model : sig
   (* [tree_read] is tick consumption of reading a tree in the durable
      storage. *)
   val tree_read : tick
+
+  (** {2 NDS backend tick costs}
+
+      Same model as tree operations: one tick per backend call,
+      plus memory I/O costs per byte read/written. *)
+
+  val nds_access : tick
+
+  val nds_read : tick
+
+  val nds_write : tick
+
+  val nds_delete : tick
+
+  val nds_move : tick
+
+  val nds_copy : tick
+
+  val nds_clear : tick
+
+  val nds_resize : tick
+
+  val nds_hash : tick
+end
+
+(** The [Nds_not_enabled] error code ([-16]) every [nds_*] host function
+    answers when NDS is not activated on chain. *)
+val nds_disabled_code : int32
+
+(** Tick cost of each NDS host function, a function of its inputs alone.
+    The interpreter charges it before it runs the body, also when NDS is
+    not activated on chain. The fast execution engine computes the same
+    cost before its own body. A negative key length raises
+    [Invalid_argument] in this computation. The interpreter commits
+    [Stuck]. The fast engine raises, and with [--slow-vm-fallback] the
+    interpreter replays the [kernel_run]. *)
+module Nds_ticks : sig
+  val registry_resize : unit -> Z.t
+
+  val registry_copy : unit -> Z.t
+
+  val registry_move : unit -> Z.t
+
+  val registry_clear : unit -> Z.t
+
+  val store_exists : key_len:int32 -> Z.t
+
+  val store_read : key_len:int32 -> Z.t
+
+  val store_write : key_len:int32 -> Z.t
+
+  val store_set : key_len:int32 -> Z.t
+
+  val store_delete : key_len:int32 -> Z.t
+
+  val store_value_size : key_len:int32 -> Z.t
+
+  val database_get_hash : unit -> Z.t
+end
+
+(** Bodies of the NDS host functions, parameterised by the memory access
+    layer like {!Aux} so the interpreter and the fast execution engine
+    share one implementation.  Each function returns the [i32] the kernel
+    receives: the operation's result, or a negative {!Error} code. *)
+module Nds_aux : sig
+  (** Size in bytes of an NDS hash (Blake3-256), the full-length output of
+      [database_get_hash]. *)
+  val nds_hash_size : int32
+
+  module type S = sig
+    type memory
+
+    val registry_resize : nds:Nds.t -> diff:int64 -> int32 Lwt.t
+
+    val registry_copy : nds:Nds.t -> src:int64 -> dst:int64 -> int32 Lwt.t
+
+    val registry_move : nds:Nds.t -> src:int64 -> dst:int64 -> int32 Lwt.t
+
+    val registry_clear : nds:Nds.t -> db_index:int64 -> int32 Lwt.t
+
+    val store_exists :
+      nds:Nds.t ->
+      memory:memory ->
+      db_index:int64 ->
+      key_offset:int32 ->
+      key_len:int32 ->
+      int32 Lwt.t
+
+    val store_read :
+      nds:Nds.t ->
+      memory:memory ->
+      db_index:int64 ->
+      key_offset:int32 ->
+      key_len:int32 ->
+      offset:int64 ->
+      dst:int32 ->
+      max_bytes:int32 ->
+      int32 Lwt.t
+
+    val store_write :
+      nds:Nds.t ->
+      memory:memory ->
+      db_index:int64 ->
+      key_offset:int32 ->
+      key_len:int32 ->
+      offset:int64 ->
+      src:int32 ->
+      num_bytes:int32 ->
+      int32 Lwt.t
+
+    val store_set :
+      nds:Nds.t ->
+      memory:memory ->
+      db_index:int64 ->
+      key_offset:int32 ->
+      key_len:int32 ->
+      src:int32 ->
+      num_bytes:int32 ->
+      int32 Lwt.t
+
+    val store_delete :
+      nds:Nds.t ->
+      memory:memory ->
+      db_index:int64 ->
+      key_offset:int32 ->
+      key_len:int32 ->
+      int32 Lwt.t
+
+    val store_value_size :
+      nds:Nds.t ->
+      memory:memory ->
+      db_index:int64 ->
+      key_offset:int32 ->
+      key_len:int32 ->
+      int32 Lwt.t
+
+    val database_get_hash :
+      nds:Nds.t ->
+      memory:memory ->
+      db_index:int64 ->
+      dst:int32 ->
+      max_bytes:int32 ->
+      int32 Lwt.t
+  end
+
+  module Make (Memory_access : Memory_access) :
+    S with type memory = Memory_access.t
+
+  include
+    S with type memory = Tezos_webassembly_interpreter.Instance.memory_inst
 end
 
 module Internal_for_tests : sig
@@ -307,6 +565,8 @@ module Internal_for_tests : sig
   val write_output : Tezos_webassembly_interpreter.Instance.func_inst
 
   val read_input : Tezos_webassembly_interpreter.Instance.func_inst
+
+  val store_exists : Tezos_webassembly_interpreter.Instance.func_inst
 
   (** [store_has] returns whether a key corresponds to a value and/or subtrees.
         Namely, it returns the following enum:
@@ -319,11 +579,15 @@ module Internal_for_tests : sig
 
   val store_delete : Tezos_webassembly_interpreter.Instance.func_inst
 
+  val store_delete_value : Tezos_webassembly_interpreter.Instance.func_inst
+
   val store_copy : Tezos_webassembly_interpreter.Instance.func_inst
 
   val store_move : Tezos_webassembly_interpreter.Instance.func_inst
 
   val store_value_size : Tezos_webassembly_interpreter.Instance.func_inst
+
+  val store_create : Tezos_webassembly_interpreter.Instance.func_inst
 
   val store_read : Tezos_webassembly_interpreter.Instance.func_inst
 
@@ -333,5 +597,29 @@ module Internal_for_tests : sig
 
   val store_get_nth_key : Tezos_webassembly_interpreter.Instance.func_inst
 
+  val store_get_hash : Tezos_webassembly_interpreter.Instance.func_inst
+
   val write_debug : Tezos_webassembly_interpreter.Instance.func_inst
+
+  val nds_registry_resize : Tezos_webassembly_interpreter.Instance.func_inst
+
+  val nds_registry_copy : Tezos_webassembly_interpreter.Instance.func_inst
+
+  val nds_registry_move : Tezos_webassembly_interpreter.Instance.func_inst
+
+  val nds_registry_clear : Tezos_webassembly_interpreter.Instance.func_inst
+
+  val nds_store_exists : Tezos_webassembly_interpreter.Instance.func_inst
+
+  val nds_store_read : Tezos_webassembly_interpreter.Instance.func_inst
+
+  val nds_store_write : Tezos_webassembly_interpreter.Instance.func_inst
+
+  val nds_store_set : Tezos_webassembly_interpreter.Instance.func_inst
+
+  val nds_store_delete : Tezos_webassembly_interpreter.Instance.func_inst
+
+  val nds_store_value_size : Tezos_webassembly_interpreter.Instance.func_inst
+
+  val nds_database_get_hash : Tezos_webassembly_interpreter.Instance.func_inst
 end

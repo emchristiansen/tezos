@@ -7,7 +7,7 @@ history can be deleted as they are not required anymore.
 
 Three history modes are provided:
 
-- **Full** (default mode with 1 additional cycle)
+- **Full**
 
   The node stores the minimal data since the genesis required to reconstruct
   (or 'replay') the complete chain's ledger state.
@@ -27,12 +27,12 @@ Three history modes are provided:
   * Downsides:
 
     - The node is not able to query the balances or staking rights
-      before the current checkpoint.
+      before the current :ref:`savepoint <history_markers>`.
     - Disk storage slowly increases as the node keeps the history.
 
   See how to :ref:`set up a full node<Set_up_a_full_node>`.
 
-- **Rolling**
+- **Rolling** (default mode with 1 :ref:`additional cycle <History_mode_additional_cycles>`)
 
   This is the lightest mode as it only maintains a minimal rolling fragment of the
   chain data so the node can still validate new blocks and synchronize with the head.
@@ -43,10 +43,10 @@ Three history modes are provided:
     + Can run on low resources architectures.
     + Can be bootstrapped within minutes, thanks to a rolling snapshot import.
 
-  * Downsides
+  * Downsides:
 
     - The node is not able to query block information of balances and
-      staking rights before the current checkpoint.
+      staking rights before the current :ref:`savepoint <history_markers>`.
     - The node does not help other nodes to bootstrap as it is not able to
       send the whole chain history.
 
@@ -80,7 +80,7 @@ History modes in a nutshell
 +---------+----------------+---------------------+--------------------+
 | Full    | Limited        | Yes                 | Complete           |
 +---------+----------------+---------------------+--------------------+
-| Rolling | Low            | Restricted*         | Restricted*        |
+| Rolling | Low            | Yes*                | Yes*               |
 +---------+----------------+---------------------+--------------------+
 
 (*) Suitable for delegation services if the number of additional
@@ -88,13 +88,16 @@ kept cycles is high enough to allow the computation of rewards.
 See :ref:`Keeping additional cycles<History_mode_additional_cycles>` for
 details.
 
+.. _history_markers:
+
 History modes use some markers which are used to describe the state
 of the storage:
 
-- `checkpoint`: the last allowed fork level of the chain (as defined
-  in the Tezos position paper),
-- `savepoint`: the last known block which contains metadata,
-- `caboose`: the last known block.
+- *checkpoint*: the most recently :ref:`finalized block <finality>` of the chain,
+- *savepoint*: the lowest level block that contains :ref:`context <def_context>` data and :ref:`metadata <def_metadata>`,
+- *caboose*: the lowest level known block.
+
+For more details about what data are stored in each mode, refer to :doc:`../shell/storage`.
 
 .. _Set_up_a_full_node:
 
@@ -115,21 +118,18 @@ or use your configuration file as described in :doc:`here <node-configuration>`:
        "history_mode": "full"
    }}
 
-Note that, since the full mode is the default one, this configuration is optional.
-
-You can then verify that your history mode is set to full by using the checkpoint RPC.
+You can then verify that your history mode is set to full by using the following RPC.
 
 .. code-block:: console
 
-   octez-client rpc get /chains/main/checkpoint
+   octez-client rpc get /config/history_mode
 
 .. code-block:: json
 
-    { "block": { "some": "data" },
-       "savepoint": 4096, "caboose": 0, "history_mode": "full" }
+   { "history_mode": { "full": { "additional_cycles": 1 } } }
 
-In full mode, the `savepoint` is the last block which contains its
-metadata. The `caboose` is the last known block which is pruned (that
+In full mode, the savepoint is the last block which contains its
+context and metadata. The caboose is the last known block which is pruned (that
 contains partial data).
 
 .. _Set_up_a_rolling_node:
@@ -141,22 +141,25 @@ To run a ``rolling`` node you can either use the command line arguments:
 
 .. code-block:: console
 
-   octez-node run --history-mode experimental-rolling
+   octez-node run --history-mode rolling
 
 or use your configuration file as described in :doc:`here <node-configuration>`:
 
 .. code-block:: json
 
    { "shell": {
-       "history_mode": "experimental-rolling"
+       "history_mode": "rolling"
    }}
 
-In ``rolling`` mode, the `caboose` is the genesis at its early state,
-and then, it is updated to the last known block of the rolling
-window. The `savepoint` is moved in accordance to the number of
-configured additional cycles.
+Note that, since the rolling mode is the default one, this configuration is optional.
 
-``$ tezos rpc get /chains/main/checkpoint``
+In ``rolling`` mode, the caboose is the genesis at its early state,
+and then, it is updated to the last known block of the rolling
+window. The savepoint is moved in accordance to the number of
+configured additional cycles::
+
+  octez-client rpc get /chains/main/levels/caboose
+  octez-client rpc get /chains/main/levels/savepoint
 
 
 .. _Set_up_an_archive_node:
@@ -174,7 +177,7 @@ If you want to start an ``archive`` node, it is now mandatory to pass
 this argument the first time you launch your node. Indeed, there are
 some restrictions when switching from one mode to another.
 
-In ``archive`` mode, both the `savepoint` and `caboose` are located
+In ``archive`` mode, both the savepoint and caboose are located
 down to the genesis.
 
 .. _History_mode_additional_cycles:
@@ -183,26 +186,22 @@ Keeping additional cycles
 -------------------------
 
 When running a node in ``full`` or ``rolling`` mode, you have a full
-access to the block information in a sliding window of
-history. Indeed, at each new cycle, a garbage collection phase removes
+access to the block information history in a sliding window of a given number
+of block levels. Indeed, at each new cycle, a garbage collection phase removes
 the ledger state and the block metadata (operation receipts, rewards
 updates, etc.) of blocks outside the offset of this sliding
-window. Depending on the network, a minimum number of cycles are
-kept. These cycles correspond to the ones above the last
-allowed fork level, containing blocks subjects to a potential chain
-reorganization (this minimal number of cycles is currently given by
-the :ref:`preserved_cycles<ps_constants>` protocol parameter, which
-on mainnet is currently set to 5 cycles). However, the
-node is able to keep an additional number of cycles that is
-configurable.
+window. The number of cycles kept (beyond the current cycle) is the
+``blocks_preservation_cycles`` :ref:`protocol parameter <protocol_constants>`
+(set to 1 cycle on mainnet) plus a number of
+additional cycles which is configurable.
 
 By default, 1 additional cycle is kept for both ``full`` and
 ``rolling`` nodes. It is possible to increase this parameter to keep
 more history or, on the contrary, decrease it to reduce the storage
 size. For example, it is possible to run a node with *5* additional
-cycles. On mainnet, this would total *10 cycles* of complete history
+cycles. On mainnet, this would total *6 cycles* of complete history
 (approximately four weeks), as we keep 5 cycles beyond the minimal
-number of cycles, that is *5 + 5 = 10*.
+number of cycles, that is *1 + 5 = 6*.
 
 
 When initializing your node on an empty storage, you may specify the
@@ -257,4 +256,7 @@ there are some restrictions when switching from one mode to another.
 (*) Switching from a ``full`` node to an ``archive`` one is possible
 using the ``reconstruct`` feature. To do so, run ``octez-node
 reconstruct`` on your node. Note that the storage reconstruction is a
-long process that, on the main network, may requires days to complete.
+long process that, on the main network, may require more than a week to
+complete. Reconstruction also requires a machine with at least 16GB of
+memory (for the flattening of the context storage operation) and takes up
+about 1TB of storage once completed.

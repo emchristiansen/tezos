@@ -29,8 +29,13 @@ open Alpha_context
 type unsigned_block = {
   unsigned_block_header : Block_header.t;
   operations : Tezos_base.Operation.t list list;
+  manager_operations_infos : Baking_state.manager_operations_infos option;
 }
 
+(** The simulation kind specifies whether the baker should first filter (and
+    then apply) the provided operations, or just apply them. The former case is
+    used for fresh proposals, while the latter for re-proposals (of an already
+    proposed payload). *)
 type simulation_kind =
   | Filter of Operation_pool.Prioritized.t
   | Apply of {
@@ -38,17 +43,15 @@ type simulation_kind =
       payload_hash : Block_payload_hash.t;
     }
 
-type simulation_mode = Local of Context.index | Node
-
 val forge :
   #Protocol_client_context.full ->
   chain_id:Chain_id.t ->
-  pred_info:Baking_state.block_info ->
+  pred_info:Baking_state_types.block_info ->
   pred_resulting_context_hash:Context_hash.t ->
   pred_live_blocks:Block_hash.Set.t ->
   timestamp:Time.Protocol.t ->
   round:Round.t ->
-  liquidity_baking_toggle_vote:Liquidity_baking.liquidity_baking_toggle_vote ->
+  liquidity_baking_toggle_vote:Per_block_votes.per_block_vote ->
   user_activated_upgrades:User_activated.upgrades ->
   Baking_configuration.fees_config ->
   force_apply:bool ->

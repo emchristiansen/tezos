@@ -1,0 +1,460 @@
+// SPDX-FileCopyrightText: 2026 Nomadic Labs <contact@nomadic-labs.com>
+//
+// SPDX-License-Identifier: MIT
+
+//! HTTP header parsing for Tezos runtime requests.
+//!
+//! Header name constants are defined in [`tezosx_interfaces`] and
+//! re-exported here for convenience. Required headers must be set by the
+//! caller; absent or malformed headers produce a `HeaderError`.
+
+pub use tezosx_interfaces::{
+    X_TEZOS_AMOUNT, X_TEZOS_BLOCK_NUMBER, X_TEZOS_CRAC_DEPTH, X_TEZOS_CRAC_ID,
+    X_TEZOS_GAS_LIMIT, X_TEZOS_SENDER, X_TEZOS_SOURCE, X_TEZOS_TIMESTAMP,
+};
+
+use tezos_data_encoding::types::Narith;
+use tezos_protocol::contract::Contract;
+use tezos_smart_rollup::types::Timestamp;
+use tezos_tezlink::enc_wrappers::BlockNumber;
+use tezosx_interfaces::headers::{
+    check_crac_depth, parse_str, parse_tez_to_mutez, parse_u32_default, require_gas,
+    require_i64, require_str, require_u32,
+};
+use tezosx_interfaces::{Gas, TezosXRuntimeError};
+
+/// Values contained in the `X-Tezos-*` request headers, in their Tezos runtime
+/// types. Used in parsing and inserting.
+#[derive(Debug)]
+pub struct MichelsonHeaders {
+    /// Transfer amount in mutez.
+    pub amount: Narith,
+    /// Gas limit, carrying the unit it was sent in.
+    pub gas_limit: Gas,
+    /// Block timestamp.
+    pub timestamp: Timestamp,
+    /// Block level.
+    pub block_number: BlockNumber,
+    /// Sender contract address for Michelson `SENDER` — either an
+    /// originated KT1 or an implicit (tz1/tz2/tz3) account. The latter is
+    /// reachable through a `Michelson -> EVM -> Michelson` round-trip: the
+    /// EVM frame's caller is the alias of the originating implicit account,
+    /// which `RoutingDecision::RoundTrip` resolves back to the original
+    /// tz1/tz2/tz3 when the alias is translated for this runtime
+    /// (cf. !21963).
+    pub sender: Contract,
+    /// CRAC origin contract address parsed from `X-Tezos-Source`.
+    /// May be an implicit `tz1`/`tz2`/`tz3` (native Michelson origin) or an
+    /// originated `KT1` (EVM alias origin). Used for CRAC receipt construction.
+    /// `None` only when the header is absent or unparseable (non-CRAC request).
+    pub crac_origin_contract: Option<Contract>,
+    /// Propagated CRAC-ID string from an incoming cross-runtime call.
+    /// Kept as a raw string; verified by `journal.verify_crac_id()`.
+    /// `None` if the header is absent (non-CRAC request).
+    pub crac_id: Option<String>,
+    pub crac_depth: u32,
+}
+
+/// Parse `X-Tezos-*` headers from `headers`.
+///
+/// Returns `HeaderError` if a required header is absent or any header value
+/// cannot be parsed as its expected type. A well-formed but over-deep
+/// `X-Tezos-CRAC-Depth` (above [`tezosx_interfaces::MAX_CRAC_DEPTH`]) is
+/// rejected as a catchable `BadRequest` — this is the cross-runtime
+/// chain-depth cap that stops a self-recursive gateway cycle.
+pub fn parse_request_headers(
+    headers: &http::HeaderMap,
+) -> Result<MichelsonHeaders, TezosXRuntimeError> {
+    // Parse X-Tezos-Source as a general Tezos Contract if present (for CRAC
+    // receipt construction). The value is a base58check-encoded address: a
+    // `KT1` (EVM alias origin) or a `tz1`/`tz2`/`tz3` (native implicit
+    // origin, e.g. a Michelson-originated chain re-entering Michelson via
+    // EVM). Both forms participate in CRAC receipt folding. The header is
+    // absent for genuine non-CRAC (direct Tezos L1) requests; absent or
+    // unparseable → `None` → `is_crac = false`.
+    let source_str = parse_str(headers, X_TEZOS_SOURCE)?;
+    let crac_origin_contract = source_str
+        .as_deref()
+        .and_then(|s| Contract::from_b58check(s).ok());
+
+    let crac_id = parse_str(headers, X_TEZOS_CRAC_ID)?;
+    let crac_depth = parse_u32_default(headers, X_TEZOS_CRAC_DEPTH, 0)?;
+    check_crac_depth(crac_depth)?;
+
+    Ok(MichelsonHeaders {
+        amount: Narith(
+            parse_tez_to_mutez(&require_str(headers, X_TEZOS_AMOUNT)?)?.into(),
+        ),
+        gas_limit: require_gas(headers, X_TEZOS_GAS_LIMIT)?,
+        timestamp: Timestamp::from(require_i64(headers, X_TEZOS_TIMESTAMP)?),
+        block_number: BlockNumber::from(require_u32(headers, X_TEZOS_BLOCK_NUMBER)?),
+        sender: require_contract(headers, X_TEZOS_SENDER)?,
+        crac_origin_contract,
+        crac_id,
+        crac_depth,
+    })
+}
+
+// Accept either an originated KT1 or an implicit (tz1/tz2/tz3) for the
+// SENDER header, matching standard Michelson semantics: a KT1 sees
+// `SENDER = tz1` when called directly by an implicit account, and the
+// gateway must deliver that same real-native identity on the round-trip
+// path (cf. !21963). See L2-1392.
+fn require_contract(
+    headers: &http::HeaderMap,
+    name: &str,
+) -> Result<Contract, TezosXRuntimeError> {
+    let s = require_str(headers, name)?;
+    Contract::from_b58check(&s).map_err(|e| {
+        TezosXRuntimeError::HeaderError(format!(
+            "Invalid {name}: expected KT1 or implicit address: {e}"
+        ))
+    })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use tezosx_interfaces::headers::headers_from;
+    use tezosx_interfaces::{RuntimeId, MAX_CRAC_DEPTH};
+
+    const KT1: &str = "KT18amZmM5W7qDWVt2pH6uj7sCEd3kbzLrHT";
+    const TZ1: &str = "tz1Ke2h7sDdakHJQh8WX4Z372du1KChsksyU";
+
+    /// Build a valid set of all required headers.
+    fn required_headers() -> Vec<(&'static str, &'static str)> {
+        vec![
+            (X_TEZOS_AMOUNT, "0"),
+            (X_TEZOS_GAS_LIMIT, "1000000"),
+            (X_TEZOS_TIMESTAMP, "1000000"),
+            (X_TEZOS_BLOCK_NUMBER, "1"),
+            (X_TEZOS_SENDER, KT1),
+        ]
+    }
+
+    #[test]
+    fn all_required_present_no_source() {
+        let headers = headers_from(&required_headers());
+        let parsed = parse_request_headers(&headers).unwrap();
+        assert_eq!(parsed.amount, Narith(0u64.into()));
+        assert_eq!(parsed.gas_limit, Gas::new(1_000_000, RuntimeId::Tezos));
+        assert_eq!(parsed.timestamp, Timestamp::from(1_000_000_i64));
+        assert_eq!(parsed.block_number, BlockNumber::from(1u32));
+        assert_eq!(parsed.sender, Contract::from_b58check(KT1).unwrap());
+        assert!(
+            parsed.crac_origin_contract.is_none(),
+            "no source → no CRAC origin contract"
+        );
+        assert!(parsed.crac_id.is_none(), "no source → no CRAC-ID");
+    }
+
+    #[test]
+    fn source_tz1_sets_crac_origin() {
+        // tz1 source (native implicit origin, e.g. re-entrant Michelson leg):
+        // crac_origin_contract is now Some(Implicit(…)) so `is_crac` will be
+        // true and the re-entrant receipt can be recorded.
+        let mut hdrs = required_headers();
+        hdrs.push((X_TEZOS_SOURCE, TZ1));
+        let parsed = parse_request_headers(&headers_from(&hdrs)).unwrap();
+        assert_eq!(
+            parsed.crac_origin_contract,
+            Some(Contract::from_b58check(TZ1).unwrap()),
+            "tz1 source must set crac_origin_contract to Some(Implicit(…))"
+        );
+        assert!(parsed.crac_id.is_none());
+    }
+
+    #[test]
+    fn source_kt1_with_crac_id() {
+        // KT1 source (EVM alias origin, CRAC): crac_origin_contract and crac_id
+        // should be set. Behavior is unchanged from before the fix.
+        let mut hdrs: Vec<(&str, &str)> = required_headers();
+        hdrs.push((X_TEZOS_SOURCE, KT1));
+        hdrs.push((X_TEZOS_CRAC_ID, "0-5"));
+        let parsed = parse_request_headers(&headers_from(&hdrs)).unwrap();
+        assert_eq!(
+            parsed.crac_origin_contract,
+            Some(Contract::from_b58check(KT1).unwrap())
+        );
+        assert_eq!(parsed.crac_id, Some("0-5".to_string()));
+    }
+
+    #[test]
+    fn amount_parsed() {
+        let mut hdrs = required_headers();
+        // 1 TEZ = 1_000_000 mutez
+        *hdrs.iter_mut().find(|(k, _)| *k == X_TEZOS_AMOUNT).unwrap() =
+            (X_TEZOS_AMOUNT, "1");
+        let parsed = parse_request_headers(&headers_from(&hdrs)).unwrap();
+        assert_eq!(parsed.amount, Narith(1_000_000u64.into()));
+        assert!(parsed.crac_origin_contract.is_none());
+        assert!(parsed.crac_id.is_none());
+    }
+
+    #[test]
+    fn amount_parsed_fractional() {
+        let mut hdrs = required_headers();
+        // 1.5 TEZ = 1_500_000 mutez
+        *hdrs.iter_mut().find(|(k, _)| *k == X_TEZOS_AMOUNT).unwrap() =
+            (X_TEZOS_AMOUNT, "1.5");
+        let parsed = parse_request_headers(&headers_from(&hdrs)).unwrap();
+        assert_eq!(parsed.amount, Narith(1_500_000u64.into()));
+        assert!(parsed.crac_origin_contract.is_none());
+        assert!(parsed.crac_id.is_none());
+    }
+
+    #[test]
+    fn amount_truncates_excess_decimals() {
+        let mut hdrs = required_headers();
+        // 7 decimals — exceeds Michelson's 6-decimal limit; truncated to 0 (ADR L2-1004)
+        *hdrs.iter_mut().find(|(k, _)| *k == X_TEZOS_AMOUNT).unwrap() =
+            (X_TEZOS_AMOUNT, "0.0000001");
+        let parsed = parse_request_headers(&headers_from(&hdrs)).unwrap();
+        assert_eq!(parsed.amount, Narith(0u64.into()));
+    }
+
+    #[test]
+    fn timestamp_parsed_negative() {
+        let mut hdrs = required_headers();
+        *hdrs
+            .iter_mut()
+            .find(|(k, _)| *k == X_TEZOS_TIMESTAMP)
+            .unwrap() = (X_TEZOS_TIMESTAMP, "-1");
+        let parsed = parse_request_headers(&headers_from(&hdrs)).unwrap();
+        assert_eq!(parsed.timestamp, Timestamp::from(-1_i64));
+    }
+
+    #[test]
+    fn missing_required_header_returns_header_error() {
+        for required in [
+            X_TEZOS_AMOUNT,
+            X_TEZOS_GAS_LIMIT,
+            X_TEZOS_TIMESTAMP,
+            X_TEZOS_BLOCK_NUMBER,
+            X_TEZOS_SENDER,
+        ] {
+            let hdrs: Vec<_> = required_headers()
+                .into_iter()
+                .filter(|(k, _)| *k != required)
+                .collect();
+            let err = parse_request_headers(&headers_from(&hdrs)).unwrap_err();
+            assert!(
+                matches!(err, TezosXRuntimeError::HeaderError(_)),
+                "expected HeaderError for missing {required}"
+            );
+        }
+    }
+
+    #[test]
+    fn invalid_u64_returns_header_error() {
+        let mut hdrs = required_headers();
+        *hdrs.iter_mut().find(|(k, _)| *k == X_TEZOS_AMOUNT).unwrap() =
+            (X_TEZOS_AMOUNT, "not-a-number");
+        let err = parse_request_headers(&headers_from(&hdrs)).unwrap_err();
+        assert!(matches!(err, TezosXRuntimeError::HeaderError(_)));
+    }
+
+    #[test]
+    fn invalid_i64_returns_header_error() {
+        let mut hdrs = required_headers();
+        *hdrs
+            .iter_mut()
+            .find(|(k, _)| *k == X_TEZOS_TIMESTAMP)
+            .unwrap() = (X_TEZOS_TIMESTAMP, "9999999999999999999999");
+        let err = parse_request_headers(&headers_from(&hdrs)).unwrap_err();
+        assert!(matches!(err, TezosXRuntimeError::HeaderError(_)));
+    }
+
+    #[test]
+    fn invalid_u32_returns_header_error() {
+        let mut hdrs = required_headers();
+        *hdrs
+            .iter_mut()
+            .find(|(k, _)| *k == X_TEZOS_BLOCK_NUMBER)
+            .unwrap() = (X_TEZOS_BLOCK_NUMBER, "5000000000");
+        let err = parse_request_headers(&headers_from(&hdrs)).unwrap_err();
+        assert!(matches!(err, TezosXRuntimeError::HeaderError(_)));
+    }
+
+    #[test]
+    fn invalid_sender_returns_header_error() {
+        let mut hdrs = required_headers();
+        *hdrs.iter_mut().find(|(k, _)| *k == X_TEZOS_SENDER).unwrap() =
+            (X_TEZOS_SENDER, "not-a-contract-address");
+        let err = parse_request_headers(&headers_from(&hdrs)).unwrap_err();
+        assert!(matches!(err, TezosXRuntimeError::HeaderError(_)));
+    }
+
+    #[test]
+    fn sr1_sender_returns_header_error() {
+        // sr1 is a smart-rollup address — not a Michelson contract.
+        // In practice the gateway never injects one as SENDER (a smart
+        // rollup cannot execute Michelson), so this branch is defensive
+        // and maps to HeaderError → 500 like any gateway-bug path.
+        let mut hdrs = required_headers();
+        *hdrs.iter_mut().find(|(k, _)| *k == X_TEZOS_SENDER).unwrap() =
+            (X_TEZOS_SENDER, "sr1RYurGZtN8KNSpkMcCt9CgWeUaNkzsAfXf");
+        let err = parse_request_headers(&headers_from(&hdrs)).unwrap_err();
+        assert!(matches!(err, TezosXRuntimeError::HeaderError(_)));
+    }
+
+    // --- Amount edge cases ---
+
+    #[test]
+    fn amount_zero_parsed_correctly() {
+        let hdrs = required_headers(); // default amount is "0"
+        let parsed = parse_request_headers(&headers_from(&hdrs)).unwrap();
+        assert_eq!(parsed.amount, Narith(0u64.into()));
+    }
+
+    #[test]
+    fn amount_one_mutez() {
+        let mut hdrs = required_headers();
+        // 0.000001 TEZ = 1 mutez
+        *hdrs.iter_mut().find(|(k, _)| *k == X_TEZOS_AMOUNT).unwrap() =
+            (X_TEZOS_AMOUNT, "0.000001");
+        let parsed = parse_request_headers(&headers_from(&hdrs)).unwrap();
+        assert_eq!(parsed.amount, Narith(1u64.into()));
+    }
+
+    #[test]
+    fn amount_rejects_negative() {
+        let mut hdrs = required_headers();
+        *hdrs.iter_mut().find(|(k, _)| *k == X_TEZOS_AMOUNT).unwrap() =
+            (X_TEZOS_AMOUNT, "-1");
+        let err = parse_request_headers(&headers_from(&hdrs)).unwrap_err();
+        assert!(matches!(err, TezosXRuntimeError::HeaderError(_)));
+    }
+
+    #[test]
+    fn amount_rejects_whitespace() {
+        let mut hdrs = required_headers();
+        *hdrs.iter_mut().find(|(k, _)| *k == X_TEZOS_AMOUNT).unwrap() =
+            (X_TEZOS_AMOUNT, " 1 ");
+        let err = parse_request_headers(&headers_from(&hdrs)).unwrap_err();
+        assert!(matches!(err, TezosXRuntimeError::HeaderError(_)));
+    }
+
+    // --- Gas limit edge cases ---
+
+    #[test]
+    fn gas_limit_zero() {
+        let mut hdrs = required_headers();
+        *hdrs
+            .iter_mut()
+            .find(|(k, _)| *k == X_TEZOS_GAS_LIMIT)
+            .unwrap() = (X_TEZOS_GAS_LIMIT, "0");
+        let parsed = parse_request_headers(&headers_from(&hdrs)).unwrap();
+        assert_eq!(parsed.gas_limit, Gas::ZERO);
+    }
+
+    #[test]
+    fn gas_limit_max_u64() {
+        let mut hdrs = required_headers();
+        *hdrs
+            .iter_mut()
+            .find(|(k, _)| *k == X_TEZOS_GAS_LIMIT)
+            .unwrap() = (X_TEZOS_GAS_LIMIT, "18446744073709551615");
+        let parsed = parse_request_headers(&headers_from(&hdrs)).unwrap();
+        assert_eq!(parsed.gas_limit, Gas::new(u64::MAX, RuntimeId::Tezos));
+    }
+
+    #[test]
+    fn gas_limit_overflow_u64() {
+        let mut hdrs = required_headers();
+        *hdrs
+            .iter_mut()
+            .find(|(k, _)| *k == X_TEZOS_GAS_LIMIT)
+            .unwrap() = (X_TEZOS_GAS_LIMIT, "18446744073709551616"); // u64::MAX + 1
+        let err = parse_request_headers(&headers_from(&hdrs)).unwrap_err();
+        assert!(matches!(err, TezosXRuntimeError::HeaderError(_)));
+    }
+
+    // --- Block number edge cases ---
+
+    #[test]
+    fn block_number_zero() {
+        let mut hdrs = required_headers();
+        *hdrs
+            .iter_mut()
+            .find(|(k, _)| *k == X_TEZOS_BLOCK_NUMBER)
+            .unwrap() = (X_TEZOS_BLOCK_NUMBER, "0");
+        let parsed = parse_request_headers(&headers_from(&hdrs)).unwrap();
+        assert_eq!(parsed.block_number, BlockNumber::from(0u32));
+    }
+
+    #[test]
+    fn block_number_max_u32() {
+        let mut hdrs = required_headers();
+        *hdrs
+            .iter_mut()
+            .find(|(k, _)| *k == X_TEZOS_BLOCK_NUMBER)
+            .unwrap() = (X_TEZOS_BLOCK_NUMBER, "4294967295"); // u32::MAX
+        let parsed = parse_request_headers(&headers_from(&hdrs)).unwrap();
+        assert_eq!(parsed.block_number, BlockNumber::from(u32::MAX));
+    }
+
+    // --- Timestamp edge cases ---
+
+    #[test]
+    fn timestamp_zero() {
+        let mut hdrs = required_headers();
+        *hdrs
+            .iter_mut()
+            .find(|(k, _)| *k == X_TEZOS_TIMESTAMP)
+            .unwrap() = (X_TEZOS_TIMESTAMP, "0");
+        let parsed = parse_request_headers(&headers_from(&hdrs)).unwrap();
+        assert_eq!(parsed.timestamp, Timestamp::from(0_i64));
+    }
+
+    // --- Sender edge cases ---
+
+    #[test]
+    fn sender_tz1_address_accepted() {
+        // An implicit account (tz1/tz2/tz3) is a legitimate SENDER in
+        // Michelson semantics — a KT1 sees `SENDER = tz1` when called
+        // directly by a user, and the same identity must survive the EVM
+        // gateway's round-trip path. L2-1392.
+        let mut hdrs = required_headers();
+        *hdrs.iter_mut().find(|(k, _)| *k == X_TEZOS_SENDER).unwrap() =
+            (X_TEZOS_SENDER, TZ1);
+        let parsed = parse_request_headers(&headers_from(&hdrs)).unwrap();
+        assert_eq!(parsed.sender, Contract::from_b58check(TZ1).unwrap());
+    }
+
+    fn parse_with_crac_depth(depth: u32) -> Result<MichelsonHeaders, TezosXRuntimeError> {
+        let depth_str = depth.to_string();
+        let pairs: Vec<(&str, &str)> = vec![
+            (X_TEZOS_AMOUNT, "0"),
+            (X_TEZOS_GAS_LIMIT, "1000000"),
+            (X_TEZOS_TIMESTAMP, "1000000"),
+            (X_TEZOS_BLOCK_NUMBER, "1"),
+            (X_TEZOS_SENDER, KT1),
+            (X_TEZOS_CRAC_DEPTH, depth_str.as_str()),
+        ];
+        parse_request_headers(&headers_from(&pairs))
+    }
+
+    #[test]
+    fn crac_depth_absent_defaults_to_zero() {
+        let parsed = parse_request_headers(&headers_from(&required_headers())).unwrap();
+        assert_eq!(parsed.crac_depth, 0);
+    }
+
+    #[test]
+    fn crac_depth_at_cap_accepted() {
+        let parsed = parse_with_crac_depth(MAX_CRAC_DEPTH).unwrap();
+        assert_eq!(parsed.crac_depth, MAX_CRAC_DEPTH);
+    }
+
+    #[test]
+    fn crac_depth_above_cap_rejected_as_bad_request() {
+        // Over-deep chain must be a catchable 400, not a 500 — the depth
+        // is user-triggerable and may only revert the operation.
+        let err = parse_with_crac_depth(MAX_CRAC_DEPTH + 1).unwrap_err();
+        assert!(
+            matches!(err, TezosXRuntimeError::BadRequest(_)),
+            "expected BadRequest, got {err:?}"
+        );
+    }
+}

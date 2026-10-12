@@ -3,7 +3,7 @@
 (* Open Source License                                                       *)
 (* Copyright (c) 2018 Dynamic Ledger Solutions, Inc. <contact@tezos.com>     *)
 (* Copyright (c) 2019-2022 Nomadic Labs <contact@nomadic-labs.com>           *)
-(* Copyright (c) 2022 TriliTech <contact@trili.tech>                         *)
+(* Copyright (c) 2022-2024 TriliTech <contact@trili.tech>                    *)
 (*                                                                           *)
 (* Permission is hereby granted, free of charge, to any person obtaining a   *)
 (* copy of this software and associated documentation files (the "Software"),*)
@@ -33,13 +33,35 @@ open Client_proto_rollups
 open Client_keys
 open Client_proto_args
 
+let get_timelock_filename path prefix enc obj =
+  let add_path r n = r ^ "/" ^ n in
+  let bin = Data_encoding.Binary.to_bytes_exn enc obj in
+  let hex = Tezos_crypto.Blake2B.(hash_bytes [bin] |> to_hex) |> Hex.show in
+  let name = prefix ^ "_" ^ hex in
+  add_path path name
+
+let write_encoding filepath enc data =
+  let str = Data_encoding.Binary.to_string_exn enc data in
+  Lwt_utils_unix.create_file filepath str
+
+let read_encoding ?(buffer_size = 32768) path enc =
+  let open Lwt_result_syntax in
+  let*! file = Lwt_unix.(openfile path [O_RDONLY; O_NONBLOCK; O_CLOEXEC] 0) in
+  let buffer = Bytes.create buffer_size in
+  let*! nb_bytes_read = Lwt_unix.read file buffer 0 buffer_size in
+  let*! () = Lwt_unix.close file in
+  let buffer =
+    if nb_bytes_read = 0 then buffer else Bytes.sub buffer 0 nb_bytes_read
+  in
+  Data_encoding.Binary.of_bytes_exn enc buffer |> return
+
 let save_zk_rollup ~force (cctxt : #Client_context.full) alias_name rollup =
   let open Lwt_result_syntax in
-  let* () = EpoxyAlias.add ~force cctxt alias_name rollup in
+  let* () = Epoxy_alias.add ~force cctxt alias_name rollup in
   let*! () = cctxt#message "Epoxy rollup memorized as %s" alias_name in
   return_unit
 
-let encrypted_switch =
+let encrypted_switch : (_, Protocol_client_context.full) Tezos_clic.arg =
   Tezos_clic.switch ~long:"encrypted" ~doc:"encrypt the key on-disk" ()
 
 let normalize_types_switch =
@@ -168,7 +190,9 @@ let commands_ro () =
       ~desc:"Get the key rank of a cache key."
       no_options
       (prefixes ["get"; "cached"; "contract"; "rank"; "for"]
-      @@ OriginatedContractAlias.destination_param ~name:"src" ~desc:"contract"
+      @@ Originated_contract_alias.destination_param
+           ~name:"src"
+           ~desc:"contract"
       @@ stop)
       (fun () contract (cctxt : Protocol_client_context.full) ->
         let open Lwt_result_syntax in
@@ -207,10 +231,10 @@ let commands_ro () =
         return_unit);
     command
       ~group
-      ~desc:"Get the balance of a contract."
+      ~desc:"Get the liquid balance of a contract."
       no_options
       (prefixes ["get"; "balance"; "for"]
-      @@ ContractAlias.destination_param ~name:"src" ~desc:"source contract"
+      @@ Contract_alias.destination_param ~name:"src" ~desc:"source contract"
       @@ stop)
       (fun () contract (cctxt : Protocol_client_context.full) ->
         let open Lwt_result_syntax in
@@ -223,10 +247,47 @@ let commands_ro () =
         return_unit);
     command
       ~group
+      ~desc:"Get the staked balance of a contract."
+      no_options
+      (prefixes ["get"; "staked"; "balance"; "for"]
+      @@ Contract_alias.destination_param ~name:"src" ~desc:"source contract"
+      @@ stop)
+      (fun () contract (cctxt : Protocol_client_context.full) ->
+        let open Lwt_result_syntax in
+        let* amount =
+          get_staked_balance
+            cctxt
+            ~chain:cctxt#chain
+            ~block:cctxt#block
+            contract
+        in
+        let amount = Option.value ~default:Tez.zero amount in
+        let*! () =
+          cctxt#answer "%a %s" Tez.pp amount Operation_result.tez_sym
+        in
+        return_unit);
+    command
+      ~group
+      ~desc:"Get the full balance of a contract."
+      no_options
+      (prefixes ["get"; "full"; "balance"; "for"]
+      @@ Contract_alias.destination_param ~name:"src" ~desc:"source contract"
+      @@ stop)
+      (fun () contract (cctxt : Protocol_client_context.full) ->
+        let open Lwt_result_syntax in
+        let* amount =
+          get_full_balance cctxt ~chain:cctxt#chain ~block:cctxt#block contract
+        in
+        let*! () =
+          cctxt#answer "%a %s" Tez.pp amount Operation_result.tez_sym
+        in
+        return_unit);
+    command
+      ~group
       ~desc:"Get the storage of a contract."
       (args1 (unparsing_mode_arg ~default:"Readable"))
       (prefixes ["get"; "contract"; "storage"; "for"]
-      @@ OriginatedContractAlias.destination_param
+      @@ Originated_contract_alias.destination_param
            ~name:"src"
            ~desc:"source contract"
       @@ stop)
@@ -250,7 +311,7 @@ let commands_ro () =
       ~desc:"Get the used storage space of a contract."
       no_options
       (prefixes ["get"; "contract"; "used"; "storage"; "space"; "for"]
-      @@ OriginatedContractAlias.destination_param
+      @@ Originated_contract_alias.destination_param
            ~name:"src"
            ~desc:"source contract"
       @@ stop)
@@ -271,7 +332,7 @@ let commands_ro () =
       ~desc:"Get the paid storage space of a contract."
       no_options
       (prefixes ["get"; "contract"; "paid"; "storage"; "space"; "for"]
-      @@ OriginatedContractAlias.destination_param
+      @@ Originated_contract_alias.destination_param
            ~name:"src"
            ~desc:"source contract"
       @@ stop)
@@ -298,7 +359,7 @@ let commands_ro () =
       @@ prefixes ["of"; "type"]
       @@ Tezos_clic.param ~name:"type" ~desc:"type of the key" data_parameter
       @@ prefix "in"
-      @@ OriginatedContractAlias.destination_param
+      @@ Originated_contract_alias.destination_param
            ~name:"src"
            ~desc:"source contract"
       @@ stop)
@@ -355,13 +416,14 @@ let commands_ro () =
       ~desc:"Get the code of a contract."
       (args2 (unparsing_mode_arg ~default:"Readable") normalize_types_switch)
       (prefixes ["get"; "contract"; "code"; "for"]
-      @@ OriginatedContractAlias.destination_param
+      @@ Originated_contract_alias.destination_param
            ~name:"src"
            ~desc:"source contract"
       @@ stop)
       (fun (unparsing_mode, normalize_types)
            contract
-           (cctxt : Protocol_client_context.full) ->
+           (cctxt : Protocol_client_context.full)
+         ->
         let open Lwt_result_syntax in
         let* v =
           get_script
@@ -386,7 +448,7 @@ let commands_ro () =
       ~desc:"Get the `BLAKE2B` script hash of a contract."
       no_options
       (prefixes ["get"; "contract"; "script"; "hash"; "for"]
-      @@ OriginatedContractAlias.destination_param
+      @@ Originated_contract_alias.destination_param
            ~name:"src"
            ~desc:"source contract"
       @@ stop)
@@ -411,14 +473,15 @@ let commands_ro () =
            ~desc:"the entrypoint to describe"
            entrypoint_parameter
       @@ prefixes ["for"]
-      @@ OriginatedContractAlias.destination_param
+      @@ Originated_contract_alias.destination_param
            ~name:"src"
            ~desc:"source contract"
       @@ stop)
       (fun normalize_types
            entrypoint
            contract
-           (cctxt : Protocol_client_context.full) ->
+           (cctxt : Protocol_client_context.full)
+         ->
         let open Lwt_syntax in
         let* t =
           Michelson_v1_entrypoints.contract_entrypoint_type
@@ -440,7 +503,7 @@ let commands_ro () =
       ~desc:"Get the entrypoint list of a contract."
       (args1 normalize_types_switch)
       (prefixes ["get"; "contract"; "entrypoints"; "for"]
-      @@ OriginatedContractAlias.destination_param
+      @@ Originated_contract_alias.destination_param
            ~name:"src"
            ~desc:"source contract"
       @@ stop)
@@ -464,7 +527,7 @@ let commands_ro () =
       ~desc:"Get the list of unreachable paths in a contract's parameter type."
       no_options
       (prefixes ["get"; "contract"; "unreachable"; "paths"; "for"]
-      @@ OriginatedContractAlias.destination_param
+      @@ Originated_contract_alias.destination_param
            ~name:"src"
            ~desc:"source contract"
       @@ stop)
@@ -487,7 +550,7 @@ let commands_ro () =
       ~desc:"Get the delegate of a contract."
       no_options
       (prefixes ["get"; "delegate"; "for"]
-      @@ ContractAlias.destination_param ~name:"src" ~desc:"source contract"
+      @@ Contract_alias.destination_param ~name:"src" ~desc:"source contract"
       @@ stop)
       (fun () contract (cctxt : Protocol_client_context.full) ->
         let open Lwt_result_syntax in
@@ -503,8 +566,12 @@ let commands_ro () =
             let*! () = cctxt#message "none" in
             return_unit
         | Some delegate ->
-            let* mn = Public_key_hash.rev_find cctxt delegate in
-            let* m = Public_key_hash.to_source delegate in
+            (* FIXME-PA *)
+            let delegate_pkh =
+              Implicit_account_repr.Forbidden.to_pkh delegate
+            in
+            let* mn = Public_key_hash.rev_find cctxt delegate_pkh in
+            let* m = Public_key_hash.to_source delegate_pkh in
             let*! () =
               cctxt#message
                 "%s (%s)"
@@ -519,9 +586,9 @@ let commands_ro () =
          type, and content."
       no_options
       (prefixes ["get"; "ticket"; "balance"; "for"]
-      @@ ContractAlias.destination_param ~name:"src" ~desc:"Source contract."
+      @@ Destination_alias.destination_param ~name:"src" ~desc:"Source address."
       @@ prefixes ["with"; "ticketer"]
-      @@ ContractAlias.destination_param
+      @@ Contract_alias.destination_param
            ~name:"ticketer"
            ~desc:"Ticketer contract of the ticket."
       @@ prefixes ["and"; "type"]
@@ -535,20 +602,37 @@ let commands_ro () =
            ~desc:"Content of the ticket."
            data_parameter
       @@ stop)
-      (fun () contract ticketer content_type content cctxt ->
+      (fun () destination ticketer content_type content cctxt ->
         let open Lwt_result_syntax in
         let* balance =
-          get_contract_ticket_balance
-            cctxt
-            ~chain:cctxt#chain
-            ~block:cctxt#block
-            contract
-            Ticket_token.
-              {
-                ticketer;
-                contents_type = content_type.expanded;
-                contents = content.expanded;
-              }
+          match destination with
+          | Contract contract ->
+              get_contract_ticket_balance
+                cctxt
+                ~chain:cctxt#chain
+                ~block:cctxt#block
+                contract
+                Ticket_token.
+                  {
+                    ticketer;
+                    contents_type = content_type.expanded;
+                    contents = content.expanded;
+                  }
+          | Sc_rollup smart_rollup ->
+              get_smart_rollup_ticket_balance
+                cctxt
+                ~chain:cctxt#chain
+                ~block:cctxt#block
+                smart_rollup
+                Ticket_token.
+                  {
+                    ticketer;
+                    contents_type = content_type.expanded;
+                    contents = content.expanded;
+                  }
+          | _ ->
+              cctxt#error
+                "Invalid address, must be a contract or smart rollup address"
         in
         let*! () = cctxt#answer "%a" Z.pp_print balance in
         return_unit);
@@ -557,7 +641,7 @@ let commands_ro () =
       ~desc:"Get the complete list of tickets owned by a given contract."
       no_options
       (prefixes ["get"; "all"; "ticket"; "balances"; "for"]
-      @@ OriginatedContractAlias.destination_param
+      @@ Originated_contract_alias.destination_param
            ~name:"src"
            ~desc:"Source contract."
       @@ stop)
@@ -601,7 +685,7 @@ let commands_ro () =
             ~placeholder:"num_blocks"
             ~doc:"number of previous blocks to check"
             ~default:"10"
-            non_negative_parameter))
+            (non_negative_parameter ())))
       (prefixes ["get"; "receipt"; "for"]
       @@ param
            ~name:"operation"
@@ -676,9 +760,12 @@ let commands_ro () =
                             (Tez.of_mutez_exn w)
                             Operation_result.tez_sym
                             (if
-                             List.mem ~equal:Protocol_hash.equal p known_protos
-                            then ""
-                            else "not "))
+                               List.mem
+                                 ~equal:Protocol_hash.equal
+                                 p
+                                 known_protos
+                             then ""
+                             else "not "))
                         ranks ;
                       pp_close_box ppf ())
               else cctxt#message "The proposals have already been cleared."
@@ -764,33 +851,41 @@ let commands_ro () =
       ~desc:"Get the frozen deposits limit of a delegate."
       no_options
       (prefixes ["get"; "deposits"; "limit"; "for"]
-      @@ ContractAlias.destination_param ~name:"src" ~desc:"source delegate"
+      @@ Client_keys.Public_key_hash.source_param
+           ~name:"src"
+           ~desc:"source delegate"
       @@ stop)
-      (fun () contract (cctxt : Protocol_client_context.full) ->
+      (fun () delegate (cctxt : Protocol_client_context.full) ->
         let open Lwt_result_syntax in
-        match contract with
-        | Originated _ ->
-            cctxt#error
-              "Cannot change deposits limit on contract %a. This operation is \
-               invalid on originated contracts."
-              Contract.pp
-              contract
-        | Implicit delegate ->
-            let* o =
-              get_frozen_deposits_limit
-                cctxt
-                ~chain:cctxt#chain
-                ~block:cctxt#block
-                delegate
-            in
-            let*! () =
-              match o with
-              | None -> cctxt#answer "unlimited"
-              | Some limit ->
-                  cctxt#answer "%a %s" Tez.pp limit Operation_result.tez_sym
-            in
-            return_unit);
+        let* deposit =
+          get_frozen_deposits_limit
+            cctxt
+            ~chain:cctxt#chain
+            ~block:cctxt#block
+            (* FIXME-PA *)
+            (Protocol.Implicit_account_repr.Forbidden.of_pkh delegate)
+        in
+        let*! () =
+          match deposit with
+          | None -> cctxt#answer "unlimited"
+          | Some limit ->
+              cctxt#answer "%a %s" Tez.pp limit Operation_result.tez_sym
+        in
+        return_unit);
   ]
+
+let dry_run_switch : (_, Protocol_client_context.full) Tezos_clic.arg =
+  Tezos_clic.switch
+    ~long:"dry-run"
+    ~short:'D'
+    ~doc:"don't inject the operation, just display it"
+    ()
+
+let verbose_signing_switch : (_, Protocol_client_context.full) Tezos_clic.arg =
+  Tezos_clic.switch
+    ~long:"verbose-signing"
+    ~doc:"display extra information before signing the operation"
+    ()
 
 (* ----------------------------------------------------------------------------*)
 (* After the activation of a new version of the protocol, the older protocols
@@ -817,19 +912,6 @@ let commands_ro () =
    is then exported in the mli file. *)
 (* ----------------------------------------------------------------------------*)
 
-let dry_run_switch =
-  Tezos_clic.switch
-    ~long:"dry-run"
-    ~short:'D'
-    ~doc:"don't inject the operation, just display it"
-    ()
-
-let verbose_signing_switch =
-  Tezos_clic.switch
-    ~long:"verbose-signing"
-    ~doc:"display extra information before signing the operation"
-    ()
-
 let simulate_switch =
   Tezos_clic.switch
     ~long:"simulation"
@@ -853,6 +935,7 @@ let transfer_command amount (source : Contract.t) destination
       simulation,
       force,
       gas_limit,
+      safety_guard,
       storage_limit,
       counter,
       arg,
@@ -886,7 +969,12 @@ let transfer_command amount (source : Contract.t) destination
         let* source =
           Managed_contract.get_contract_manager cctxt contract_hash
         in
-        let* _, src_pk, src_sk = Client_keys.get_key cctxt source in
+        (* FIXME-PA *)
+        let* _, src_pk, src_sk =
+          Client_keys.get_key
+            cctxt
+            (Implicit_account_repr.Forbidden.to_pkh source)
+        in
         Managed_contract.transfer
           cctxt
           ~chain:cctxt#chain
@@ -907,11 +995,17 @@ let transfer_command amount (source : Contract.t) destination
           ?arg
           ~amount
           ?gas_limit
+          ?safety_guard
           ?storage_limit
           ?counter
           ()
     | Implicit source ->
-        let* _, src_pk, src_sk = Client_keys.get_key cctxt source in
+        (* FIXME-PA *)
+        let* _, src_pk, src_sk =
+          Client_keys.get_key
+            cctxt
+            (Implicit_account_repr.Forbidden.to_pkh source)
+        in
         transfer
           cctxt
           ~chain:cctxt#chain
@@ -931,6 +1025,7 @@ let transfer_command amount (source : Contract.t) destination
           ?arg
           ~amount
           ?gas_limit
+          ?safety_guard
           ?storage_limit
           ?counter
           ~replace_by_fees
@@ -950,7 +1045,7 @@ let prepare_batch_operation cctxt ?arg ?fee ?gas_limit ?storage_limit
     ?entrypoint (source : Contract.t) index batch =
   let open Lwt_result_syntax in
   let* destination =
-    Client_proto_contracts.ContractAlias.find_destination
+    Client_proto_contracts.Contract_alias.find_destination
       cctxt
       batch.destination
   in
@@ -1058,6 +1153,35 @@ let commands_network network () =
             return_unit);
       ]
 
+let get_pop_material (cctxt : Protocol_client_context.full) pop
+    (public_key : public_key) =
+  let open Lwt_result_syntax in
+  match pop with
+  | Some pop -> return_some @@ Either.left pop
+  | None -> (
+      match public_key with
+      | Bls _ -> (
+          let pkh = Signature.Public_key.hash public_key in
+          let*! res = Client_keys.get_key cctxt pkh in
+          match res with
+          | Ok (_, _, secret_key_uri) ->
+              return_some @@ Either.right secret_key_uri
+          | Error [Exn (Failure s)]
+            when String.equal
+                   s
+                   (Format.asprintf
+                      "Unknown secret key for %a"
+                      Signature.Public_key_hash.pp
+                      pkh) ->
+              cctxt#error
+                "Unable to include a proof of possession for %a: the \
+                 associated private key must be available in your wallet, or a \
+                 proof of possession must be explicitly provided."
+                Signature.Public_key_hash.pp
+                pkh
+          | Error err -> fail err)
+      | _ -> return_none)
+
 let commands_rw () =
   let open Client_proto_programs in
   let open Tezos_micheline in
@@ -1066,30 +1190,37 @@ let commands_rw () =
     command
       ~group
       ~desc:"Set the delegate of a contract."
-      (args5
+      (args6
          fee_arg
          dry_run_switch
          verbose_signing_switch
          simulate_switch
-         fee_parameter_args)
+         fee_parameter_args
+         initial_stake_arg)
       (prefixes ["set"; "delegate"; "for"]
-      @@ ContractAlias.destination_param ~name:"src" ~desc:"source contract"
+      @@ Contract_alias.destination_param ~name:"src" ~desc:"source contract"
       @@ prefix "to"
       @@ Public_key_hash.source_param
            ~name:"dlgt"
            ~desc:"new delegate of the contract"
       @@ stop)
-      (fun (fee, dry_run, verbose_signing, simulation, fee_parameter)
+      (fun (fee, dry_run, verbose_signing, simulation, fee_parameter, amount)
            contract
            delegate
-           (cctxt : Protocol_client_context.full) ->
+           (cctxt : Protocol_client_context.full)
+         ->
         let open Lwt_result_syntax in
         match contract with
         | Originated contract ->
             let* source =
               Managed_contract.get_contract_manager cctxt contract
             in
-            let* _, src_pk, src_sk = Client_keys.get_key cctxt source in
+            (* FIXME-PA *)
+            let* _, src_pk, src_sk =
+              Client_keys.get_key
+                cctxt
+                (Implicit_account_repr.Forbidden.to_pkh source)
+            in
             let*! errors =
               Managed_contract.set_delegate
                 cctxt
@@ -1105,7 +1236,8 @@ let commands_rw () =
                 ~src_pk
                 ~src_sk
                 contract
-                (Some delegate)
+                (* FIXME-PA *)
+                (Some (Protocol.Implicit_account_repr.Forbidden.of_pkh delegate))
             in
             let*! (_ :
                     (Operation_hash.t
@@ -1120,8 +1252,13 @@ let commands_rw () =
             in
             return_unit
         | Implicit mgr ->
-            let* _, src_pk, manager_sk = Client_keys.get_key cctxt mgr in
-            let* (_ : _ Injection.result) =
+            (* FIXME-PA *)
+            let* _, src_pk, manager_sk =
+              Client_keys.get_key
+                cctxt
+                (Protocol.Implicit_account_repr.Forbidden.to_pkh mgr)
+            in
+            let* _ =
               set_delegate
                 cctxt
                 ~chain:cctxt#chain
@@ -1132,8 +1269,10 @@ let commands_rw () =
                 ~simulation
                 ~fee_parameter
                 ?fee
+                ?amount
                 mgr
-                (Some delegate)
+                (* FIXME-PA *)
+                (Some (Protocol.Implicit_account_repr.Forbidden.of_pkh delegate))
                 ~src_pk
                 ~manager_sk
             in
@@ -1143,18 +1282,24 @@ let commands_rw () =
       ~desc:"Withdraw the delegate from a contract."
       (args4 fee_arg dry_run_switch verbose_signing_switch fee_parameter_args)
       (prefixes ["withdraw"; "delegate"; "from"]
-      @@ ContractAlias.destination_param ~name:"src" ~desc:"source contract"
+      @@ Contract_alias.destination_param ~name:"src" ~desc:"source contract"
       @@ stop)
       (fun (fee, dry_run, verbose_signing, fee_parameter)
            contract
-           (cctxt : Protocol_client_context.full) ->
+           (cctxt : Protocol_client_context.full)
+         ->
         let open Lwt_result_syntax in
         match contract with
         | Originated contract ->
             let* source =
               Managed_contract.get_contract_manager cctxt contract
             in
-            let* _, src_pk, src_sk = Client_keys.get_key cctxt source in
+            (* FIXME-PA *)
+            let* _, src_pk, src_sk =
+              Client_keys.get_key
+                cctxt
+                (Protocol.Implicit_account_repr.Forbidden.to_pkh source)
+            in
             let*! errors =
               Managed_contract.set_delegate
                 cctxt
@@ -1180,8 +1325,13 @@ let commands_rw () =
             in
             return_unit
         | Implicit mgr ->
-            let* _, src_pk, manager_sk = Client_keys.get_key cctxt mgr in
-            let*! (_ : _ Injection.result tzresult) =
+            (* FIXME-PA *)
+            let* _, src_pk, manager_sk =
+              Client_keys.get_key
+                cctxt
+                (Protocol.Implicit_account_repr.Forbidden.to_pkh mgr)
+            in
+            let*! _ =
               set_delegate
                 cctxt
                 ~chain:cctxt#chain
@@ -1200,11 +1350,12 @@ let commands_rw () =
     command
       ~group
       ~desc:"Launch a smart contract on the blockchain."
-      (args10
+      (args11
          fee_arg
          dry_run_switch
          verbose_signing_switch
          gas_limit_arg
+         safety_guard_arg
          storage_limit_arg
          delegate_arg
          (Client_keys.force_switch ())
@@ -1212,7 +1363,7 @@ let commands_rw () =
          no_print_source_flag
          fee_parameter_args)
       (prefixes ["originate"; "contract"]
-      @@ RawContractAlias.fresh_alias_param
+      @@ Raw_contract_alias.fresh_alias_param
            ~name:"new"
            ~desc:"name of the new contract"
       @@ prefix "transferring"
@@ -1232,6 +1383,7 @@ let commands_rw () =
              dry_run,
              verbose_signing,
              gas_limit,
+             safety_guard,
              storage_limit,
              delegate,
              force,
@@ -1242,9 +1394,10 @@ let commands_rw () =
            balance
            source
            program
-           (cctxt : Protocol_client_context.full) ->
+           (cctxt : Protocol_client_context.full)
+         ->
         let open Lwt_result_syntax in
-        let* alias_name = RawContractAlias.of_fresh cctxt force alias_name in
+        let* alias_name = Raw_contract_alias.of_fresh cctxt force alias_name in
         let* {expanded = code; _} =
           Lwt.return (Micheline_parser.no_parsing_error program)
         in
@@ -1259,11 +1412,18 @@ let commands_rw () =
             ~verbose_signing
             ?fee
             ?gas_limit
+            ?safety_guard
             ?storage_limit
-            ~delegate
+            ~delegate:
+              (* FIXME-PA *)
+              (Option.map
+                 Protocol.Implicit_account_repr.Forbidden.of_pkh
+                 delegate)
             ~initial_storage
             ~balance
-            ~source
+            ~source:
+              (* FIXME-PA *)
+              (Protocol.Implicit_account_repr.Forbidden.of_pkh source)
             ~src_pk
             ~src_sk
             ~code
@@ -1287,13 +1447,14 @@ let commands_rw () =
       ~desc:
         "Execute multiple transfers from a single source account.\n\
          If one of the transfers fails, none of them get executed."
-      (args13
+      (args14
          default_fee_arg
          dry_run_switch
          verbose_signing_switch
          simulate_switch
          force_switch
          default_gas_limit_arg
+         safety_guard_arg
          default_storage_limit_arg
          counter_arg
          default_arg_arg
@@ -1302,7 +1463,7 @@ let commands_rw () =
          default_entrypoint_arg
          replace_by_fees_arg)
       (prefixes ["multiple"; "transfers"; "from"]
-      @@ ContractAlias.destination_param
+      @@ Contract_alias.destination_param
            ~name:"src"
            ~desc:"name of the source contract"
       @@ prefix "using"
@@ -1346,6 +1507,7 @@ let commands_rw () =
              simulation,
              force,
              gas_limit,
+             safety_guard,
              storage_limit,
              counter,
              arg,
@@ -1355,7 +1517,8 @@ let commands_rw () =
              replace_by_fees )
            source
            operations
-           cctxt ->
+           cctxt
+         ->
         (* When --force is used we want to inject the transfer even if it fails.
            In that case we cannot rely on simulation to compute limits and fees
            so we require the corresponding options to be set. *)
@@ -1369,9 +1532,11 @@ let commands_rw () =
         in
         let*! () =
           if force && not simulation then
-            let*! () = check_force_dependency "--gas-limit" gas_limit in
-            let*! () = check_force_dependency "--storage-limit" storage_limit in
-            check_force_dependency "--fee" fee
+            let*! () = check_force_dependency "--default-gas-limit" gas_limit in
+            let*! () =
+              check_force_dependency "--default-storage-limit" storage_limit
+            in
+            check_force_dependency "--default-fee" fee
           else Lwt.return_unit
         in
         let prepare i =
@@ -1394,7 +1559,12 @@ let commands_rw () =
                   Managed_contract.get_contract_manager cctxt contract
               | Implicit source -> return source
             in
-            let* _, src_pk, src_sk = Client_keys.get_key cctxt source in
+            (* FIXME-PA *)
+            let* _, src_pk, src_sk =
+              Client_keys.get_key
+                cctxt
+                (Protocol.Implicit_account_repr.Forbidden.to_pkh source)
+            in
             let* contents = List.mapi_ep prepare operations in
             let (Manager_list contents) =
               Annotated_manager_operation.manager_of_list contents
@@ -1413,6 +1583,7 @@ let commands_rw () =
                 ~fee:(Limit.of_option fee)
                 ~gas_limit:(Limit.of_option gas_limit)
                 ~storage_limit:(Limit.of_option storage_limit)
+                ?safety_guard
                 ?counter
                 ~src_pk
                 ~src_sk
@@ -1436,13 +1607,14 @@ let commands_rw () =
     command
       ~group
       ~desc:"Execute an Epoxy origination operation.\n"
-      (args13
+      (args14
          force_switch
          default_fee_arg
          dry_run_switch
          verbose_signing_switch
          simulate_switch
          default_gas_limit_arg
+         safety_guard_arg
          default_storage_limit_arg
          counter_arg
          default_arg_arg
@@ -1451,7 +1623,7 @@ let commands_rw () =
          default_entrypoint_arg
          replace_by_fees_arg)
       (prefixes ["originate"; "epoxy"]
-      @@ EpoxyAlias.fresh_alias_param
+      @@ Epoxy_alias.fresh_alias_param
            ~name:"epoxy"
            ~desc:"Fresh name for an Epoxy rollup"
       @@ prefix "from"
@@ -1482,6 +1654,7 @@ let commands_rw () =
              verbose_signing,
              simulation,
              gas_limit,
+             safety_guard,
              storage_limit,
              counter,
              _arg,
@@ -1495,7 +1668,8 @@ let commands_rw () =
            init_state
            circuits_info
            nb_ops
-           cctxt ->
+           cctxt
+         ->
         let open Lwt_result_syntax in
         let* _, src_pk, src_sk = Client_keys.get_key cctxt source in
         let* _, _, res =
@@ -1507,11 +1681,14 @@ let commands_rw () =
             ~verbose_signing
             ?fee
             ?gas_limit
+            ?safety_guard
             ?storage_limit
             ?counter
             ?confirmations:cctxt#confirmations
             ~simulation
-            ~source
+            ~source:
+              (* FIXME-PA *)
+              (Protocol.Implicit_account_repr.Forbidden.of_pkh source)
             ~src_pk
             ~src_sk
             ~fee_parameter
@@ -1528,23 +1705,24 @@ let commands_rw () =
                 operation_result =
                   Apply_operation_result.Applied
                     (Apply_results.Zk_rollup_origination_result
-                      {originated_zk_rollup; _});
+                       {originated_zk_rollup; _});
                 _;
               } ->
               Ok originated_zk_rollup
           | _ -> error_with "Epoxy rollup was not correctly originated"
         in
-        let* alias_name = EpoxyAlias.of_fresh cctxt force alias in
+        let* alias_name = Epoxy_alias.of_fresh cctxt force alias in
         save_zk_rollup ~force cctxt alias_name res);
     command
       ~group
       ~desc:"Execute an Epoxy publish operation.\n"
-      (args12
+      (args13
          default_fee_arg
          dry_run_switch
          verbose_signing_switch
          simulate_switch
          default_gas_limit_arg
+         safety_guard_arg
          default_storage_limit_arg
          counter_arg
          default_arg_arg
@@ -1566,6 +1744,7 @@ let commands_rw () =
              verbose_signing,
              simulation,
              gas_limit,
+             safety_guard,
              storage_limit,
              counter,
              _arg,
@@ -1576,7 +1755,8 @@ let commands_rw () =
            source
            zk_rollup
            ops
-           cctxt ->
+           cctxt
+         ->
         let open Lwt_result_syntax in
         let* _, src_pk, src_sk = Client_keys.get_key cctxt source in
         let* _res =
@@ -1588,11 +1768,14 @@ let commands_rw () =
             ~verbose_signing
             ?fee
             ?gas_limit
+            ?safety_guard
             ?storage_limit
             ?counter
             ?confirmations:cctxt#confirmations
             ~simulation
-            ~source
+            ~source:
+              (* FIXME-PA *)
+              (Protocol.Implicit_account_repr.Forbidden.of_pkh source)
             ~src_pk
             ~src_sk
             ~fee_parameter
@@ -1604,12 +1787,13 @@ let commands_rw () =
     command
       ~group
       ~desc:"Execute an Epoxy update operation.\n"
-      (args12
+      (args13
          default_fee_arg
          dry_run_switch
          verbose_signing_switch
          simulate_switch
          default_gas_limit_arg
+         safety_guard_arg
          default_storage_limit_arg
          counter_arg
          default_arg_arg
@@ -1631,6 +1815,7 @@ let commands_rw () =
              verbose_signing,
              simulation,
              gas_limit,
+             safety_guard,
              storage_limit,
              counter,
              _arg,
@@ -1641,7 +1826,8 @@ let commands_rw () =
            source
            zk_rollup
            update
-           cctxt ->
+           cctxt
+         ->
         let open Lwt_result_syntax in
         let* _, src_pk, src_sk = Client_keys.get_key cctxt source in
         let* _res =
@@ -1653,11 +1839,14 @@ let commands_rw () =
             ~verbose_signing
             ?fee
             ?gas_limit
+            ?safety_guard
             ?storage_limit
             ?counter
             ?confirmations:cctxt#confirmations
             ~simulation
-            ~source
+            ~source:
+              (* FIXME-PA *)
+              (Protocol.Implicit_account_repr.Forbidden.of_pkh source)
             ~src_pk
             ~src_sk
             ~fee_parameter
@@ -1669,13 +1858,14 @@ let commands_rw () =
     command
       ~group
       ~desc:"Transfer tokens / call a smart contract."
-      (args14
+      (args15
          fee_arg
          dry_run_switch
          verbose_signing_switch
          simulate_switch
          force_switch
          gas_limit_arg
+         safety_guard_arg
          storage_limit_arg
          counter_arg
          arg_arg
@@ -1687,11 +1877,11 @@ let commands_rw () =
       (prefixes ["transfer"]
       @@ tez_param ~name:"qty" ~desc:"amount taken from source"
       @@ prefix "from"
-      @@ ContractAlias.destination_param
+      @@ Contract_alias.destination_param
            ~name:"src"
            ~desc:"name of the source contract"
       @@ prefix "to"
-      @@ ContractAlias.destination_param
+      @@ Contract_alias.destination_param
            ~name:"dst"
            ~desc:"name/literal of the destination contract"
       @@ stop)
@@ -1701,6 +1891,7 @@ let commands_rw () =
              simulation,
              force,
              gas_limit,
+             safety_guard,
              storage_limit,
              counter,
              arg,
@@ -1712,7 +1903,8 @@ let commands_rw () =
            amount
            source
            destination
-           cctxt ->
+           cctxt
+         ->
         transfer_command
           amount
           source
@@ -1724,6 +1916,7 @@ let commands_rw () =
             simulation,
             force,
             gas_limit,
+            safety_guard,
             storage_limit,
             counter,
             arg,
@@ -1763,7 +1956,8 @@ let commands_rw () =
              counter )
            global_constant_str
            source
-           cctxt ->
+           cctxt
+         ->
         let open Lwt_result_syntax in
         let* _, src_pk, src_sk = Client_keys.get_key cctxt source in
         let*! errors =
@@ -1778,7 +1972,9 @@ let commands_rw () =
             ?counter
             ?confirmations:cctxt#confirmations
             ~simulation
-            ~source
+            ~source:
+              (* FIXME-PA *)
+              (Protocol.Implicit_account_repr.Forbidden.of_pkh source)
             ~src_pk
             ~src_sk
             ~fee_parameter
@@ -1796,13 +1992,14 @@ let commands_rw () =
     command
       ~group
       ~desc:"Call a smart contract (same as 'transfer 0')."
-      (args14
+      (args15
          fee_arg
          dry_run_switch
          verbose_signing_switch
          simulate_switch
          force_switch
          gas_limit_arg
+         safety_guard_arg
          storage_limit_arg
          counter_arg
          arg_arg
@@ -1812,11 +2009,11 @@ let commands_rw () =
          replace_by_fees_arg
          successor_level_arg)
       (prefixes ["call"]
-      @@ ContractAlias.destination_param
+      @@ Contract_alias.destination_param
            ~name:"dst"
            ~desc:"name/literal of the destination contract"
       @@ prefix "from"
-      @@ ContractAlias.destination_param
+      @@ Contract_alias.destination_param
            ~name:"src"
            ~desc:"name of the source contract"
       @@ stop)
@@ -1826,6 +2023,7 @@ let commands_rw () =
              simulation,
              force,
              gas_limit,
+             safety_guard,
              storage_limit,
              counter,
              arg,
@@ -1836,7 +2034,8 @@ let commands_rw () =
              successor_level )
            destination
            source
-           cctxt ->
+           cctxt
+         ->
         let amount = Tez.zero in
         transfer_command
           amount
@@ -1849,6 +2048,7 @@ let commands_rw () =
             simulation,
             force,
             gas_limit,
+            safety_guard,
             storage_limit,
             counter,
             arg,
@@ -1857,6 +2057,664 @@ let commands_rw () =
             entrypoint,
             replace_by_fees,
             successor_level ));
+    command
+      ~group
+      ~desc:
+        "Stake the given amount for the source. The source must be a delegator \
+         to be allowed to stake."
+      (args13
+         fee_arg
+         dry_run_switch
+         verbose_signing_switch
+         simulate_switch
+         force_switch
+         gas_limit_arg
+         safety_guard_arg
+         storage_limit_arg
+         counter_arg
+         no_print_source_flag
+         fee_parameter_args
+         replace_by_fees_arg
+         successor_level_arg)
+      (prefix "stake"
+      @@ tez_param ~name:"qty" ~desc:"amount staked from source"
+      @@ prefix "for"
+      @@ Public_key_hash.source_param
+           ~name:"src"
+           ~desc:"name of the source contract"
+      @@ stop)
+      (fun ( fee,
+             dry_run,
+             verbose_signing,
+             simulation,
+             force,
+             gas_limit,
+             safety_guard,
+             storage_limit,
+             counter,
+             no_print_source,
+             fee_parameter,
+             replace_by_fees,
+             successor_level )
+           amount
+           source
+           cctxt
+         ->
+        (* FIXME-PA *)
+        let contract =
+          Contract.Implicit
+            (Protocol.Implicit_account_repr.Forbidden.of_pkh source)
+        in
+        let arg = None in
+        let entrypoint = Some Entrypoint.stake in
+        (* Show the stake that would actually be credited. *)
+        let show_credited_stake () =
+          let open Lwt_syntax in
+          let* credited_res =
+            simulated_staked_amount
+              cctxt
+              ~chain:cctxt#chain
+              ~block:cctxt#block
+              ~source
+              ~amount
+          in
+          match credited_res with
+          | Ok (Some credited) ->
+              let diff_mutez =
+                Int64.sub (Tez.to_mutez amount) (Tez.to_mutez credited)
+              in
+              cctxt#message
+                "At the delegate's current conversion rate, staking %a will \
+                 credit %a of stake to the staker%t."
+                Tez.pp
+                amount
+                Tez.pp
+                credited
+                (fun ppf ->
+                  if Int64.compare diff_mutez 0L > 0 then
+                    Format.fprintf
+                      ppf
+                      " (%a lost to rounding)"
+                      Tez.pp
+                      (Tez.of_mutez_exn diff_mutez)
+                  else Format.fprintf ppf "")
+          | Ok None | Error _ -> Lwt.return_unit
+        in
+        let open Lwt_result_syntax in
+        let*! () = show_credited_stake () in
+        (* TODO #6162
+           (unless --force)
+              - check contract is delegated
+              - check amount is positive
+              - check contract is a baker if AI is not enabled *)
+        transfer_command
+          amount
+          contract
+          contract
+          cctxt
+          ( fee,
+            dry_run,
+            verbose_signing,
+            simulation,
+            force,
+            gas_limit,
+            safety_guard,
+            storage_limit,
+            counter,
+            arg,
+            no_print_source,
+            fee_parameter,
+            entrypoint,
+            replace_by_fees,
+            successor_level ));
+    command
+      ~group
+      ~desc:
+        "Unstake the given amount. If \"everything\" is given as amount, \
+         unstakes everything from the staking balance. Unstaked tez remains \
+         frozen for a set amount of cycles (the slashing period) after the \
+         operation. Once this period is over, the operation \"finalize \
+         unstake\" must be called for the funds to appear in the liquid \
+         balance."
+      (args13
+         fee_arg
+         dry_run_switch
+         verbose_signing_switch
+         simulate_switch
+         force_switch
+         gas_limit_arg
+         safety_guard_arg
+         storage_limit_arg
+         counter_arg
+         no_print_source_flag
+         fee_parameter_args
+         replace_by_fees_arg
+         successor_level_arg)
+      (prefix "unstake"
+      @@ everything_or_tez_param
+           ~name:"qty"
+           ~desc:"amount to unstake from source"
+      @@ prefix "for"
+      @@ Public_key_hash.source_param
+           ~name:"src"
+           ~desc:"name of the source contract"
+      @@ stop)
+      (fun ( fee,
+             dry_run,
+             verbose_signing,
+             simulation,
+             force,
+             gas_limit,
+             safety_guard,
+             storage_limit,
+             counter,
+             no_print_source,
+             fee_parameter,
+             replace_by_fees,
+             successor_level )
+           amount
+           source
+           cctxt
+         ->
+        (* FIXME-PA *)
+        let contract =
+          Contract.Implicit
+            (Protocol.Implicit_account_repr.Forbidden.of_pkh source)
+        in
+        let entrypoint = Some Entrypoint.unstake in
+        (* TODO #6162
+           (unless --force)
+              - check contract is delegated
+              - check contract has stake
+              - check amount is positive
+              - check contract is a baker if AI is not enabled
+              - print a warning if effective stake is lower *)
+        transfer_command
+          amount
+          contract
+          contract
+          cctxt
+          ( fee,
+            dry_run,
+            verbose_signing,
+            simulation,
+            force,
+            gas_limit,
+            safety_guard,
+            storage_limit,
+            counter,
+            None,
+            no_print_source,
+            fee_parameter,
+            entrypoint,
+            replace_by_fees,
+            successor_level ));
+    command
+      ~group
+      ~desc:
+        "Transfer all the finalizable unstaked funds of the source to their \
+         liquid balance."
+      (args13
+         fee_arg
+         dry_run_switch
+         verbose_signing_switch
+         simulate_switch
+         force_switch
+         gas_limit_arg
+         safety_guard_arg
+         storage_limit_arg
+         counter_arg
+         no_print_source_flag
+         fee_parameter_args
+         replace_by_fees_arg
+         successor_level_arg)
+      (prefixes ["finalize"; "unstake"]
+      @@ prefix "for"
+      @@ Public_key_hash.source_param
+           ~name:"src"
+           ~desc:"name of the source contract"
+      @@ stop)
+      (fun ( fee,
+             dry_run,
+             verbose_signing,
+             simulation,
+             force,
+             gas_limit,
+             safety_guard,
+             storage_limit,
+             counter,
+             no_print_source,
+             fee_parameter,
+             replace_by_fees,
+             successor_level )
+           source
+           cctxt
+         ->
+        (* FIXME-PA *)
+        let contract =
+          Contract.Implicit
+            (Protocol.Implicit_account_repr.Forbidden.of_pkh source)
+        in
+        let arg = None in
+        let amount = Tez.zero in
+        let entrypoint = Some Entrypoint.finalize_unstake in
+        (* TODO #6162
+           (unless --force)
+              - check contract has finalizable unstake requests
+        *)
+        transfer_command
+          amount
+          contract
+          contract
+          cctxt
+          ( fee,
+            dry_run,
+            verbose_signing,
+            simulation,
+            force,
+            gas_limit,
+            safety_guard,
+            storage_limit,
+            counter,
+            arg,
+            no_print_source,
+            fee_parameter,
+            entrypoint,
+            replace_by_fees,
+            successor_level ));
+    (* Start: sTEZ client commands *)
+    command
+      ~group
+      ~desc:"Deposit the given amount of tez into the sTEZ contract."
+      (args13
+         fee_arg
+         dry_run_switch
+         verbose_signing_switch
+         simulate_switch
+         force_switch
+         gas_limit_arg
+         safety_guard_arg
+         storage_limit_arg
+         counter_arg
+         no_print_source_flag
+         fee_parameter_args
+         replace_by_fees_arg
+         successor_level_arg)
+      (prefixes ["stez"; "deposit"]
+      @@ tez_param ~name:"qty" ~desc:"amount deposited from source"
+      @@ prefix "for"
+      @@ Public_key_hash.source_param
+           ~name:"src"
+           ~desc:"name of the source contract"
+      @@ stop)
+      (fun ( fee,
+             dry_run,
+             verbose_signing,
+             simulation,
+             force,
+             gas_limit,
+             safety_guard,
+             storage_limit,
+             counter,
+             no_print_source,
+             fee_parameter,
+             replace_by_fees,
+             successor_level )
+           amount
+           source
+           (cctxt : Protocol_client_context.full)
+         ->
+        let open Lwt_result_syntax in
+        let* stez_contract_hash =
+          get_stez_contract_hash cctxt ~chain:cctxt#chain ~block:cctxt#block
+        in
+        (* FIXME-PA *)
+        let contract =
+          Contract.Implicit
+            (Protocol.Implicit_account_repr.Forbidden.of_pkh source)
+        in
+        let arg = None in
+        let entrypoint = Some (Entrypoint.of_string_strict_exn "deposit") in
+        transfer_command
+          amount
+          contract
+          (Contract.Originated stez_contract_hash)
+          cctxt
+          ( fee,
+            dry_run,
+            verbose_signing,
+            simulation,
+            force,
+            gas_limit,
+            safety_guard,
+            storage_limit,
+            counter,
+            arg,
+            no_print_source,
+            fee_parameter,
+            entrypoint,
+            replace_by_fees,
+            successor_level ));
+    command
+      ~group
+      ~desc:"Redeem the given amount of tez from the sTEZ contract."
+      (args13
+         fee_arg
+         dry_run_switch
+         verbose_signing_switch
+         simulate_switch
+         force_switch
+         gas_limit_arg
+         safety_guard_arg
+         storage_limit_arg
+         counter_arg
+         no_print_source_flag
+         fee_parameter_args
+         replace_by_fees_arg
+         successor_level_arg)
+      (prefixes ["stez"; "redeem"]
+      @@ tez_param ~name:"qty" ~desc:"amount in tez to redeem from sTEZ"
+      @@ prefix "for"
+      @@ Public_key_hash.source_param
+           ~name:"src"
+           ~desc:"name of the recipient contract"
+      @@ stop)
+      (fun ( fee,
+             dry_run,
+             verbose_signing,
+             simulation,
+             force,
+             gas_limit,
+             safety_guard,
+             storage_limit,
+             counter,
+             no_print_source,
+             fee_parameter,
+             replace_by_fees,
+             successor_level )
+           amount
+           source
+           cctxt
+         ->
+        let open Lwt_result_syntax in
+        let* stez_contract_hash =
+          get_stez_contract_hash cctxt ~chain:cctxt#chain ~block:cctxt#block
+        in
+        (* FIXME-PA *)
+        let contract =
+          Contract.Implicit
+            (Protocol.Implicit_account_repr.Forbidden.of_pkh source)
+        in
+        let arg = Some (Int64.to_string (Tez.to_mutez amount)) in
+        let entrypoint = Some (Entrypoint.of_string_strict_exn "redeem") in
+        transfer_command
+          Tez.zero
+          contract
+          (Contract.Originated stez_contract_hash)
+          cctxt
+          ( fee,
+            dry_run,
+            verbose_signing,
+            simulation,
+            force,
+            gas_limit,
+            safety_guard,
+            storage_limit,
+            counter,
+            arg,
+            no_print_source,
+            fee_parameter,
+            entrypoint,
+            replace_by_fees,
+            successor_level ));
+    (* End: sTEZ client commands *)
+    command
+      ~group
+      ~desc:"Set delegate parameters"
+      (args15
+         limit_of_staking_over_baking_millionth_arg
+         edge_of_baking_over_staking_billionth_arg
+         fee_arg
+         dry_run_switch
+         verbose_signing_switch
+         simulate_switch
+         force_switch
+         gas_limit_arg
+         safety_guard_arg
+         storage_limit_arg
+         counter_arg
+         no_print_source_flag
+         fee_parameter_args
+         replace_by_fees_arg
+         successor_level_arg)
+      (prefixes ["set"; "delegate"; "parameters"; "for"]
+      @@ Public_key_hash.source_param ~name:"src" ~desc:"name of the delegate"
+      @@ stop)
+      (fun ( limit_of_staking_over_baking_millionth_opt,
+             edge_of_baking_over_staking_billionth_opt,
+             fee,
+             dry_run,
+             verbose_signing,
+             simulation,
+             force,
+             gas_limit,
+             safety_guard,
+             storage_limit,
+             counter,
+             no_print_source,
+             fee_parameter,
+             replace_by_fees,
+             successor_level )
+           source
+           cctxt
+         ->
+        let open Lwt_result_syntax in
+        let* limit_of_staking_over_baking_millionth =
+          match limit_of_staking_over_baking_millionth_opt with
+          | None ->
+              cctxt#error
+                "The --limit-of-staking-over-baking argument is mandatory"
+          | Some x -> return x
+        in
+        let* edge_of_baking_over_staking_billionth =
+          match edge_of_baking_over_staking_billionth_opt with
+          | None ->
+              cctxt#error
+                "The --edge-of-baking-over-staking argument is mandatory"
+          | Some x -> return x
+        in
+        (* FIXME-PA *)
+        let contract =
+          Contract.Implicit
+            (Protocol.Implicit_account_repr.Forbidden.of_pkh source)
+        in
+        let arg =
+          (* Is there a better way? *)
+          Some
+            (Format.sprintf
+               "Pair %d %d Unit"
+               limit_of_staking_over_baking_millionth
+               edge_of_baking_over_staking_billionth)
+        in
+        let amount = Tez.zero in
+        let entrypoint = Some Entrypoint.set_delegate_parameters in
+        let* () =
+          (* FIXME-PA *)
+          let* is_delegate =
+            is_delegate
+              cctxt
+              (Protocol.Implicit_account_repr.Forbidden.of_pkh source)
+          in
+          if is_delegate || force then return_unit
+          else
+            cctxt#error
+              "The provided address is not a delegate. Only delegates can \
+               change their staking parameters. (You can use --force to inject \
+               the operation anyway)"
+        in
+        transfer_command
+          amount
+          contract
+          contract
+          cctxt
+          ( fee,
+            dry_run,
+            verbose_signing,
+            simulation,
+            force,
+            gas_limit,
+            safety_guard,
+            storage_limit,
+            counter,
+            arg,
+            no_print_source,
+            fee_parameter,
+            entrypoint,
+            replace_by_fees,
+            successor_level ));
+    command
+      ~group
+      ~desc:"Update delegate parameters"
+      (args15
+         limit_of_staking_over_baking_millionth_arg
+         edge_of_baking_over_staking_billionth_arg
+         fee_arg
+         dry_run_switch
+         verbose_signing_switch
+         simulate_switch
+         force_switch
+         gas_limit_arg
+         safety_guard_arg
+         storage_limit_arg
+         counter_arg
+         no_print_source_flag
+         fee_parameter_args
+         replace_by_fees_arg
+         successor_level_arg)
+      (prefixes ["update"; "delegate"; "parameters"; "for"]
+      @@ Public_key_hash.source_param ~name:"src" ~desc:"name of the delegate"
+      @@ stop)
+      (fun ( limit_of_staking_over_baking_millionth_opt,
+             edge_of_baking_over_staking_billionth_opt,
+             fee,
+             dry_run,
+             verbose_signing,
+             simulation,
+             force,
+             gas_limit,
+             safety_guard,
+             storage_limit,
+             counter,
+             no_print_source,
+             fee_parameter,
+             replace_by_fees,
+             successor_level )
+           source
+           cctxt
+         ->
+        let open Lwt_result_syntax in
+        let* () =
+          (* FIXME-PA *)
+          let* is_delegate =
+            is_delegate
+              cctxt
+              (Protocol.Implicit_account_repr.Forbidden.of_pkh source)
+          in
+          if is_delegate || force then return_unit
+          else
+            cctxt#error
+              "The provided address is not a delegate. Only delegates can \
+               change their staking parameters. (You can use --force to inject \
+               the operation anyway)"
+        in
+        (* FIXME-PA *)
+        let* latest =
+          get_latest_staking_parameters
+            cctxt
+            (Protocol.Implicit_account_repr.Forbidden.of_pkh source)
+        in
+        let* ( limit_of_staking_over_baking_millionth,
+               edge_of_baking_over_staking_billionth ) =
+          match
+            ( limit_of_staking_over_baking_millionth_opt,
+              edge_of_baking_over_staking_billionth_opt )
+          with
+          | None, None ->
+              cctxt#error
+                "You must specify at least one of the following parameters: \
+                 %s, %s@."
+                "--limit-of-staking-over-baking"
+                "--edge-of-baking-over-staking"
+          | None, Some x ->
+              let latest =
+                Int32.to_int latest.limit_of_staking_over_baking_millionth
+              in
+              let*! () =
+                cctxt#warning
+                  "The limit of staking over baking has not been changed, it \
+                   will be kept at %d millionth.\n"
+                  latest
+              in
+              return (latest, x)
+          | Some limit, None ->
+              let latest_edge =
+                Int32.to_int latest.edge_of_baking_over_staking_billionth
+              in
+              let*! () =
+                cctxt#warning
+                  "The edge of baking over staking has not been changed, it \
+                   will be kept at %d billionth.\n"
+                  latest_edge
+              in
+              return (limit, latest_edge)
+          | Some limit, Some edge -> return (limit, edge)
+        in
+        if
+          edge_of_baking_over_staking_billionth
+          = Int32.to_int latest.edge_of_baking_over_staking_billionth
+          && limit_of_staking_over_baking_millionth
+             = Int32.to_int latest.limit_of_staking_over_baking_millionth
+        then
+          cctxt#error
+            "You must change at least one parameter. Latest pending parameters \
+             correspond to the values you specified@."
+        else
+          (* FIXME-PA *)
+          let contract =
+            Contract.Implicit
+              (Protocol.Implicit_account_repr.Forbidden.of_pkh source)
+          in
+          let arg =
+            (* Is there a better way? *)
+            Some
+              (Format.sprintf
+                 "Pair %d %d Unit"
+                 limit_of_staking_over_baking_millionth
+                 edge_of_baking_over_staking_billionth)
+          in
+          let amount = Tez.zero in
+          let entrypoint = Some Entrypoint.set_delegate_parameters in
+
+          transfer_command
+            amount
+            contract
+            contract
+            cctxt
+            ( fee,
+              dry_run,
+              verbose_signing,
+              simulation,
+              force,
+              gas_limit,
+              safety_guard,
+              storage_limit,
+              counter,
+              arg,
+              no_print_source,
+              fee_parameter,
+              entrypoint,
+              replace_by_fees,
+              successor_level ));
     command
       ~group
       ~desc:"Reveal the public key of the contract manager."
@@ -1877,7 +2735,9 @@ let commands_rw () =
             ~chain:cctxt#chain
             ~block:cctxt#block
             ?confirmations:cctxt#confirmations
-            ~source
+            ~source:
+              (* FIXME-PA *)
+              (Protocol.Implicit_account_repr.Forbidden.of_pkh source)
             ?fee
             ~src_pk
             ~src_sk
@@ -1888,14 +2748,90 @@ let commands_rw () =
     command
       ~group
       ~desc:"Register the public key hash as a delegate."
-      (args4 fee_arg dry_run_switch verbose_signing_switch fee_parameter_args)
+      (args9
+         fee_arg
+         dry_run_switch
+         verbose_signing_switch
+         fee_parameter_args
+         (Public_key.source_arg
+            ~long:"consensus-key"
+            ~placeholder:"consensus_key"
+            ~doc:"Register the consensus key for the delegate"
+            ())
+         (Public_key.source_arg
+            ~long:"companion-key"
+            ~placeholder:"companion_key"
+            ~doc:"Register the companion key for the delegate"
+            ())
+         consensus_key_pop_arg
+         companion_key_pop_arg
+         initial_stake_arg)
       (prefixes ["register"; "key"]
       @@ Public_key_hash.source_param ~name:"mgr" ~desc:"the delegate key"
       @@ prefixes ["as"; "delegate"]
       @@ stop)
-      (fun (fee, dry_run, verbose_signing, fee_parameter) src_pkh cctxt ->
+      (fun ( fee,
+             dry_run,
+             verbose_signing,
+             fee_parameter,
+             consensus_key,
+             companion_key,
+             consensus_key_pop,
+             companion_key_pop,
+             amount )
+           src_pkh
+           cctxt
+         ->
         let open Lwt_result_syntax in
         let* _, src_pk, src_sk = Client_keys.get_key cctxt src_pkh in
+        let* consensus_keys =
+          match consensus_key with
+          | None -> return None
+          | Some (name_pk_consensus, public_key_consensus) ->
+              let* public_key =
+                match public_key_consensus with
+                | Some pk -> return pk
+                | None -> Client_keys.public_key name_pk_consensus
+              in
+              let* pop_material =
+                match consensus_key_pop with
+                | Some pop -> return_some @@ Either.left pop
+                | None -> (
+                    match public_key with
+                    | Bls _ ->
+                        let pkh = Signature.Public_key.hash public_key in
+                        let* _, _, secret_key_uri =
+                          Client_keys.get_key cctxt pkh
+                        in
+                        return_some @@ Either.right secret_key_uri
+                    | _ -> return_none)
+              in
+              return @@ Some (public_key, pop_material)
+        in
+        let* companion_keys =
+          match companion_key with
+          | None -> return None
+          | Some (name_pk_companion, public_key_companion) ->
+              let* public_key =
+                match public_key_companion with
+                | Some pk -> return pk
+                | None -> Client_keys.public_key name_pk_companion
+              in
+              let* pop_material =
+                match companion_key_pop with
+                | Some pop -> return_some @@ Either.left pop
+                | None -> (
+                    match public_key with
+                    | Bls _ ->
+                        let pkh = Signature.Public_key.hash public_key in
+                        let* _, _, secret_key_uri =
+                          Client_keys.get_key cctxt pkh
+                        in
+                        return_some @@ Either.right secret_key_uri
+                    | _ -> return_none)
+              in
+              return @@ Some (public_key, pop_material)
+        in
         let*! r =
           register_as_delegate
             cctxt
@@ -1907,6 +2843,9 @@ let commands_rw () =
             ~verbose_signing
             ?fee
             ~manager_sk:src_sk
+            ?consensus_keys
+            ?companion_keys
+            ?amount
             src_pk
         in
         match r with
@@ -1921,23 +2860,43 @@ let commands_rw () =
         | Error el -> Lwt.return_error el);
     command
       ~group
-      ~desc:"Register the public key hash as a delegate."
-      (args4 fee_arg dry_run_switch verbose_signing_switch fee_parameter_args)
+      ~desc:"Register the public key hash as a delegate with a consensus key."
+      (args5
+         fee_arg
+         dry_run_switch
+         verbose_signing_switch
+         fee_parameter_args
+         consensus_key_pop_arg)
       (prefixes ["register"; "key"]
       @@ Public_key_hash.source_param ~name:"mgr" ~desc:"the delegate key"
       @@ prefixes ["as"; "delegate"; "with"; "consensus"; "key"]
       @@ Public_key.source_param ~name:"key" ~desc:"the consensus key"
       @@ stop)
-      (fun (fee, dry_run, verbose_signing, fee_parameter)
+      (fun (fee, dry_run, verbose_signing, fee_parameter, consensus_key_pop)
            src_pkh
-           (name_pk, consensus_pk)
-           cctxt ->
+           (name_pk, public_key)
+           cctxt
+         ->
         let open Lwt_result_syntax in
         let* _, src_pk, src_sk = Client_keys.get_key cctxt src_pkh in
-        let* consensus_pk =
-          match consensus_pk with
-          | Some pk -> return pk
-          | None -> Client_keys.public_key name_pk
+        let* consensus_keys =
+          let* public_key =
+            match public_key with
+            | Some pk -> return pk
+            | None -> Client_keys.public_key name_pk
+          in
+          let* pop_material =
+            match consensus_key_pop with
+            | Some pop -> return_some @@ Either.left pop
+            | None -> (
+                match public_key with
+                | Bls _ ->
+                    let pkh = Signature.Public_key.hash public_key in
+                    let* _, _, secret_key_uri = Client_keys.get_key cctxt pkh in
+                    return_some @@ Either.right secret_key_uri
+                | _ -> return_none)
+          in
+          return (public_key, pop_material)
         in
         let*! r =
           register_as_delegate
@@ -1950,7 +2909,7 @@ let commands_rw () =
             ~verbose_signing
             ?fee
             ~manager_sk:src_sk
-            ~consensus_pk
+            ~consensus_keys
             src_pk
         in
         match r with
@@ -1966,24 +2925,41 @@ let commands_rw () =
     command
       ~group
       ~desc:"Update the consensus key of a delegate."
-      (args4 fee_arg dry_run_switch verbose_signing_switch fee_parameter_args)
+      (args5
+         fee_arg
+         dry_run_switch
+         verbose_signing_switch
+         fee_parameter_args
+         consensus_key_pop_arg)
       (prefixes ["set"; "consensus"; "key"; "for"]
       @@ Public_key_hash.source_param ~name:"mgr" ~desc:"the delegate key"
       @@ prefixes ["to"]
       @@ Public_key.source_param ~name:"key" ~desc:"the consensus key"
       @@ stop)
-      (fun (fee, dry_run, verbose_signing, fee_parameter)
+      (fun (fee, dry_run, verbose_signing, fee_parameter, consensus_key_pop)
            delegate_pkh
-           (name_pk, consensus_pk)
-           cctxt ->
+           (name_pk, public_key)
+           cctxt
+         ->
         let open Lwt_result_syntax in
         let* _, delegate_pk, delegate_sk =
           Client_keys.get_key cctxt delegate_pkh
         in
-        let* consensus_pk =
-          match consensus_pk with
+        let* public_key =
+          match public_key with
           | Some pk -> return pk
           | None -> Client_keys.public_key name_pk
+        in
+        let* pop_material =
+          match consensus_key_pop with
+          | Some pop -> return_some @@ Either.left pop
+          | None -> (
+              match public_key with
+              | Bls _ ->
+                  let pkh = Signature.Public_key.hash public_key in
+                  let* _, _, secret_key_uri = Client_keys.get_key cctxt pkh in
+                  return_some @@ Either.right secret_key_uri
+              | _ -> return_none)
         in
         let*! r =
           update_consensus_key
@@ -1995,7 +2971,63 @@ let commands_rw () =
             ~fee_parameter
             ~verbose_signing
             ?fee
-            ~consensus_pk
+            ?pop_material
+            ~public_key
+            ~manager_sk:delegate_sk
+            delegate_pk
+        in
+        match r with Ok _ -> return_unit | Error el -> Lwt.return_error el);
+    command
+      ~group
+      ~desc:"Update the companion key of a delegate."
+      (args5
+         fee_arg
+         dry_run_switch
+         verbose_signing_switch
+         fee_parameter_args
+         companion_key_pop_arg)
+      (prefixes ["set"; "companion"; "key"; "for"]
+      @@ Public_key_hash.source_param ~name:"mgr" ~desc:"the delegate key"
+      @@ prefixes ["to"]
+      @@ Public_key.source_param ~name:"key" ~desc:"the companion key"
+      @@ stop)
+      (fun (fee, dry_run, verbose_signing, fee_parameter, companion_key_pop)
+           delegate_pkh
+           (name_pk, public_key)
+           cctxt
+         ->
+        let open Lwt_result_syntax in
+        let* _, delegate_pk, delegate_sk =
+          Client_keys.get_key cctxt delegate_pkh
+        in
+        let* public_key =
+          match public_key with
+          | Some pk -> return pk
+          | None -> Client_keys.public_key name_pk
+        in
+        let* pop_material =
+          match companion_key_pop with
+          | Some pop -> return_some @@ Either.left pop
+          | None -> (
+              match public_key with
+              | Bls _ ->
+                  let pkh = Signature.Public_key.hash public_key in
+                  let* _, _, secret_key_uri = Client_keys.get_key cctxt pkh in
+                  return_some @@ Either.right secret_key_uri
+              | _ -> return_none)
+        in
+        let*! r =
+          update_companion_key
+            cctxt
+            ~chain:cctxt#chain
+            ~block:cctxt#block
+            ?confirmations:cctxt#confirmations
+            ~dry_run
+            ~fee_parameter
+            ~verbose_signing
+            ?fee
+            ?pop_material
+            ~public_key
             ~manager_sk:delegate_sk
             delegate_pk
         in
@@ -2014,6 +3046,11 @@ let commands_rw () =
         let* _, _consensus_pk, consensus_sk =
           Client_keys.get_key cctxt consensus_pkh
         in
+        (* FIXME-PA *)
+        let delegate = Implicit_account_repr.Forbidden.of_pkh delegate_pkh in
+        let destination =
+          Implicit_account_repr.Forbidden.of_pkh consensus_pkh
+        in
         let*! r =
           drain_delegate
             cctxt
@@ -2024,7 +3061,8 @@ let commands_rw () =
             ~verbose_signing
             ~consensus_pkh
             ~consensus_sk
-            ~delegate:delegate_pkh
+            ~delegate
+            ~destination
             ()
         in
         match r with Ok _ -> return_unit | Error el -> Lwt.return_error el);
@@ -2045,10 +3083,16 @@ let commands_rw () =
            delegate_pkh
            destination_pkh
            consensus_pkh
-           cctxt ->
+           cctxt
+         ->
         let open Lwt_result_syntax in
         let* _, _consensus_pk, consensus_sk =
           Client_keys.get_key cctxt consensus_pkh
+        in
+        (* FIXME-PA *)
+        let delegate = Implicit_account_repr.Forbidden.of_pkh delegate_pkh in
+        let destination =
+          Implicit_account_repr.Forbidden.of_pkh destination_pkh
         in
         let*! r =
           drain_delegate
@@ -2060,8 +3104,8 @@ let commands_rw () =
             ~verbose_signing
             ~consensus_pkh
             ~consensus_sk
-            ~destination:destination_pkh
-            ~delegate:delegate_pkh
+            ~destination
+            ~delegate
             ()
         in
         match r with Ok _ -> return_unit | Error el -> Lwt.return_error el);
@@ -2075,13 +3119,13 @@ let commands_rw () =
               "wait until 'N' additional blocks after the operation appears in \
                the considered chain"
             ~default:"0"
-            non_negative_parameter)
+            (non_negative_parameter ()))
          (default_arg
             ~long:"check-previous"
             ~placeholder:"num_blocks"
             ~doc:"number of previous blocks to check"
             ~default:"10"
-            non_negative_parameter)
+            (non_negative_parameter ()))
          (arg
             ~long:"branch"
             ~placeholder:"block_hash"
@@ -2100,7 +3144,8 @@ let commands_rw () =
       @@ stop)
       (fun (confirmations, predecessors, branch)
            operation_hash
-           (ctxt : Protocol_client_context.full) ->
+           (ctxt : Protocol_client_context.full)
+         ->
         let open Lwt_result_syntax in
         let* (_ : Block_hash.t * int * int) =
           Client_confirmations.wait_for_operation_inclusion
@@ -2139,7 +3184,8 @@ let commands_rw () =
       (fun (dry_run, verbose_signing, force)
            src_pkh
            proposals
-           (cctxt : Protocol_client_context.full) ->
+           (cctxt : Protocol_client_context.full)
+         ->
         let open Lwt_result_syntax in
         let* src_name, _src_pk, src_sk = Client_keys.get_key cctxt src_pkh in
         let* info =
@@ -2164,10 +3210,11 @@ let commands_rw () =
         in
         let* has_voting_power =
           let*! r =
-            Alpha_services.Delegate.voting_power
+            Plugin.Alpha_services.Delegate.voting_power
               cctxt
               (cctxt#chain, cctxt#block)
-              src_pkh
+              (* FIXME-PA *)
+              (Protocol.Implicit_account_repr.Forbidden.of_pkh src_pkh)
           in
           match r with
           | Ok voting_power -> return (voting_power <> 0L)
@@ -2203,8 +3250,8 @@ let commands_rw () =
               error
                 "There %s: %a."
                 (if Compare.List_length_with.(dups = 1) then
-                 "is a duplicate proposal"
-                else "are duplicate proposals")
+                   "is a duplicate proposal"
+                 else "are duplicate proposals")
                 Format.(
                   pp_print_list
                     ~pp_sep:(fun ppf () -> pp_print_string ppf ", ")
@@ -2231,7 +3278,7 @@ let commands_rw () =
               cctxt#message
                 "There %s with the submission:%t"
                 (if Compare.List_length_with.(!errors = 1) then "is an issue"
-                else "are issues")
+                 else "are issues")
                 Format.(
                   fun ppf ->
                     pp_print_cut ppf () ;
@@ -2265,7 +3312,8 @@ let commands_rw () =
             ~chain:cctxt#chain
             ~block:cctxt#block
             ~src_sk
-            src_pkh
+            (* FIXME-PA *)
+            (Protocol.Implicit_account_repr.Forbidden.of_pkh src_pkh)
             proposals
         in
         match r with
@@ -2312,7 +3360,9 @@ let commands_rw () =
                 | Some hash -> Lwt_result_syntax.return hash))
       @@ param
            ~name:"ballot"
-           ~desc:"the ballot value (yea/yay, nay, or pass)"
+           ~desc:
+             "the ballot value (yea, nay, or pass; yay is a deprecated synonym \
+              for yea)"
            (parameter
               ~autocomplete:(fun _ ->
                 Lwt_result_syntax.return ["yea"; "nay"; "pass"])
@@ -2329,7 +3379,8 @@ let commands_rw () =
            src_pkh
            proposal
            ballot
-           (cctxt : Protocol_client_context.full) ->
+           (cctxt : Protocol_client_context.full)
+         ->
         let open Lwt_result_syntax in
         let* src_name, _src_pk, src_sk = Client_keys.get_key cctxt src_pkh in
         let* info =
@@ -2365,10 +3416,11 @@ let commands_rw () =
         in
         let* has_voting_power =
           let*! r =
-            Alpha_services.Delegate.voting_power
+            Plugin.Alpha_services.Delegate.voting_power
               cctxt
               (cctxt#chain, cctxt#block)
-              src_pkh
+              (* FIXME-PA *)
+              (Protocol.Implicit_account_repr.Forbidden.of_pkh src_pkh)
           in
           match r with
           | Ok voting_power -> return (voting_power <> 0L)
@@ -2394,7 +3446,8 @@ let commands_rw () =
             ~chain:cctxt#chain
             ~block:cctxt#block
             ~src_sk
-            src_pkh
+            (* FIXME-PA *)
+            (Protocol.Implicit_account_repr.Forbidden.of_pkh src_pkh)
             ~verbose_signing
             ~dry_run
             proposal
@@ -2411,44 +3464,39 @@ let commands_rw () =
          simulate_switch
          fee_parameter_args)
       (prefixes ["set"; "deposits"; "limit"; "for"]
-      @@ ContractAlias.destination_param ~name:"src" ~desc:"source contract"
+      @@ Client_keys.Public_key_hash.source_param
+           ~name:"src"
+           ~desc:"source contract"
       @@ prefix "to"
       @@ tez_param
            ~name:"deposits limit"
            ~desc:"the maximum amount of frozen deposits"
       @@ stop)
       (fun (fee, dry_run, verbose_signing, simulation, fee_parameter)
-           contract
+           mgr
            limit
-           (cctxt : Protocol_client_context.full) ->
+           (cctxt : Protocol_client_context.full)
+         ->
         let open Lwt_result_syntax in
-        match contract with
-        | Originated _ ->
-            cctxt#error
-              "Cannot change deposits limit on contract %a. This operation is \
-               invalid on originated contracts or unregistered delegate \
-               contracts."
-              Contract.pp
-              contract
-        | Implicit mgr ->
-            let* _, src_pk, manager_sk = Client_keys.get_key cctxt mgr in
-            let* (_ : _ Injection.result) =
-              set_deposits_limit
-                cctxt
-                ~chain:cctxt#chain
-                ~block:cctxt#block
-                ?confirmations:cctxt#confirmations
-                ~dry_run
-                ~verbose_signing
-                ~simulation
-                ~fee_parameter
-                ?fee
-                mgr
-                ~src_pk
-                ~manager_sk
-                (Some limit)
-            in
-            return_unit);
+        let* _, src_pk, manager_sk = Client_keys.get_key cctxt mgr in
+        let* (_ : _ Injection.result) =
+          set_deposits_limit
+            cctxt
+            ~chain:cctxt#chain
+            ~block:cctxt#block
+            ?confirmations:cctxt#confirmations
+            ~dry_run
+            ~verbose_signing
+            ~simulation
+            ~fee_parameter
+            ?fee
+            (* FIXME-PA *)
+            (Protocol.Implicit_account_repr.Forbidden.of_pkh mgr)
+            ~src_pk
+            ~manager_sk
+            (Some limit)
+        in
+        return_unit);
     command
       ~group
       ~desc:"Remove the deposits limit of a registered delegate."
@@ -2459,39 +3507,34 @@ let commands_rw () =
          simulate_switch
          fee_parameter_args)
       (prefixes ["unset"; "deposits"; "limit"; "for"]
-      @@ ContractAlias.destination_param ~name:"src" ~desc:"source contract"
+      @@ Client_keys.Public_key_hash.source_param
+           ~name:"src"
+           ~desc:"source contract"
       @@ stop)
       (fun (fee, dry_run, verbose_signing, simulation, fee_parameter)
-           contract
-           (cctxt : Protocol_client_context.full) ->
+           mgr
+           (cctxt : Protocol_client_context.full)
+         ->
         let open Lwt_result_syntax in
-        match contract with
-        | Originated _ ->
-            cctxt#error
-              "Cannot change deposits limit on contract %a. This operation is \
-               invalid on originated contracts or unregistered delegate \
-               contracts."
-              Contract.pp
-              contract
-        | Implicit mgr ->
-            let* _, src_pk, manager_sk = Client_keys.get_key cctxt mgr in
-            let* (_ : _ Injection.result) =
-              set_deposits_limit
-                cctxt
-                ~chain:cctxt#chain
-                ~block:cctxt#block
-                ?confirmations:cctxt#confirmations
-                ~dry_run
-                ~verbose_signing
-                ~simulation
-                ~fee_parameter
-                ?fee
-                mgr
-                ~src_pk
-                ~manager_sk
-                None
-            in
-            return_unit);
+        let* _, src_pk, manager_sk = Client_keys.get_key cctxt mgr in
+        let* (_ : _ Injection.result) =
+          set_deposits_limit
+            cctxt
+            ~chain:cctxt#chain
+            ~block:cctxt#block
+            ?confirmations:cctxt#confirmations
+            ~dry_run
+            ~verbose_signing
+            ~simulation
+            ~fee_parameter
+            ?fee
+            (* FIXME-PA *)
+            (Protocol.Implicit_account_repr.Forbidden.of_pkh mgr)
+            ~src_pk
+            ~manager_sk
+            None
+        in
+        return_unit);
     command
       ~group
       ~desc:"Increase the paid storage of a smart contract."
@@ -2503,7 +3546,7 @@ let commands_rw () =
          simulate_switch
          fee_parameter_args)
       (prefixes ["increase"; "the"; "paid"; "storage"; "of"]
-      @@ OriginatedContractAlias.destination_param
+      @@ Originated_contract_alias.destination_param
            ~name:"contract"
            ~desc:"name of the smart contract"
       @@ prefix "by"
@@ -2517,7 +3560,8 @@ let commands_rw () =
            contract
            amount_in_bytes
            payer
-           (cctxt : Protocol_client_context.full) ->
+           (cctxt : Protocol_client_context.full)
+         ->
         let open Lwt_result_syntax in
         let* _, src_pk, manager_sk = Client_keys.get_key cctxt payer in
         let* (_ : _ Injection.result) =
@@ -2531,7 +3575,9 @@ let commands_rw () =
             ?fee
             ?confirmations:cctxt#confirmations
             ~simulation
-            ~source:payer
+            ~source:
+              (* FIXME-PA *)
+              (Protocol.Implicit_account_repr.Forbidden.of_pkh payer)
             ~src_pk
             ~manager_sk
             ~destination:contract
@@ -2560,7 +3606,7 @@ let commands_rw () =
            ~name:"tickets owner"
            ~desc:"Implicit account owning the tickets."
       @@ prefix "to"
-      @@ ContractAlias.destination_param
+      @@ Contract_alias.destination_param
            ~name:"recipient contract"
            ~desc:"Contract receiving the tickets."
       @@ prefixes ["with"; "entrypoint"]
@@ -2581,7 +3627,7 @@ let commands_rw () =
            ~desc:"Type of the tickets."
            Client_proto_args.string_parameter
       @@ prefixes ["and"; "ticketer"]
-      @@ ContractAlias.destination_param
+      @@ Contract_alias.destination_param
            ~name:"tickets ticketer"
            ~desc:"Ticketer contract of the tickets."
       @@ stop)
@@ -2599,7 +3645,8 @@ let commands_rw () =
            contents
            ty
            ticketer
-           cctxt ->
+           cctxt
+         ->
         let open Lwt_result_syntax in
         let* _, src_pk, src_sk = Client_keys.get_key cctxt source in
         match Ticket_amount.of_zint amount with
@@ -2616,7 +3663,9 @@ let commands_rw () =
                 ?counter
                 ?confirmations:cctxt#confirmations
                 ~simulation
-                ~source
+                ~source:
+                  (* FIXME-PA *)
+                  (Protocol.Implicit_account_repr.Forbidden.of_pkh source)
                 ~src_pk
                 ~src_sk
                 ~fee_parameter
@@ -2633,15 +3682,21 @@ let commands_rw () =
     command
       ~group
       ~desc:"Originate a new smart rollup."
-      (args7
+      (args9
          fee_arg
          dry_run_switch
          verbose_signing_switch
          simulate_switch
          fee_parameter_args
          storage_limit_arg
-         counter_arg)
-      (prefixes ["originate"; "smart"; "rollup"; "from"]
+         counter_arg
+         (Client_keys.force_switch ())
+         whitelist_arg)
+      (prefixes ["originate"; "smart"; "rollup"]
+      @@ Smart_rollup_alias.Address.fresh_alias_param
+           ~name:"alias"
+           ~desc:"name of the new smart rollup"
+      @@ prefix "from"
       @@ Client_keys.Public_key_hash.source_param
            ~name:"src"
            ~desc:"Name of the account originating the smart rollup."
@@ -2669,19 +3724,25 @@ let commands_rw () =
              simulation,
              fee_parameter,
              storage_limit,
-             counter )
+             counter,
+             force,
+             whitelist )
+           alias
            source
            kind
            parameters_ty
            boot_sector
-           cctxt ->
+           cctxt
+         ->
         let open Lwt_result_syntax in
         let* _, src_pk, src_sk = Client_keys.get_key cctxt source in
-        let (Packed (module R) as pvm) = Sc_rollup.Kind.pvm_of kind in
+        let (Packed (module R) as pvm) =
+          Sc_rollup.Kind.pvm_of ~config:[] kind
+        in
         let Michelson_v1_parser.{expanded; _} = parameters_ty in
         let parameters_ty = Script.lazy_expr expanded in
         let* boot_sector = boot_sector pvm in
-        let* _res =
+        let* _, _, res =
           sc_rollup_originate
             cctxt
             ~chain:cctxt#chain
@@ -2693,26 +3754,55 @@ let commands_rw () =
             ?counter
             ?confirmations:cctxt#confirmations
             ~simulation
-            ~source
+            ~source:
+              (* FIXME-PA *)
+              (Protocol.Implicit_account_repr.Forbidden.of_pkh source)
             ~src_pk
             ~src_sk
             ~fee_parameter
             ~kind
             ~boot_sector
             ~parameters_ty
+            ?whitelist
             ()
         in
-        return_unit);
+        match res with
+        | Apply_results.Manager_operation_result
+            {
+              operation_result =
+                Apply_operation_result.Applied
+                  (Apply_results.Sc_rollup_originate_result
+                     {address = rollup_address; _});
+              _;
+            } ->
+            if dry_run then return_unit
+            else
+              let* alias =
+                Smart_rollup_alias.Address.of_fresh cctxt force alias
+              in
+              let* () =
+                Smart_rollup_alias.Address.add ~force cctxt alias rollup_address
+              in
+              let*! () =
+                cctxt#message
+                  {|Smart rollup %a memorized as "%s"|}
+                  Sc_rollup.Address.pp
+                  rollup_address
+                  alias
+              in
+              return_unit
+        | _ -> return_unit);
     command
       ~group
       ~desc:"Send one or more messages to a smart rollup."
-      (args8
+      (args9
          fee_arg
          dry_run_switch
          verbose_signing_switch
          simulate_switch
          fee_parameter_args
          gas_limit_arg
+         safety_guard_arg
          storage_limit_arg
          counter_arg)
       (prefixes ["send"; "smart"; "rollup"; "message"]
@@ -2735,11 +3825,13 @@ let commands_rw () =
              simulation,
              fee_parameter,
              gas_limit,
+             safety_guard,
              storage_limit,
              counter )
            messages
            source
-           cctxt ->
+           cctxt
+         ->
         let open Lwt_result_syntax in
         let* messages =
           match messages with
@@ -2775,11 +3867,14 @@ let commands_rw () =
             ?verbose_signing:(Some verbose_signing)
             ?fee
             ?gas_limit
+            ?safety_guard
             ?storage_limit
             ?counter
             ?confirmations:cctxt#confirmations
             ~simulation
-            ~source
+            ~source:
+              (* FIXME-PA *)
+              (Protocol.Implicit_account_repr.Forbidden.of_pkh source)
             ~messages
             ~src_pk
             ~src_sk
@@ -2804,7 +3899,7 @@ let commands_rw () =
            ~name:"src"
            ~desc:"Name of the source contract."
       @@ prefixes ["for"; "smart"; "rollup"]
-      @@ Sc_rollup_params.sc_rollup_address_param
+      @@ Smart_rollup_alias.Address.param
            ~desc:
              "The address of the smart rollup where the commitment will be \
               published."
@@ -2817,7 +3912,7 @@ let commands_rw () =
       @@ param
            ~name:"inbox_level"
            ~desc:"The inbox level for the commitment."
-           raw_level_parameter
+           (raw_level_parameter ())
       @@ prefixes ["and"; "predecessor"]
       @@ param
            ~name:"predecessor"
@@ -2842,7 +3937,8 @@ let commands_rw () =
            inbox_level
            predecessor
            number_of_ticks
-           cctxt ->
+           cctxt
+         ->
         let open Lwt_result_syntax in
         let* _, src_pk, src_sk = Client_keys.get_key cctxt source in
         let commitment : Alpha_context.Sc_rollup.Commitment.t =
@@ -2860,7 +3956,9 @@ let commands_rw () =
             ?counter
             ?confirmations:cctxt#confirmations
             ~simulation
-            ~source
+            ~source:
+              (* FIXME-PA *)
+              (Protocol.Implicit_account_repr.Forbidden.of_pkh source)
             ~rollup
             ~commitment
             ~src_pk
@@ -2881,16 +3979,12 @@ let commands_rw () =
          counter_arg
          fee_parameter_args)
       (prefixes ["cement"; "commitment"]
-      @@ param
-           ~name:"commitment"
-           ~desc:"The hash of the commitment to be cemented for a smart rollup."
-           Sc_rollup_params.commitment_hash_parameter
       @@ prefixes ["from"]
       @@ Client_keys.Public_key_hash.source_param
            ~name:"src"
            ~desc:"Name of the source contract."
       @@ prefixes ["for"; "smart"; "rollup"]
-      @@ Sc_rollup_params.sc_rollup_address_param
+      @@ Smart_rollup_alias.Address.param
            ~desc:
              "The address of the smart rollup of which the commitment will be \
               cemented."
@@ -2902,10 +3996,10 @@ let commands_rw () =
              storage_limit,
              counter,
              fee_parameter )
-           commitment
            source
            rollup
-           cctxt ->
+           cctxt
+         ->
         let open Lwt_result_syntax in
         let* _, src_pk, src_sk = Client_keys.get_key cctxt source in
         let* _res =
@@ -2920,9 +4014,10 @@ let commands_rw () =
             ?counter
             ?confirmations:cctxt#confirmations
             ~simulation
-            ~source
+            ~source:
+              (* FIXME-PA *)
+              (Protocol.Implicit_account_repr.Forbidden.of_pkh source)
             ~rollup
-            ~commitment
             ~src_pk
             ~src_sk
             ~fee_parameter
@@ -2941,7 +4036,7 @@ let commands_rw () =
          counter_arg
          fee_parameter_args)
       (prefixes ["timeout"; "dispute"; "on"; "smart"; "rollup"]
-      @@ Sc_rollup_params.sc_rollup_address_param
+      @@ Smart_rollup_alias.Address.param
            ~desc:
              "The address of the smart rollup where the staker of the dispute \
               has timed-out."
@@ -2969,22 +4064,29 @@ let commands_rw () =
            staker1
            staker2
            source
-           cctxt ->
+           cctxt
+         ->
         let open Lwt_result_syntax in
         let* games =
           Plugin.RPC.Sc_rollup.ongoing_refutation_games
             cctxt
             (cctxt#chain, cctxt#block)
             rollup
-            staker1
+            (* FIXME-PA *)
+            (Protocol.Implicit_account_repr.Forbidden.of_pkh staker1)
         in
         let* alice, bob =
           let* answer =
             List.find_es
               (fun (_, alice, bob) ->
-                let stakers = Sc_rollup.Game.Index.make staker1 staker2 in
+                (* FIXME-PA *)
+                let stakers =
+                  Sc_rollup.Game.Index.make
+                    (Protocol.Implicit_account_repr.Forbidden.of_pkh staker1)
+                    (Protocol.Implicit_account_repr.Forbidden.of_pkh staker2)
+                in
                 return
-                  Signature.Public_key_hash.(
+                  Protocol.Implicit_account_repr.(
                     alice = stakers.alice && bob = stakers.bob))
               games
           in
@@ -3008,7 +4110,9 @@ let commands_rw () =
             ?counter
             ?confirmations:cctxt#confirmations
             ~simulation
-            ~source
+            ~source:
+              (* FIXME-PA *)
+              (Protocol.Implicit_account_repr.Forbidden.of_pkh source)
             ~rollup
             ~alice
             ~bob
@@ -3049,7 +4153,7 @@ let commands_rw () =
          storage_limit_arg
          counter_arg)
       (prefixes ["execute"; "outbox"; "message"; "of"; "smart"; "rollup"]
-      @@ Sc_rollup_params.sc_rollup_address_param
+      @@ Smart_rollup_alias.Address.param
            ~desc:"The address of the smart rollup where the message resides."
       @@ prefix "from"
       @@ Client_keys.Public_key_hash.source_param
@@ -3078,7 +4182,8 @@ let commands_rw () =
            source
            cemented_commitment
            output_proof
-           cctxt ->
+           cctxt
+         ->
         let open Lwt_result_syntax in
         let* _, src_pk, src_sk = Client_keys.get_key cctxt source in
         let* _res =
@@ -3093,7 +4198,9 @@ let commands_rw () =
             ?counter
             ?confirmations:cctxt#confirmations
             ~simulation
-            ~source
+            ~source:
+              (* FIXME-PA *)
+              (Protocol.Implicit_account_repr.Forbidden.of_pkh source)
             ~rollup
             ~cemented_commitment
             ~output_proof:(Bytes.to_string output_proof)
@@ -3119,7 +4226,7 @@ let commands_rw () =
            ~name:"staker"
            ~desc:"The implicit account that owns the frozen bond."
       @@ prefixes ["for"; "smart"; "rollup"]
-      @@ Sc_rollup_params.sc_rollup_address_param
+      @@ Smart_rollup_alias.Address.param
            ~desc:"The address of the smart rollup of the bond."
       @@ prefixes ["from"]
       @@ Client_keys.Public_key_hash.source_param
@@ -3136,7 +4243,8 @@ let commands_rw () =
            staker
            sc_rollup
            source
-           cctxt ->
+           cctxt
+         ->
         let open Lwt_result_syntax in
         let* _, src_pk, src_sk = Client_keys.get_key cctxt source in
         let* _res =
@@ -3151,12 +4259,242 @@ let commands_rw () =
             ?counter
             ?confirmations:cctxt#confirmations
             ~simulation
-            ~source
+            ~source:
+              (* FIXME-PA *) (Implicit_account_repr.Forbidden.of_pkh source)
             ~src_pk
             ~src_sk
             ~fee_parameter
             ~sc_rollup
-            ~staker
+            ~staker:
+              (* FIXME-PA *) (Implicit_account_repr.Forbidden.of_pkh staker)
+            ()
+        in
+        return_unit);
+    command
+      ~group
+      ~desc:"Precompute timelock tuple."
+      (args1 timelock_locked_value_arg)
+      (prefixes ["timelock"; "precompute"]
+      @@ prefix "for"
+      @@ param ~name:"time" ~desc:" timelock difficulty" int_parameter
+      @@ prefix "in"
+      @@ param ~name:"file" ~desc:" updates dir" string_parameter
+      @@ stop)
+      (fun locked (time : int) (timelock_path : string) cctxt ->
+        let open Lwt_result_syntax in
+        let open Tezos_crypto.Timelock in
+        let* locked_value =
+          match locked with
+          | None -> return_none
+          | Some l ->
+              let locked_option = to_locked_value_opt l in
+              if Option.is_none locked_option then
+                let*! () =
+                  cctxt#warning
+                    "%s"
+                    "Locked value not in RSA group, using its residue."
+                in
+                return_some @@ to_locked_value_unsafe l
+              else return locked_option
+        in
+        let _ =
+          precompute_timelock
+            ~locked_value
+            ~precompute_path:(Some timelock_path)
+            ~time
+            ()
+        in
+        let*! () =
+          cctxt#message "%s" "Timelock tuple precomputed and saved locally."
+        in
+        return_unit);
+    command
+      ~group
+      ~desc:"Generate timelock chest."
+      no_options
+      (prefixes ["timelock"; "create"]
+      @@ prefix "for"
+      @@ param ~name:"time" ~desc:" timelock difficulty" int_parameter
+      @@ prefix "with"
+      @@ param ~name:"payload" ~desc:" timelock message" bytes_parameter
+      @@ prefix "in"
+      @@ param ~name:"file" ~desc:" updates dir" string_parameter
+      @@ stop)
+      (fun () (time : int) (payload : bytes) (timelock_path : string) cctxt ->
+        let open Lwt_result_syntax in
+        let open Tezos_crypto.Timelock in
+        let chest, chest_key =
+          create_chest_and_chest_key
+            ~precompute_path:(Some timelock_path)
+            ~payload
+            ~time
+            ()
+        in
+        let chest_name =
+          get_timelock_filename timelock_path "time_chest" chest_encoding chest
+        in
+        let chest_key_name =
+          get_timelock_filename
+            timelock_path
+            "time_key_create"
+            chest_encoding
+            chest
+        in
+        let*! () = write_encoding chest_name chest_encoding chest in
+        let*! () = write_encoding chest_key_name chest_key_encoding chest_key in
+        let*! () =
+          cctxt#message "%s" "Timelock chest and chest_key computed."
+        in
+        return_unit);
+    command
+      ~group
+      ~desc:"Open timelock chest."
+      no_options
+      (prefixes ["timelock"; "open"]
+      @@ prefix "for"
+      @@ param ~name:"time" ~desc:" timelock difficulty" int_parameter
+      @@ prefix "chest"
+      @@ param ~name:"chest" ~desc:" timelock chest" string_parameter
+      @@ prefix "in"
+      @@ param ~name:"file" ~desc:" updates dir" string_parameter
+      @@ stop)
+      (fun ()
+           (time : int)
+           (chest_path : string)
+           (timelock_path : string)
+           cctxt
+         ->
+        let open Lwt_result_syntax in
+        let open Tezos_crypto.Timelock in
+        let* chest = read_encoding chest_path chest_encoding in
+        let chest_key = create_chest_key chest ~time in
+        let chest_key_name =
+          get_timelock_filename
+            timelock_path
+            "time_key_open"
+            chest_encoding
+            chest
+        in
+        let*! () = write_encoding chest_key_name chest_key_encoding chest_key in
+        let*! () = cctxt#message "%s" "Timelock chest_key computed." in
+        return_unit);
+    command
+      ~group
+      ~desc:"Verify timelock chest."
+      no_options
+      (prefixes ["timelock"; "verify"]
+      @@ prefix "for"
+      @@ param ~name:"time" ~desc:" timelock difficulty" int_parameter
+      @@ prefix "chest"
+      @@ param ~name:"chest" ~desc:" timelock chest" string_parameter
+      @@ prefix "chest_key"
+      @@ param ~name:"chest_key" ~desc:" timelock chest's key" string_parameter
+      @@ stop)
+      (fun ()
+           (time : int)
+           (chest_path : string)
+           (chest_key_path : string)
+           cctxt
+         ->
+        let open Lwt_result_syntax in
+        let open Tezos_crypto.Timelock in
+        let* chest = read_encoding chest_path chest_encoding in
+        let* chest_key = read_encoding chest_key_path chest_key_encoding in
+        let result = open_chest chest chest_key ~time in
+        let*! () =
+          match result with
+          | Correct msg ->
+              let m = Hex.of_bytes msg |> Hex.show in
+              cctxt#message "Timelock chest verified, message is: %s" m
+          | Bogus_opening ->
+              cctxt#error "Error opening: incorrect proof or unlocked value."
+        in
+        return_unit);
+    command
+      ~group
+      ~desc:"Publish a DAL commitment on L1 for the given slot index"
+      (args7
+         fee_arg
+         dry_run_switch
+         verbose_signing_switch
+         simulate_switch
+         storage_limit_arg
+         counter_arg
+         fee_parameter_args)
+      (prefixes ["publish"; "dal"; "commitment"]
+      @@ param
+           ~name:"commitment"
+           ~desc:"The DAL commitment to publish."
+           Dal.commitment_parameter
+      @@ prefixes ["from"]
+      @@ Client_keys.Public_key_hash.source_param
+           ~name:"src"
+           ~desc:"Name of the source contract."
+      @@ prefixes ["for"; "slot"]
+      @@ param
+           ~name:"DAL slot index"
+           ~desc:"The index of the DAL slot."
+           int_parameter
+      @@ prefixes ["with"; "proof"]
+      @@ param
+           ~name:"commitment proof"
+           ~desc:"The proof of the DAL commitment to publish."
+           Dal.commitment_proof_parameter
+      @@ stop)
+      (fun ( fee,
+             dry_run,
+             verbose_signing,
+             simulation,
+             storage_limit,
+             counter,
+             fee_parameter )
+           commitment
+           source
+           slot_index
+           commitment_proof
+           cctxt
+         ->
+        let open Lwt_result_syntax in
+        let* _, src_pk, src_sk = Client_keys.get_key cctxt source in
+        (* FIXME-PA *)
+        let source = Implicit_account_repr.Forbidden.of_pkh source in
+        let* {parametric = {dal = {number_of_slots; _}; _}; _} =
+          Alpha_services.Constants.all cctxt (cctxt#chain, `Head 0)
+        in
+        let* slot_index =
+          match
+            Alpha_context.Dal.Slot_index.of_int ~number_of_slots slot_index
+          with
+          | Ok i -> return i
+          | Error err ->
+              cctxt#error
+                "Bad slot index: %a. A slot index should be in the interval \
+                 [0;%d]."
+                Environment.Error_monad.pp_trace
+                err
+                (number_of_slots - 1)
+        in
+        let slot_header =
+          Alpha_context.Dal.Operations.Publish_commitment.
+            {slot_index; commitment; commitment_proof}
+        in
+        let* _res =
+          dal_publish
+            cctxt
+            ~chain:cctxt#chain
+            ~block:cctxt#block
+            ~dry_run
+            ~verbose_signing
+            ?fee
+            ?storage_limit
+            ?counter
+            ?confirmations:cctxt#confirmations
+            ~simulation
+            ~source
+            ~slot_header
+            ~src_pk
+            ~src_sk
+            ~fee_parameter
             ()
         in
         return_unit);

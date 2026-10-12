@@ -29,15 +29,17 @@ module Store = Storage.Sc_rollup
 module Commitment = Sc_rollup_commitment_repr
 module Commitment_hash = Commitment.Hash
 
-(** [address_from_nonce ctxt nonce] produces an address completely determined by
-    an operation hash and an origination counter, and accounts for gas spent. *)
-let address_from_nonce ctxt nonce =
+(** [new_address ctxt] produces an address completely
+    determined by an operation hash and an origination counter, and
+    accounts for gas spent. *)
+let new_address ctxt =
   let open Result_syntax in
+  let* ctxt, nonce = Raw_context.increment_origination_nonce ctxt in
   let* ctxt =
     Raw_context.consume_gas ctxt Sc_rollup_costs.Constants.cost_serialize_nonce
   in
   match Data_encoding.Binary.to_bytes_opt Origination_nonce.encoding nonce with
-  | None -> error Sc_rollup_address_generation
+  | None -> tzfail Sc_rollup_address_generation
   | Some nonce_bytes ->
       let bytes_len = Bytes.length nonce_bytes in
       let+ ctxt =
@@ -47,32 +49,27 @@ let address_from_nonce ctxt nonce =
       in
       (ctxt, Sc_rollup_repr.Address.hash_bytes [nonce_bytes])
 
-let originate ctxt ~kind ~parameters_ty ~genesis_commitment =
+let init_genesis_info ctxt address genesis_commitment =
   let open Lwt_result_syntax in
-  let*? ctxt, genesis_commitment_hash =
+  let*? ctxt, commitment_hash =
     Sc_rollup_commitment_storage.hash ctxt genesis_commitment
   in
-  let*? ctxt, nonce = Raw_context.increment_origination_nonce ctxt in
-  let*? ctxt, address = address_from_nonce ctxt nonce in
-  let* ctxt, pvm_kind_size, _kind_existed =
-    Store.PVM_kind.add ctxt address kind
+  (* The [genesis_commitment.inbox_level] is equal to the current level. *)
+  let genesis_info : Commitment.genesis_info =
+    {commitment_hash; level = genesis_commitment.inbox_level}
   in
-  let origination_level = (Raw_context.current_level ctxt).level in
-  let* ctxt, genesis_info_size, _info_existed =
-    Store.Genesis_info.add
-      ctxt
-      address
-      {commitment_hash = genesis_commitment_hash; level = origination_level}
-  in
-  let* ctxt, param_ty_size_diff, _added =
-    Store.Parameters_type.add ctxt address parameters_ty
-  in
-  let* ctxt = Sc_rollup_staker_index_storage.init ctxt address in
-  let* ctxt, lcc_size_diff =
+  let* ctxt, size = Store.Genesis_info.init ctxt address genesis_info in
+  return (ctxt, genesis_info, size)
+
+let init_commitment_storage ctxt address
+    ({commitment_hash = genesis_commitment_hash; level = origination_level} :
+      Commitment.genesis_info) genesis_commitment =
+  let open Lwt_result_syntax in
+  let* ctxt, lcc_size =
     Store.Last_cemented_commitment.init ctxt address genesis_commitment_hash
   in
-  let* ctxt, commitment_size_diff, _was_bound =
-    Store.Commitments.add
+  let* ctxt, commitment_size_diff =
+    Store.Commitments.init
       (ctxt, address)
       genesis_commitment_hash
       genesis_commitment
@@ -83,8 +80,8 @@ let originate ctxt ~kind ~parameters_ty ~genesis_commitment =
      [sc_rollup_state_storage.deallocate] function does not have to handle a
      edge case.
   *)
-  let* ctxt, commitment_added_size_diff, _commitment_existed =
-    Store.Commitment_added.add
+  let* ctxt, commitment_added_size_diff =
+    Store.Commitment_added.init
       (ctxt, address)
       genesis_commitment_hash
       origination_level
@@ -94,8 +91,8 @@ let originate ctxt ~kind ~parameters_ty ~genesis_commitment =
      in order the [sc_rollup_state_storage.deallocate_commitment_metadata]
      function does not have to handle an edge case of genesis commitment hash.
   *)
-  let* ctxt, commitment_first_publication_level_diff, _existed =
-    Store.Commitment_first_publication_level.add
+  let* ctxt, commitment_first_publication_level_diff =
+    Store.Commitment_first_publication_level.init
       (ctxt, address)
       origination_level
       origination_level
@@ -106,17 +103,93 @@ let originate ctxt ~kind ~parameters_ty ~genesis_commitment =
       origination_level
       [genesis_commitment_hash]
   in
-  let addresses_size = 2 * Sc_rollup_repr.Address.size in
-  let stored_kind_size = 2 (* because tag_size of kind encoding is 16bits. *) in
-  let origination_size = Constants_storage.sc_rollup_origination_size ctxt in
-  let size =
-    Z.of_int
-      (origination_size + stored_kind_size + addresses_size + lcc_size_diff
-     + commitment_size_diff + commitment_added_size_diff
-     + commitment_first_publication_level_diff + param_ty_size_diff
-     + pvm_kind_size + genesis_info_size + commitments_per_inbox_level_diff)
+  return
+    ( ctxt,
+      lcc_size + commitment_size_diff + commitment_added_size_diff
+      + commitment_first_publication_level_diff
+      + commitments_per_inbox_level_diff )
+
+let check_whitelist ctxt whitelist =
+  let open Result_syntax in
+  match whitelist with
+  | Some whitelist ->
+      let private_enabled = Constants_storage.sc_rollup_private_enable ctxt in
+      (* The whitelist must be None when the feature is deactivated. *)
+      let* () =
+        error_unless
+          private_enabled
+          Sc_rollup_errors.Sc_rollup_whitelist_disabled
+      in
+      (* The origination fails with an empty list. *)
+      error_when
+        (List.is_empty whitelist)
+        Sc_rollup_errors.Sc_rollup_empty_whitelist
+  | None -> Ok ()
+
+let raw_originate ?whitelist ctxt ~kind ~parameters_ty ~genesis_commitment
+    ~address =
+  let open Lwt_result_syntax in
+  let*? () = check_whitelist ctxt whitelist in
+  let* ctxt, pvm_kind_size = Store.PVM_kind.init ctxt address kind in
+  let* ctxt, param_ty_size =
+    Store.Parameters_type.init ctxt address parameters_ty
   in
-  return (address, size, genesis_commitment_hash, ctxt)
+  let* ctxt = Sc_rollup_staker_index_storage.init ctxt address in
+  let* ctxt, genesis_info, genesis_info_size_diff =
+    init_genesis_info ctxt address genesis_commitment
+  in
+  let* ctxt, commitment_size_diff =
+    init_commitment_storage ctxt address genesis_info genesis_commitment
+  in
+  (* TODO: https://gitlab.com/tezos/tezos/-/issues/4551
+     There is no need to have both `origination_size` and the size of storage.
+     We should remove one of them. *)
+  let addresses_size = 2 * Sc_rollup_repr.Address.size in
+  let stored_kind_size =
+    2
+    (* because tag_size of kind encoding is 16bits. *)
+  in
+  let origination_size = Constants_storage.sc_rollup_origination_size ctxt in
+  let* ctxt, whitelist_size =
+    let*? () = check_whitelist ctxt whitelist in
+    match whitelist with
+    | Some whitelist ->
+        let* ctxt, new_storage_size =
+          Sc_rollup_whitelist_storage.init
+            ~whitelist
+            ctxt
+            address
+            ~origination_level:genesis_info.level
+        in
+        Sc_rollup_whitelist_storage.adjust_storage_space
+          ctxt
+          address
+          ~new_storage_size
+    | None -> return (ctxt, Z.zero)
+  in
+  let size =
+    Z.(
+      add
+        (of_int
+           (origination_size + stored_kind_size + addresses_size + param_ty_size
+          + pvm_kind_size + genesis_info_size_diff + commitment_size_diff))
+        whitelist_size)
+  in
+  return (size, genesis_info.commitment_hash, ctxt)
+
+let originate ?whitelist ctxt ~kind ~parameters_ty ~genesis_commitment =
+  let open Lwt_result_syntax in
+  let*? ctxt, address = new_address ctxt in
+  let* size, genesis_commitment, ctxt =
+    raw_originate
+      ?whitelist
+      ctxt
+      ~kind
+      ~parameters_ty
+      ~genesis_commitment
+      ~address
+  in
+  return (address, size, genesis_commitment, ctxt)
 
 let kind ctxt address =
   let open Lwt_result_syntax in
@@ -126,9 +199,9 @@ let kind ctxt address =
   | None -> tzfail (Sc_rollup_errors.Sc_rollup_does_not_exist address)
 
 let list_unaccounted ctxt =
-  let open Lwt_syntax in
-  let+ res = Store.PVM_kind.keys_unaccounted ctxt in
-  Result.return res
+  let open Lwt_result_syntax in
+  let*! res = Store.PVM_kind.keys_unaccounted ctxt in
+  return res
 
 let genesis_info ctxt rollup =
   let open Lwt_result_syntax in
@@ -152,5 +225,76 @@ let parameters_type ctxt rollup =
 
 let must_exist ctxt rollup =
   let open Lwt_result_syntax in
-  let+ ctxt, _info = genesis_info ctxt rollup in
-  ctxt
+  let* ctxt, exists = Store.Genesis_info.mem ctxt rollup in
+  if exists then return ctxt else tzfail (Sc_rollup_does_not_exist rollup)
+
+let get_past_commitment_periods ctxt =
+  let open Lwt_result_syntax in
+  let+ cell = Store.Past_commitment_periods.find ctxt in
+  Option.value ~default:[] cell
+
+let signals ctxt =
+  let open Lwt_result_syntax in
+  let+ cell = Store.Signals.find ctxt in
+  Option.value ~default:[] cell
+
+let is_signal_enable ctxt signal =
+  let open Lwt_result_syntax in
+  let+ enabled_signals = signals ctxt in
+  List.mem_assoc ~equal:String.equal signal enabled_signals
+
+let enable_signal ctxt signal =
+  let open Lwt_result_syntax in
+  let* enabled_signals = signals ctxt in
+  if List.mem_assoc ~equal:String.equal signal enabled_signals then return ctxt
+  else
+    let*! ctxt =
+      Store.Signals.add
+        ctxt
+        ((signal, (Raw_context.current_level ctxt).level) :: enabled_signals)
+    in
+    return ctxt
+
+let save_commitment_period ctxt previous_commitment_period
+    next_protocol_activation =
+  let open Lwt_result_syntax in
+  let* past_commitments = get_past_commitment_periods ctxt in
+  let*! ctxt =
+    Store.Past_commitment_periods.add
+      ctxt
+      (past_commitments
+      @ [
+          {
+            commitment_period_in_blocks = previous_commitment_period;
+            next_protocol_activation;
+          };
+        ])
+    (* We enforce the fact that the past commitment periods is sorted in
+       ascending order of [next_protocol_activation_level]. *)
+  in
+  return ctxt
+
+let next_commitment_level ctxt inbox_level =
+  let open Lwt_result_syntax in
+  (* This function assumes [past_commitments] is sorted in ascending order of
+     [next_protocol_activation_level]. This invariant is enforced by
+     [save_commitment_period]. *)
+  let+ past_commitments = get_past_commitment_periods ctxt in
+  let candidate_level =
+    List.find_map
+      (fun Sc_rollup_repr.Past_commitment_period.
+             {commitment_period_in_blocks; next_protocol_activation}
+         ->
+        let candidate_level =
+          Raw_level_repr.add inbox_level commitment_period_in_blocks
+        in
+        if Raw_level_repr.(candidate_level <= next_protocol_activation) then
+          Some candidate_level
+        else None)
+      past_commitments
+  in
+  match candidate_level with
+  | Some candidate_level -> candidate_level
+  | None ->
+      Raw_level_repr.(
+        add inbox_level Raw_context.(sc_rollup ctxt).commitment_period_in_blocks)

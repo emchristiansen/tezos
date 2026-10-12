@@ -3,6 +3,7 @@
 (* Open Source License                                                       *)
 (* Copyright (c) 2020 Nomadic Labs <contact@nomadic-labs.com>                *)
 (* Copyright (c) 2020 Metastate AG <hello@metastate.dev>                     *)
+(* Copyright (c) 2024, 2026 Trilitech <contact@trili.tech>                   *)
 (*                                                                           *)
 (* Permission is hereby granted, free of charge, to any person obtaining a   *)
 (* copy of this software and associated documentation files (the "Software"),*)
@@ -24,23 +25,247 @@
 (*                                                                           *)
 (*****************************************************************************)
 
-let tezos_client = "./octez-client"
+(* Some constants such as [octez_client] are automatically added to [~uses],
+   so they have to be defined in the wrapper library.
+   [Constant] merely provides an alias. *)
+let octez_client = Uses.octez_client
 
-let tezos_admin_client = "./octez-admin-client"
+let octez_admin_client = Uses.octez_admin_client
 
-let tezos_node = "./octez-node"
+let octez_node = Uses.octez_node
 
-let tezos_proxy_server = "./octez-proxy-server"
+let michelson_test_scripts =
+  Uses.make ~tag:"michelson_test_scripts" ~path:"michelson_test_scripts" ()
 
-let tezos_codec = "./octez-codec"
+let tzt_reference_test_suite =
+  Uses.make ~tag:"tzt_reference_test_suite" ~path:"tzt_reference_test_suite" ()
 
-let tezos_snoop = "./octez-snoop"
+let octez_codec = Uses.make ~tag:"codec" ~path:"./octez-codec" ()
 
-let tezos_protocol_compiler = "./octez-protocol-compiler"
+let octez_snoop = Uses.make ~tag:"snoop" ~path:"./octez-snoop" ()
 
-let dal_node = "./octez-dal-node"
+let octez_protocol_compiler =
+  Uses.make ~tag:"protocol_compiler" ~path:"./octez-protocol-compiler" ()
 
-let dac_node = "./octez-dac-node"
+let octez_dal_node = Uses.make ~tag:"dal_node" ~path:"./octez-dal-node" ()
+
+let octez_dac_node = Uses.make ~tag:"dac_node" ~path:"./octez-dac-node" ()
+
+let octez_dac_client = Uses.make ~tag:"dac_client" ~path:"./octez-dac-client" ()
+
+let octez_smart_rollup_node =
+  Uses.make ~tag:"smart_rollup_node" ~path:"./octez-smart-rollup-node" ()
+
+let octez_evm_node = Uses.make ~tag:"evm_node" ~path:"./octez-evm-node" ()
+
+let etherlink_governance_observer =
+  Uses.make
+    ~tag:"etherlink_governance_observer"
+    ~path:"./etherlink-governance-observer"
+    ()
+
+let octez_signer = Uses.make ~tag:"signer" ~path:"./octez-signer" ()
+
+let octez_injector_server =
+  Uses.make
+    ~tag:"injector_server"
+    ~path:
+      "./_build/default/contrib/octez_injector_server/octez_injector_server.exe"
+    ()
+
+let smart_rollup_installer =
+  Uses.make ~tag:"smart_rollup_installer" ~path:"smart-rollup-installer" ()
+
+(* The following is unused because even though the WASM debugger is released,
+   there are no tests for it yet, except [tezt/tests/binaries.ml].
+   However, this test requires the executables it tests to be declared with
+   [Uses.make] so that they are registered in the lookup table of [Uses]. *)
+let _octez_smart_rollup_wasm_debugger =
+  Uses.make ~tag:"wasm_debugger" ~path:"./octez-smart-rollup-wasm-debugger" ()
+
+let teztale_archiver =
+  Uses.make ~tag:"teztale_archiver" ~path:"./octez-teztale-archiver" ()
+
+let teztale_server =
+  Uses.make ~tag:"teztale_server" ~path:"./octez-teztale-server" ()
+
+let _teztale_snitch =
+  Uses.make ~tag:"teztale_snitch" ~path:"./octez-teztale-snitch" ()
+
+(* TODO: Remove these once the binaries are completely removed from
+   [released-executables] or [experimental-executables].
+   (issue : https://gitlab.com/tezos/tezos/-/issues/7763) *)
+
+let _octez_baker_rio =
+  Uses.make ~tag:"baker_psriotum" ~path:"./octez-baker-PsRiotum" ()
+
+let _octez_baker_seoul =
+  Uses.make ~tag:"baker_ptseoulo" ~path:"./octez-baker-PtSeouLo" ()
+
+let _octez_baker_tallinn =
+  Uses.make ~tag:"baker_psd5wvtj" ~path:"./octez-baker-PtTALLiN" ()
+
+let _octez_baker_ushuaia =
+  Uses.make ~tag:"baker_psgxqmsv" ~path:"./octez-baker-PsUshuai" ()
+
+let _octez_baker_alpha =
+  Uses.make ~tag:"baker_alpha" ~path:"./octez-baker-alpha" ()
+
+let octez_agnostic_baker =
+  Uses.make ~tag:"agnostic_baker" ~path:"./octez-baker" ()
+
+let _octez_accuser_rio =
+  Uses.make ~tag:"accuser_psriotum" ~path:"./octez-accuser-PsRiotum" ()
+
+let _octez_accuser_seoul =
+  Uses.make ~tag:"accuser_ptseoulo" ~path:"./octez-accuser-PtSeouLo" ()
+
+let _octez_accuser_tallinn =
+  Uses.make ~tag:"accuser_tallinn" ~path:"./octez-accuser-PtTALLiN" ()
+
+let _octez_accuser_ushuaia =
+  Uses.make ~tag:"accuser_ushuaia" ~path:"./octez-accuser-PsUshuai" ()
+
+let _octez_accuser_alpha =
+  Uses.make ~tag:"accuser_alpha" ~path:"./octez-accuser-alpha" ()
+
+let octez_accuser = Uses.make ~tag:"accuser" ~path:"./octez-accuser" ()
+
+let yes_wallet =
+  Uses.make
+    ~tag:"yes_wallet"
+    ~path:"./_build/default/devtools/yes_wallet/yes_wallet.exe"
+    ()
+
+let watchtower =
+  Uses.make
+    ~how_to_build:"make fa-bridge-watchtower"
+    ~tag:"watchtower"
+    ~path:"./fa-bridge-watchtower"
+    ()
+
+module WASM = struct
+  let dal_echo_kernel =
+    Uses.make ~tag:"dal_echo_kernel" ~path:"dal_echo_kernel.wasm" ()
+
+  let dal_echo_kernel_bandwidth =
+    Uses.make
+      ~tag:"dal_echo_kernel_bandwidth"
+      ~path:"dal_echo_kernel_bandwidth.wasm"
+      ()
+
+  let debug_kernel =
+    Uses.make
+      ~tag:"debug_kernel"
+      ~path:"etherlink/kernel_latest/kernel/tests/resources/debug_kernel.wasm"
+      ()
+
+  (* Note: this should probably depend on the protocol,
+     and thus be in the [Protocol] module? *)
+  let echo =
+    Uses.make
+      ~tag:"echo"
+      ~path:
+        "src/proto_alpha/lib_protocol/test/integration/wasm_kernel/echo.wasm"
+      ()
+
+  let echo_dal_reveal_parameters =
+    Uses.make
+      ~tag:"echo_dal_reveal_parameters"
+      ~path:"tezt/tests/kernels/echo_dal_reveal_parameters.wasm"
+      ()
+
+  (* Toy kernel "echo_dal_reveal_pages".
+
+     - On each kernel_run, asks to reveal exactly one DAL page:
+     published level = 15, slot = 1, page_index = 2.
+
+     - The revealed bytes are written to the key "/dal/page" next to the pages
+     that were already written, if any.
+
+     - No per-page loop, no L1-level watcher, and no strict size/error checks. *)
+  let echo_dal_reveal_pages =
+    Uses.make
+      ~tag:"echo_dal_reveal_pages"
+      ~path:"tezt/tests/kernels/echo_dal_reveal_pages.wasm"
+      ()
+
+  (* Same as {!echo_dal_reveal_pages} above, but the publish level is equal to
+     3000. It is used to test the corner case where a rollup is asked to import
+     a slot whose level is very far in the future. *)
+  let echo_dal_reveal_pages_high_target_pub_level =
+    Uses.make
+      ~tag:"echo_dal_reveal_pages"
+      ~path:
+        "tezt/tests/kernels/echo_dal_reveal_pages_high_target_pub_level.wasm"
+      ()
+
+  (* Toy kernel "echo_dal_reveal_pages_with_external_message".
+
+     Same as {!echo_dal_reveal_pages} above, but the page is revealed and
+    appended to the key "/dal/page" only when an external message starts
+    with "I". *)
+  let echo_dal_reveal_pages_with_external_message =
+    Uses.make
+      ~tag:"echo_dal_reveal_pages"
+      ~path:
+        "tezt/tests/kernels/echo_dal_reveal_pages_with_external_message.wasm"
+      ()
+
+  let unreachable_kernel =
+    Uses.make
+      ~tag:"unreachable_kernel"
+      ~path:"tezt/tests/kernels/unreachable_kernel.wasm"
+      ()
+
+  let evm_kernel =
+    Uses.make
+      ~how_to_build:"make -f etherlink.mk build"
+      ~tag:"evm_kernel"
+      ~path:"evm_kernel.wasm"
+      ()
+
+  let failed_migration =
+    Uses.make
+      ~tag:"failed_migration"
+      ~path:
+        "etherlink/kernel_latest/kernel/tests/resources/failed_migration.wasm"
+      ()
+
+  let sink =
+    Uses.make
+      ~tag:"sink"
+      ~path:"etherlink/kernel_latest/kernel/tests/resources/sink_kernel.wasm"
+      ()
+
+  let mainnet_kernel =
+    Uses.make
+      ~tag:"mainnet_kernel"
+      ~path:"etherlink/kernel_latest/kernel/tests/resources/mainnet_kernel.wasm"
+      ()
+
+  let mainnet_commit = "54a7b0920d33be3ce011edcc7dfed25a64868fb4"
+
+  let previewnet_kernel =
+    Uses.make
+      ~tag:"previewnet_kernel"
+      ~path:
+        "etherlink/kernel_latest/kernel/tests/resources/previewnet_kernel.wasm"
+      ()
+
+  let previewnet_commit = "ae3d731879b9443f52dc14de64e3208ab256d7a0"
+
+  let tx_kernel = Uses.make ~tag:"tx_kernel" ~path:"tx_kernel.wasm" ()
+
+  let tx_kernel_dal =
+    Uses.make ~tag:"tx_kernel_dal" ~path:"tx_kernel_dal.wasm" ()
+end
+
+let octez_p2p_node =
+  Uses.make
+    ~tag:"p2p_node"
+    ~path:"./_build/default/src/bin_p2p_node/main_p2p_node.exe"
+    ()
 
 (* TODO: tezos/tezos#4803
    Can we do better than to depend on script-inputs?
@@ -52,6 +277,16 @@ let released_executables = "./script-inputs/released-executables"
 (* We use the [experimental-executables] script input as source of
    experimental executable binaries to test. *)
 let experimental_executables = "./script-inputs/experimental-executables"
+
+(** Default hostname to use for endpoints when no specific one is required. *)
+let default_host =
+  (* The value of [default_host] is set to ["127.0.0.1"] because the
+     alternatives have the following drawbacks :
+     - Using ["localhost"] leads to an extra consumption of RAM
+       (https://gitlab.com/tezos/tezos/-/issues/6789).
+     - There are or were some problems with IPv6 on GCP.
+  *)
+  "127.0.0.1"
 
 (** Key pair used to activate a protocol from genesis with [--network sandbox].
     The public key is hard-coded in the node. *)
@@ -89,27 +324,7 @@ let max_op_ttl = 120
 
 (** Constant gas cost required for every manager operation. Should
     match [Michelson_v1_gas.Cost_of.manager_operation]. *)
-let manager_operation_gas_cost = 1000
-
-(** A valid base58 encoded layer-2 address to be used to test
-    transaction rollups. *)
-let tx_rollup_l2_address = "tz4MSfZsn6kMDczShy8PMeB628TNukn9hi2K"
-
-let tx_rollup_empty_l2_context =
-  "CoVu7Pqp1Gh3z33mink5T5Q2kAQKtnn3GHxVhyehdKZpQMBxFBGF"
-
-let tx_rollup_empty_withdraw_list_hash =
-  "txw1sFoLju3ySMAdY6v1dcHUMqJ4Zxc1kcynC8xkYgCmH6bpNSDhV"
-
-let tx_rollup_initial_message_result =
-  "txmr344vtdPzvWsfnoSd3mJ3MCFA5ehKLQs1pK9WGcX4FEACg1rVgC"
-
-(** A valid rejection proof for the initial layer2 state. *)
-let tx_rollup_proof_initial_state =
-  {|{ "version": 3,
-  "before": { "node": "CoVu7Pqp1Gh3z33mink5T5Q2kAQKtnn3GHxVhyehdKZpQMBxFBGF" },
-  "after": { "node": "CoVu7Pqp1Gh3z33mink5T5Q2kAQKtnn3GHxVhyehdKZpQMBxFBGF" } ,
-  "state": [] }|}
+let manager_operation_gas_cost ~protocol:_ = 100
 
 (** A valid base58 encoded compressed state hash. *)
 let sc_rollup_compressed_state =
@@ -117,23 +332,14 @@ let sc_rollup_compressed_state =
 
 (** A valid base58 encoded layer-2 account to be used to test transaction and
     smart contract rollups. *)
-let aggregate_tz4_account : Account.aggregate_key =
-  {
-    aggregate_alias = "bls_test_account";
-    aggregate_public_key_hash = "tz4EECtMxAuJ9UDLaiMZH7G1GCFYUWsj8HZn";
-    aggregate_public_key =
-      "BLpk1yUiLJ7RezbyViD5ZvWTfQndM3TRRYmvYWkUfH2EJqsLFnzzvpJss6pbuz3U1DDMpk8v16nV";
-    aggregate_secret_key =
-      Unencrypted "BLsk1hKAHyGqY9qRbgoSVnjiSmDWpKGjFF3WNQ7BaiaMUA6RMA6Pfq";
-  }
-
-(** The same as {!aggregate_tz4_account} but for use on layer 1. *)
 let tz4_account : Account.key =
   {
-    alias = aggregate_tz4_account.aggregate_alias;
-    public_key_hash = aggregate_tz4_account.aggregate_public_key_hash;
-    public_key = aggregate_tz4_account.aggregate_public_key;
-    secret_key = aggregate_tz4_account.aggregate_secret_key;
+    alias = "bls_test_account";
+    public_key_hash = "tz4EECtMxAuJ9UDLaiMZH7G1GCFYUWsj8HZn";
+    public_key =
+      "BLpk1yUiLJ7RezbyViD5ZvWTfQndM3TRRYmvYWkUfH2EJqsLFnzzvpJss6pbuz3U1DDMpk8v16nV";
+    secret_key =
+      Unencrypted "BLsk1hKAHyGqY9qRbgoSVnjiSmDWpKGjFF3WNQ7BaiaMUA6RMA6Pfq";
   }
 
 (** The `echo` kernel that is listed in the “Smart Optimistic Rollups”

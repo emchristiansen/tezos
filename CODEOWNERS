@@ -15,92 +15,88 @@
 # Insert code owner declarations here!
 # ************************************
 
-/docs/                       @NicVolanschi
-/docs/protocols/alpha.rst
+/etherlink/tezt                       @jtcoolen @m-kus
+/brassaia                    @mattiasdrp
 
-/src/bin_codec               @raphael-proust
-/src/bin_node                @romain.nl
-/src/bin_openapi             @romain.nl
-/src/bin_snoop               @naih
-/src/lib_base                @raphael-proust
-/src/lib_benchmark           @naih
-/src/lib_error_monad         @raphael-proust
-/src/lib_event_logging       @romain.nl
-/src/lib_lwt_result_stdlib   @raphael-proust
-/src/lib_mockup_proxy        @igarnier
-/src/lib_node_config         @Killian-Delarue
-/src/lib_openapi             @romain.nl @Killian-Delarue
-/src/lib_p2p*                @julien.t @vivienpe
-/src/lib_protocol_environment   @raphael-proust
-/src/lib_shell_benchmarks    @naih
-/src/lib_stdlib              @raphael-proust
-/src/lib_stdlib_unix         @raphael-proust
-/src/lib_version             @romain.nl
-/src/proto_*/lib_benchmark   @naih
-/src/proto_*/lib_benchmarks_proto @naih
-/src/proto_*/lib_protocol/sc_rollup_proof*         @sribaroud
-/src/proto_*/lib_protocol/sc_rollup_game*          @sribaroud
-/src/proto_*/lib_protocol/sc_rollup_inbox*         @sribaroud
-/src/proto_*/lib_protocol/sc_rollup_refutation*    @sribaroud
-/src/proto_*/bin_sc_rollup*  @ole.kruger
-/src/proto_*/lib_sc_rollup*  @ole.kruger
+/irmin                    @mattiasdrp
 
-/src/lib_webassembly         @lthms @ole.kruger @picdc
-/src/lib_scoru_wasm          @lthms @ole.kruger @picdc
+/src/lib_context_brassaia    @mattiasdrp
+/src/lib_context             @mattiasdrp
 
-/scripts                     @romain.nl
-
-/tests_python                @arvidnl
-
-/tezt/lib*                   @romain.nl
-/tezt/records                @romain.nl
-
-/manifest                    @romain.nl
-
-/.gitlab                     @romain.nl
+# SDK Working Group
+#
+# These users are members of the SDK Working Group, and should review any code changes
+# in the following paths.
+#
+# @emturner = Emma Turner
+# @lthms = Thomas Letan
+# @rodibozman = Rodi-Can Bozman
+# @spalmer25 = Palmer Sébastien
+/src/kernel_sdk           @emturner @ole.kruger @lthms @rodibozman @spalmer25
+/sdk/rust                 @emturner @ole.kruger @lthms @rodibozman @spalmer25
+/contrib/sdk-bindings     @emturner @spalmer25
 
 # Octez Merge Team
 #
 # These users are, as members of the Octez Merge Team, permitted to act as authorities on any code.
 #
-# @andrea.cerone = Andrea Cerone
-# @arvidnl = Arvid Jakobsson
-# @bsall = Boubacar Sall
-# @camlspotter = Jun Furuse
+# @abate = Pietro Abate
+# @ACoquereau = Albin Coquereau
+# @onurb = Bruno Bernardo
+# @dianegalloiswong = Diane Gallois-Wong
 # @emturner = Emma Turner
 # @eugenz = Eugen Zalinescu
-# @hhugo1 = Hugo Heuzard
-# @igarnier = Ilias Garnier
 # @iguerNL = Mohamed Iguernlala
 # @jobjo = Joel Bjornson
+# @julien.sagot.nl = Julien Sagot
 # @julien.t = Julien Tesson
 # @Killian-Delarue = Killian Delarue
-# @klakplok = Benjamin Canou
-# @linoscope = Lin Oshitani
 # @lrand = Lucas Randazzo
 # @lthms = Thomas Letan
-# @mbouaziz = Mehdi Bouaziz
+# @MBourgoin = Mathias Bourgoin
+# @mattiasdrp = Mattias Roux
 # @mebsout = Alain Mebsout
 # @murbard = Arthur B.
 # @naih = Nicolas Ayache
 # @NicVolanschi = Nic Volanschi
-# @ole.kruger = Ole Krüger
-# @paracetamolo = Marco Stronati
+# @pe.cornilleau = Pierre-Emmanuel Cornilleau
+# @phink = Paul Lafourge
 # @picdc = Pierrick Couderc
-# @pirbo = Pierre Boutillier
+# @polubelova = Marina Polubelova
 # @rafoo_ = Raphaël Cauderlier
-# @raphael-proust = Raphaël Proust
+# @rodibozman = Rodi-Can Bozman
 # @romain.nl = Romain
 # @Saroupille = François Thiré
-# @smondet = Seb Mondet
 # @sribaroud = Sylvain R.
-# @tomjack = Tom Jack
-# @vbotbol = vbot
+# @thomas.athorne = Thomas Athorne 
 # @vch9 = Valentin Chaboche
 # @vect0r = Victor Allombert
+# @victor-dumitrescu = Victor Dumitrescu
 # @yrg = Yann Regis-Gianas
+# @4dam = Adam Allombert-Goget
+# @gabriel.moise = Gabriel Moise
 #
-* @andrea.cerone @arvidnl @bsall @camlspotter @emturner @eugenz @hhugo1 @igarnier @iguerNL @jobjo @julien.t @Killian-Delarue @klakplok @linoscope @lrand @lthms @mbouaziz @mebsout @murbard @naih @NicVolanschi @ole.kruger @paracetamolo @picdc @pirbo @rafoo_ @raphael-proust @romain.nl @Saroupille @smondet @sribaroud @tomjack @vbotbol @vch9 @vect0r @yrg
+* @abate @ACoquereau @onurb @dianegalloiswong @emturner @eugenz @iguerNL @jobjo @julien.sagot.nl @julien.t @Killian-Delarue @lrand @lthms @MBourgoin @mattiasdrp @mebsout @murbard @naih @NicVolanschi @pe.cornilleau @phink @picdc @polubelova @rafoo_ @rodibozman @romain.nl @Saroupille @sribaroud @thomas.athorne @vch9 @vect0r @victor-dumitrescu @yrg @4dam @gabriel.moise
+
+# Platform Engineering
+#
+# The Platform Engineering team owns the CI, build/base images, release tooling
+# and PE monitoring perimeter, plus the shared Claude Code skills
+# committed under .claude/skills/platform-engineering/ (see !22384).
+#
+# CI pipeline generation & configuration (source; .gitlab/ci/ is auto-generated)
+/ci/                       @abate @onurb @Killian-Delarue @pierre.mary1 @romain.nl
+/scripts/ci/               @abate @onurb @Killian-Delarue @pierre.mary1 @romain.nl
+# CI/build/base Docker images
+/images/                   @abate @onurb @Killian-Delarue @pierre.mary1 @romain.nl
+/Dockerfile                @abate @onurb @Killian-Delarue @pierre.mary1 @romain.nl
+# Release tooling
+/scripts/releases/         @abate @onurb @Killian-Delarue @pierre.mary1 @romain.nl
+# PE monitoring
+/teztale/                  @abate @onurb @Killian-Delarue @pierre.mary1 @romain.nl
+/grafazos/                 @abate @onurb @Killian-Delarue @pierre.mary1 @romain.nl
+# Shared Claude Code skills
+/.claude/skills/platform-engineering/    @abate @onurb @Killian-Delarue @pierre.mary1 @romain.nl
 
 # CODEOWNERS Owners
 #
@@ -108,6 +104,6 @@
 #
 # Note that this stanza MUST appear LAST so that it takes precedence over prior rules.
 #
-/CODEOWNERS         @murbard @pirbo @smondet @klakplok @vbotbol @romain.nl
-/docs/CODEOWNERS    @murbard @pirbo @smondet @klakplok @vbotbol @romain.nl
-/.gitlab/CODEOWNERS @murbard @pirbo @smondet @klakplok @vbotbol @romain.nl
+/CODEOWNERS         @murbard @romain.nl
+/docs/CODEOWNERS    @murbard @romain.nl
+/.gitlab/CODEOWNERS @murbard @romain.nl

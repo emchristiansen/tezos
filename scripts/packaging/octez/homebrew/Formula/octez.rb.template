@@ -1,0 +1,148 @@
+#
+# SPDX-License-Identifier: MIT
+# SPDX-FileCopyrightText: 2024 Nomadic Labs <contact@nomadic-labs.com>
+#
+
+# This is a Homebrew formula for installing Octez.
+class Octez < Formula
+  @all_bins = []
+
+  class << self
+    attr_accessor :all_bins
+  end
+  homepage "https://gitlab.com/tezos/tezos"
+  url "%%CI_MERGE_REQUEST_SOURCE_PROJECT_URL%%.git", :tag => "%%CI_COMMIT_REF_NAME%%", :shallow => false
+  version "%%VERSION%%"
+  license "MIT"
+
+  # llvm provides libclang, which bindgen needs to generate the RocksDB FFI
+  # bindings pulled in by the rollup node's on-disk NDS backend.
+  build_dependencies = %w[pkg-config coreutils autoconf rsync wget unzip opam protobuf cmake make rustup gcc llvm]
+  build_dependencies.each do |dependency|
+    depends_on dependency => :build
+  end
+
+  # opam extracts .tbz source archives with bzip2. Homebrew does not put it on
+  # the sandbox PATH by itself: bzip2 is only a runtime dependency of unzip, a
+  # build dependency, and Homebrew prunes the transitive dependencies of build
+  # dependencies. It used to reach the PATH by accident, through
+  # hidapi -> systemd -> python@3.14, until systemd dropped that dependency
+  # (Homebrew/homebrew-core@2ecc31ed). On macOS the system bzip2 is used.
+  uses_from_macos "bzip2" => :build
+  # Same for .txz archives: xz is only on the Linux PATH today because
+  # systemd happens to depend on it at runtime, and macOS does not ship it
+  # at all, hence a plain depends_on. The xz formula also provides lzma.
+  depends_on "xz" => :build
+
+  dependencies = %w[gmp hidapi libev libffi libpq zstd]
+  dependencies.each do |dependency|
+    depends_on dependency
+  end
+  # The opam package ssl (ocaml-ssl 0.7.0) sets SSLv3 as the minimum protocol
+  # version of its default context, which OpenSSL 4 rejects since it removed
+  # SSLv3: every binary using conduit then aborts at startup with "Failed to
+  # set protocol to SSLv3". Build against openssl@3, which is keg-only since
+  # Homebrew made openssl@4 its default OpenSSL (homebrew-core, 2026-09-27).
+  depends_on "openssl@3"
+
+  def make_deps
+    ENV.deparallelize
+    ENV["CARGO_HOME"]="./.cargo"
+    ENV["OPAMROOT"]="./.opam"
+    ENV["OPAMYES"]="true"
+    ENV["BLST_PORTABLE"]="yes"
+    # OCaml's configure bakes LDFLAGS into the link command of every
+    # executable, ahead of the flags the libraries pass. On macOS, cc-override
+    # below bypasses Homebrew's compiler shim, which would otherwise put the
+    # keg-only openssl@3 first, so -lssl would resolve to the openssl@4 linked
+    # in #{HOMEBREW_PREFIX}/lib. Put openssl@3 first explicitly.
+    ENV["LDFLAGS"] = "-L#{Formula["openssl@3"].opt_lib} -L#{HOMEBREW_PREFIX}/lib"
+    ENV["DUNE_BUILD_JOBS"]="-j 12"
+    # opam tarballs embed uid/gid from their build machines; when tar runs as
+    # root it tries to chown extracted files to those non-existent ids and
+    # exits with code 2, causing opam install to fail depending on cache state.
+    ENV["TAR_OPTIONS"] = "--no-same-owner"
+    if OS.mac?
+      sdk_path = Utils.safe_popen_read("xcrun", "--show-sdk-path").chomp
+      ENV["CPLUS_INCLUDE_PATH"] = "#{sdk_path}/usr/include/c++/v1" unless sdk_path.empty?
+      (buildpath/"cc-override").mkpath
+      (buildpath/"cc-override/cc").write <<~SH
+        #!/bin/sh
+        exec xcrun clang "$@"
+      SH
+      chmod 0755, buildpath/"cc-override/cc"
+      (buildpath/"cc-override/c++").write <<~SH
+        #!/bin/sh
+        exec xcrun clang++ "$@"
+      SH
+      chmod 0755, buildpath/"cc-override/c++"
+      ENV.prepend_path "PATH", buildpath/"cc-override"
+    end
+
+    # Set the internal variable for CI use
+    if ENV["HOMEBREW_KISSCACHE"]
+      ENV["KISSCACHE"] = ENV["HOMEBREW_KISSCACHE"]
+      puts "--> Enabled KISSCACHE: #{ENV['KISSCACHE']}"
+    end
+    if ENV["HOMEBREW_OPAMFETCH"]
+      # Set the internal variable that your scripts/makefile expect
+      ENV["OPAMFETCH"] = ENV["HOMEBREW_OPAMFETCH"]
+      puts "--> Enabled OPAMFETCH: #{ENV['OPAMFETCH']}"
+    end
+
+    (buildpath/"script.sh").write <<~EOS
+      #!/bin/sh
+
+      set +x
+      # Stop at the first failing step. Without this, a failure in
+      # [make build-deps] does not stop the script: it carries on to
+      # [make release], which dies with "dune: not found" -- burying the real
+      # error many lines earlier in the build log.
+      set -e
+
+      . ./scripts/version.sh
+      rustup install $recommended_rust_version
+      opam init --bare --disable-sandboxing
+
+      make build-deps
+
+      eval $(opam env)
+      make release
+    EOS
+
+    chmod 0755, buildpath/"script.sh"
+    system "./script.sh"
+  end
+
+  def install_template(name)
+    bin.mkpath
+    self.class.all_bins << name
+    bin.install name
+  end
+
+  def install_opt_template(name)
+    source = Pathname.new(name)
+    unless source.exist?
+      opoo "Skipping #{name}: source file not found in the build directory"
+      return
+    end
+
+    install_template(name)
+  end
+
+  def install
+    make_deps
+    install_template "octez-node"
+    install_template "octez-client"
+    install_template "octez-signer"
+    install_template "octez-baker"
+    install_template "octez-accuser"
+
+    install_template "octez-accuser-%%PROTO_CURRENT%%"
+    install_template "octez-baker-%%PROTO_CURRENT%%"
+
+    install_opt_template "octez-accuser-%%PROTO_NEXT%%"
+    install_opt_template "octez-baker-%%PROTO_NEXT%%"
+  end
+
+end

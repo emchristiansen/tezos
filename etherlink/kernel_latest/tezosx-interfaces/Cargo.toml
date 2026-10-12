@@ -1,0 +1,24 @@
+# SPDX-FileCopyrightText: 2026 Nomadic-Labs <contact@nomadic-labs.com>
+#
+# SPDX-License-Identifier: MIT
+
+[package]
+name = "tezosx-interfaces"
+version = "0.1.0"
+edition = "2021"
+license = "MIT"
+
+[dependencies]
+primitive-types.workspace = true
+tezos-smart-rollup-host.workspace = true
+tezos-smart-rollup-keyspace.workspace = true
+http.workspace = true
+tezosx-journal = { workspace = true, optional = true }
+tezosx-types.workspace = true
+tezos-evm-runtime.workspace = true
+
+[dev-dependencies]
+
+
+[features]
+testing = ["dep:tezosx-journal"]

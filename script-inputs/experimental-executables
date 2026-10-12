@@ -1,7 +1,8 @@
-octez-evm-proxy-server
-octez-dac-node
-octez-dal-node
-octez-smart-rollup-node-alpha
-octez-smart-rollup-client-alpha
+fa-bridge-watchtower
+etherlink-governance-observer
+octez-evm-node
 octez-accuser-alpha
 octez-baker-alpha
+octez-teztale-snitch
+octez-teztale-archiver
+octez-teztale-server

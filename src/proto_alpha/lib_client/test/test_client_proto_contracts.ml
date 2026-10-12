@@ -26,7 +26,8 @@
 (** Testing
     -------
     Component:    Client
-    Invocation:   dune exec src/proto_alpha/lib_client/test/test_client_proto_contracts.exe
+    Invocation:   dune exec src/proto_alpha/lib_client/test/main.exe \
+                  -- --file test_client_proto_contracts.ml
     Subject:      Unit tests for Client_proto_contracts
 *)
 
@@ -48,6 +49,7 @@ class mock_wallet (entities : string) : Tezos_client_base.Client_context.wallet
 
     method load : type a.
         string -> default:a -> a Data_encoding.encoding -> a tzresult Lwt.t =
+      let open Lwt_result_syntax in
       fun _alias_name ~default:_default _encoding ->
         let json = (Ezjsonm.from_string entities :> Data_encoding.json) in
         return @@ Data_encoding.Json.destruct _encoding json
@@ -63,35 +65,41 @@ class mock_wallet (entities : string) : Tezos_client_base.Client_context.wallet
 (**
    Test.
    Tests different lookups of
-   [Client_proto_contracts.ContractAlias.find_destination].
+   [Client_proto_contracts.Contract_alias.find_destination].
 *)
 let test_find_destination _ =
+  let open Lwt_result_syntax in
   let bootstrap1 = "tz1KqTpEZ7Yob7QbPE4Hy4Wo8fHG8LhKxZSx" in
   let wallet_json =
     Format.asprintf {| [{"name": "test_alias", "value": "%s" }] |} bootstrap1
   in
   let w = new mock_wallet wallet_json in
   let test msg key exp_source =
-    Client_proto_contracts.ContractAlias.find_destination w key
-    >>=? fun contract ->
-    Client_proto_contracts.RawContractAlias.to_source contract
-    >>=? fun source ->
+    let* contract =
+      Client_proto_contracts.Contract_alias.find_destination w key
+    in
+    let* source =
+      Client_proto_contracts.Raw_contract_alias.to_source contract
+    in
     (* Alcotest equality assertion *)
     Alcotest.(check string msg source exp_source) ;
     return_unit
   in
-  test "Expected alias:test_alias = bootstrap1" "alias:test_alias" bootstrap1
-  >>=? fun () ->
-  test "Expected key:test_alias = bootstrap1" "key:test_alias" bootstrap1
-  >>=? fun () ->
-  test "Expected bootstrap1 = bootstrap1" bootstrap1 bootstrap1 >>=? fun () ->
+  let* () =
+    test "Expected alias:test_alias = bootstrap1" "alias:test_alias" bootstrap1
+  in
+  let* () =
+    test "Expected key:test_alias = bootstrap1" "key:test_alias" bootstrap1
+  in
+  let* () = test "Expected bootstrap1 = bootstrap1" bootstrap1 bootstrap1 in
   test "Expected test_alias bootstrap1" "test_alias" bootstrap1
 
 let () =
   Alcotest_lwt.run
-    "tezos-lib-client-proto-contracts"
+    ~__FILE__
+    Protocol.name
     [
-      ( Protocol.name ^ ": client_proto_contracts",
+      ( "client_proto_contracts",
         [Tztest.tztest "test_find_destination" `Quick test_find_destination] );
     ]
   |> Lwt_main.run

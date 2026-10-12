@@ -29,19 +29,21 @@
 module Baker : sig
   val run :
     Protocol_client_context.full ->
+    ?dal_node_rpc_ctxt:Tezos_rpc.Context.generic ->
     ?minimal_fees:Protocol.Alpha_context.Tez.t ->
     ?minimal_nanotez_per_gas_unit:Q.t ->
     ?minimal_nanotez_per_byte:Q.t ->
-    ?liquidity_baking_toggle_vote:
-      Protocol.Alpha_context.Liquidity_baking.liquidity_baking_toggle_vote ->
-    ?per_block_vote_file:string ->
+    ?votes:Baking_configuration.per_block_votes_config ->
     ?extra_operations:Baking_configuration.Operations_source.t ->
-    ?dal_node_endpoint:Uri.t ->
-    ?force_apply:bool ->
+    ?pre_emptive_forge_time:Q.t ->
+    ?force_apply_from_round:int ->
+    ?remote_calls_timeout:Q.t ->
+    ?data_dir:string ->
+    ?state_recorder:Baking_configuration.state_recorder_config ->
     chain:Shell_services.chain ->
-    context_path:string ->
     keep_alive:bool ->
-    Baking_state.consensus_key list ->
+    extra_nodes:Protocol_client_context.full list ->
+    Baking_state_types.Key.t list ->
     unit tzresult Lwt.t
 end
 

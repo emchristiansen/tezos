@@ -23,13 +23,36 @@
 (*                                                                           *)
 (*****************************************************************************)
 
+(** Type describing an opening failure for the listening socket. *)
+type listening_socket_open_failure = {
+  reason : Unix.error;  (** The error we are re-raising *)
+  address : P2p_addr.t;  (** The interface we are trying to listen to *)
+  port : int;  (** The port we are trying to listen to *)
+}
+
+(** Type of an error in case of the listening
+    socket fails to open. *)
+type error +=
+  | Failed_to_open_listening_socket of listening_socket_open_failure
+  | Full_waiting_queue
+
 (** This module defines a type [t] which wraps a file descriptor. Most
     functions simply call the underlying file descriptor function and generate
     logs with prefix "p2p.fd". *)
 
 type t
 
-(* [close_reason] is used by the functions [read] or [write] in case of error.
+(** [`Unexpected_error] is a generic case of error that is used by default
+    to represent a raising error that cannot be identified as a known error
+    case.
+
+    Note: This errror is needed in general to address unexpetected exception
+    that could be raised during fd processing. Though, it is not encouraged to
+    use it. It is a better practice to catch exceptions and convert them explicitly
+    to a dedicated (polymorphic) variant type. *)
+type unexpected_error = [`Unexpected_error of exn]
+
+(** [read_write_error] is used by the functions [read] or [write] in case of error.
 
    [`Connection_closed_by_peer] is returned when the socket returns 0 bytes read
    or written.
@@ -38,79 +61,129 @@ type t
    because of a timeout or another problem related to the remote peer.
 
    [`Connection_locally_closed] is returned when the connection's socket
-   has been locally closed before we try to access it.
-
-   [`Unexpected_error_when_closing (exn1,exn2)] is returned when two unexpected errors
-   occurred: a first one [exn1] which triggered an attempt to close the socket, and a
-   second one [exn2] whilst closing the socket.
-
-   [`Unexpected_error] is returned in case of an error not caught by the
-   previous cases.
-*)
-type close_reason =
+   has been locally closed before we try to access it. *)
+type read_write_error =
   [ `Connection_closed_by_peer
-  | `Connection_locally_closed
   | `Connection_lost of exn
-  | `Unexpected_error of exn
-  | `Unexpected_error_when_closing of exn * exn ]
+  | `Connection_locally_closed
+  | unexpected_error ]
 
-val pp_close_reason : Format.formatter -> close_reason -> unit
+(**
 
-(** [id t] returns a unique, positive, identifier for t. Identifiers
-    are generated sequentially at creation time. *)
-val id : t -> int
+   - Unreachable can be issued when we don't know how to reach to this address
 
-(** [read fd buf ofs len] reads up to [len] bytes from [fd], and writes them to
-    [buf], starting at offset [ofs].
-    If the operation leads to a [`Connection_lost] error it  is guaranteed that the
-    underlying socket has been closed.
+   - Canceled likely happens because of a timeout. This happens if a
+   firewall blocks us on the port used
+
+   - Refused can happen for similar reasons as Canceled. It depends on
+   the behaviour of the firewall: If the firewall drops packets, it
+   will be canceled because of a timeout, otherwise it can refuse the
+   connection and we get this error.
+
 *)
-val read : t -> Bytes.t -> int -> int -> (int, close_reason) result Lwt.t
 
-(** [close fd] close the connection and the underlying fd.
-    It is idempotent.
-*)
-val close : t -> (unit, [`Unexpected_error of exn]) result Lwt.t
+type connect_error =
+  [ `Connection_refused
+  | `Connection_unreachable
+  | `Network_unreachable
+    (** Likely when try to reach an ipv6 and this is not supported by the ISP. *)
+  | `Connection_canceled
+  | unexpected_error ]
 
-(** [write fd buf] writes all bytes from [buf] to [fd].
-    If the operation leads to a [`Connection_lost] error it is guaranteed that the
-    underlying socket has been closed.
-*)
-val write : t -> Bytes.t -> (unit, close_reason) result Lwt.t
+(** [accept_error] is used in case of error while trying to [accept] some connection.
 
-(** Returns a fresh fd. This call always succeed. *)
-val socket : Lwt_unix.socket_domain -> Lwt_unix.socket_type -> int -> t Lwt.t
-
-(** [connect fd addr] connect [fd] to [addr]. *)
-val connect :
-  t ->
-  Lwt_unix.sockaddr ->
-  (unit, [`Unexpected_error of exn | `Connection_refused]) result Lwt.t
-
-(** [accept sock] accept connections on socket [sock]
-
-    This function can fail and raise an error.
-
-    [`System_error] : System-wide errors which are related to the state of
+    [`System_error] represents system-wide errors which are related to the state of
     whole process or computer. These are errors that will probably reoccur at
-    next call and must be treated accordingly (for example by giving some time to
+    next [accept] and must be treated accordingly (for example by giving some time to
     the system to recover).
 
-
-    [`Socket_error ] : Socket-specific errors which are related to the one
+    [`Socket_error ] represents socket-specific errors which are related to the one
     connection that the function attempted to accept. These are usually temporary
     errors related to network delays or remote host responsiveness .
     For most socket-errors you can just log them and call accept again to be
-    ready for the next connection.
+    ready for the next connection. *)
+type accept_error =
+  [ `System_error of exn
+  | `Socket_error of exn
+  | `Full_waiting_queue
+  | unexpected_error ]
 
-    [`Unexpected_error] : These are other types of errors that can arise and not
-    caught by the previous cases.
-*)
+val accept_error_to_tzerror : accept_error -> error
+
+(** Pretty printer for read_write_error. *)
+val pp_read_write_error : Format.formatter -> read_write_error -> unit
+
+(** [id t] returns a unique, positive, identifier for t.
+    Identifiers are generated sequentially at creation time. *)
+val id : t -> int
+
+(** [set_point ~point t] sets the point where [fd] is or will be connected to.
+   *)
+val set_point : point:P2p_point.Id.t -> t -> unit
+
+(** [set_peer_id ~peer_id t] sets the peer id where [fd] is or will be
+    connected to. *)
+val set_peer_id : peer_id:P2p_peer.Id.t -> t -> unit
+
+(** [close ?reason fd] closes the connection and the underlying fd.
+    It is idempotent. *)
+val close : ?reason:P2p_disconnection_reason.t -> t -> unit Lwt.t
+
+(** Stores in the fd a reason for which it will be closed in a near future. *)
+val add_closing_reason : reason:P2p_disconnection_reason.t -> t -> unit
+
+(** [read fd buf ofs len] reads up to [len] bytes from [fd], and writes them to
+    [buf], starting at offset [ofs].
+    If the operation leads to a [`Connection_lost] error it is guaranteed that the
+    underlying socket has been closed. *)
+val read : t -> Bytes.t -> int -> int -> (int, read_write_error) result Lwt.t
+
+(** [write fd buf] writes all bytes from [buf] to [fd].
+    If the operation leads to a [`Connection_lost] error it is guaranteed that the
+    underlying socket has been closed. *)
+val write : t -> Bytes.t -> (unit, read_write_error) result Lwt.t
+
+(** [fd_pool] is the type of file descriptors pool used to control the number
+    of connections opened simultaneously. *)
+type fd_pool
+
+(** [create_fd_pool capacity] creates a file descriptors pool accepting at most
+    [capacity] connections. *)
+val create_fd_pool : capacity:int -> fd_pool
+
+(** [socket ?fd_pool ()] returns a fresh fd.
+    If [fd_pool] is [None], this call succeeds immediatly.
+    If [fd_pool] is [Some p], it waits until [p] has a free element which
+    can be taken, and succeds. *)
+val socket : ?fd_pool:fd_pool -> unit -> t tzresult Lwt.t
+
+(** [create_listening_socket ?reuse_port ~backlog ?addr port] creates
+    a socket that listens on [addr] or [Ipaddr.V6.unspecified] if
+    [addr] is not provided and on [port].
+
+   [reuse_port] is used to set Unix socket option [SO_REUSEPORT]. If
+   [reuse_port] is not provided this option is set to false.
+   [SO_REUSEADDR] is set to true.
+
+   [backlog] set the maximum number of pending connections. *)
+val create_listening_socket :
+  ?reuse_port:bool ->
+  backlog:int ->
+  ?addr:Ipaddr.V6.t ->
+  int ->
+  Lwt_unix.file_descr tzresult Lwt.t
+
+(** [connect fd addr] connects [fd] to [addr]. If there is an error, [fd] is
+    closed. *)
+val connect : t -> Lwt_unix.sockaddr -> (unit, connect_error) result Lwt.t
+
+(** [accept ?fd_pool sock] accepts connections on socket [sock].
+    If [fd_pool] is [None], it does not perform more checks.
+    If [fd_pool] is [Some p], it waits until [p] has a free element which
+    can be taken, and succeeds. *)
 val accept :
+  ?fd_pool:fd_pool ->
   Lwt_unix.file_descr ->
-  ( t * Lwt_unix.sockaddr,
-    [`System_error of exn | `Socket_error of exn | `Unexpected_error of exn] )
-  result
-  Lwt.t
+  (t * Lwt_unix.sockaddr, accept_error) result Lwt.t
 
 module Table : Hashtbl.S with type key = t

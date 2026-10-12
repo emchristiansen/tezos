@@ -27,15 +27,14 @@ open Protocol
 open Alpha_context
 
 type incremental = {
-  predecessor : Baking_state.block_info;
+  predecessor : Baking_state_types.block_info;
   context : Tezos_protocol_environment.Context.t;
   state : validation_state * application_state option;
   rev_operations : Operation.packed list;
   header : Tezos_base.Block_header.shell_header;
 }
 
-val load_context :
-  context_path:string -> Abstract_context_index.t tzresult Lwt.t
+val load_context : data_dir:string -> Abstract_context_index.t tzresult Lwt.t
 
 (** Make sure that the given context is consistent by trying to read in it *)
 val check_context_consistency :
@@ -54,7 +53,7 @@ val begin_construction :
   force_apply:bool ->
   pred_resulting_context_hash:Context_hash.t ->
   Abstract_context_index.t ->
-  Baking_state.block_info ->
+  Baking_state_types.block_info ->
   Chain_id.t ->
   incremental tzresult Lwt.t
 

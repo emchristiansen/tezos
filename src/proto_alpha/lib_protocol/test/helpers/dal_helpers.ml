@@ -46,12 +46,16 @@ let () =
     (function Test_failure e -> Some e | _ -> None)
     (fun e -> Test_failure e)
 
+let dal_prover_srs =
+  lazy
+    (Cryptobox.init_prover_dal
+       ~find_srs_files:Tezos_base.Dal_srs.find_trusted_setup_files
+       ~fetch_trusted_setup:false
+       ())
+
 let mk_cryptobox dal_params =
-  let open Result_syntax in
-  let parameters =
-    Cryptobox.Internal_for_tests.parameters_initialisation dal_params
-  in
-  let () = Cryptobox.Internal_for_tests.load_parameters parameters in
+  let open Lwt_result_syntax in
+  let* () = Lazy.force dal_prover_srs in
   match Cryptobox.make dal_params with
   | Ok dal -> return dal
   | Error (`Fail s) -> fail [Test_failure s]
@@ -59,16 +63,48 @@ let mk_cryptobox dal_params =
 let derive_dal_parameters (reference : Cryptobox.parameters) ~redundancy_factor
     ~constants_divider =
   {
-    S.redundancy_factor;
+    S.Parameters.redundancy_factor;
     page_size = reference.page_size / constants_divider;
     slot_size = reference.slot_size / constants_divider;
     number_of_shards = reference.number_of_shards / constants_divider;
   }
 
+let content_slot_id cell = (Hist.content_id cell).header_id
+
+let dal_attestations slot_indexes =
+  let open Alpha_context.Dal in
+  let number_of_slots = Default_parameters.constants_test.dal.number_of_slots in
+  let number_of_lags =
+    List.length Default_parameters.constants_test.dal.attestation_lags
+  in
+  List.fold_left
+    (fun acc slot_index ->
+      Attestations.commit
+        acc
+        ~number_of_slots
+        ~number_of_lags
+        ~lag_index:(number_of_lags - 1)
+        slot_index)
+    Attestations.empty
+    slot_indexes
+
+let has_assigned_shards ctxt ?level pkh =
+  let open Lwt_result_syntax in
+  (* FIXME-PA *)
+  let pkh_sig = Implicit_account_repr.Forbidden.to_pkh pkh in
+  let* dal_committee = Context.Dal.shards ctxt ?level ~delegates:[pkh_sig] () in
+  match dal_committee with
+  | [] -> return_false
+  | [({delegate; _} : Plugin.RPC.Dal.S.shards_assignment)] ->
+      (* FIXME-PA *)
+      assert (Signature.Public_key_hash.equal pkh_sig delegate) ;
+      return_true
+  | _ -> fail [Test_failure "unexpected Dal.shards RPC result"]
+
 module Make (Parameters : sig
   val dal_parameters : Alpha_context.Constants.Parametric.dal
 
-  val cryptobox : Cryptobox.t
+  val cryptobox : Cryptobox.t tzresult Lwt.t Lazy.t
 end) =
 struct
   (* Some global constants. *)
@@ -87,10 +123,12 @@ struct
 
   (* Helper functions. *)
 
-  let get_history cache h = Hist.History_cache.find h cache |> Lwt.return
+  let get_history cache h =
+    Hist.History_cache.(Map.find h (view cache)) |> Lwt.return
 
   let dal_mk_polynomial_from_slot slot_data =
-    let open Result_syntax in
+    let open Lwt_result_syntax in
+    let* cryptobox = Lazy.force cryptobox in
     match Cryptobox.polynomial_from_slot cryptobox slot_data with
     | Ok p -> return p
     | Error (`Slot_wrong_size s) ->
@@ -105,42 +143,29 @@ struct
     match Cryptobox.commit cryptobox polynomial with
     | Ok cm -> return cm
     | Error
-        (`Invalid_degree_strictly_less_than_expected
-          Cryptobox.{given; expected}) ->
-        fail
-          [
-            Test_failure
-              (Format.sprintf
-                 "commit: Invalid_degree (got %d, expecting a value strictly \
-                  less than %d)"
-                 given
-                 expected);
-          ]
+        ((`Invalid_degree_strictly_less_than_expected _ | `Prover_SRS_not_loaded)
+         as commit_error) ->
+        fail [Test_failure (Cryptobox.string_of_commit_error commit_error)]
 
   let dal_mk_prove_page polynomial page_id =
-    let open Result_syntax in
+    let open Lwt_result_syntax in
+    let* cryptobox = Lazy.force cryptobox in
     match Cryptobox.prove_page cryptobox polynomial page_id.P.page_index with
     | Ok p -> return p
-    | Error `Segment_index_out_of_range ->
-        fail [Test_failure "compute_proof_segment: Segment_index_out_of_range"]
+    | Error `Page_index_out_of_range ->
+        fail [Test_failure "compute_proof_segment: Page_index_out_of_range"]
     | Error
-        (`Invalid_degree_strictly_less_than_expected
-          Cryptobox.{given; expected}) ->
-        fail
-          [
-            Test_failure
-              (Format.sprintf
-                 "Got %d, expecting a value strictly less than %d"
-                 given
-                 expected);
-          ]
+        ((`Invalid_degree_strictly_less_than_expected _ | `Prover_SRS_not_loaded)
+         as commit_error) ->
+        fail [Test_failure (Cryptobox.string_of_commit_error commit_error)]
 
   let mk_slot ?(level = level_one) ?(index = Slot_index.zero)
       ?(fill_function = fun _i -> 'x') () =
-    let open Result_syntax in
+    let open Lwt_result_syntax in
     let slot_data = Bytes.init params.slot_size fill_function in
     let* polynomial = dal_mk_polynomial_from_slot slot_data in
-    let* commitment = dal_commit cryptobox polynomial in
+    let* cryptobox = Lazy.force cryptobox in
+    let*? commitment = dal_commit cryptobox polynomial in
     return
       ( slot_data,
         polynomial,
@@ -151,13 +176,17 @@ struct
 
   let no_data = Some (fun ~default_char:_ _ -> None)
 
-  let mk_page_info ?(default_char = 'x') ?level ?(page_index = P.Index.zero)
-      ?(custom_data = None) (slot : S.Header.t) polynomial =
-    let open Result_syntax in
+  let mk_page_info ?(default_char = 'x') ?level ?slot_index
+      ?(page_index = P.Index.zero) ?(custom_data = None) (slot : S.Header.t)
+      polynomial =
+    let open Lwt_result_syntax in
     let level =
       match level with None -> slot.id.published_level | Some level -> level
     in
-    let page_id = mk_page_id level slot.id.index page_index in
+    let slot_index =
+      match slot_index with None -> slot.id.index | Some index -> index
+    in
+    let page_id = mk_page_id level slot_index page_index in
     let* page_proof = dal_mk_prove_page polynomial page_id in
     match custom_data with
     | None ->
@@ -170,7 +199,10 @@ struct
 
   let succ_slot_index index =
     Option.value_f
-      Slot_index.(of_int_opt (to_int index + 1))
+      Slot_index.(
+        of_int_opt
+          ~number_of_slots:Parameters.dal_parameters.number_of_slots
+          (to_int index + 1))
       ~default:(fun () -> Slot_index.zero)
 
   let next_char c = Char.(chr ((code c + 1) mod 255))
@@ -181,19 +213,32 @@ struct
       [check_verify_result], respectively. *)
   let produce_and_verify_proof ~check_produce ?check_verify ~get_history
       skip_list ~page_info ~page_id =
-    let open Lwt_result_syntax in
-    let*! res =
-      Hist.produce_proof params ~page_info page_id ~get_history skip_list
-      |> Lwt.map Environment.wrap_tzresult
+    let open Lwt_result_wrap_syntax in
+    let*!@ res =
+      Hist.produce_proof
+        params
+        ~precheck_lag:(Lag_interval (0, Hist.legacy_attestation_lag))
+        ~page_id_is_valid:(fun ~lag_check:_ _page_id -> true)
+        ~page_info
+        ~attestation_threshold_percent:None
+        ~restricted_commitments_publishers:None
+        page_id
+        ~get_history
+        skip_list
     in
     let* () = check_produce res page_info in
     match check_verify with
     | None -> return_unit
     | Some check_verify ->
         let*? proof, _input_opt = res in
-        let res =
-          Hist.verify_proof params page_id skip_list proof
-          |> Environment.wrap_tzresult
+        let@ res =
+          Hist.verify_proof
+            params
+            ~precheck_lag:(Lag_interval (0, Hist.legacy_attestation_lag))
+            ~page_id_is_valid:(fun ~lag_check:_ _page_id -> true)
+            page_id
+            skip_list
+            proof
         in
         check_verify res page_info
 
@@ -243,7 +288,7 @@ struct
   let failing_check_produce_result ~__LOC__ ~expected_error res _page_info =
     Assert.proto_error ~loc:__LOC__ res (fun e ->
         match (e, expected_error) with
-        | Hist.Dal_proof_error s, Hist.Dal_proof_error expected ->
+        | Hist.Dal_page_proof_error s, Hist.Dal_page_proof_error expected ->
             String.equal s expected
         | ( Hist.Unexpected_page_size {expected_size = e1; page_size = p1},
             Hist.Unexpected_page_size {expected_size = e2; page_size = p2} ) ->
@@ -268,7 +313,7 @@ struct
     failing_check_produce_result
       ~__LOC__
       ~expected_error:
-        (Hist.Dal_proof_error
+        (Hist.Dal_page_proof_error
            "The page ID's slot is confirmed, but no page content and proof are \
             provided.")
 
@@ -276,7 +321,80 @@ struct
     failing_check_produce_result
       ~__LOC__
       ~expected_error:
-        (Hist.Dal_proof_error
+        (Hist.Dal_page_proof_error
            "The page ID's slot is not confirmed, but page content and proof \
             are provided.")
+
+  let bad_history_cache ~__LOC__ =
+    failing_check_produce_result
+      ~__LOC__
+      ~expected_error:
+        (Hist.Dal_page_proof_error
+           "Skip_list.search returned Nearest', while all given levels to \
+            produce proofs are supposed to be in the skip list.")
 end
+
+let dal_content_of_z z =
+  let open Lwt_result_wrap_syntax in
+  let*?@ attestations =
+    Alpha_context.Dal.Attestations.Internal_for_tests.of_z z
+  in
+  return Alpha_context.{attestations}
+
+let dal_content_of_int_list
+    ?(number_of_slots = Default_parameters.constants_test.dal.number_of_slots)
+    attested_slots =
+  let open Alpha_context in
+  let number_of_lags =
+    List.length Default_parameters.constants_test.dal.attestation_lags
+  in
+  let dal_attestations =
+    List.fold_left
+      (fun dal_attestations slot ->
+        match Dal.Slot_index.of_int ~number_of_slots slot with
+        | Ok slot_index ->
+            Dal.Attestations.commit
+              dal_attestations
+              ~number_of_slots
+              ~number_of_lags
+              ~lag_index:(number_of_lags - 1)
+              slot_index
+        | Error err ->
+            Test.fail ~__LOC__ "%a" Environment.Error_monad.pp_trace err)
+      Dal.Attestations.empty
+      attested_slots
+  in
+  {attestations = dal_attestations}
+
+let various_dal_contents =
+  let number_of_slots = Default_parameters.constants_test.dal.number_of_slots in
+  None
+  :: List.map
+       (fun l -> Some (dal_content_of_int_list ~number_of_slots l))
+       [[]; [0]; [1; 3]; Misc.(0 --> (number_of_slots - 1))]
+
+(* Associates each committee member with an element of
+   dal_content_list in order, going back to the beginning of
+   dal_content_list if dal_content_list is shorter. In other words,
+   the member at position i in committee receives the dal_content in
+   dal_content_list at position (i modulo (length of
+   dal_content_list)). *)
+let committee_with_cycling_dal_contents
+    (dal_content_list : Alpha_context.dal_content option list)
+    (committee : 'a list) : ('a * Alpha_context.dal_content option) list =
+  let rec aux acc remaining_dal_contents_to_pick committee =
+    match (committee, remaining_dal_contents_to_pick) with
+    | [], _ -> List.rev acc
+    | _, [] ->
+        (* We have gone through the whole dal_content_list and there
+           are still committee members waiting to receive a dal
+           content: reset remaining_dal_contents_to_pick to
+           dal_content_list. *)
+        aux acc dal_content_list committee
+    | member :: rest_committee, dal :: rest_dal ->
+        aux ((member, dal) :: acc) rest_dal rest_committee
+  in
+  aux [] dal_content_list committee
+
+let committee_with_various_dal_contents committee =
+  committee_with_cycling_dal_contents various_dal_contents committee

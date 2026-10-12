@@ -80,10 +80,26 @@ let () =
     (function Inconsistent_nonce -> Some () | _ -> None)
     (fun () -> Inconsistent_nonce)
 
+type unrevealed = {
+  nonce_hash : Nonce_hash.t;
+  delegate : Implicit_account_repr.t;
+}
+
+let unrevealed_to_storage {nonce_hash; delegate} : Storage.Seed.unrevealed_nonce
+    =
+  {nonce_hash; delegate}
+
+let unrevealed_of_storage
+    ({nonce_hash; delegate} : Storage.Seed.unrevealed_nonce) =
+  {nonce_hash; delegate}
+
+type status = Unrevealed of unrevealed | Revealed of Seed_repr.nonce
+
 (* Checks that the level of a revelation is not too early or too late wrt to the
    current context and that a nonce has not been already revealed for that level.
    Also checks that we are not past the nonce revelation period. *)
 let get_unrevealed ctxt (level : Level_repr.t) =
+  let open Lwt_result_syntax in
   let current_level = Level_storage.current ctxt in
   match Cycle_repr.pred current_level.cycle with
   | None -> tzfail Too_early_revelation (* no revelations during cycle 0 *)
@@ -97,16 +113,21 @@ let get_unrevealed ctxt (level : Level_repr.t) =
              >= Constants_storage.nonce_revelation_threshold ctxt)
       then tzfail Too_late_revelation
       else
-        Storage.Seed.Nonce.get ctxt level >>=? function
+        let* status = Storage.Seed.Nonce.get ctxt level in
+        match status with
         | Revealed _ -> tzfail Already_revealed_nonce
-        | Unrevealed status -> return status)
+        | Unrevealed status -> return (unrevealed_of_storage status))
 
 let record_hash ctxt unrevealed =
   let level = Level_storage.current ctxt in
-  Storage.Seed.Nonce.init ctxt level (Unrevealed unrevealed)
+  Storage.Seed.Nonce.init
+    ctxt
+    level
+    (Unrevealed (unrevealed_to_storage unrevealed))
 
 let check_unrevealed ctxt (level : Level_repr.t) nonce =
-  get_unrevealed ctxt level >>=? fun unrevealed ->
+  let open Lwt_result_syntax in
+  let* unrevealed = get_unrevealed ctxt level in
   fail_unless
     (Seed_repr.check_hash nonce unrevealed.nonce_hash)
     Inconsistent_nonce
@@ -114,23 +135,23 @@ let check_unrevealed ctxt (level : Level_repr.t) nonce =
 let reveal ctxt level nonce =
   Storage.Seed.Nonce.update ctxt level (Revealed nonce)
 
-type unrevealed = Storage.Seed.unrevealed_nonce = {
-  nonce_hash : Nonce_hash.t;
-  delegate : Signature.Public_key_hash.t;
-}
+let storage_status_to_status = function
+  | Storage.Seed.Unrevealed u -> Unrevealed (unrevealed_of_storage u)
+  | Storage.Seed.Revealed n -> Revealed n
 
-type status = Storage.Seed.nonce_status =
-  | Unrevealed of unrevealed
-  | Revealed of Seed_repr.nonce
-
-let get = Storage.Seed.Nonce.get
+let get ctxt level =
+  let open Lwt_result_syntax in
+  let+ status = Storage.Seed.Nonce.get ctxt level in
+  storage_status_to_status status
 
 type nonce_presence = No_nonce_expected | Nonce_expected of status
 
 let check ctxt level =
-  Storage.Seed.Nonce.find ctxt level >>=? function
-  | None -> return No_nonce_expected
-  | Some status -> return (Nonce_expected status)
+  let open Lwt_result_syntax in
+  let+ status_opt = Storage.Seed.Nonce.find ctxt level in
+  match status_opt with
+  | None -> No_nonce_expected
+  | Some status -> Nonce_expected (storage_status_to_status status)
 
 let of_bytes = Seed_repr.make_nonce
 

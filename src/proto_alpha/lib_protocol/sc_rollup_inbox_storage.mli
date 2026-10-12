@@ -44,21 +44,27 @@ val add_deposit :
   Raw_context.t ->
   payload:Script_repr.expr ->
   sender:Contract_hash.t ->
-  source:Signature.public_key_hash ->
+  source:Implicit_account_repr.t ->
   destination:Sc_rollup_repr.Address.t ->
   Raw_context.t tzresult Lwt.t
 
 (** Initialize the inbox in the storage at protocol initialization. *)
 val init_inbox :
-  predecessor:Block_hash.t -> Raw_context.t -> Raw_context.t Lwt.t
+  predecessor:Block_hash.t -> Raw_context.t -> Raw_context.t tzresult Lwt.t
 
-(** Adds the [Protocol_migration] in the in-memory inbox level witness. *)
-val add_protocol_migration : Raw_context.t -> Raw_context.t Lwt.t
-
-(** Adds the [Info_per_level] in the in-memory inbox level witness. *)
-val add_info_per_level :
-  predecessor:Block_hash.t -> Raw_context.t -> Raw_context.t Lwt.t
+(** Adds the [Info_per_level] in the in-memory inbox level witness. If
+    the current level is the first level of the current protocol then
+    also add [Migration] message.  *)
+val add_level_info :
+  predecessor:Block_hash.t -> Raw_context.t -> Raw_context.t tzresult Lwt.t
 
 (** [finalize_inbox_level ctxt] ends the internal representation for the block.
 *)
-val finalize_inbox_level : Raw_context.t -> Raw_context.t Lwt.t
+val finalize_inbox_level : Raw_context.t -> Raw_context.t tzresult Lwt.t
+
+(** [add_internal_message ctxt msg] adds internal message [msg]
+    to the smart rollups' inbox. *)
+val add_internal_message :
+  Raw_context.t ->
+  Sc_rollup_inbox_message_repr.internal_inbox_message ->
+  Raw_context.t tzresult Lwt.t

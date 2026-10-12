@@ -47,27 +47,41 @@ let with_node f =
         user_activated_upgrades = [];
         user_activated_protocol_overrides = [];
         operation_metadata_size_limit = Unlimited;
+        internal_events = Tezos_base.Internal_event_config.stdout;
         patch_context = None;
         data_dir = dir;
         store_root = dir / "store";
-        context_root = dir / "context";
         protocol_root = dir / "protocol";
         p2p = None;
         target = None;
         disable_mempool = true;
         enable_testchain = false;
-        dal = Tezos_crypto_dal.Cryptobox.Config.default;
+        dal_config = Tezos_crypto_dal.Cryptobox.Config.default;
       }
+    in
+    let version =
+      Tezos_version.Version.to_string
+        Tezos_version_value.Current_git_info.octez_version
+    in
+    let commit_info =
+      ({
+         commit_hash = Tezos_version_value.Current_git_info.commit_hash;
+         commit_date = Tezos_version_value.Current_git_info.committer_date;
+       }
+        : Tezos_version.Octez_node_version.commit_info)
     in
     let* node =
       Node.create
         ~singleprocess:true
+        ~version
+        ~commit_info
         node_config
         Tezos_shell_services.Shell_limits.default_peer_validator_limits
         Tezos_shell_services.Shell_limits.default_block_validator_limits
         Tezos_shell_services.Shell_limits.default_prevalidator_limits
         Tezos_shell_services.Shell_limits.default_chain_validator_limits
-        None
+        ?history_mode:None
+        ?maintenance_delay:None
     in
     f node
   in

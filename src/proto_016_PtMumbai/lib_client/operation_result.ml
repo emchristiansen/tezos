@@ -96,13 +96,13 @@ let pp_internal_operation ppf (Internal_operation {operation; source; _}) =
           Format.fprintf
             ppf
             "@,Delegate: %a"
-            Tezos_crypto.Signature.Public_key_hash.pp
+            Signature.Public_key_hash.pp
             delegate)
   | Delegation delegate_opt -> (
       Format.fprintf ppf "Delegation:@,Contract: %a@,To: " Destination.pp source ;
       match delegate_opt with
       | None -> Format.pp_print_string ppf "nobody"
-      | Some delegate -> Tezos_crypto.Signature.Public_key_hash.pp ppf delegate)
+      | Some delegate -> Signature.Public_key_hash.pp ppf delegate)
   | Event {ty; tag; payload} ->
       Format.fprintf
         ppf
@@ -169,7 +169,7 @@ let pp_manager_operation_content (type kind) source ppf
           Format.fprintf
             ppf
             "@,Delegate: %a"
-            Tezos_crypto.Signature.Public_key_hash.pp
+            Signature.Public_key_hash.pp
             delegate)
   | Reveal key ->
       Format.fprintf
@@ -177,13 +177,13 @@ let pp_manager_operation_content (type kind) source ppf
         "Revelation of manager public key:@,Contract: %a@,Key: %a"
         Contract.pp
         source
-        Tezos_crypto.Signature.Public_key.pp
+        Signature.Public_key.pp
         key
   | Delegation delegate_opt -> (
       Format.fprintf ppf "Delegation:@,Contract: %a@,To: " Contract.pp source ;
       match delegate_opt with
       | None -> Format.pp_print_string ppf "nobody"
-      | Some delegate -> Tezos_crypto.Signature.Public_key_hash.pp ppf delegate)
+      | Some delegate -> Signature.Public_key_hash.pp ppf delegate)
   | Register_global_constant {value} ->
       Format.fprintf
         ppf
@@ -213,8 +213,8 @@ let pp_manager_operation_content (type kind) source ppf
       Format.fprintf
         ppf
         "Update_consensus_key:@,Public key hash: %a"
-        Tezos_crypto.Signature.Public_key_hash.pp
-        (Tezos_crypto.Signature.Public_key.hash pk)
+        Signature.Public_key_hash.pp
+        (Signature.Public_key.hash pk)
   | Tx_rollup_origination ->
       Format.fprintf
         ppf
@@ -389,7 +389,7 @@ let pp_manager_operation_content (type kind) source ppf
         "Smart rollup bond retrieval:@,Address: %a@,Staker: %a"
         Sc_rollup.Address.pp
         sc_rollup
-        Tezos_crypto.Signature.Public_key_hash.pp
+        Signature.Public_key_hash.pp
         staker
   | Dal_publish_slot_header slot_header ->
       Format.fprintf
@@ -410,12 +410,9 @@ let pp_balance_updates ppf balance_updates =
      (tz1Ke2h7sDdakHJQh8WX4Z372du1KChsksyU). Instead of printing this
      key hash, we want to make the result more informative. *)
   let pp_baker ppf baker =
-    if
-      Tezos_crypto.Signature.Public_key_hash.equal
-        baker
-        Tezos_crypto.Signature.Public_key_hash.zero
-    then Format.fprintf ppf "the baker who will include this operation"
-    else Tezos_crypto.Signature.Public_key_hash.pp ppf baker
+    if Signature.Public_key_hash.equal baker Signature.Public_key_hash.zero then
+      Format.fprintf ppf "the baker who will include this operation"
+    else Signature.Public_key_hash.pp ppf baker
   in
   let balance_updates =
     List.map
@@ -662,7 +659,7 @@ let pp_operation_result ~operation_name pp_operation_result ppf = function
 let pp_manager_operation_contents_result ppf op_result =
   let pp_register_global_constant_result
       (Register_global_constant_result
-        {balance_updates; consumed_gas; size_of_constant; global_address}) =
+         {balance_updates; consumed_gas; size_of_constant; global_address}) =
     (match balance_updates with
     | [] ->
         (* Not possible - register global constant operation always returns
@@ -680,7 +677,7 @@ let pp_manager_operation_contents_result ppf op_result =
   in
   let pp_tx_rollup_origination_result
       (Tx_rollup_origination_result
-        {balance_updates; consumed_gas; originated_tx_rollup}) =
+         {balance_updates; consumed_gas; originated_tx_rollup}) =
     pp_balance_updates ppf balance_updates ;
     pp_consumed_gas ppf consumed_gas ;
     Format.fprintf
@@ -691,7 +688,7 @@ let pp_manager_operation_contents_result ppf op_result =
   in
   let pp_tx_rollup_submit_batch_result
       (Tx_rollup_submit_batch_result
-        {balance_updates; consumed_gas; paid_storage_size_diff}) =
+         {balance_updates; consumed_gas; paid_storage_size_diff}) =
     pp_balance_updates ppf balance_updates ;
     pp_consumed_gas ppf consumed_gas ;
     pp_paid_storage_size_diff ppf paid_storage_size_diff
@@ -708,14 +705,14 @@ let pp_manager_operation_contents_result ppf op_result =
   in
   let pp_tx_rollup_finalize_commitment_result
       (Tx_rollup_finalize_commitment_result
-        {balance_updates; consumed_gas; level}) =
+         {balance_updates; consumed_gas; level}) =
     pp_balance_updates ppf balance_updates ;
     pp_consumed_gas ppf consumed_gas ;
     Format.fprintf ppf "@finalized level:@,  %a" Tx_rollup_level.pp level
   in
   let pp_tx_rollup_remove_commitment_result
-      (Tx_rollup_remove_commitment_result
-        {balance_updates; consumed_gas; level}) =
+      (Tx_rollup_remove_commitment_result {balance_updates; consumed_gas; level})
+      =
     pp_balance_updates ppf balance_updates ;
     pp_consumed_gas ppf consumed_gas ;
     Format.fprintf ppf "@finalized level:@,  %a" Tx_rollup_level.pp level
@@ -727,14 +724,14 @@ let pp_manager_operation_contents_result ppf op_result =
   in
   let pp_tx_rollup_dispatch_tickets_result
       (Tx_rollup_dispatch_tickets_result
-        {balance_updates; consumed_gas; paid_storage_size_diff}) =
+         {balance_updates; consumed_gas; paid_storage_size_diff}) =
     pp_paid_storage_size_diff ppf paid_storage_size_diff ;
     pp_consumed_gas ppf consumed_gas ;
     pp_balance_updates ppf balance_updates
   in
   let pp_transfer_ticket_result
       (Transfer_ticket_result
-        {balance_updates; ticket_receipt; consumed_gas; paid_storage_size_diff})
+         {balance_updates; ticket_receipt; consumed_gas; paid_storage_size_diff})
       =
     pp_paid_storage_size_diff ppf paid_storage_size_diff ;
     pp_ticket_receipt ppf ticket_receipt ;
@@ -747,7 +744,7 @@ let pp_manager_operation_contents_result ppf op_result =
   in
   let pp_sc_rollup_originate_result
       (Sc_rollup_originate_result
-        {address; genesis_commitment_hash; consumed_gas; size; balance_updates})
+         {address; genesis_commitment_hash; consumed_gas; size; balance_updates})
       =
     pp_consumed_gas ppf consumed_gas ;
     pp_storage_size ppf size ;
@@ -770,7 +767,7 @@ let pp_manager_operation_contents_result ppf op_result =
   in
   let pp_sc_rollup_publish_result
       (Sc_rollup_publish_result
-        {consumed_gas; staked_hash; published_at_level; balance_updates}) =
+         {consumed_gas; staked_hash; published_at_level; balance_updates}) =
     pp_consumed_gas ppf consumed_gas ;
     Format.fprintf
       ppf
@@ -806,7 +803,7 @@ let pp_manager_operation_contents_result ppf op_result =
   in
   let pp_sc_rollup_execute_outbox_message_result
       (Sc_rollup_execute_outbox_message_result
-        {balance_updates; ticket_receipt; consumed_gas; paid_storage_size_diff})
+         {balance_updates; ticket_receipt; consumed_gas; paid_storage_size_diff})
       =
     pp_paid_storage_size_diff ppf paid_storage_size_diff ;
     pp_consumed_gas ppf consumed_gas ;
@@ -820,7 +817,7 @@ let pp_manager_operation_contents_result ppf op_result =
   in
   let pp_zk_rollup_origination_result
       (Zk_rollup_origination_result
-        {consumed_gas; originated_zk_rollup; storage_size; balance_updates}) =
+         {consumed_gas; originated_zk_rollup; storage_size; balance_updates}) =
     pp_consumed_gas ppf consumed_gas ;
     pp_storage_size ppf storage_size ;
     Format.fprintf ppf "@,Address: %a" Zk_rollup.Address.pp originated_zk_rollup ;
@@ -828,14 +825,14 @@ let pp_manager_operation_contents_result ppf op_result =
   in
   let pp_zk_rollup_publish_result
       (Zk_rollup_publish_result
-        {balance_updates; consumed_gas; paid_storage_size_diff}) =
+         {balance_updates; consumed_gas; paid_storage_size_diff}) =
     pp_paid_storage_size_diff ppf paid_storage_size_diff ;
     pp_consumed_gas ppf consumed_gas ;
     pp_balance_updates ppf balance_updates
   in
   let pp_zk_rollup_update_result
       (Zk_rollup_update_result
-        {balance_updates; consumed_gas; paid_storage_size_diff}) =
+         {balance_updates; consumed_gas; paid_storage_size_diff}) =
     pp_consumed_gas ppf consumed_gas ;
     pp_paid_storage_size_diff ppf paid_storage_size_diff ;
     pp_balance_updates ppf balance_updates
@@ -970,11 +967,7 @@ let pp_manager_operation_result ppf
       Manager_operation_result
         {balance_updates; operation_result; internal_operation_results} ) =
   Format.fprintf ppf "@[<v 2>Manager signed operations:" ;
-  Format.fprintf
-    ppf
-    "@,From: %a"
-    Tezos_crypto.Signature.Public_key_hash.pp
-    source ;
+  Format.fprintf ppf "@,From: %a" Signature.Public_key_hash.pp source ;
   Format.fprintf ppf "@,Fee to the baker: %s%a" tez_sym Tez.pp fee ;
   Format.fprintf ppf "@,Expected counter: %a" Manager_counter.pp counter ;
   Format.fprintf ppf "@,Gas limit: %a" Gas.Arith.pp_integral gas_limit ;
@@ -991,9 +984,8 @@ let pp_manager_operation_result ppf
     internal_operation_results ;
   Format.fprintf ppf "@]"
 
-let pp_contents_and_result :
-    type kind. Format.formatter -> kind contents * kind contents_result -> unit
-    =
+let pp_contents_and_result : type kind.
+    Format.formatter -> kind contents * kind contents_result -> unit =
  fun ppf -> function
   | Seed_nonce_revelation {level; nonce}, Seed_nonce_revelation_result bus ->
       Format.fprintf
@@ -1069,7 +1061,7 @@ let pp_contents_and_result :
       Format.fprintf
         ppf
         "@[<v 2>Slot attestation:@,Delegate: %a@]"
-        Tezos_crypto.Signature.Public_key_hash.pp
+        Signature.Public_key_hash.pp
         delegate
   | ( Double_endorsement_evidence {op1; op2},
       Double_endorsement_evidence_result bus ) ->
@@ -1116,7 +1108,7 @@ let pp_contents_and_result :
       Format.fprintf
         ppf
         "@[<v 2>Proposals:@,From: %a@,Period: %ld@,Protocols:@,  @[<v 0>%a@]@]"
-        Tezos_crypto.Signature.Public_key_hash.pp
+        Signature.Public_key_hash.pp
         source
         period
         (Format.pp_print_list Protocol_hash.pp)
@@ -1125,7 +1117,7 @@ let pp_contents_and_result :
       Format.fprintf
         ppf
         "@[<v 2>Ballot:@,From: %a@,Period: %ld@,Protocol: %a@,Vote: %a@]"
-        Tezos_crypto.Signature.Public_key_hash.pp
+        Signature.Public_key_hash.pp
         source
         period
         Protocol_hash.pp
@@ -1141,11 +1133,11 @@ let pp_contents_and_result :
          Consensus key hash: %a@,\
          Delegate: %a@,\
          Destination: %a%s%a@]"
-        Tezos_crypto.Signature.Public_key_hash.pp
+        Signature.Public_key_hash.pp
         consensus_key
-        Tezos_crypto.Signature.Public_key_hash.pp
+        Signature.Public_key_hash.pp
         delegate
-        Tezos_crypto.Signature.Public_key_hash.pp
+        Signature.Public_key_hash.pp
         destination
         (if allocated_destination_contract then " (allocated)" else "")
         pp_balance_updates
@@ -1156,8 +1148,8 @@ let pp_contents_and_result :
   | (Manager_operation _ as op), (Manager_operation_result _ as res) ->
       pp_manager_operation_result ppf (op, res)
 
-let rec pp_contents_and_result_list :
-    type kind. Format.formatter -> kind contents_and_result_list -> unit =
+let rec pp_contents_and_result_list : type kind.
+    Format.formatter -> kind contents_and_result_list -> unit =
  fun ppf -> function
   | Single_and_result (op, res) -> pp_contents_and_result ppf (op, res)
   | Cons_and_result

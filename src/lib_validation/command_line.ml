@@ -23,9 +23,8 @@
 (*                                                                           *)
 (*****************************************************************************)
 
-let parse_args () =
+let parse_args name =
   let socket_dir = ref None in
-  let readonly_flag = ref false in
   let args =
     Arg.
       [
@@ -38,44 +37,49 @@ let parse_args () =
                      (Format.sprintf "File '%s' is not a valid directory" s))
               else socket_dir := Some s),
           {|<dir>
-      When provided, the validator will communicate through a socket located
+      The validator will communicate through a socket located
       at '<dir>/tezos-validation-socket-<pid>' where <pid> is the
-      tezos-validator's process identifier. By default, the validator will
-      communicate through its standard input and output.|}
-        );
-        ( "--readonly",
-          Unit (fun () -> readonly_flag := true),
-          {|<flag>
-      When provided, the validator will start in readonly mode. It will not be
-      able to update the context.|}
+      tezos-validator's process identifier.|}
         );
         ( "--version",
           Unit
             (fun () ->
-              Format.printf "%s\n" Tezos_version.Bin_version.version_string ;
+              Format.printf
+                "%s\n"
+                Tezos_version_value.Bin_version.octez_version_string ;
               Stdlib.exit 0),
           " Display version information" );
       ]
   in
-  let usage_msg =
-    Format.sprintf
-      "tezos-validator [--version] [--socket-dir <dir>] [--readonly]"
-  in
+  let usage_msg = Format.sprintf "%s [--version] [--socket-dir <dir>]" name in
   Arg.parse
     args
     (fun s -> raise (Arg.Bad (Format.sprintf "Unexpected argument: %s" s)))
     usage_msg ;
-  (!socket_dir, !readonly_flag)
+  match !socket_dir with
+  | Some s -> s
+  | None ->
+      raise (Arg.Bad (Format.sprintf "%s: please provide --socket-dir" name))
 
-let run () =
-  let socket_dir, readonly = parse_args () in
-  let main_promise = External_validator.main ?socket_dir ~readonly () in
+let run name main =
+  let socket_dir = parse_args name in
+  let main_promise = main ~socket_dir in
   Stdlib.exit
     (let open Lwt_syntax in
-    Lwt_main.run
-      (let* r = Lwt_exit.wrap_and_exit main_promise in
-       match r with
-       | Ok () -> Lwt_exit.exit_and_wait 0
-       | Error err ->
-           Format.eprintf "%a\n%!" pp_print_trace err ;
-           Lwt_exit.exit_and_wait 1))
+     Lwt.Exception_filter.(set handle_all_except_runtime) ;
+     Tezos_base_unix.Event_loop.main_run ~process_name:name ~eio:true (fun () ->
+         let* r = Lwt_exit.wrap_and_exit main_promise in
+         match r with
+         | Ok () -> Lwt_exit.exit_and_wait 0
+         | Error err ->
+             Format.eprintf "%a\n%!" pp_print_trace err ;
+             Lwt_exit.exit_and_wait 1))
+
+module Validator = struct
+  let run () = run "octez-validator" External_validator.main
+end
+
+module Hypervisor = struct
+  let run () =
+    run "octez-validator-hypervisor" External_validator.Hypervisor.main
+end

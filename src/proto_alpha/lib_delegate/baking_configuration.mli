@@ -43,13 +43,18 @@ type fees_config = {
 }
 
 type validation_config =
-  | Local of {context_path : string}
+  | Local of {data_dir : string}
   | Node
   | ContextIndex of Abstract_context_index.t
 
 type nonce_config = Deterministic | Random
 
-type state_recorder_config = Filesystem | Disabled
+type state_recorder_config = Filesystem | Memory
+
+type per_block_votes_config = {
+  vote_file : string option;
+  liquidity_baking_vote : Protocol.Alpha_context.Per_block_votes.per_block_vote;
+}
 
 type t = {
   fees : fees_config;
@@ -57,14 +62,14 @@ type t = {
   validation : validation_config;
   retries_on_failure : int;
   user_activated_upgrades : (int32 * Protocol_hash.t) list;
-  liquidity_baking_toggle_vote :
-    Protocol.Alpha_context.Liquidity_baking.liquidity_baking_toggle_vote;
-  per_block_vote_file : string option;
-  force_apply : bool;
+  per_block_votes : per_block_votes_config;
+  force_apply_from_round : Protocol.Alpha_context.Round.t;
   force : bool;
   state_recorder : state_recorder_config;
   extra_operations : Operations_source.t option;
-  dal_node_endpoint : Uri.t option;
+  pre_emptive_forge_time : Time.System.Span.t;
+  remote_calls_timeout : float option;
+  multi_node : bool;
 }
 
 val default_fees_config : fees_config
@@ -77,10 +82,9 @@ val default_retries_on_failure_config : int
 
 val default_user_activated_upgrades : (int32 * Protocol_hash.t) list
 
-val default_liquidity_baking_toggle_vote :
-  Protocol.Alpha_context.Liquidity_baking.liquidity_baking_toggle_vote
+val default_votes_config : per_block_votes_config
 
-val default_force_apply : bool
+val default_force_apply_from_round : Protocol.Alpha_context.Round.t
 
 val default_force : bool
 
@@ -88,7 +92,11 @@ val default_state_recorder_config : state_recorder_config
 
 val default_extra_operations : Operations_source.t option
 
-val default_per_block_vote_file : string
+val default_pre_emptive_forge_time : Time.System.Span.t
+
+val default_remote_calls_timeout : float option
+
+val default_multi_node : bool
 
 val default_config : t
 
@@ -97,17 +105,17 @@ val make :
   ?minimal_nanotez_per_gas_unit:Q.t ->
   ?minimal_nanotez_per_byte:Q.t ->
   ?nonce:nonce_config ->
-  ?context_path:string ->
+  ?data_dir:string ->
   ?retries_on_failure:int ->
   ?user_activated_upgrades:(int32 * Protocol_hash.t) list ->
-  ?liquidity_baking_toggle_vote:
-    Protocol.Alpha_context.Liquidity_baking.liquidity_baking_toggle_vote ->
-  ?per_block_vote_file:string ->
-  ?force_apply:bool ->
+  ?votes:per_block_votes_config ->
+  ?force_apply_from_round:int ->
   ?force:bool ->
   ?state_recorder:state_recorder_config ->
   ?extra_operations:Operations_source.t ->
-  ?dal_node_endpoint:Uri.t ->
+  ?pre_emptive_forge_time:Time.System.Span.t ->
+  ?remote_calls_timeout:float ->
+  ?multi_node:bool ->
   unit ->
   t
 
@@ -123,8 +131,9 @@ val user_activate_upgrades_config_encoding :
   (int32 * Protocol_hash.t) list Data_encoding.t
 
 val liquidity_baking_toggle_vote_config_encoding :
-  Protocol.Alpha_context.Liquidity_baking.liquidity_baking_toggle_vote
-  Data_encoding.t
+  Protocol.Alpha_context.Per_block_votes.per_block_vote Data_encoding.t
+
+val per_block_votes_config_encoding : per_block_votes_config Data_encoding.t
 
 val encoding : t Data_encoding.t
 

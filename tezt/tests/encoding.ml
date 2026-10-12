@@ -44,22 +44,63 @@
             the list of encodings.
 *)
 
+let sample_as_tags sample = String.split_on_char '.' sample
+
 let check_dump_encodings () =
   Test.register
     ~__FILE__
     ~title:"octez-codec dump encodings"
-    ~tags:["codec"; "dump"]
+    ~tags:["dump"]
+    ~uses:[Constant.octez_codec]
+    ~uses_node:false
+    ~uses_client:false
+    ~uses_admin_client:false
   @@ fun () ->
   let* (_ : JSON.t) = Codec.dump_encodings () in
+  unit
+
+let test_michelson_primitives_encoding =
+  Protocol.register_regression_test
+    ~__FILE__
+    ~title:"Michelson primitives regression"
+    ~tags:["michelson"; "primitives"; "encoding"]
+    ~uses:(fun _ -> [Constant.octez_codec])
+    ~uses_node:false
+    ~uses_client:false
+    ~uses_admin_client:false
+  @@ fun protocol ->
+  let encoding_id = sf "%s.script.prim" (Protocol.encoding_prefix protocol) in
+  let* encoding_dump = Codec.dump_encoding ~id:encoding_id () in
+  let prim_list =
+    JSON.(
+      encoding_dump |-> "binary" |-> "fields" |=> 0 |-> "encoding" |-> "cases"
+      |> as_list)
+  in
+  let () =
+    List.iter
+      (fun json ->
+        match JSON.as_list json with
+        | [tag; prim] ->
+            let tag = JSON.as_int tag in
+            let prim = JSON.as_string prim in
+            Regression.capture (sf "%d: %s" tag prim)
+        | _ -> Test.fail "expected a list of length 2")
+      prim_list
+  in
   unit
 
 let check_sample ~name ~file =
   let* json_string = Tezos_stdlib_unix.Lwt_utils_unix.read_file file in
   let original_json = JSON.parse ~origin:json_string json_string in
-  let* binary =
-    Codec.encode ~hooks:Regression.hooks ~name (JSON.unannotate original_json)
+  let* binary = Codec.encode ~name (JSON.unannotate original_json) in
+  let () =
+    Regression.capture
+      (sf
+         "%s: %s"
+         Filename.(file |> basename |> remove_extension |> remove_extension)
+         binary)
   in
-  let* decoded_json = Codec.decode ~hooks:Regression.hooks ~name binary in
+  let* decoded_json = Codec.decode ~name binary in
   Check.(
     (original_json = decoded_json)
       json
@@ -76,11 +117,20 @@ let iter_sample_s base_path func =
 
 (** The given sample must be included in registered encodings. These can be
     found with [octez-codec list encodings]. *)
-let check_protocol_sample_encoding ?supports sample =
+let check_protocol_sample_encoding ?title ?supports sample =
+  let title, tags =
+    match title with
+    | None -> (sample, sample_as_tags sample)
+    | Some title -> (title, sample_as_tags title)
+  in
   Protocol.register_regression_test
     ~__FILE__
-    ~title:(sf "protocol encoding regression test: %s" sample)
-    ~tags:["encoding"; "protocol"]
+    ~title:(sf "protocol encoding regression test: %s" title)
+    ~tags:(["encoding"; "protocol"] @ tags)
+    ~uses:(fun _protocol -> [Constant.octez_codec])
+    ~uses_node:false
+    ~uses_client:false
+    ~uses_admin_client:false
     ?supports
   @@ fun protocol ->
   let base_path =
@@ -95,7 +145,11 @@ let check_shell_sample_encoding sample =
   Regression.register
     ~__FILE__
     ~title:(sf "shell encoding regression test: %s" sample)
-    ~tags:["encoding"; "shell"]
+    ~tags:(["encoding"; "shell"] @ sample_as_tags sample)
+    ~uses:[Constant.octez_codec]
+    ~uses_node:false
+    ~uses_client:false
+    ~uses_admin_client:false
   @@ fun () ->
   let base_path =
     "tezt" // "tests" // "encoding_samples" // "shell" // sample
@@ -103,8 +157,8 @@ let check_shell_sample_encoding sample =
   iter_sample_s base_path @@ fun file -> check_sample ~name:sample ~file
 
 let check_samples protocols =
-  let protocol_sample ?supports name =
-    check_protocol_sample_encoding ?supports name protocols
+  let protocol_sample ?title ?supports name =
+    check_protocol_sample_encoding ?title ?supports name protocols
   in
   check_shell_sample_encoding "network_version" ;
   protocol_sample "block_header" ;
@@ -115,12 +169,18 @@ let check_samples protocols =
   protocol_sample "fitness" ;
   protocol_sample "gas.cost" ;
   protocol_sample "gas" ;
+  protocol_sample "lazy_storage_diff" ;
   protocol_sample "level" ;
   protocol_sample "nonce" ;
   protocol_sample "operation.internal" ;
   protocol_sample "operation" ;
   protocol_sample "operation.raw" ;
   protocol_sample "operation.unsigned" ;
+  protocol_sample ~supports:(From_protocol 023) "operation.bls_mode_unsigned" ;
+  protocol_sample
+    ~supports:(From_protocol 023)
+    "operation.internal_and_metadata" ;
+  protocol_sample ~supports:(From_protocol 023) "operation.data_and_metadata" ;
   protocol_sample "period" ;
   protocol_sample "raw_level" ;
   protocol_sample "seed" ;
@@ -135,4 +195,5 @@ let check_samples protocols =
 
 let register ~protocols =
   check_dump_encodings () ;
-  check_samples protocols
+  check_samples protocols ;
+  test_michelson_primitives_encoding protocols

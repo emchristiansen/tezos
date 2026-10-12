@@ -30,8 +30,14 @@
    Subject:      Tests origination and calls to manager contracts.
 *)
 
+let team = Tag.layer1
+
 let test_manager_contracts =
-  Protocol.register_test ~__FILE__ ~title:"Manager" ~tags:["manager"]
+  Protocol.register_test
+    ~__FILE__
+    ~title:"Manager"
+    ~tags:[team; "manager"]
+    ~uses_node:false
   @@ fun protocol ->
   let* client = Client.init_mockup ~protocol () in
   let check_delegate ~__LOC__ src expected_delegate =
@@ -155,9 +161,9 @@ let test_manager_contracts =
       client
   in
   Log.info "Manager set delegate" ;
-  let*! () = Client.set_delegate ~src:"manager" ~delegate:"bootstrap2" client in
+  let* () = Client.set_delegate ~src:"manager" ~delegate:"bootstrap2" client in
   let bootstrap2_pkh = Constant.bootstrap2.public_key_hash in
-  let*! () =
+  let* () =
     Client.set_delegate
       ~src:"delegatable_target"
       ~delegate:bootstrap2_pkh
@@ -166,8 +172,8 @@ let test_manager_contracts =
   let delegate = Constant.bootstrap2.public_key_hash in
   let* () = check_delegate ~__LOC__ "manager" (Some delegate) in
   let* () = check_delegate ~__LOC__ "delegatable_target" (Some delegate) in
-  let*! () = Client.set_delegate ~src:"manager" ~delegate:"bootstrap3" client in
-  let*! () =
+  let* () = Client.set_delegate ~src:"manager" ~delegate:"bootstrap3" client in
+  let* () =
     Client.set_delegate ~src:"delegatable_target" ~delegate:"bootstrap3" client
   in
   let delegate = Constant.bootstrap3.public_key_hash in
@@ -184,15 +190,16 @@ let test_manager_contracts =
     Client.get_balance_for ~account:"bootstrap2" client
   in
   let amount = Tez.of_mutez_int 10_001_000 in
+  let fee = Tez.of_mutez_int 0_000_475 in
   let* () =
     Client.transfer
       ~amount
       ~giver:"bootstrap2"
       ~receiver:"manager"
       ~gas_limit:((128 * 15450) + 108)
+      ~fee
       client
   in
-  let fee = Tez.of_mutez_int 0_000_475 in
   let* () = check_balance ~__LOC__ "manager" Tez.(balance + amount) in
   let* () =
     check_balance ~__LOC__ "bootstrap2" Tez.(balance_bootstrap - fee - amount)
@@ -224,15 +231,16 @@ let test_manager_contracts =
     Client.get_balance_for ~account:"bootstrap2" client
   in
   let amount = Tez.of_int 10 in
+  let fee = Tez.of_mutez_int 0_000_824 in
   let* () =
     Client.transfer
       ~amount
       ~giver:"manager"
       ~receiver:"manager2"
       ~gas_limit:((128 * 44950) + 112)
+      ~fee
       client
   in
-  let fee = Tez.of_mutez_int 0_000_824 in
   let* () = check_balance ~__LOC__ "manager" Tez.(balance - amount) in
   let* () = check_balance ~__LOC__ "manager2" Tez.(balance_dest + amount) in
   let* () = check_balance ~__LOC__ "bootstrap2" Tez.(balance_bootstrap - fee) in

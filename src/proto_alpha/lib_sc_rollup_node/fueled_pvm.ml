@@ -26,308 +26,446 @@
 open Protocol
 open Alpha_context
 module Inbox = Sc_rollup.Inbox
-open Protocol
-open Alpha_context
+open Pvm_plugin_sig
 
-module type S = sig
-  module PVM : Pvm.S
+module Make_fueled (F : Fuel.S) : FUELED_PVM with type fuel = F.t = struct
+  type fuel = F.t
 
-  type fuel
+  type 'a mut_pvm_impl = (module Pvm_sig.MUTABLE_STATE_S with type t = 'a)
 
-  type eval_result = {state : PVM.state; remaining_fuel : fuel; num_ticks : Z.t}
+  let get_reveal ~pre_images_endpoint ~data_dir ~pvm_kind reveal_map hash =
+    let open Lwt_result_syntax in
+    let found_in_map =
+      match reveal_map with
+      | None -> None
+      | Some map ->
+          Utils.Reveal_hash_map.find_opt (Reveals.proto_hash_to_bytes hash) map
+    in
+    match found_in_map with
+    | Some data -> return data
+    | None -> Reveals.get ~pre_images_endpoint ~data_dir ~pvm_kind hash
 
-  (** [eval_block_inbox ~fuel node_ctxt (inbox, messages) state] evaluates the
-      [messages] for the [inbox] in the given [state] of the PVM and returns the
-      evaluation results containing the new state, the number of messages, the
-      inbox level and the remaining fuel. *)
-  val eval_block_inbox :
-    fuel:fuel ->
-    _ Node_context.t ->
-    Sc_rollup.Inbox.t * Sc_rollup.Inbox_message.t list ->
-    PVM.state ->
-    (PVM.state * int * Raw_level.t * fuel) Node_context.delayed_write tzresult
-    Lwt.t
+  type eval_completion =
+    | Aborted of {fuel : fuel; current_tick : int64}
+    | Completed of {
+        fuel : fuel;
+        current_tick : int64;
+        failing_ticks : int64 list;
+      }
 
-  (** [eval_messages ?reveal_map ~fuel node_ctxt ~message_counter_offset state
-      inbox_level messages] evaluates the [messages] for inbox level
-      [inbox_level] in the given [state] of the PVM and returns the evaluation
-      results containing the new state, the remaining fuel, and the number of
-      ticks for the evaluation of these messages. [message_counter_offset] is
-      used when we evaluate partial inboxes, such as during simulation. When
-      [reveal_map] is provided, it is used as an additional source of data for
-      revelation ticks. *)
-  val eval_messages :
-    ?reveal_map:string Sc_rollup_reveal_hash.Map.t ->
-    fuel:fuel ->
-    _ Node_context.t ->
-    message_counter_offset:int ->
-    PVM.state ->
-    Raw_level.t ->
-    Sc_rollup.Inbox_message.t list ->
-    eval_result Node_context.delayed_write tzresult Lwt.t
-end
+  let metadata (node_ctxt : _ Node_context.t) =
+    let address =
+      Sc_rollup_proto_types.Address.of_octez node_ctxt.config.sc_rollup_address
+    in
+    let origination_level =
+      Raw_level.of_int32_exn node_ctxt.genesis_info.level
+    in
+    Sc_rollup.Metadata.{address; origination_level}
 
-module Make (PVM : Pvm.S) = struct
-  module Make_fueled (F : Fuel.S) :
-    S with module PVM = PVM and type fuel = F.t = struct
-    module PVM = PVM
-
-    type fuel = F.t
-
-    type eval_result = {
-      state : PVM.state;
-      remaining_fuel : fuel;
-      num_ticks : Z.t;
-    }
-
-    let get_reveal ~data_dir reveal_map hash =
-      let found_in_map =
-        match reveal_map with
-        | None -> None
-        | Some map -> Sc_rollup_reveal_hash.Map.find_opt hash map
-      in
-      match found_in_map with
-      | Some data -> return data
-      | None -> Reveals.get ~data_dir ~pvm_kind:PVM.kind ~hash
-
-    let continue_with_fuel consumption initial_fuel state f =
-      let open Delayed_write_monad.Lwt_result_syntax in
-      match F.consume consumption initial_fuel with
-      | None -> return (state, initial_fuel, 0L)
-      | Some fuel_left -> f fuel_left state
-
-    exception Error_wrapper of tztrace
-
-    (** [eval_until_input node_ctxt reveal_map level message_index ~fuel
+  (** [eval_until_input node_ctxt reveal_map level message_index ~fuel
         start_tick failing_ticks state] advances a PVM [state] until it wants
         more inputs or there are no more [fuel] (if [Some fuel] is
         specified). The evaluation is running under the processing of some
         [message_index] at a given [level] and this is the [start_tick] of this
         message processing. If some [failing_ticks] are planned by the loser
         mode, they will be made. *)
-    let eval_until_input node_ctxt reveal_map level message_index ~fuel
-        start_tick failing_ticks state =
-      let open Lwt_result_syntax in
-      let open Delayed_write_monad.Lwt_result_syntax in
-      let metadata = Node_context.metadata node_ctxt in
-      let dal_attestation_lag =
-        node_ctxt.protocol_constants.parametric.dal.attestation_lag
-      in
-      let reveal_builtins =
-        Tezos_scoru_wasm.Builtins.
-          {
-            reveal_preimage =
-              (fun hash ->
-                let hash =
-                  (* The payload represents the encoded [Sc_rollup_reveal_hash.t]. We must
-                     decode it properly, instead of converting it byte-for-byte. *)
-                  Data_encoding.Binary.of_string_exn
-                    Sc_rollup_reveal_hash.encoding
-                    hash
-                in
-                let*! data =
-                  get_reveal ~data_dir:node_ctxt.data_dir reveal_map hash
-                in
-                match data with
-                | Error error ->
-                    (* The [Error_wrapper] must be caught upstream and converted into a
-                       tzresult. *)
-                    Lwt.fail (Error_wrapper error)
-                | Ok data -> Lwt.return data);
-            reveal_metadata =
-              (fun () ->
-                Lwt.return
-                  (Data_encoding.Binary.to_string_exn
-                     Sc_rollup.Metadata.encoding
-                     metadata));
-          }
-      in
-      let eval_tick fuel failing_ticks state =
-        let max_steps = F.max_ticks fuel in
-        let normal_eval ?(max_steps = max_steps) state =
-          Lwt.catch
-            (fun () ->
-              let*! state, executed_ticks =
-                PVM.eval_many
-                  ~reveal_builtins
-                  ~write_debug:(Printer Event.kernel_debug)
-                  ~max_steps
-                  state
-              in
-              return (state, executed_ticks, failing_ticks))
-            (function
-              | Error_wrapper error -> Lwt.return (Error error)
-              | exn -> raise exn)
-        in
-        let failure_insertion_eval state tick failing_ticks' =
-          let*! () =
-            Interpreter_event.intended_failure
-              ~level
-              ~message_index
-              ~message_tick:tick
-              ~internal:true
+  let eval_until_input (type mut_state)
+      ((module PVM_mut_state) : mut_state mut_pvm_impl)
+      (node_ctxt : _ Node_context.t) reveal_map level message_index ~fuel
+      start_tick failing_ticks (state : mut_state) =
+    let open Lwt_result_syntax in
+    let* constants =
+      Protocol_plugins.get_constants_of_level node_ctxt (Int32.of_int level)
+    in
+    let is_reveal_enabled =
+      match constants.sc_rollup.reveal_activation_level with
+      | None -> fun ~current_block_level:_ _ -> true
+      | Some reveal_activation_level ->
+          reveal_activation_level
+          |> Sc_rollup_proto_types.Constants.reveal_activation_level_of_octez
+          |> Protocol.Alpha_context.Sc_rollup.is_reveal_enabled_predicate
+    in
+    let metadata = metadata node_ctxt in
+    let dal_attested_slots_validity_lag =
+      match constants.sc_rollup.reveal_activation_level with
+      | Some reveal_activation_level when constants.dal.feature_enable ->
+          Int32.to_int reveal_activation_level.dal_attested_slots_validity_lag
+      | _ -> max_int
+    in
+    let* dal_activation_level =
+      if constants.dal.feature_enable then
+        match constants.sc_rollup.reveal_activation_level with
+        | None -> return_none
+        | Some reveal_activation_level ->
+            let*? level =
+              Raw_level.of_int32 reveal_activation_level.dal_parameters
+              |> Environment.wrap_tzresult
+            in
+            return_some level
+      else return_none
+    in
+    let dal_parameters =
+      Sc_rollup.Dal_parameters.
+        {
+          number_of_slots = Int64.of_int constants.dal.number_of_slots;
+          attestation_lag = Int64.of_int constants.dal.attestation_lag;
+          slot_size = Int64.of_int constants.dal.cryptobox_parameters.slot_size;
+          page_size = Int64.of_int constants.dal.cryptobox_parameters.page_size;
+        }
+    in
+    let reveal_builtins request =
+      match Sc_rollup.Wasm_2_0_0PVM.decode_reveal request with
+      | Reveal_raw_data hash
+        when Sc_rollup_reveal_hash.(equal hash well_known_reveal_hash) ->
+          Lwt.return Sc_rollup_reveal_hash.well_known_reveal_preimage
+      | Reveal_raw_data hash -> (
+          let*! data =
+            get_reveal
+              ~pre_images_endpoint:node_ctxt.config.pre_images_endpoint
+              ~data_dir:node_ctxt.data_dir
+              ~pvm_kind:node_ctxt.kind
+              reveal_map
+              hash
           in
-          let*! state = PVM.Internal_for_tests.insert_failure state in
-          return (state, 1L, failing_ticks')
-        in
-        match failing_ticks with
-        | xtick :: failing_ticks' ->
-            let jump = Int64.(max 0L (pred xtick)) in
-            if Compare.Int64.(jump = 0L) then
-              (* Insert the failure in the first tick. *)
-              failure_insertion_eval state xtick failing_ticks'
-            else
-              (* Jump just before the tick where we'll insert a failure.
-                 Nevertheless, we don't execute more than [max_steps]. *)
-              let max_steps = Int64.max 0L max_steps |> Int64.min max_steps in
-              let open Delayed_write_monad.Lwt_result_syntax in
-              let>* state, executed_ticks, _failing_ticks =
-                normal_eval ~max_steps state
+          match data with
+          | Error error ->
+              (* The [Error_wrapper] must be caught upstream and converted into
+                 a tzresult. *)
+              Lwt.fail (Rollup_node_errors.Error_wrapper error)
+          | Ok data -> Lwt.return data)
+      | Reveal_metadata ->
+          Lwt.return
+            (Data_encoding.Binary.to_string_exn
+               Sc_rollup.Metadata.encoding
+               metadata)
+      | (Request_dal_page _ | Request_adal_page _) as xdal_request -> (
+          let dal_page =
+            match xdal_request with
+            | Request_dal_page dal_page -> dal_page
+            | Request_adal_page _ -> Stdlib.failwith "Not_implemented"
+            | _ ->
+                (* This case is not reachable because we know that [xdal_request]
+                   is either [Request_dal_page] or [Request_adal_page] *)
+                assert false
+          in
+          let inbox_level = Int32.of_int level in
+          let*! content =
+            Dal_pages_request.page_content
+              ~dal_activation_level
+              ~dal_attested_slots_validity_lag
+              ~inbox_level
+              node_ctxt
+              dal_page
+          in
+          match content with
+          | Error error ->
+              (* The [Error_wrapper] must be caught upstream and converted into
+                 a tzresult. *)
+              (* This happens when, for example, the kernel requests a page from a future level. *)
+              Lwt.fail (Rollup_node_errors.Error_wrapper error)
+          | Ok data_opt -> (
+              let*! data_opt =
+                let published_level =
+                  Raw_level.to_int32 dal_page.slot_id.published_level
+                in
+                let slot_index = Dal.Slot_index.to_int dal_page.slot_id.index in
+                let page_index = dal_page.page_index in
+                let*! is_invalid_dal_page =
+                  Loser_mode.is_invalid_dal_page
+                    node_ctxt.config.loser_mode
+                    ~inbox_level
+                    ~published_level
+                    ~slot_index
+                    ~page_index
+                    ~page_size:(Int64.to_int dal_parameters.page_size)
+                    ~honest_payload:data_opt
+                in
+                Lwt.return
+                  (match is_invalid_dal_page with
+                  | Either.Left () -> data_opt
+                  | Either.Right data_opt -> data_opt)
               in
-              (* Insert the failure. *)
-              let>* state, executed_ticks', failing_ticks' =
-                failure_insertion_eval state xtick failing_ticks'
-              in
-              let executed_ticks = Int64.add executed_ticks executed_ticks' in
-              return (state, executed_ticks, failing_ticks')
-        | _ -> normal_eval state
+              match data_opt with
+              | None ->
+                  (* The page was not confirmed by L1.
+                     We return empty string in this case, as done in the slow executon. *)
+                  Lwt.return ""
+              | Some b -> Lwt.return (Bytes.to_string b)))
+      | Reveal_dal_parameters ->
+          (* TODO: https://gitlab.com/tezos/tezos/-/issues/6562
+             Consider supporting revealing of historical DAL parameters. *)
+          let dal_parameters =
+            match
+              Loser_mode.is_invalid_dal_parameters node_ctxt.config.loser_mode
+            with
+            | None -> dal_parameters
+            | Some {number_of_slots; attestation_lag; slot_size; page_size} ->
+                Sc_rollup.Dal_parameters.
+                  {number_of_slots; attestation_lag; slot_size; page_size}
+          in
+          Lwt.return
+            (Data_encoding.Binary.to_string_exn
+               Sc_rollup.Dal_parameters.encoding
+               dal_parameters)
+    in
+
+    let eval_tick_consume_fuel fuel failing_ticks state =
+      let normal_eval state fuel =
+        let max_steps = F.max_ticks fuel in
+        Lwt.catch
+          (fun () ->
+            (* This call to the PVM implementation of [eval_many] should never return running more
+               ticks than the given [max_steps] ticks. If it were to happen, this is a security issue,
+               and should be reported as such. *)
+            let*! executed_ticks =
+              PVM_mut_state.eval_many
+                ~check_invalid_kernel:
+                  (not node_ctxt.config.unsafe_disable_wasm_kernel_checks)
+                ~fallback_to_slow_vm:node_ctxt.config.slow_vm_fallback
+                ~reveal_builtins
+                ~write_debug:(Printer node_ctxt.kernel_debug_logger)
+                ~max_steps
+                ~is_reveal_enabled
+                state
+            in
+            let* remaining_fuel =
+              match F.consume (F.of_ticks executed_ticks) fuel with
+              | None ->
+                  tzfail
+                  @@ Rollup_node_errors.PVM_eval_too_many_ticks
+                       {max_given = max_steps; executed = executed_ticks}
+              | Some remaining_fuel -> Lwt_result.return remaining_fuel
+            in
+            return (executed_ticks, failing_ticks, remaining_fuel))
+          (function
+            | Rollup_node_errors.Error_wrapper error -> Lwt.return (Error error)
+            | exn -> Lwt.reraise exn)
       in
-      let rec go (fuel : fuel) current_tick failing_ticks state =
-        let*! input_request = PVM.is_input_state state in
-        if F.is_empty fuel then return (state, fuel, current_tick, failing_ticks)
-        else
-          match input_request with
-          | No_input_required -> (
-              let>* next_state, executed_ticks, failing_ticks =
-                eval_tick fuel failing_ticks state
-              in
-              let fuel_executed = F.of_ticks executed_ticks in
-              match F.consume fuel_executed fuel with
-              | None -> return (state, fuel, current_tick, failing_ticks)
+      let normal_eval_wrapper state fuel one_step_eval =
+        let* xticks, fticks, remaining_fuel = normal_eval state fuel in
+        return (xticks, fticks, remaining_fuel, one_step_eval)
+      in
+      let failure_insertion_eval state tick =
+        let*! () =
+          Interpreter_event.intended_failure
+            ~level
+            ~message_index
+            ~message_tick:tick
+            ~internal:true
+        in
+        PVM_mut_state.Internal_for_tests.insert_failure state
+      in
+      match failing_ticks with
+      | xtick :: failing_ticks' ->
+          let one_step_eval state = failure_insertion_eval state xtick in
+          let jump = Int64.(max 0L (pred xtick)) in
+          if Compare.Int64.(jump = 0L) then
+            (* Insert the failure in the first tick. *)
+            return (xtick, failing_ticks', fuel, Some one_step_eval)
+          else
+            (* Jump just before the tick where we'll insert a failure.
+               Nevertheless, we don't execute more than [fuel] steps. *)
+            normal_eval_wrapper state fuel (Some one_step_eval)
+      | _ -> normal_eval_wrapper state fuel None
+    in
+    let abort fuel current_tick = return (Aborted {fuel; current_tick}) in
+    let rec go (fuel : fuel) current_tick failing_ticks state =
+      let*! input_request =
+        PVM_mut_state.is_input_state ~is_reveal_enabled state
+      in
+      match input_request with
+      | No_input_required when F.is_empty fuel -> abort fuel current_tick
+      | No_input_required -> (
+          let* executed_ticks, failing_ticks, fuel, one_step_advancement =
+            eval_tick_consume_fuel fuel failing_ticks state
+          in
+          let tick_after_eval_consume = Int64.add current_tick executed_ticks in
+          match one_step_advancement with
+          | None -> go fuel tick_after_eval_consume failing_ticks state
+          | Some one_step_eval -> (
+              let*! () = one_step_eval state in
+              match F.consume F.one_tick_consumption fuel with
+              | None -> abort fuel tick_after_eval_consume
               | Some fuel ->
                   go
                     fuel
-                    (Int64.add current_tick executed_ticks)
+                    (Int64.succ tick_after_eval_consume)
                     failing_ticks
-                    next_state)
-          | Needs_reveal (Reveal_raw_data hash) -> (
+                    state))
+      | Needs_reveal (Reveal_raw_data hash) -> (
+          match F.consume F.one_tick_consumption fuel with
+          | None -> abort fuel current_tick
+          | Some fuel ->
               let* data =
-                get_reveal ~data_dir:node_ctxt.data_dir reveal_map hash
+                get_reveal
+                  ~pre_images_endpoint:node_ctxt.config.pre_images_endpoint
+                  ~data_dir:node_ctxt.data_dir
+                  ~pvm_kind:node_ctxt.kind
+                  reveal_map
+                  hash
               in
-              let*! next_state = PVM.set_input (Reveal (Raw_data data)) state in
-              match F.consume F.one_tick_consumption fuel with
-              | None -> return (state, fuel, current_tick, failing_ticks)
-              | Some fuel ->
-                  go fuel (Int64.succ current_tick) failing_ticks next_state)
-          | Needs_reveal Reveal_metadata -> (
-              let*! next_state =
-                PVM.set_input (Reveal (Metadata metadata)) state
+              let*! () =
+                PVM_mut_state.set_input (Reveal (Raw_data data)) state
               in
-              match F.consume F.one_tick_consumption fuel with
-              | None -> return (state, fuel, current_tick, failing_ticks)
-              | Some fuel ->
-                  go fuel (Int64.succ current_tick) failing_ticks next_state)
-          | Needs_reveal (Request_dal_page page_id) -> (
+              go fuel (Int64.succ current_tick) failing_ticks state)
+      | Needs_reveal Reveal_metadata -> (
+          match F.consume F.one_tick_consumption fuel with
+          | None -> abort fuel current_tick
+          | Some fuel ->
+              let*! () =
+                PVM_mut_state.set_input (Reveal (Metadata metadata)) state
+              in
+              go fuel (Int64.succ current_tick) failing_ticks state)
+      | Needs_reveal
+          ((Request_dal_page _ | Request_adal_page _) as xdal_request) -> (
+          let page_id =
+            match xdal_request with
+            | Request_dal_page page_id -> page_id
+            | Request_adal_page _ -> Stdlib.failwith "Not_implemented"
+            | _ ->
+                (* This case is not reachable because we know that [xdal_request]
+                   is either [Request_dal_page] or [Request_adal_page] *)
+                assert false
+          in
+          match F.consume F.one_tick_consumption fuel with
+          | None -> abort fuel current_tick
+          | Some fuel ->
               let* content_opt =
                 Dal_pages_request.page_content
-                  ~dal_attestation_lag
+                  ~inbox_level:(Int32.of_int level)
+                  ~dal_activation_level
+                  ~dal_attested_slots_validity_lag
                   node_ctxt
                   page_id
               in
-              let*! next_state =
-                PVM.set_input (Reveal (Dal_page content_opt)) state
+              let*! () =
+                PVM_mut_state.set_input (Reveal (Dal_page content_opt)) state
               in
-              match F.consume F.one_tick_consumption fuel with
-              | None -> return (state, fuel, current_tick, failing_ticks)
-              | Some fuel ->
-                  go fuel (Int64.succ current_tick) failing_ticks next_state)
-          | Initial | First_after _ ->
-              return (state, fuel, current_tick, failing_ticks)
-      in
-      go fuel start_tick failing_ticks state
+              go fuel (Int64.succ current_tick) failing_ticks state)
+      | Needs_reveal Reveal_dal_parameters -> (
+          (* TODO: https://gitlab.com/tezos/tezos/-/issues/6562
+             Consider supporting revealing of historical DAL parameters. *)
+          match F.consume F.one_tick_consumption fuel with
+          | None -> abort fuel current_tick
+          | Some fuel ->
+              let*! () =
+                PVM_mut_state.set_input
+                  (Reveal (Dal_parameters dal_parameters))
+                  state
+              in
+              go fuel (Int64.succ current_tick) failing_ticks state)
+      | Initial | First_after _ ->
+          return @@ Completed {fuel; current_tick; failing_ticks}
+    in
+    go fuel start_tick failing_ticks state
 
-    (** [mutate input] corrupts the payload of [input] for testing purposes. *)
-    let mutate input =
-      let payload =
-        Sc_rollup.Inbox_message.unsafe_of_string
-          "\001to the cheater we promise pain and misery"
-      in
-      {input with Sc_rollup.payload}
+  (** [mutate input] corrupts the payload of [input] for testing purposes. *)
+  let mutate input =
+    let payload =
+      Sc_rollup.Inbox_message.unsafe_of_string
+        "\001to the cheater we promise pain and misery"
+    in
+    {input with Sc_rollup.payload}
 
-    (** [feed_input node_ctxt reveal_map level message_index ~fuel
+  type feed_input_completion =
+    | Feed_input_aborted of {fuel : fuel; fed_input : bool}
+    | Feed_input_completed of fuel
+
+  (** [feed_input node_ctxt reveal_map level message_index ~fuel
         ~failing_ticks state input] feeds [input] (that has a given
         [message_index] in inbox of [level]) to the PVM in order to advance
         [state] to the next step that requires an input. This function is
         controlled by some [fuel] and may introduce intended failures at some
         given [failing_ticks]. *)
-    let feed_input node_ctxt reveal_map level message_index ~fuel ~failing_ticks
-        state input =
-      let open Lwt_result_syntax in
-      let open Delayed_write_monad.Lwt_result_syntax in
-      let>* state, fuel, tick, failing_ticks =
-        eval_until_input
-          node_ctxt
-          reveal_map
-          level
-          message_index
-          ~fuel
-          0L
-          failing_ticks
-          state
-      in
-      continue_with_fuel F.one_tick_consumption fuel state @@ fun fuel state ->
-      let>* input, failing_ticks =
-        match failing_ticks with
-        | xtick :: failing_ticks' ->
-            if xtick = tick then
-              let*! () =
-                Interpreter_event.intended_failure
-                  ~level
-                  ~message_index
-                  ~message_tick:tick
-                  ~internal:false
-              in
-              return (mutate input, failing_ticks')
-            else return (input, failing_ticks)
-        | [] -> return (input, failing_ticks)
-      in
-      let*! state = PVM.set_input (Inbox_message input) state in
-      let>* state, fuel, tick, _failing_ticks =
-        eval_until_input
-          node_ctxt
-          reveal_map
-          level
-          message_index
-          ~fuel
-          tick
-          failing_ticks
-          state
-      in
-      return (state, fuel, tick)
+  let feed_input (type mut_state)
+      ((module PVM_mut_state) : mut_state mut_pvm_impl)
+      (node_ctxt : _ Node_context.t) reveal_map level message_index ~fuel
+      ~failing_ticks (state : mut_state) input =
+    let open Lwt_result_syntax in
+    let* res =
+      eval_until_input
+        (module PVM_mut_state)
+        node_ctxt
+        reveal_map
+        level
+        message_index
+        ~fuel
+        0L
+        failing_ticks
+        state
+    in
+    match res with
+    | Aborted {fuel; _} -> return (Feed_input_aborted {fuel; fed_input = false})
+    | Completed {fuel; current_tick = tick; failing_ticks} -> (
+        match F.consume F.one_tick_consumption fuel with
+        | None -> return (Feed_input_aborted {fuel; fed_input = false})
+        | Some fuel -> (
+            let* input, failing_ticks =
+              match failing_ticks with
+              | xtick :: failing_ticks' ->
+                  if xtick = tick then
+                    let*! () =
+                      Interpreter_event.intended_failure
+                        ~level
+                        ~message_index
+                        ~message_tick:tick
+                        ~internal:false
+                    in
+                    return (mutate input, failing_ticks')
+                  else return (input, failing_ticks)
+              | [] -> return (input, failing_ticks)
+            in
+            let*! () = PVM_mut_state.set_input (Inbox_message input) state in
+            let* res =
+              eval_until_input
+                (module PVM_mut_state)
+                node_ctxt
+                reveal_map
+                level
+                message_index
+                ~fuel
+                tick
+                failing_ticks
+                state
+            in
+            match res with
+            | Aborted {fuel; _} ->
+                return (Feed_input_aborted {fuel; fed_input = true})
+            | Completed {fuel; _} -> return (Feed_input_completed fuel)))
 
-    let eval_messages ~reveal_map ~fuel node_ctxt ~message_counter_offset state
-        inbox_level messages =
-      let open Lwt_result_syntax in
-      let open Delayed_write_monad.Lwt_result_syntax in
-      let level = Raw_level.to_int32 inbox_level |> Int32.to_int in
-      (* Iterate the PVM state with all the messages. *)
-      list_fold_left_i_es
-        (fun message_counter (state, fuel) message ->
-          let*? payload =
-            Sc_rollup.Inbox_message.(
-              message |> serialize |> Environment.wrap_tzresult)
-          in
-          let message_index = message_counter_offset + message_counter in
+  let eval_messages ~reveal_map ~fuel (type mut_state)
+      ((module PVM_mut_state) : mut_state mut_pvm_impl) node_ctxt
+      ~message_counter_offset (state : mut_state) inbox_level messages =
+    let open Lwt_result_syntax in
+    let level = Int32.to_int inbox_level in
+    (* Iterate the PVM state with all the messages. *)
+    let rec feed_messages (state, fuel) message_index = function
+      | [] ->
+          (* Fed all messages *)
+          return (fuel, message_index - message_counter_offset, [])
+      | messages when F.is_empty fuel ->
+          (* Consumed all fuel *)
+          return (fuel, message_index - message_counter_offset, messages)
+      | message :: messages -> (
+          let payload = Sc_rollup.Inbox_message.unsafe_of_string message in
           let message_counter = Z.of_int message_index in
-          let input = Sc_rollup.{inbox_level; message_counter; payload} in
+          let input =
+            Sc_rollup.
+              {
+                inbox_level = Raw_level.of_int32_exn inbox_level;
+                message_counter;
+                payload;
+              }
+          in
           let failing_ticks =
             Loser_mode.is_failure
-              node_ctxt.Node_context.loser_mode
+              node_ctxt.Node_context.config.loser_mode
               ~level
               ~message_index
           in
-          let>* state, fuel, _executed_ticks =
+          let* res =
             feed_input
+              (module PVM_mut_state)
               node_ctxt
               reveal_map
               level
@@ -337,51 +475,127 @@ module Make (PVM : Pvm.S) = struct
               state
               input
           in
-          return (state, fuel))
-        (state, fuel)
+          match res with
+          | Feed_input_completed fuel ->
+              feed_messages (state, fuel) (message_index + 1) messages
+          | Feed_input_aborted {fuel; fed_input = false} ->
+              return
+                ( fuel,
+                  message_index - message_counter_offset,
+                  message :: messages )
+          | Feed_input_aborted {fuel; fed_input = true} ->
+              return (fuel, message_index + 1 - message_counter_offset, messages)
+          )
+    in
+    (feed_messages [@tailcall]) (state, fuel) message_counter_offset messages
+
+  let eval_block_inbox ~fuel (node_ctxt : _ Node_context.t) (inbox, messages)
+      (state : _ Context.pvmstate) : fuel eval_result tzresult Lwt.t =
+    let open Lwt_result_syntax in
+    let module PVM = (val Pvm.of_kind node_ctxt.kind) in
+    let module PVM_mut_state = PVM.Mutable_state in
+    let mut_state = PVM.Ctxt_wrapper.of_node_pvmstate state in
+    (* Obtain inbox and its messages for this block. *)
+    let inbox_level = Octez_smart_rollup.Inbox.inbox_level inbox in
+    let*! initial_tick = PVM_mut_state.get_tick mut_state in
+    (* Evaluate all the messages for this level. *)
+    let* remaining_fuel, num_messages, remaining_messages =
+      eval_messages
+        ~reveal_map:None
+        ~fuel
+        (module PVM_mut_state)
+        node_ctxt
+        ~message_counter_offset:0
+        mut_state
+        inbox_level
         messages
+    in
+    let*! final_tick = PVM_mut_state.get_tick mut_state in
+    let*! state_hash = PVM_mut_state.state_hash mut_state in
+    let num_ticks = Sc_rollup.Tick.distance initial_tick final_tick in
+    let state_info =
+      {
+        state_hash = Sc_rollup_proto_types.State_hash.to_octez state_hash;
+        tick = Sc_rollup.Tick.to_z final_tick;
+        inbox_level;
+        message_counter_offset = num_messages;
+        remaining_fuel;
+        remaining_messages;
+      }
+    in
+    return {state_info; num_ticks; num_messages}
 
-    let eval_block_inbox ~fuel node_ctxt (inbox, messages) (state : PVM.state) :
-        (PVM.state * int * Raw_level.t * fuel) Node_context.delayed_write
-        tzresult
-        Lwt.t =
-      let open Delayed_write_monad.Lwt_result_syntax in
-      (* Obtain inbox and its messages for this block. *)
-      let inbox_level = Inbox.inbox_level inbox in
-      let num_messages = List.length messages in
-      (* Evaluate all the messages for this level. *)
-      let>* state, fuel =
-        eval_messages
-          ~reveal_map:None
-          ~fuel
-          node_ctxt
-          ~message_counter_offset:0
-          state
-          inbox_level
-          messages
-      in
-      return (state, num_messages, inbox_level, fuel)
-
-    let eval_messages ?reveal_map ~fuel node_ctxt ~message_counter_offset state
-        inbox_level messages =
-      let open Lwt_result_syntax in
-      let open Delayed_write_monad.Lwt_result_syntax in
-      let*! initial_tick = PVM.get_tick state in
-      let>* state, remaining_fuel =
-        eval_messages
-          ~reveal_map
-          ~fuel
-          node_ctxt
-          ~message_counter_offset
-          state
-          inbox_level
-          messages
-      in
-      let*! final_tick = PVM.get_tick state in
-      let num_ticks = Sc_rollup.Tick.distance initial_tick final_tick in
-      return {state; remaining_fuel; num_ticks}
-  end
-
-  module Free = Make_fueled (Fuel.Free)
-  module Accounted = Make_fueled (Fuel.Accounted)
+  let eval_messages ?reveal_map (node_ctxt : _ Node_context.t)
+      {
+        state;
+        info =
+          {
+            tick = initial_tick;
+            inbox_level;
+            message_counter_offset;
+            remaining_fuel = fuel;
+            remaining_messages = messages;
+            _;
+          };
+      } =
+    let open Lwt_result_syntax in
+    let module PVM = (val Pvm.of_kind node_ctxt.kind) in
+    let module PVM_mut_state = PVM.Mutable_state in
+    let state = PVM.Ctxt_wrapper.of_node_pvmstate state in
+    let* remaining_fuel, num_messages, remaining_messages =
+      match messages with
+      | [] ->
+          let level = Int32.to_int inbox_level in
+          let message_index = message_counter_offset - 1 in
+          let failing_ticks =
+            Loser_mode.is_failure
+              node_ctxt.Node_context.config.loser_mode
+              ~level
+              ~message_index
+          in
+          let* res =
+            eval_until_input
+              (module PVM_mut_state)
+              node_ctxt
+              reveal_map
+              level
+              message_index
+              ~fuel
+              0L
+              failing_ticks
+              state
+          in
+          let remaining_fuel =
+            match res with Aborted {fuel; _} | Completed {fuel; _} -> fuel
+          in
+          return (remaining_fuel, 0, [])
+      | _ ->
+          eval_messages
+            ~reveal_map
+            ~fuel
+            (module PVM_mut_state)
+            node_ctxt
+            ~message_counter_offset
+            state
+            inbox_level
+            messages
+    in
+    let*! final_tick = PVM_mut_state.get_tick state in
+    let final_tick = Sc_rollup.Tick.to_z final_tick in
+    let*! state_hash = PVM_mut_state.state_hash state in
+    let num_ticks = Z.sub final_tick initial_tick in
+    let state_info =
+      {
+        state_hash = Sc_rollup_proto_types.State_hash.to_octez state_hash;
+        tick = final_tick;
+        inbox_level;
+        message_counter_offset = message_counter_offset + num_messages;
+        remaining_fuel;
+        remaining_messages;
+      }
+    in
+    return {state_info; num_ticks; num_messages}
 end
+
+module Free = Make_fueled (Fuel.Free)
+module Accounted = Make_fueled (Fuel.Accounted)

@@ -19,8 +19,8 @@ obtained using the following command::
 
 .. _node-conf-file:
 
-Configuration file
-------------------
+Node configuration file
+-----------------------
 
 Parameters in the configuration file can be specified in two different ways:
 
@@ -106,6 +106,8 @@ RPC parameters allow to customize the :doc:`JSON/RPC interface
 to node's network interfaces) to listen for RPC requests on, or a
 certificate/key file necessary when TLS is used.
 
+.. _node_access_control:
+
 Access Control Lists
 ~~~~~~~~~~~~~~~~~~~~
 
@@ -185,11 +187,11 @@ modifying the file.
    Rules are always searched from the beginning of the list to the end and
    the first matching address is returned. Therefore if one wants to put one
    rule on a specific port on a given host and another rule for all other ports
-   on the same host, then more specific rules should always be written *first*
+   on the same host, then more specific rules should always be written *first*.
    Otherwise they'll be shadowed by the more general rule.
 
 Examples
-~~~~~~~~
+""""""""
 
 ::
 
@@ -225,7 +227,7 @@ remote address.
 
 A common situation is when one wants to accept only safe RPC requests coming from
 remote hosts, but enable all RPCs for localhost (which is for instance necessary
-to perform baking and endorsing). Since all RPCs are available to localhost by
+to perform baking and attesting). Since all RPCs are available to localhost by
 default, it is sufficient to open another listening address::
 
   $ octez-node run --rpc-addr localhost --rpc-addr 0.0.0.0
@@ -247,7 +249,7 @@ in order to accommodate each specific setup.
 .. _default_acl:
 
 Default ACL for RPC
--------------------
+"""""""""""""""""""
 
 The default ACL for RPC depends on the listening address that the node is using.
 
@@ -261,15 +263,18 @@ If the listening address is a network address, then a more restrictive policy
 applies. Its main purpose is to protect nodes from attacks. These attacks can
 take two main forms:
 
-  - spamming the node with costly requests (denial of service attack)
-  - breaking the node by forcing it to perform a risky operation
+- spamming the node with costly requests (denial of service attack)
+- breaking the node by forcing it to perform a risky operation
 
 Thus all costly or risky endpoints are blocked by default. This can be
 relaxed or tightened by modifying the configuration file. It's
-worth noting that this default policy among other things disallows baking and
-endorsing by bakers running on remote servers,
-because endpoints such as ``/injection/block`` are not open remotely.
-Rather than opening them remotely, the recommended practice for baking is to run a node locally listening to ``localhost``, with the default ACL policy.
+worth noting that this default policy disallows use cases such as:
+
+- public RPC nodes, because it disables many useful RPCs.
+  RPC operators should define on their own the list of unsafe RPCs (that can take lot of RAM/CPU/...) that they want to open, according to their infrastructure capacity, support for load balancing, debouncing in case of any abuse/attack, etc.
+- baking and attesting by bakers running on remote servers,
+  because endpoints such as ``/injection/block`` are not open remotely.
+  Rather than opening them remotely, the recommended practice for baking is to run a node locally listening to ``localhost``, with the default ACL policy.
 
 The following is the default ACL policy for the node,
 hard-coded in :src:`src/lib_rpc_http/RPC_server.ml` (remember to replace
@@ -278,6 +283,30 @@ actually listening on):
 
 .. literalinclude:: default-acl.json
    :language: json
+
+HTTP Caching Headers
+~~~~~~~~~~~~~~~~~~~~
+
+It is possible to enable http caching headers in the RPC responses with the
+``--enable-http-cache-headers`` option. This feature is disabled by default.
+
+When enabled, the RPC server will support `max-age <https://developer.mozilla.org/en-US/docs/Web/HTTP/Reference/Headers/Cache-Control#response_directives>`_
+header. The header ``Cache-control: public, max-age: <duration>`` will be included in the response headers of head related
+queries (``/chains/main/blocks/head*``) for responses that are cacheable. This also works on paths
+that are relative to ``head`` such as ``head-n`` and ``head~n``. The response is cacheable throughout the ``<duration>``
+of the head block's consensus round where ``<duration>`` is the remaining time until the :ref:`estimated end time<time_between_blocks>`
+of the consensus round. If a response should not be cached, the RPC server will not include any cache control headers.
+
+The RPC server will also support the conditional request header `If-None-Match <https://developer.mozilla.org/en-US/docs/Web/HTTP/Reference/Headers/If-None-Match>`_
+and include the ``ETag`` field in every head related query. The value of the ``ETag`` will be set to the block hash that the query
+is related to. If the client sends a request with ``If-None-Match: <comma-separated list of ETag values>`` header and the block hash
+is included in the list of etag values, the RPC server will respond with a ``304 Not Modified`` status code with an empty body.
+
+This feature is useful when running the RPC server behind a reverse proxy that supports automatic
+content caching (eg. `NGINX's proxy_cache setting <https://blog.nginx.org/blog/nginx-caching-guide>`_). Beware that
+enabling this feature adds a non-negligible performance overhead (up to 10-15% slower) to every head related query
+as the RPC server needs to perform additional checks and calculations. Consequently, it is advised to enable thie feature
+only when operating the RPC server behind appropriate caching infrastructure.
 
 .. _configure_p2p:
 
@@ -305,7 +334,7 @@ Note that the IP address is only used for selecting an active network interface
 (technically, it is only passed to the ``bind()`` function of the socket API).
 It is also possible to advertise to peers a different port than
 the binding port using ``--advertised-net-port`` configuration option or the P2P
-`advertised-net-port`` configuration parameter. Currently it is only possible to
+``advertised-net-port`` configuration parameter. Currently it is only possible to
 specify an advertised port, but not an IP address.
 
 .. note::
@@ -314,7 +343,7 @@ specify an advertised port, but not an IP address.
     subject to NAT, a port forwarding rule has
     to be added on the NAT server ``S`` on the listening port towards
     machine ``M``: ``S:p1 -> M:p2``, where ``p1`` is ``advertised-net-port`` and
-    ``p2`` is the port specified by ``listening-addr``. Alternatively, if the
+    ``p2`` is the port specified by ``listen-addr``. Alternatively, if the
     ``advertised-net-port`` is not configured, ``p1`` must be the same as ``p2``.
 
     As a consequence, if a second node has to be run behind the
@@ -327,7 +356,7 @@ specify an advertised port, but not an IP address.
     port forwarding can be initiated by the internal host without any manual
     modification on the router. This is not possible for corporate networks with
     UPnP disabled, but is typically handy for home routers, or other networks
-    where this option is available.
+    where this option is available. See :ref:`Mapping ports with UPnP<mapping_upnp>`.
 
 Private node
 ~~~~~~~~~~~~

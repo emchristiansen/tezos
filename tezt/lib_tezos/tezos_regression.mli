@@ -25,10 +25,13 @@
 
 (** Tezos-specific extension for the [Regression] module. *)
 
+(** List of default replacement *)
+val replacements : (string * string) list
+
 (** [replace_variables log] returns [log] with all occurrences of variables
     such as contract addresses, hashes etc. that may change between different
     runs replaced by constants. *)
-val replace_variables : string -> string
+val replace_variables : ?replacements:(string * string) list -> string -> string
 
 (** Custom Tezos-specific regression hooks that replaces Tezos-specific values
     with constants.
@@ -50,3 +53,7 @@ val hooks_custom :
 
     This is {!hooks_custom} with the default arguments. *)
 val hooks : Process.hooks
+
+(** PRC_hooks that replaces Tezos-specific values with constants and calls
+    Regression.capture on request and response. *)
+val rpc_hooks : RPC_core.rpc_hooks

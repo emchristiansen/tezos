@@ -49,12 +49,13 @@
   *)
 
 module Message = Distributed_db_message
+module Distributed_db_event = Distributed_db_event.Distributed_db_event
 
 type p2p = (Message.t, Peer_metadata.t, Connection_metadata.t) P2p.net
 
 type db = {
   p2p : p2p;
-  p2p_readers : P2p_reader.t P2p_peer.Table.t;
+  p2p_readers : P2p_reader.worker P2p_peer.Table.t;
   disk : Store.t;
   active_chains : P2p_reader.chain_db Chain_id.Table.t;
   protocol_db : Distributed_db_requester.Raw_protocol.t;
@@ -122,10 +123,41 @@ let create disk p2p =
 let activate
     ({p2p; active_chains; protocol_db; disk; p2p_readers; _} as global_db)
     chain_store callback =
-  let run_p2p_reader gid =
-    let register p2p_reader = P2p_peer.Table.add p2p_readers gid p2p_reader in
+  let run_p2p_reader gid conn =
+    let register p2p_reader =
+      (match P2p_peer.Table.find p2p_readers gid with
+      | None -> ()
+      | Some old_p2p_reader ->
+          Distributed_db_event.(
+            emit__dont_wait__use_with_care multiple_p2p_reader)
+            gid ;
+          (* It is not expected to have exception raised by this function,
+             however to prevent future problems potential exceptions are
+             logged. *)
+          Lwt.dont_wait
+            (fun () -> P2p_reader.shutdown_worker old_p2p_reader)
+            (fun exn ->
+              match exn with
+              | Out_of_memory | Stack_overflow -> raise exn
+              | _ ->
+                  Distributed_db_event.(
+                    emit__dont_wait__use_with_care p2p_reader_shutdown_failed)
+                    (gid, Printexc.to_string exn))) ;
+      P2p_peer.Table.add p2p_readers gid p2p_reader
+    in
     let unregister () = P2p_peer.Table.remove p2p_readers gid in
-    P2p_reader.run ~register ~unregister p2p disk protocol_db active_chains gid
+    let _ =
+      P2p_reader.run_worker
+        ~register
+        ~unregister
+        p2p
+        disk
+        protocol_db
+        active_chains
+        gid
+        conn
+    in
+    ()
   in
   P2p.on_new_connection p2p run_p2p_reader ;
   P2p.iter_connections p2p run_p2p_reader ;
@@ -224,16 +256,16 @@ let get_chain global_db chain_id =
 let greylist {global_db = {p2p; _}; _} peer_id =
   Lwt.return (P2p.greylist_peer p2p peer_id)
 
-let disconnect {global_db = {p2p; _}; _} peer_id =
+let disconnect ~reason {global_db = {p2p; _}; _} peer_id =
   match P2p.find_connection_by_peer_id p2p peer_id with
   | None -> Lwt.return_unit
-  | Some conn -> P2p.disconnect p2p conn
+  | Some conn -> P2p.disconnect ~reason p2p conn
 
 let shutdown {p2p_readers; active_chains; _} =
   let open Lwt_syntax in
   let* () =
     P2p_peer.Table.iter_p
-      (fun _peer_id reader -> P2p_reader.shutdown reader)
+      (fun _peer_id reader -> P2p_reader.shutdown_worker reader)
       p2p_readers
   in
   Chain_id.Table.iter_p
@@ -290,7 +322,7 @@ let inject_operation chain_db h op =
     h
     op
 
-let inject_prechecked_block chain_db hash block_header operations =
+let inject_validated_block chain_db hash block_header operations =
   Store.Block.store_validated_block
     chain_db.reader_chain_db.chain_store
     ~hash
@@ -310,7 +342,8 @@ let commit_protocol db h p =
     [Distributed_db_requester.Raw_*.t] has been properly created before it is
     possible to use it *)
 module Make
-    (Table : Requester.REQUESTER) (Kind : sig
+    (Table : Requester.REQUESTER)
+    (Kind : sig
       type t
 
       val proj : t -> Table.t
@@ -420,13 +453,14 @@ module Request = struct
     let chain_id = Store.Chain.chain_id chain_db.reader_chain_db.chain_store in
     ignore
       (P2p.broadcast
+         chain_db.global_db.p2p
          chain_db.reader_chain_db.active_connections
          (Get_current_head chain_id))
 
   let current_branch chain_db peer =
     let chain_id = Store.Chain.chain_id chain_db.reader_chain_db.chain_store in
     let meta = P2p.get_peer_metadata chain_db.global_db.p2p peer in
-    Peer_metadata.incr meta (Sent_request Head) ;
+    Peer_metadata.incr meta (Sent_request Branch) ;
     try_send chain_db peer @@ Get_current_branch chain_id
 end
 
@@ -434,6 +468,7 @@ module Advertise = struct
   let current_head chain_db ?(mempool = Mempool.empty) head =
     let chain_id = Store.Chain.chain_id chain_db.reader_chain_db.chain_store in
     P2p.broadcast
+      chain_db.global_db.p2p
       ~alt:
         (let if_conn conn =
            let {Connection_metadata.disable_mempool; _} =
@@ -448,7 +483,7 @@ module Advertise = struct
       chain_db.reader_chain_db.active_connections
       (Message.Current_head (chain_id, Store.Block.header head, mempool))
 
-  let prechecked_head chain_db ?(mempool = Mempool.empty) header =
+  let validated_head chain_db ?(mempool = Mempool.empty) header =
     let p2p = chain_db.global_db.p2p in
     let acceptable_version conn =
       let {Network_version.distributed_db_version; _} =
@@ -462,6 +497,7 @@ module Advertise = struct
     let chain_id = Store.Chain.chain_id chain_db.reader_chain_db.chain_store in
     let msg = Message.Current_head (chain_id, header, mempool) in
     P2p.broadcast
+      chain_db.global_db.p2p
       ~except:(fun conn -> not (acceptable_version conn))
       chain_db.reader_chain_db.active_connections
       msg

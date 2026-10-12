@@ -26,8 +26,8 @@
 (** Testing
     -------
     Component:    pbt for bytes <=> nat/int conversions
-    Invocation:   [QCHECK_SEED=<seed>] dune exec \
-                  src/proto_alpha/lib_protocol/test/pbt/test_bytes_conversion.exe
+    Invocation:   dune exec src/proto_alpha/lib_protocol/test/pbt/main.exe \
+                  -- --file test_bytes_conversion.ml
     Subject:      Test the conversions between bytes and int/nat
 *)
 
@@ -161,9 +161,9 @@ let test_bytes_of_int_random () =
   (* [bytes_of_int] must return the shortest encoding: at most 1 char of zero
      or '\255's at the head. *)
   (if Bytes.length bytes >= 2 then
-   match (Bytes.get bytes 0, Bytes.get bytes 1) with
-   | '\000', '\000' | '\255', '\255' -> assert false
-   | _ -> ()) ;
+     match (Bytes.get bytes 0, Bytes.get bytes 1) with
+     | '\000', '\000' | '\255', '\255' -> assert false
+     | _ -> ()) ;
   (* [int_of_bytes @@ bytes_of_int z = z] *)
   (let z' = to_zint @@ int_of_bytes_be bytes in
    Z.Compare.(z = z'))
@@ -210,6 +210,6 @@ let tests =
 
 let () =
   Alcotest.run
-    ("protocol > script_bytes > " ^ Protocol.name
-   ^ ": bytes and int/nat conversion ")
+    ~__FILE__
+    (Protocol.name ^ ": bytes and int/nat conversion ")
     tests

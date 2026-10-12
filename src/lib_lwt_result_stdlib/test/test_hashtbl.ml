@@ -23,6 +23,14 @@
 (*                                                                           *)
 (*****************************************************************************)
 
+(* Testing
+   -------
+   Component:    Stdlib
+   Invocation:   dune exec src/lib_lwt_result_stdlib/test/main.exe \
+                  -- --file test_hashtbl.ml
+   Subject:      Test hashtable
+*)
+
 (* This test suite relies heavily on Lwt. It also deals with error a lot, but it
    checks most errors directly. So we don't need the syntactic support to
    alleviate the error handling. *)
@@ -111,7 +119,7 @@ let test_self_clean _ _ =
       (fun () ->
         let* _ = IntESHashtbl.find_or_make t 6 (fun () -> Lwt.fail Not_found) in
         Assert.fail_msg "Not_found exception should propagate")
-      (function Not_found -> Lwt.return_unit | exn -> Lwt.fail exn)
+      (function Not_found -> Lwt.return_unit | exn -> Lwt.reraise exn)
   in
   let l = IntESHashtbl.length t in
   if not (l = 3) then
@@ -175,7 +183,7 @@ let test_order _ _ =
   (* Check that the `world` record is as expected *)
   match !world with
   | ["b_outer"; "a_outer"; "a_inner"] | ["a_outer"; "b_outer"; "a_inner"] ->
-      Lwt.return ()
+      Lwt.return_unit
   | world ->
       Assert.String.fail
         "[outers;a_inner]"
@@ -191,4 +199,5 @@ let tests =
     Alcotest_lwt.test_case "order" `Quick test_order;
   ]
 
-let () = Alcotest_lwt.run "hashtbl" [("hashtbl-lwt", tests)] |> Lwt_main.run
+let () =
+  Alcotest_lwt.run ~__FILE__ "hashtbl" [("hashtbl-lwt", tests)] |> Lwt_main.run

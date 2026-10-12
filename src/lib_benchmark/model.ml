@@ -40,6 +40,8 @@ module type Model_impl = sig
 
   val name : Namespace.t
 
+  val takes_saturation_reprs : bool
+
   module Def (X : Costlang.S) : sig
     type model_type
 
@@ -86,26 +88,40 @@ type _ t =
     }
       -> 'workload t
 
+let pp_packed_model ppf (Model model) =
+  let module Model = (val model) in
+  let module Pp = Model.Def (Costlang.Pp) in
+  Format.fprintf ppf "@[<v2>%a:@ %s@]" Namespace.pp Model.name Pp.model
+
+let pp ppf = function
+  | Abstract {model; _} ->
+      Format.fprintf ppf "@[<v2>Abstract@ %a@]" pp_packed_model (Model model)
+  | Aggregate {sub_models; _} ->
+      Format.fprintf
+        ppf
+        "@[<v2>Aggregate with submodels:@ @[%a@]@]"
+        (Format.pp_print_list pp_packed_model)
+        sub_models
+
 let apply_model : 'arg -> 'arg model -> applied =
-  fun (type e) (elim : e) ((module Impl) : e model) ->
-   let module Applied (X : Costlang.S) = struct
-     include Impl.Def (X)
+ fun (type e) (elim : e) ((module Impl) : e model) ->
+  let module Applied (X : Costlang.S) = struct
+    include Impl.Def (X)
 
-     type t = X.size X.repr
+    type t = X.size X.repr
 
-     let rec apply :
-         type a b c.
-         (int -> c X.repr) -> (c, a, b) arity -> a X.repr -> b -> c X.repr =
-      fun conv arity f arg ->
-       match arity with
-       | Zero_arity -> f
-       | Succ_arity ar ->
-           let arg, rest = arg in
-           apply conv ar (X.app f (conv arg)) rest
+    let rec apply : type a b c.
+        (int -> c X.repr) -> (c, a, b) arity -> a X.repr -> b -> c X.repr =
+     fun conv arity f arg ->
+      match arity with
+      | Zero_arity -> f
+      | Succ_arity ar ->
+          let arg, rest = arg in
+          apply conv ar (X.app f (conv arg)) rest
 
-     let applied = apply X.int arity model elim
-   end in
-   ((module Applied) : applied)
+    let applied = apply X.int arity model elim
+  end in
+  ((module Applied) : applied)
 
 module Instantiate (X : Costlang.S) (M : Model_impl) :
   Instantiated
@@ -119,8 +135,7 @@ module Instantiate (X : Costlang.S) (M : Model_impl) :
   include M
   include Def (X)
 
-  let rec apply :
-      type a b c.
+  let rec apply : type a b c.
       (int -> c X.repr) -> (c, a, b) arity -> a X.repr -> b -> c X.repr =
    fun conv arity f arg ->
     match arity with
@@ -132,7 +147,17 @@ module Instantiate (X : Costlang.S) (M : Model_impl) :
   let model elim = apply X.int arity model elim
 end
 
-let make ~conv ~model = Abstract {conv; model}
+let set_takes_saturation_reprs (type a) b ((module Model) : a model) : a model =
+  let module Model' = struct
+    include Model
+
+    let takes_saturation_reprs = b
+  end in
+  (module Model')
+
+let make ?(takes_saturation_reprs = false) ~conv model =
+  let model = set_takes_saturation_reprs takes_saturation_reprs model in
+  Abstract {conv; model}
 
 let make_aggregated ~model ~sub_models = Aggregate {model; sub_models}
 
@@ -187,6 +212,45 @@ let get_free_variable_set (type a) (model : a model) =
   let module R = M.Def (T1) in
   T0.prj @@ T1.prj R.model
 
+(* No workload application.  For [Aggregate _], only extract
+   the free variables of the [sub_models].
+*)
+let get_free_variable_set_of_t =
+  let get_free_variables_of_packed_model (Model (module Model) : packed_model) =
+    let module M = Model.Def (Costlang.Free_variables) in
+    M.model
+  in
+  function
+  | Abstract {model; _} -> get_free_variables_of_packed_model (Model model)
+  | Aggregate {sub_models; _} ->
+      List.fold_left
+        (fun acc packed_model ->
+          Free_variable.Set.union acc
+          @@ get_free_variables_of_packed_model packed_model)
+        Free_variable.Set.empty
+        sub_models
+
+let get_free_variable_set_applied (type workload) (model : workload t)
+    (workload : workload) =
+  (* If a parameter is fixed to 0 in the workload data, the application
+      of the workload can eliminate free variables multiplied
+      by the parameter.
+
+      The typical example is the intercept case where some parameters
+      tend to be fixed to 0.  This may not work when the intercept point
+      is not at "zero"s.
+
+      It is unfortunate that we need to apply workload data to a model to
+      know which variables can be optimized out.  We may be able to do it
+      without workload, but it seems not an easy task.
+  *)
+  let applied = apply model workload in
+  let module M = (val applied) in
+  let module T0 = Costlang.Fold_constants (Costlang.Free_variables) in
+  let module T1 = Costlang.Beta_normalize (T0) in
+  let module R = M (T1) in
+  T0.prj @@ T1.prj R.applied
+
 (* -------------------------------------------------------------------------- *)
 (* Commonly used models *)
 
@@ -195,6 +259,8 @@ let zero =
     type arg_type = unit
 
     let name = Namespace.root "zero"
+
+    let takes_saturation_reprs = false
 
     module Def (X : Costlang.S) = struct
       open X
@@ -214,6 +280,8 @@ let unknown_const1 ~name ~const =
 
     let name = name
 
+    let takes_saturation_reprs = false
+
     module Def (X : Costlang.S) = struct
       open X
 
@@ -226,11 +294,55 @@ let unknown_const1 ~name ~const =
   end in
   (module M : Model_impl with type arg_type = unit)
 
+let unknown_const1_skip1 ~name ~const =
+  let module M = struct
+    type arg_type = int * unit
+
+    let name = name
+
+    let takes_saturation_reprs = false
+
+    module Def (X : Costlang.S) = struct
+      open X
+
+      type model_type = size -> size
+
+      let arity = arity_1
+
+      let model = lam ~name:"size" @@ fun (_ : size repr) -> free ~name:const
+    end
+  end in
+  (module M : Model_impl with type arg_type = int * unit)
+
+let unknown_const1_skip2 ~name ~const =
+  let module M = struct
+    type arg_type = int * (int * unit)
+
+    let name = name
+
+    let takes_saturation_reprs = false
+
+    module Def (X : Costlang.S) = struct
+      open X
+
+      type model_type = size -> size -> size
+
+      let arity = arity_2
+
+      let model =
+        lam ~name:"size1" @@ fun (_ : size repr) ->
+        lam ~name:"size2" @@ fun (_ : size repr) -> free ~name:const
+    end
+  end in
+  (module M : Model_impl with type arg_type = int * (int * unit))
+
 let linear ~name ~coeff =
   let module M = struct
     type arg_type = int * unit
 
     let name = name
+
+    let takes_saturation_reprs = false
 
     module Def (X : Costlang.S) = struct
       open X
@@ -250,6 +362,8 @@ let affine ~name ~intercept ~coeff =
 
     let name = name
 
+    let takes_saturation_reprs = false
+
     module Def (X : Costlang.S) = struct
       open X
 
@@ -264,11 +378,35 @@ let affine ~name ~intercept ~coeff =
   end in
   (module M : Model_impl with type arg_type = int * unit)
 
+let affine_offset ~name ~intercept ~coeff ~offset =
+  let module M = struct
+    type arg_type = int * unit
+
+    let name = name
+
+    let takes_saturation_reprs = false
+
+    module Def (X : Costlang.S) = struct
+      open X
+
+      type model_type = size -> size
+
+      let arity = arity_1
+
+      let model =
+        lam ~name:"size" @@ fun size ->
+        free ~name:intercept + (free ~name:coeff * sat_sub size (int offset))
+    end
+  end in
+  (module M : Model_impl with type arg_type = int * unit)
+
 let quadratic ~name ~coeff =
   let module M = struct
     type arg_type = int * unit
 
     let name = name
+
+    let takes_saturation_reprs = false
 
     module Def (X : Costlang.S) = struct
       open X
@@ -288,6 +426,8 @@ let nlogn ~name ~intercept ~coeff =
     type arg_type = int * unit
 
     let name = name
+
+    let takes_saturation_reprs = false
 
     module Def (X : Costlang.S) = struct
       open X
@@ -309,6 +449,8 @@ let nsqrtn_const ~name ~intercept ~coeff =
 
     let name = name
 
+    let takes_saturation_reprs = false
+
     module Def (X : Costlang.S) = struct
       open X
 
@@ -329,6 +471,8 @@ let logn ~name ~coeff =
 
     let name = name
 
+    let takes_saturation_reprs = false
+
     module Def (X : Costlang.S) = struct
       open X
 
@@ -348,6 +492,8 @@ let linear_sum ~name ~intercept ~coeff =
 
     let name = name
 
+    let takes_saturation_reprs = false
+
     module Def (X : Costlang.S) = struct
       open X
 
@@ -363,11 +509,36 @@ let linear_sum ~name ~intercept ~coeff =
   end in
   (module M : Model_impl with type arg_type = int * (int * unit))
 
+let linear_sat_sub ~name ~intercept ~coeff =
+  let module M = struct
+    type arg_type = int * (int * unit)
+
+    let name = name
+
+    let takes_saturation_reprs = false
+
+    module Def (X : Costlang.S) = struct
+      open X
+
+      type model_type = size -> size -> size
+
+      let arity = arity_2
+
+      let model =
+        lam ~name:"size1" @@ fun size1 ->
+        lam ~name:"size2" @@ fun size2 ->
+        free ~name:intercept + (free ~name:coeff * sat_sub size1 size2)
+    end
+  end in
+  (module M : Model_impl with type arg_type = int * (int * unit))
+
 let linear_max ~name ~intercept ~coeff =
   let module M = struct
     type arg_type = int * (int * unit)
 
     let name = name
+
+    let takes_saturation_reprs = false
 
     module Def (X : Costlang.S) = struct
       open X
@@ -390,6 +561,8 @@ let linear_min ~name ~intercept ~coeff =
 
     let name = name
 
+    let takes_saturation_reprs = false
+
     module Def (X : Costlang.S) = struct
       open X
 
@@ -405,11 +578,37 @@ let linear_min ~name ~intercept ~coeff =
   end in
   (module M : Model_impl with type arg_type = int * (int * unit))
 
+let linear_min_offset ~name ~intercept ~coeff ~offset =
+  let module M = struct
+    type arg_type = int * (int * unit)
+
+    let name = name
+
+    let takes_saturation_reprs = false
+
+    module Def (X : Costlang.S) = struct
+      open X
+
+      type model_type = size -> size -> size
+
+      let arity = arity_2
+
+      let model =
+        lam ~name:"size1" @@ fun size1 ->
+        lam ~name:"size2" @@ fun size2 ->
+        free ~name:intercept
+        + (free ~name:coeff * sat_sub (min size1 size2) (int offset))
+    end
+  end in
+  (module M : Model_impl with type arg_type = int * (int * unit))
+
 let linear_mul ~name ~intercept ~coeff =
   let module M = struct
     type arg_type = int * (int * unit)
 
     let name = name
+
+    let takes_saturation_reprs = false
 
     module Def (X : Costlang.S) = struct
       open X
@@ -432,6 +631,8 @@ let bilinear ~name ~coeff1 ~coeff2 =
 
     let name = name
 
+    let takes_saturation_reprs = false
+
     module Def (X : Costlang.S) = struct
       open X
 
@@ -453,6 +654,8 @@ let bilinear_affine ~name ~intercept ~coeff1 ~coeff2 =
 
     let name = name
 
+    let takes_saturation_reprs = false
+
     module Def (X : Costlang.S) = struct
       open X
 
@@ -470,11 +673,36 @@ let bilinear_affine ~name ~intercept ~coeff1 ~coeff2 =
   end in
   (module M : Model_impl with type arg_type = int * (int * unit))
 
+let affine_skip1 ~name ~intercept ~coeff =
+  let module M = struct
+    type arg_type = int * (int * unit)
+
+    let name = name
+
+    let takes_saturation_reprs = false
+
+    module Def (X : Costlang.S) = struct
+      open X
+
+      type model_type = size -> size -> size
+
+      let arity = arity_2
+
+      let model =
+        lam ~name:"size1" @@ fun (_size1 : size repr) ->
+        lam ~name:"size2" @@ fun size2 ->
+        free ~name:intercept + (free ~name:coeff * size2)
+    end
+  end in
+  (module M : Model_impl with type arg_type = int * (int * unit))
+
 let nlogm ~name ~intercept ~coeff =
   let module M = struct
     type arg_type = int * (int * unit)
 
     let name = name
+
+    let takes_saturation_reprs = false
 
     module Def (X : Costlang.S) = struct
       open X
@@ -498,6 +726,8 @@ let n_plus_logm ~name ~intercept ~linear_coeff ~log_coeff =
 
     let name = name
 
+    let takes_saturation_reprs = false
+
     module Def (X : Costlang.S) = struct
       open X
 
@@ -520,6 +750,8 @@ let trilinear ~name ~coeff1 ~coeff2 ~coeff3 =
     type arg_type = int * (int * (int * unit))
 
     let name = name
+
+    let takes_saturation_reprs = false
 
     module Def (X : Costlang.S) = struct
       open X
@@ -547,6 +779,8 @@ let breakdown ~name ~coeff1 ~coeff2 ~break =
 
     let name = name
 
+    let takes_saturation_reprs = false
+
     module Def (X : Costlang.S) = struct
       open X
 
@@ -568,6 +802,8 @@ let breakdown2 ~name ~coeff1 ~coeff2 ~coeff3 ~break1 ~break2 =
     type arg_type = int * unit
 
     let name = name
+
+    let takes_saturation_reprs = false
 
     module Def (X : Costlang.S) = struct
       open X
@@ -592,6 +828,8 @@ let breakdown2_const ~name ~coeff1 ~coeff2 ~coeff3 ~const ~break1 ~break2 =
 
     let name = name
 
+    let takes_saturation_reprs = false
+
     module Def (X : Costlang.S) = struct
       open X
 
@@ -608,3 +846,115 @@ let breakdown2_const ~name ~coeff1 ~coeff2 ~coeff3 ~const ~break1 ~break2 =
     end
   end in
   (module M : Model_impl with type arg_type = int * unit)
+
+let breakdown2_const_offset ~name ~coeff1 ~coeff2 ~coeff3 ~const ~break1 ~break2
+    ~offset =
+  assert (0 <= break1 && break1 <= break2) ;
+  let module M = struct
+    type arg_type = int * unit
+
+    let name = name
+
+    let takes_saturation_reprs = false
+
+    module Def (X : Costlang.S) = struct
+      open X
+
+      type model_type = size -> size
+
+      let arity = arity_1
+
+      let model =
+        lam ~name:"size" @@ fun size ->
+        let_ ~name:"size" (sat_sub size (int offset)) @@ fun size ->
+        (free ~name:coeff1 * min (int break1) size)
+        + (free ~name:coeff2 * sat_sub (min (int break2) size) (int break1))
+        + (free ~name:coeff3 * sat_sub size (int break2))
+        + free ~name:const
+    end
+  end in
+  (module M : Model_impl with type arg_type = int * unit)
+
+module type Binary_operation = sig
+  module Def (X : Costlang.S) : sig
+    val op : X.size X.repr -> X.size X.repr -> X.size X.repr
+  end
+end
+
+module Synthesize
+    (B : Binary_operation)
+    (X : Model_impl)
+    (Y : Model_impl with type arg_type = X.arg_type)
+    (Names : sig
+      val name : Namespace.t
+
+      val x_label : string
+
+      val y_label : string
+    end) : Model_impl with type arg_type = X.arg_type = struct
+  type arg_type = X.arg_type
+
+  let name = Names.name
+
+  (* Use X's configuration *)
+  let takes_saturation_reprs = X.takes_saturation_reprs
+
+  module Def (C : Costlang.S) = struct
+    module Args = X.Def (Costlang.Arg_names)
+    module BinOp = B.Def (C)
+    module X = X.Def (C)
+    module Y = Y.Def (C)
+
+    type model_type = X.model_type
+
+    let arity = X.arity
+
+    let rec synthesize : type a args_model x_model y_model.
+        (Costlang.Arg_names.size, args_model, a) arity ->
+        args_model Costlang.Arg_names.repr ->
+        (C.size, x_model, a) arity ->
+        x_model C.repr ->
+        (C.size, y_model, a) arity ->
+        y_model C.repr ->
+        x_model C.repr =
+     fun arg_arity args arity1 term1 arity2 term2 ->
+      match arg_arity with
+      | Zero_arity ->
+          (* These bindings of Zero_arity are necessary for type checking *)
+          let Zero_arity = arity1 in
+          let Zero_arity = arity2 in
+          let open C in
+          let_ ~name:Names.x_label term1 @@ fun term1 ->
+          let_ ~name:Names.y_label term2 @@ fun term2 -> BinOp.op term1 term2
+      | Succ_arity arg_arity ->
+          let (Succ_arity arity1) = arity1 in
+          let (Succ_arity arity2) = arity2 in
+          let open C in
+          lam ~name:(Costlang.Arg_names.arg_name args) @@ fun arg ->
+          synthesize
+            arg_arity
+            (Costlang.Arg_names.unwrap_size args)
+            arity1
+            (app term1 arg)
+            arity2
+            (app term2 arg)
+
+    let model = synthesize Args.arity Args.model X.arity X.model Y.arity Y.model
+  end
+end
+
+let synthesize (type a) ~name ~binop ~x_label ~x_model ~y_label ~y_model =
+  let (module B : Binary_operation) = binop in
+  let ((module X) : a model) = x_model in
+  let ((module Y) : a model) = y_model in
+  let module M =
+    Synthesize (B) (X) (Y)
+      (struct
+        let x_label = x_label
+
+        let y_label = y_label
+
+        let name = name
+      end)
+  in
+  ((module M) : a model)

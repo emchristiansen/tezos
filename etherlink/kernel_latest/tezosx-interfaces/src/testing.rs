@@ -1,0 +1,671 @@
+// SPDX-FileCopyrightText: 2026 Nomadic Labs <contact@nomadic-labs.com>
+//
+// SPDX-License-Identifier: MIT
+
+//! Shared `Registry` test stubs for kernel crates.
+//!
+//! Replaces the per-crate `MockRegistry` / `StubRegistry` copies that
+//! used to duplicate trait-conformance boilerplate. Three presets cover
+//! the recurring shapes: a panicking stub, a `RuntimeNotFound` stub, and
+//! a configurable mock with call tracking.
+
+use std::cell::{Cell, RefCell};
+use tezos_evm_runtime::runtime_keyspaces::RuntimeKeyspaces;
+use tezos_smart_rollup_host::storage::StorageV1;
+use tezos_smart_rollup_keyspace::{KeySpace, KeySpaceLoader};
+use tezosx_journal::TezosXJournal;
+
+use crate::{
+    AliasInfo, Classification, CrossRuntimeContext, Gas, Registry, RuntimeId,
+    TezosXRuntimeError, X_TEZOS_GAS_CONSUMED,
+};
+
+/// Registry whose every method panics. Use when a test needs a
+/// `Registry` only to satisfy the type system and must fail loudly if
+/// the registry is unexpectedly invoked.
+pub struct UnimplementedRegistry;
+
+impl Registry for UnimplementedRegistry {
+    type Journal = TezosXJournal;
+    fn ensure_alias<Host>(
+        &self,
+        _rk: &mut RuntimeKeyspaces<'_, Host, Host::KeySpace>,
+        _journal: &mut TezosXJournal,
+        _alias_info: AliasInfo,
+        _native_public_key: Option<&[u8]>,
+        _target_runtime: RuntimeId,
+        _context: CrossRuntimeContext,
+        _gas_remaining: Gas,
+    ) -> Result<(String, crate::AliasResolution), TezosXRuntimeError>
+    where
+        Host: StorageV1 + KeySpaceLoader,
+    {
+        unimplemented!("UnimplementedRegistry::ensure_alias")
+    }
+
+    fn alias_exists<Host>(
+        &self,
+        _rk: &mut RuntimeKeyspaces<'_, Host, Host::KeySpace>,
+        _journal: &mut Self::Journal,
+        _target_runtime: RuntimeId,
+        _alias: &str,
+    ) -> Result<bool, TezosXRuntimeError>
+    where
+        Host: StorageV1 + KeySpaceLoader,
+    {
+        unimplemented!("UnimplementedRegistry::alias_exists")
+    }
+
+    fn compute_alias(
+        &self,
+        _alias_info: &AliasInfo,
+    ) -> Result<String, TezosXRuntimeError> {
+        unimplemented!("UnimplementedRegistry::compute_alias")
+    }
+
+    fn address_from_string(
+        &self,
+        _address_str: &str,
+        _runtime_id: RuntimeId,
+    ) -> Result<Vec<u8>, TezosXRuntimeError> {
+        unimplemented!("UnimplementedRegistry::address_from_string")
+    }
+
+    fn public_key_from_string(
+        &self,
+        _public_key: &str,
+        _runtime_id: RuntimeId,
+    ) -> Result<Vec<u8>, TezosXRuntimeError> {
+        unimplemented!("UnimplementedRegistry::public_key_from_string")
+    }
+
+    fn read_origin<Host, KS>(
+        &self,
+        _rk: &RuntimeKeyspaces<'_, Host, KS>,
+        _addr_runtime: RuntimeId,
+        _addr: &str,
+        _gas: Gas,
+    ) -> Result<(crate::Classification, Gas), TezosXRuntimeError>
+    where
+        Host: StorageV1,
+        KS: KeySpace,
+    {
+        unimplemented!("UnimplementedRegistry::read_origin")
+    }
+
+    fn check_is_native_address<Host, KS>(
+        &self,
+        _rk: &RuntimeKeyspaces<'_, Host, KS>,
+        _addr_runtime: RuntimeId,
+        _address: &str,
+        _public_key: Option<&str>,
+        _budget: &mut Gas,
+    ) -> Result<(), TezosXRuntimeError>
+    where
+        Host: StorageV1,
+        KS: KeySpace,
+    {
+        unimplemented!("UnimplementedRegistry::check_is_native_address")
+    }
+
+    fn serve<Host, KS>(
+        &self,
+        _rk: &mut RuntimeKeyspaces<'_, Host, KS>,
+        _journal: &mut TezosXJournal,
+        _request: http::Request<Vec<u8>>,
+    ) -> http::Response<Vec<u8>>
+    where
+        Host: StorageV1 + KeySpaceLoader<KeySpace = KS>,
+        KS: KeySpace,
+    {
+        unimplemented!("UnimplementedRegistry::serve")
+    }
+}
+
+/// Registry whose every fallible method returns
+/// `RuntimeNotFound(runtime_id)`, and whose `serve()` returns a 500
+/// with the body `b"stub"`. Use when a test asserts that a code path
+/// does not cross runtimes — a stray dispatch surfaces as a
+/// well-formed error rather than a panic.
+pub struct NotWiredRegistry;
+
+impl Registry for NotWiredRegistry {
+    type Journal = TezosXJournal;
+    fn ensure_alias<Host>(
+        &self,
+        _rk: &mut RuntimeKeyspaces<'_, Host, Host::KeySpace>,
+        _journal: &mut TezosXJournal,
+        _alias_info: AliasInfo,
+        _native_public_key: Option<&[u8]>,
+        target_runtime: RuntimeId,
+        _context: CrossRuntimeContext,
+        _gas_remaining: Gas,
+    ) -> Result<(String, crate::AliasResolution), TezosXRuntimeError>
+    where
+        Host: StorageV1 + KeySpaceLoader,
+    {
+        Err(TezosXRuntimeError::RuntimeNotFound(target_runtime))
+    }
+
+    fn alias_exists<Host>(
+        &self,
+        _rk: &mut RuntimeKeyspaces<'_, Host, Host::KeySpace>,
+        _journal: &mut Self::Journal,
+        target_runtime: RuntimeId,
+        _alias: &str,
+    ) -> Result<bool, TezosXRuntimeError>
+    where
+        Host: StorageV1 + KeySpaceLoader,
+    {
+        Err(TezosXRuntimeError::RuntimeNotFound(target_runtime))
+    }
+
+    fn compute_alias(
+        &self,
+        alias_info: &AliasInfo,
+    ) -> Result<String, TezosXRuntimeError> {
+        Err(TezosXRuntimeError::RuntimeNotFound(alias_info.runtime))
+    }
+
+    fn address_from_string(
+        &self,
+        _address_str: &str,
+        runtime_id: RuntimeId,
+    ) -> Result<Vec<u8>, TezosXRuntimeError> {
+        Err(TezosXRuntimeError::RuntimeNotFound(runtime_id))
+    }
+
+    fn public_key_from_string(
+        &self,
+        _public_key: &str,
+        runtime_id: RuntimeId,
+    ) -> Result<Vec<u8>, TezosXRuntimeError> {
+        Err(TezosXRuntimeError::RuntimeNotFound(runtime_id))
+    }
+
+    fn read_origin<Host, KS>(
+        &self,
+        _rk: &RuntimeKeyspaces<'_, Host, KS>,
+        addr_runtime: RuntimeId,
+        _addr: &str,
+        _gas: Gas,
+    ) -> Result<(crate::Classification, Gas), TezosXRuntimeError>
+    where
+        Host: StorageV1,
+        KS: KeySpace,
+    {
+        Err(TezosXRuntimeError::RuntimeNotFound(addr_runtime))
+    }
+
+    fn check_is_native_address<Host, KS>(
+        &self,
+        _rk: &RuntimeKeyspaces<'_, Host, KS>,
+        addr_runtime: RuntimeId,
+        _address: &str,
+        _public_key: Option<&str>,
+        _budget: &mut Gas,
+    ) -> Result<(), TezosXRuntimeError>
+    where
+        Host: StorageV1,
+        KS: KeySpace,
+    {
+        Err(TezosXRuntimeError::RuntimeNotFound(addr_runtime))
+    }
+
+    fn serve<Host, KS>(
+        &self,
+        _rk: &mut RuntimeKeyspaces<'_, Host, KS>,
+        _journal: &mut TezosXJournal,
+        _request: http::Request<Vec<u8>>,
+    ) -> http::Response<Vec<u8>>
+    where
+        Host: StorageV1 + KeySpaceLoader<KeySpace = KS>,
+        KS: KeySpace,
+    {
+        http::Response::builder()
+            .status(http::StatusCode::INTERNAL_SERVER_ERROR)
+            .body(b"stub".to_vec())
+            .expect("stub response must build")
+    }
+}
+
+/// What [`MockRegistry::with_serve_journal_hook`] runs on the journal.
+pub type ServeJournalHook = Box<dyn Fn(&mut TezosXJournal)>;
+
+/// Configurable success mock with call tracking.
+///
+/// - `ensure_alias` / `compute_alias` return `generated_alias` (unless
+///   `with_injective_aliases` redirects `compute_alias`, see below).
+/// - `address_from_string` returns the UTF-8 bytes of the input.
+/// - `serve` returns 200 OK with an empty body and
+///   `X-Tezos-Gas-Consumed: 0`, or the override pair set by
+///   `with_serve_response`.
+///
+/// `ensure_alias_calls` and `serve_calls` are `RefCell` so tests can
+/// `borrow()` them after the call to assert what was dispatched.
+pub struct MockRegistry {
+    pub generated_alias: String,
+    pub serve_override: Option<(u16, Vec<u8>)>,
+    pub injective_aliases: bool,
+    /// When `Some`, `ensure_alias` returns
+    /// `AliasResolution::build_with_delegated_storage_cost(remaining, v)`
+    /// so tests can exercise the caller-side accumulation of
+    /// `delegated_storage_cost`. Default `None` (no delegation).
+    pub alias_delegated_storage_cost: Option<u64>,
+    /// When `Some(cost)`, `check_is_native_address` consumes `cost` and
+    /// rejects the address as not provably native. Default `None` (every
+    /// address is native, for free).
+    pub native_address_rejection_cost: Option<Gas>,
+    /// When `true`, `ensure_alias` runs out of gas, as an alias creation
+    /// given too small a budget does. Default `false`.
+    pub alias_creation_out_of_gas: bool,
+    pub ensure_alias_calls: RefCell<Vec<(AliasInfo, RuntimeId)>>,
+    pub serve_calls: RefCell<Vec<http::Request<Vec<u8>>>>,
+    /// When `Some`, `serve` runs it on the journal before answering, so
+    /// tests can leave what the target runtime would have recorded there
+    /// (e.g. the CRAC receipt of a nested call). Default `None`.
+    pub serve_journal_hook: Option<ServeJournalHook>,
+}
+
+impl MockRegistry {
+    pub fn new(generated_alias: impl Into<String>) -> Self {
+        Self {
+            generated_alias: generated_alias.into(),
+            serve_override: None,
+            injective_aliases: false,
+            alias_delegated_storage_cost: None,
+            native_address_rejection_cost: None,
+            alias_creation_out_of_gas: false,
+            ensure_alias_calls: RefCell::new(Vec::new()),
+            serve_calls: RefCell::new(Vec::new()),
+            serve_journal_hook: None,
+        }
+    }
+
+    /// Have `check_is_native_address` consume `cost` and reject the address
+    /// as not provably native, so tests can drive the rejection path.
+    pub fn with_native_address_rejected(mut self, cost: Gas) -> Self {
+        self.native_address_rejection_cost = Some(cost);
+        self
+    }
+
+    /// Have `ensure_alias` run out of gas.
+    pub fn with_alias_creation_out_of_gas(mut self) -> Self {
+        self.alias_creation_out_of_gas = true;
+        self
+    }
+
+    /// Replace the default 200 OK `serve()` response with a caller-
+    /// chosen status code and body. No headers are added on the
+    /// override path.
+    pub fn with_serve_response(mut self, status: u16, body: Vec<u8>) -> Self {
+        self.serve_override = Some((status, body));
+        self
+    }
+
+    /// Have `serve()` run `hook` on the journal before answering.
+    pub fn with_serve_journal_hook(
+        mut self,
+        hook: impl Fn(&mut TezosXJournal) + 'static,
+    ) -> Self {
+        self.serve_journal_hook = Some(Box::new(hook));
+        self
+    }
+
+    /// Make `compute_alias` injective in the native address: it renders
+    /// `alias_info.native_address` verbatim as a (lossy) UTF-8 string
+    /// instead of the fixed `generated_alias`. Native routing feeds the
+    /// source's base58check ASCII bytes there, so two distinct source
+    /// addresses yield two distinct aliases — letting a test tell apart
+    /// e.g. the alias behind `X-Tezos-Sender` from the one behind
+    /// `X-Tezos-Source`.
+    pub fn with_injective_aliases(mut self) -> Self {
+        self.injective_aliases = true;
+        self
+    }
+
+    /// Have `ensure_alias` report `delegated_storage_cost: Some(v)`
+    /// on every materialization, so tests can drive the caller-side
+    /// accumulation path that activates only when the target runtime
+    /// delegates a non-zero cost.
+    pub fn with_alias_delegated_storage_cost(mut self, v: u64) -> Self {
+        self.alias_delegated_storage_cost = Some(v);
+        self
+    }
+}
+
+impl Registry for MockRegistry {
+    type Journal = TezosXJournal;
+    fn ensure_alias<Host>(
+        &self,
+        _rk: &mut RuntimeKeyspaces<'_, Host, Host::KeySpace>,
+        _journal: &mut TezosXJournal,
+        alias_info: AliasInfo,
+        _native_public_key: Option<&[u8]>,
+        target_runtime: RuntimeId,
+        _context: CrossRuntimeContext,
+        gas_remaining: Gas,
+    ) -> Result<(String, crate::AliasResolution), TezosXRuntimeError>
+    where
+        Host: StorageV1 + KeySpaceLoader,
+    {
+        if self.alias_creation_out_of_gas {
+            return Err(TezosXRuntimeError::OutOfGas);
+        }
+        self.ensure_alias_calls
+            .borrow_mut()
+            .push((alias_info, target_runtime));
+        let resolution = match self.alias_delegated_storage_cost {
+            Some(v) => crate::AliasResolution::build_with_delegated_storage_cost(
+                gas_remaining,
+                v,
+            ),
+            None => crate::AliasResolution::build(gas_remaining),
+        };
+        Ok((self.generated_alias.clone(), resolution))
+    }
+
+    fn alias_exists<Host>(
+        &self,
+        _rk: &mut RuntimeKeyspaces<'_, Host, Host::KeySpace>,
+        _journal: &mut Self::Journal,
+        target_runtime: RuntimeId,
+        alias: &str,
+    ) -> Result<bool, TezosXRuntimeError>
+    where
+        Host: StorageV1 + KeySpaceLoader,
+    {
+        Ok(self.ensure_alias_calls.borrow().iter().any(|(info, rt)| {
+            let stored_alias = self.compute_alias(info).unwrap_or_default();
+            stored_alias == alias && *rt == target_runtime
+        }))
+    }
+
+    fn compute_alias(
+        &self,
+        alias_info: &AliasInfo,
+    ) -> Result<String, TezosXRuntimeError> {
+        if self.injective_aliases {
+            Ok(alias_info.native_address.clone())
+        } else {
+            Ok(self.generated_alias.clone())
+        }
+    }
+
+    fn address_from_string(
+        &self,
+        address_str: &str,
+        _runtime_id: RuntimeId,
+    ) -> Result<Vec<u8>, TezosXRuntimeError> {
+        Ok(address_str.as_bytes().to_vec())
+    }
+
+    fn public_key_from_string(
+        &self,
+        public_key: &str,
+        _runtime_id: RuntimeId,
+    ) -> Result<Vec<u8>, TezosXRuntimeError> {
+        Ok(public_key.as_bytes().to_vec())
+    }
+
+    fn read_origin<Host, KS>(
+        &self,
+        _rk: &RuntimeKeyspaces<'_, Host, KS>,
+        _addr_runtime: RuntimeId,
+        _addr: &str,
+        _budget: Gas,
+    ) -> Result<(crate::Classification, Gas), TezosXRuntimeError>
+    where
+        Host: StorageV1,
+        KS: KeySpace,
+    {
+        Ok((crate::Classification::Unknown, Gas::ZERO))
+    }
+
+    fn check_is_native_address<Host, KS>(
+        &self,
+        _rk: &RuntimeKeyspaces<'_, Host, KS>,
+        _addr_runtime: RuntimeId,
+        _address: &str,
+        _public_key: Option<&str>,
+        budget: &mut Gas,
+    ) -> Result<(), TezosXRuntimeError>
+    where
+        Host: StorageV1,
+        KS: KeySpace,
+    {
+        match self.native_address_rejection_cost {
+            Some(cost) => {
+                budget.consume(cost)?;
+                Err(TezosXRuntimeError::CheckNativeAddressError(
+                    tezosx_types::CheckNativeAddressError::NotProvablyNative,
+                ))
+            }
+            None => Ok(()),
+        }
+    }
+
+    fn serve<Host, KS>(
+        &self,
+        _rk: &mut RuntimeKeyspaces<'_, Host, KS>,
+        journal: &mut TezosXJournal,
+        request: http::Request<Vec<u8>>,
+    ) -> http::Response<Vec<u8>>
+    where
+        Host: StorageV1 + KeySpaceLoader<KeySpace = KS>,
+        KS: KeySpace,
+    {
+        self.serve_calls.borrow_mut().push(request);
+        if let Some(hook) = &self.serve_journal_hook {
+            hook(journal);
+        }
+        match &self.serve_override {
+            None => http::Response::builder()
+                .status(200)
+                .header(X_TEZOS_GAS_CONSUMED, "0")
+                .body(vec![])
+                .expect("default serve response must build"),
+            Some((status, body)) => http::Response::builder()
+                .status(*status)
+                .body(body.clone())
+                .expect("override serve response must build"),
+        }
+    }
+}
+
+/// Configurable success stub built on top of [`MockRegistry`].
+///
+/// Delegates `ensure_alias` and `serve` to the inner [`MockRegistry`]
+/// (so tests can still `inner.ensure_alias_calls.borrow()` if they
+/// need to inspect call history). Overrides the rest:
+/// - `read_origin` returns `classification` on the first call and
+///   `destination_classification` (falling back to `classification`)
+///   on subsequent calls. Differentiates source-side from
+///   destination-side reads in `resolveAddress`-style dispatch tests.
+/// - `compute_alias` returns `computed_alias`. If
+///   `expected_derivation_runtime` is set, asserts the caller passed
+///   that runtime — catches wrong-runtime dispatch bugs.
+/// - `address_from_string` rejects strings starting with `"not-"` or
+///   equal to `"invalid"` with `BadRequest`; everything else is
+///   accepted as UTF-8 bytes.
+pub struct StubRegistry {
+    pub inner: MockRegistry,
+    pub classification: Classification,
+    pub computed_alias: String,
+    pub destination_classification: Option<Classification>,
+    pub read_count: Cell<u32>,
+    pub expected_derivation_runtime: Option<RuntimeId>,
+    pub expected_native_address: Option<String>,
+}
+
+impl StubRegistry {
+    pub fn with_classification(classification: Classification) -> Self {
+        Self {
+            inner: MockRegistry::new(""),
+            classification,
+            computed_alias: String::new(),
+            destination_classification: None,
+            read_count: Cell::new(0),
+            expected_derivation_runtime: None,
+            expected_native_address: None,
+        }
+    }
+
+    pub fn with_alias_and_expected_runtime(
+        source_classification: Classification,
+        alias: &str,
+        destination_classification: Option<Classification>,
+        expected_derivation_runtime: RuntimeId,
+    ) -> Self {
+        Self {
+            inner: MockRegistry::new(""),
+            classification: source_classification,
+            computed_alias: alias.to_string(),
+            destination_classification,
+            read_count: Cell::new(0),
+            expected_derivation_runtime: Some(expected_derivation_runtime),
+            expected_native_address: None,
+        }
+    }
+
+    pub fn expecting_native_address(mut self, expected: String) -> Self {
+        self.expected_native_address = Some(expected);
+        self
+    }
+}
+
+impl Registry for StubRegistry {
+    type Journal = TezosXJournal;
+    fn ensure_alias<Host>(
+        &self,
+        rk: &mut RuntimeKeyspaces<'_, Host, Host::KeySpace>,
+        journal: &mut TezosXJournal,
+        alias_info: AliasInfo,
+        native_public_key: Option<&[u8]>,
+        target_runtime: RuntimeId,
+        context: CrossRuntimeContext,
+        gas_remaining: Gas,
+    ) -> Result<(String, crate::AliasResolution), TezosXRuntimeError>
+    where
+        Host: StorageV1 + KeySpaceLoader,
+    {
+        self.inner.ensure_alias(
+            rk,
+            journal,
+            alias_info,
+            native_public_key,
+            target_runtime,
+            context,
+            gas_remaining,
+        )
+    }
+
+    fn alias_exists<Host>(
+        &self,
+        rk: &mut RuntimeKeyspaces<'_, Host, Host::KeySpace>,
+        journal: &mut Self::Journal,
+        target_runtime: RuntimeId,
+        alias: &str,
+    ) -> Result<bool, TezosXRuntimeError>
+    where
+        Host: StorageV1 + KeySpaceLoader,
+    {
+        self.inner.alias_exists(rk, journal, target_runtime, alias)
+    }
+
+    fn compute_alias(
+        &self,
+        alias_info: &AliasInfo,
+    ) -> Result<String, TezosXRuntimeError> {
+        if let Some(expected) = self.expected_derivation_runtime {
+            assert_eq!(
+                alias_info.runtime, expected,
+                "StubRegistry::compute_alias called with wrong runtime \
+                 (got {:?}, expected {:?})",
+                alias_info.runtime, expected,
+            );
+        }
+        if let Some(expected) = self.expected_native_address.as_deref() {
+            assert_eq!(
+                alias_info.native_address, expected,
+                "StubRegistry::compute_alias called with wrong native_address \
+                 (got {:?}, expected {:?})",
+                alias_info.native_address, expected,
+            );
+        }
+        Ok(self.computed_alias.clone())
+    }
+
+    fn address_from_string(
+        &self,
+        address_str: &str,
+        _runtime_id: RuntimeId,
+    ) -> Result<Vec<u8>, TezosXRuntimeError> {
+        if address_str.starts_with("not-") || address_str == "invalid" {
+            Err(TezosXRuntimeError::BadRequest(format!(
+                "malformed address: {address_str}"
+            )))
+        } else {
+            Ok(address_str.as_bytes().to_vec())
+        }
+    }
+
+    fn public_key_from_string(
+        &self,
+        public_key: &str,
+        _runtime_id: RuntimeId,
+    ) -> Result<Vec<u8>, TezosXRuntimeError> {
+        Ok(public_key.as_bytes().to_vec())
+    }
+
+    fn read_origin<Host, KS>(
+        &self,
+        _rk: &RuntimeKeyspaces<'_, Host, KS>,
+        _addr_runtime: RuntimeId,
+        _addr: &str,
+        _budget: Gas,
+    ) -> Result<(Classification, Gas), TezosXRuntimeError>
+    where
+        Host: StorageV1,
+        KS: KeySpace,
+    {
+        let count = self.read_count.get();
+        self.read_count.set(count + 1);
+        let classification = if count == 0 {
+            self.classification.clone()
+        } else {
+            self.destination_classification
+                .clone()
+                .unwrap_or_else(|| self.classification.clone())
+        };
+        Ok((classification, Gas::ZERO))
+    }
+
+    fn check_is_native_address<Host, KS>(
+        &self,
+        _rk: &RuntimeKeyspaces<'_, Host, KS>,
+        _addr_runtime: RuntimeId,
+        _address: &str,
+        _public_key: Option<&str>,
+        _budget: &mut Gas,
+    ) -> Result<(), TezosXRuntimeError>
+    where
+        Host: StorageV1,
+        KS: KeySpace,
+    {
+        Ok(())
+    }
+
+    fn serve<Host, KS>(
+        &self,
+        rk: &mut RuntimeKeyspaces<'_, Host, KS>,
+        journal: &mut TezosXJournal,
+        request: http::Request<Vec<u8>>,
+    ) -> http::Response<Vec<u8>>
+    where
+        Host: StorageV1 + KeySpaceLoader<KeySpace = KS>,
+        KS: KeySpace,
+    {
+        self.inner.serve(rk, journal, request)
+    }
+}

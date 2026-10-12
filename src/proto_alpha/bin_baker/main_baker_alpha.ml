@@ -24,12 +24,16 @@
 (*                                                                           *)
 (*****************************************************************************)
 
+(** Force linking for having Simple_profiler to init few backends by itself *)
+let () = ignore Simple_profiler.headless
+
 let () =
   Client_commands.register Protocol.hash @@ fun _network ->
   List.map (Tezos_clic.map_command (new Protocol_client_context.wrap_full))
   @@ Baking_commands.baker_commands ()
 
 let select_commands _ _ =
+  let open Lwt_result_syntax in
   return
     (List.map
        (Tezos_clic.map_command (new Protocol_client_context.wrap_full))
@@ -44,4 +48,14 @@ let select_commands _ _ =
    validation will not be more expensive. *)
 let () = Tezos_sapling.Core.Validator.init_params ()
 
-let () = Client_main_run.run (module Daemon_config) ~select_commands
+module Config = struct
+  include Daemon_config
+
+  let default_daily_logs_path = Some ("octez-baker-" ^ Protocol.name)
+
+  let advertise_log_levels = Some true
+end
+
+let () =
+  Memtrace.trace_if_requested () ;
+  Client_main_run.run (module Config) ~select_commands

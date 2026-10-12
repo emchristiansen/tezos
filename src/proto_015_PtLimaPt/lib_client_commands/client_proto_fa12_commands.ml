@@ -33,10 +33,10 @@ let group =
     title = "Commands for managing FA1.2-compatible smart contracts";
   }
 
-let alias_param = Client_proto_contracts.ContractAlias.destination_param
+let alias_param = Client_proto_contracts.Contract_alias.destination_param
 
 let token_contract_param () =
-  Client_proto_contracts.OriginatedContractAlias.destination_param
+  Client_proto_contracts.Originated_contract_alias.destination_param
     ~name:"contract"
     ~desc:"name or address of the FA1.2-compatible contract"
 
@@ -60,7 +60,7 @@ let tez_amount_arg =
   tez_arg ~default:"0" ~parameter:"tez-amount" ~doc:"amount in \xEA\x9C\xA9"
 
 let as_arg =
-  Client_proto_contracts.ContractAlias.destination_arg
+  Client_proto_contracts.Contract_alias.destination_arg
     ~name:"as"
     ~doc:"name or address of the caller of the contract"
     ()
@@ -163,7 +163,8 @@ let commands_ro () : #Protocol_client_context.full Tezos_clic.command list =
         (fun (gas, payer, unparsing_mode)
              contract
              addr
-             (cctxt : #Protocol_client_context.full) ->
+             (cctxt : #Protocol_client_context.full)
+           ->
           let open Lwt_syntax in
           let action =
             Client_proto_fa12.Get_balance (addr, (dummy_callback, None))
@@ -201,7 +202,8 @@ let commands_ro () : #Protocol_client_context.full Tezos_clic.command list =
              contract
              source
              destination
-             (cctxt : #Protocol_client_context.full) ->
+             (cctxt : #Protocol_client_context.full)
+           ->
           let open Lwt_syntax in
           let action =
             Client_proto_fa12.Get_allowance
@@ -231,7 +233,8 @@ let commands_ro () : #Protocol_client_context.full Tezos_clic.command list =
         @@ stop)
         (fun (gas, payer, unparsing_mode)
              contract
-             (cctxt : #Protocol_client_context.full) ->
+             (cctxt : #Protocol_client_context.full)
+           ->
           let open Lwt_syntax in
           let action =
             Client_proto_fa12.Get_total_supply (dummy_callback, None)
@@ -279,7 +282,8 @@ let commands_ro () : #Protocol_client_context.full Tezos_clic.command list =
              contract
              addr
              callback
-             (cctxt : #Protocol_client_context.full) ->
+             (cctxt : #Protocol_client_context.full)
+           ->
           let open Lwt_result_syntax in
           let* source, src_pk, src_sk = get_contract_caller_keys cctxt addr in
           let action =
@@ -347,7 +351,8 @@ let commands_ro () : #Protocol_client_context.full Tezos_clic.command list =
              src
              dst
              callback
-             (cctxt : #Protocol_client_context.full) ->
+             (cctxt : #Protocol_client_context.full)
+           ->
           let open Lwt_result_syntax in
           let* source, src_pk, src_sk = get_contract_caller_keys cctxt src in
           let action =
@@ -412,7 +417,8 @@ let commands_ro () : #Protocol_client_context.full Tezos_clic.command list =
              contract
              addr
              callback
-             (cctxt : #Protocol_client_context.full) ->
+             (cctxt : #Protocol_client_context.full)
+           ->
           let open Lwt_result_syntax in
           let* source, src_pk, src_sk = get_contract_caller_keys cctxt addr in
           let action =
@@ -485,7 +491,8 @@ let commands_rw () : #Protocol_client_context.full Tezos_clic.command list =
              amount
              src
              dst
-             (cctxt : #Protocol_client_context.full) ->
+             (cctxt : #Protocol_client_context.full)
+           ->
           let open Lwt_result_syntax in
           let caller = Option.value ~default:src as_address in
           let* source, caller_pk, caller_sk =
@@ -546,7 +553,8 @@ let commands_rw () : #Protocol_client_context.full Tezos_clic.command list =
              source
              amount
              dst
-             (cctxt : #Protocol_client_context.full) ->
+             (cctxt : #Protocol_client_context.full)
+           ->
           let open Lwt_result_syntax in
           let* source, src_pk, src_sk = get_contract_caller_keys cctxt source in
           let action = Client_proto_fa12.Approve (dst, amount) in
@@ -626,7 +634,8 @@ let commands_rw () : #Protocol_client_context.full Tezos_clic.command list =
                fee_parameter )
              src
              operations_json
-             cctxt ->
+             cctxt
+           ->
           let open Lwt_result_syntax in
           let caller = Option.value ~default:src as_address in
           match

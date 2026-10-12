@@ -101,9 +101,10 @@ let of_string str =
   | Some str -> of_non_empty_string str
 
 let of_string_strict ~loc str =
+  let open Result_syntax in
   match of_string str with
-  | Too_long -> error (Name_too_long str)
-  | Got_default -> error (Unexpected_default loc)
+  | Too_long -> tzfail (Name_too_long str)
+  | Got_default -> tzfail (Unexpected_default loc)
   | Ok name -> Ok name
 
 let of_string_strict' str =
@@ -116,9 +117,10 @@ let of_string_strict_exn str =
   match of_string_strict' str with Ok v -> v | Error err -> invalid_arg err
 
 let of_annot_strict ~loc a =
+  let open Result_syntax in
   match of_non_empty_string a with
-  | Too_long -> error (Name_too_long (a :> string))
-  | Got_default -> error (Unexpected_default loc)
+  | Too_long -> tzfail (Name_too_long (a :> string))
+  | Got_default -> tzfail (Unexpected_default loc)
   | Ok name -> Ok name
 
 let of_annot_lax_opt a =
@@ -135,12 +137,12 @@ let of_string_lax_opt str =
 
 let of_string_lax str =
   match of_string_lax_opt str with
-  | None -> error (Name_too_long str)
+  | None -> Result_syntax.tzfail (Name_too_long str)
   | Some name -> Ok name
 
 let of_annot_lax a =
   match of_non_empty_string a with
-  | Too_long -> error (Name_too_long (a :> string))
+  | Too_long -> Result_syntax.tzfail (Name_too_long (a :> string))
   | Got_default -> Ok default
   | Ok name -> Ok name
 
@@ -158,6 +160,14 @@ let set_delegate = of_string_strict_exn "set_delegate"
 let remove_delegate = of_string_strict_exn "remove_delegate"
 
 let deposit = of_string_strict_exn "deposit"
+
+let stake = of_string_strict_exn "stake"
+
+let unstake = of_string_strict_exn "unstake"
+
+let finalize_unstake = of_string_strict_exn "finalize_unstake"
+
+let set_delegate_parameters = of_string_strict_exn "set_delegate_parameters"
 
 let is_deposit = ( = ) deposit
 
@@ -212,6 +222,10 @@ let smart_encoding =
       builtin_case 3 set_delegate;
       builtin_case 4 remove_delegate;
       builtin_case 5 deposit;
+      builtin_case 6 stake;
+      builtin_case 7 unstake;
+      builtin_case 8 finalize_unstake;
+      builtin_case 9 set_delegate_parameters;
       case
         (Tag 255)
         ~title:"named"

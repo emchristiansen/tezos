@@ -203,12 +203,15 @@ module type INTERFACE = sig
     (cached_value * size) option ->
     Raw_context.t tzresult
 
-  (** [find ctxt i = Some v] if [v] is the value associated to [i]
-       in the subcache. Returns [None] if there is no such value in
+  (** [find ctxt i = (ctxt, Some v)] if [v] is the value associated to [i]
+       in the subcache. Returns [(ctxt, None)] if there is no such value in
        the subcache. This function is in the Lwt monad because if the
        value may have not been constructed (see the lazy loading
        mode in {!Environment_context}), it is constructed on the fly. *)
-  val find : Raw_context.t -> identifier -> cached_value option tzresult Lwt.t
+  val find :
+    Raw_context.t ->
+    identifier ->
+    (Raw_context.t * cached_value option) tzresult Lwt.t
 
   (** [list_identifiers ctxt] returns the list of the
        identifiers of the cached values along with their respective
@@ -238,7 +241,11 @@ val register_exn :
   (module CLIENT with type cached_value = 'a) ->
   (module INTERFACE with type cached_value = 'a)
 
-(** [cache_nonce_from_block_header shell_header contents] computes a
-   {!cache_nonce} from the [shell_header] and its [contents]. *)
+(** [cache_nonce_from_block_header ~round shell_header contents] computes a
+    {!cache_nonce} from the [shell_header], its [contents] and the block
+    [round]. *)
 val cache_nonce_from_block_header :
-  Block_header_repr.shell_header -> Block_header_repr.contents -> cache_nonce
+  round:Round_repr.t ->
+  Block_header_repr.shell_header ->
+  Block_header_repr.contents ->
+  cache_nonce

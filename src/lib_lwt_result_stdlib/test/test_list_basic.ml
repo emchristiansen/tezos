@@ -23,6 +23,14 @@
 (*                                                                           *)
 (*****************************************************************************)
 
+(* Testing
+   -------
+   Component:    Stdlib
+   Invocation:   dune exec src/lib_lwt_result_stdlib/test/main.exe \
+                  -- --file test_list_basic.ml
+   Subject:      Test basic properties of list
+*)
+
 module ListGen = struct
   include Support.Lib.List
 
@@ -573,6 +581,7 @@ end
 
 let () =
   Alcotest.run
+    ~__FILE__
     "list-basic"
     [
       ("is_empty", IsEmpty.tests);

@@ -24,14 +24,20 @@
 (*****************************************************************************)
 
 let is_inactive ctxt delegate =
-  Storage.Contract.Inactive_delegate.mem ctxt (Contract_repr.Implicit delegate)
-  >>= fun inactive ->
-  if inactive then return inactive
-  else
-    Storage.Contract.Delegate_last_cycle_before_deactivation.find
+  let open Lwt_result_syntax in
+  let*! inactive =
+    Storage.Contract.Inactive_delegate.mem
       ctxt
       (Contract_repr.Implicit delegate)
-    >|=? function
+  in
+  if inactive then return inactive
+  else
+    let+ cycle_opt =
+      Storage.Contract.Delegate_last_cycle_before_deactivation.find
+        ctxt
+        (Contract_repr.Implicit delegate)
+    in
+    match cycle_opt with
     | Some last_active_cycle ->
         let ({Level_repr.cycle = current_cycle; _} : Level_repr.t) =
           Raw_context.current_level ctxt
@@ -50,36 +56,42 @@ let set_inactive ctxt delegate =
   Storage.Contract.Inactive_delegate.add ctxt (Contract_repr.Implicit delegate)
 
 let set_active ctxt delegate =
-  is_inactive ctxt delegate >>=? fun inactive ->
+  let open Lwt_result_syntax in
+  let* inactive = is_inactive ctxt delegate in
   let current_cycle = (Raw_context.current_level ctxt).cycle in
-  let preserved_cycles = Constants_storage.preserved_cycles ctxt in
+  let tolerance = Constants_storage.tolerated_inactivity_period ctxt in
+  let consensus_rights_delay = Constants_storage.consensus_rights_delay ctxt in
   (* We allow a number of cycles before a delegate is deactivated as follows:
-     - if the delegate is active, we give it at least `1 + preserved_cycles`
+     - if the delegate is active, we give it at least `tolerance` cycles
      after the current cycle before to be deactivated.
      - if the delegate is new or inactive, we give it additionally
-     `preserved_cycles` because the delegate needs this number of cycles to
-     receive rights, so `1 + 2 * preserved_cycles` in total. *)
+     `consensus_rights_delay` because the delegate needs this number of cycles to
+     receive rights, so `tolerance + consensus_rights_delay` in total. *)
   let delegate_contract = Contract_repr.Implicit delegate in
-  Storage.Contract.Delegate_last_cycle_before_deactivation.find
-    ctxt
-    delegate_contract
-  >>=? fun current_last_active_cycle ->
+  let* current_last_active_cycle =
+    Storage.Contract.Delegate_last_cycle_before_deactivation.find
+      ctxt
+      delegate_contract
+  in
   let last_active_cycle =
     match current_last_active_cycle with
-    | None -> Cycle_repr.add current_cycle (1 + (2 * preserved_cycles))
+    | None -> Cycle_repr.add current_cycle (tolerance + consensus_rights_delay)
     | Some current_last_active_cycle ->
         let delay =
-          if inactive then 1 + (2 * preserved_cycles) else 1 + preserved_cycles
+          if inactive then tolerance + consensus_rights_delay else tolerance
         in
         let updated = Cycle_repr.add current_cycle delay in
         Cycle_repr.max current_last_active_cycle updated
   in
-  Storage.Contract.Delegate_last_cycle_before_deactivation.add
-    ctxt
-    delegate_contract
-    last_active_cycle
-  >>= fun ctxt ->
+  let*! ctxt =
+    Storage.Contract.Delegate_last_cycle_before_deactivation.add
+      ctxt
+      delegate_contract
+      last_active_cycle
+  in
   if not inactive then return (ctxt, inactive)
   else
-    Storage.Contract.Inactive_delegate.remove ctxt delegate_contract
-    >>= fun ctxt -> return (ctxt, inactive)
+    let*! ctxt =
+      Storage.Contract.Inactive_delegate.remove ctxt delegate_contract
+    in
+    return (ctxt, inactive)

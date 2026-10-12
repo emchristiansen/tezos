@@ -3,6 +3,7 @@
 (* Open Source License                                                       *)
 (* Copyright (c) 2021 Trili Tech, <contact@trili.tech>                       *)
 (* Copyright (c) 2022 Nomadic Labs, <contact@nomadic-labs.com>               *)
+(* Copyright (c) 2024 Marigold, <contact@marigold.dev>                       *)
 (*                                                                           *)
 (* Permission is hereby granted, free of charge, to any person obtaining a   *)
 (* copy of this software and associated documentation files (the "Software"),*)
@@ -27,9 +28,8 @@
 (** Testing
     -------
     Component:  Protocol (Ticket_scanner)
-    Invocation: dune exec \
-                src/proto_alpha/lib_protocol/test/integration/michelson/main.exe \
-                -- test "^ticket scanner"
+    Invocation: dune exec src/proto_alpha/lib_protocol/test/integration/michelson/main.exe \
+                  -- --file test_ticket_scanner.ml
     Subject:    Ticket scanner tests
 *)
 
@@ -51,7 +51,7 @@ let assert_fails ~loc ?error m =
         Stdlib.failwith msg
     | _, None ->
         (* Any error is ok. *)
-        return ()
+        return_unit
   in
   match res with
   | Ok _ -> Stdlib.failwith "Expected failure"
@@ -70,7 +70,7 @@ let string_list_of_ex_tickets ctxt tickets =
   let open Lwt_result_wrap_syntax in
   let accum (xs, ctxt)
       (Ticket_scanner.Ex_ticket
-        (cty, {Script_typed_ir.ticketer; contents; amount})) =
+         (cty, {Script_typed_ir.ticketer; contents; amount})) =
     let*@ x, ctxt =
       Script_ir_translator.unparse_data
         ctxt
@@ -137,7 +137,8 @@ let tickets_of_value ctxt ~include_lazy ~type_exp ~value_exp =
     Script_ir_translator.parse_data
       ctxt
       ~elab_conf:(Script_ir_translator_config.make ~legacy:false ())
-      ~allow_forged:true
+      ~allow_forged_tickets:true
+      ~allow_forged_lazy_storage_id:true
       ty
       node
   in
@@ -153,7 +154,8 @@ let assert_contains_tickets ctxt ~loc ~include_lazy ~type_exp ~value_exp
   assert_equals_ex_tickets ctxt ~loc ex_tickets expected
 
 let assert_fail_non_empty_overlay ctxt ~loc ~include_lazy ~type_exp ~value_exp =
-  tickets_of_value ctxt ~include_lazy ~type_exp ~value_exp >>= fun res ->
+  let open Lwt_result_syntax in
+  let*! res = tickets_of_value ctxt ~include_lazy ~type_exp ~value_exp in
   match res with
   | Error [x] ->
       let x = Format.kasprintf Fun.id "%a" Error_monad.pp x in
@@ -285,7 +287,9 @@ let test_tickets_in_unit_ticket () =
   let open Lwt_result_wrap_syntax in
   let* ctxt = new_ctxt () in
   let type_exp = "ticket(unit)" in
-  let value_exp = {|Pair "KT1ThEdxfUcWUwqsdergy3QnbCWGHSUHeHJq" Unit 10|} in
+  let value_exp =
+    {|Ticket "KT1ThEdxfUcWUwqsdergy3QnbCWGHSUHeHJq" unit Unit 10|}
+  in
   let* ex_ticket, ctxt =
     make_ex_ticket
       ctxt
@@ -317,10 +321,10 @@ let test_tickets_in_list_with_zero_amount () =
     ~value_exp:
       {|
         {
-          Pair "KT1ThEdxfUcWUwqsdergy3QnbCWGHSUHeHJq" "red" 1;
-          Pair "KT1ThEdxfUcWUwqsdergy3QnbCWGHSUHeHJq" "green" 2;
-          Pair "KT1ThEdxfUcWUwqsdergy3QnbCWGHSUHeHJq" "blue" 3;
-          Pair "KT1ThEdxfUcWUwqsdergy3QnbCWGHSUHeHJq" "orange" 0;
+          Ticket "KT1ThEdxfUcWUwqsdergy3QnbCWGHSUHeHJq" string "red" 1;
+          Ticket "KT1ThEdxfUcWUwqsdergy3QnbCWGHSUHeHJq" string "green" 2;
+          Ticket "KT1ThEdxfUcWUwqsdergy3QnbCWGHSUHeHJq" string "blue" 3;
+          Ticket "KT1ThEdxfUcWUwqsdergy3QnbCWGHSUHeHJq" string "orange" 0;
         }
       |}
 
@@ -333,9 +337,9 @@ let test_tickets_in_list () =
     ~value_exp:
       {|
         {
-          Pair "KT1ThEdxfUcWUwqsdergy3QnbCWGHSUHeHJq" "red" 1;
-          Pair "KT1ThEdxfUcWUwqsdergy3QnbCWGHSUHeHJq" "green" 2;
-          Pair "KT1ThEdxfUcWUwqsdergy3QnbCWGHSUHeHJq" "blue" 3;
+          Ticket "KT1ThEdxfUcWUwqsdergy3QnbCWGHSUHeHJq" string "red" 1;
+          Ticket "KT1ThEdxfUcWUwqsdergy3QnbCWGHSUHeHJq" string "green" 2;
+          Ticket "KT1ThEdxfUcWUwqsdergy3QnbCWGHSUHeHJq" string "blue" 3;
         }
       |}
     ~expected:
@@ -353,9 +357,9 @@ let test_tickets_in_pair_with_zero_amount () =
     ~value_exp:
       {|
         Pair
-          (Pair "KT1ThEdxfUcWUwqsdergy3QnbCWGHSUHeHJq" "red" 1)
-          (Pair "KT1ThEdxfUcWUwqsdergy3QnbCWGHSUHeHJq" "green" 2)
-          (Pair "KT1ThEdxfUcWUwqsdergy3QnbCWGHSUHeHJq" "blue" 0)
+          (Ticket "KT1ThEdxfUcWUwqsdergy3QnbCWGHSUHeHJq" string "red" 1)
+          (Ticket "KT1ThEdxfUcWUwqsdergy3QnbCWGHSUHeHJq" string "green" 2)
+          (Ticket "KT1ThEdxfUcWUwqsdergy3QnbCWGHSUHeHJq" string "blue" 0)
       |}
 
 (** Test that all tickets can be extracted from a pair of tickets *)
@@ -367,8 +371,8 @@ let test_tickets_in_pair () =
     ~value_exp:
       {|
         Pair
-          (Pair "KT1ThEdxfUcWUwqsdergy3QnbCWGHSUHeHJq" "red" 1)
-          (Pair "KT1ThEdxfUcWUwqsdergy3QnbCWGHSUHeHJq" "green" 2)
+          (Ticket "KT1ThEdxfUcWUwqsdergy3QnbCWGHSUHeHJq" string "red" 1)
+          (Ticket "KT1ThEdxfUcWUwqsdergy3QnbCWGHSUHeHJq" string "green" 2)
       |}
     ~expected:
       [
@@ -384,9 +388,9 @@ let test_tickets_in_map_with_zero_amount () =
     ~value_exp:
       {|
         {
-          Elt 1 (Pair "KT1ThEdxfUcWUwqsdergy3QnbCWGHSUHeHJq" "red" 1);
-          Elt 2 (Pair "KT1ThEdxfUcWUwqsdergy3QnbCWGHSUHeHJq" "green" 2);
-          Elt 3 (Pair "KT1ThEdxfUcWUwqsdergy3QnbCWGHSUHeHJq" "blue" 0);
+          Elt 1 (Ticket "KT1ThEdxfUcWUwqsdergy3QnbCWGHSUHeHJq" string "red" 1);
+          Elt 2 (Ticket "KT1ThEdxfUcWUwqsdergy3QnbCWGHSUHeHJq" string "green" 2);
+          Elt 3 (Ticket "KT1ThEdxfUcWUwqsdergy3QnbCWGHSUHeHJq" string "blue" 0);
         }
     |}
 
@@ -399,8 +403,8 @@ let test_tickets_in_map () =
     ~value_exp:
       {|
         {
-          Elt 1 (Pair "KT1ThEdxfUcWUwqsdergy3QnbCWGHSUHeHJq" "red" 1);
-          Elt 2 (Pair "KT1ThEdxfUcWUwqsdergy3QnbCWGHSUHeHJq" "green" 2);
+          Elt 1 (Ticket "KT1ThEdxfUcWUwqsdergy3QnbCWGHSUHeHJq" string "red" 1);
+          Elt 2 (Ticket "KT1ThEdxfUcWUwqsdergy3QnbCWGHSUHeHJq" string "green" 2);
         }
     |}
     ~expected:
@@ -424,8 +428,8 @@ let test_tickets_in_big_map () =
     ~value_exp:
       {|
         {
-          Elt 1 (Pair "KT1ThEdxfUcWUwqsdergy3QnbCWGHSUHeHJq" "red" 1);
-          Elt 2 (Pair "KT1ThEdxfUcWUwqsdergy3QnbCWGHSUHeHJq" "green" 2);
+          Elt 1 (Ticket "KT1ThEdxfUcWUwqsdergy3QnbCWGHSUHeHJq" string "red" 1);
+          Elt 2 (Ticket "KT1ThEdxfUcWUwqsdergy3QnbCWGHSUHeHJq" string "green" 2);
         }
       |}
 
@@ -439,9 +443,9 @@ let test_tickets_in_big_map_strict_only () =
     ~value_exp:
       {|
         {
-          Elt 1 (Pair "KT1ThEdxfUcWUwqsdergy3QnbCWGHSUHeHJq" "red" 1);
-          Elt 2 (Pair "KT1ThEdxfUcWUwqsdergy3QnbCWGHSUHeHJq" "green" 2);
-          Elt 3 (Pair "KT1ThEdxfUcWUwqsdergy3QnbCWGHSUHeHJq" "blue" 3);
+          Elt 1 (Ticket "KT1ThEdxfUcWUwqsdergy3QnbCWGHSUHeHJq" string "red" 1);
+          Elt 2 (Ticket "KT1ThEdxfUcWUwqsdergy3QnbCWGHSUHeHJq" string "green" 2);
+          Elt 3 (Ticket "KT1ThEdxfUcWUwqsdergy3QnbCWGHSUHeHJq" string "blue" 3);
         }
       |}
     ~expected:[]
@@ -462,12 +466,12 @@ let test_tickets_in_list_in_big_map () =
       {|
         {
           Elt 1 {
-            Pair "KT1ThEdxfUcWUwqsdergy3QnbCWGHSUHeHJq" "red" 1 ;
-            Pair "KT1ThEdxfUcWUwqsdergy3QnbCWGHSUHeHJq" "green" 1
+            Ticket "KT1ThEdxfUcWUwqsdergy3QnbCWGHSUHeHJq" string "red" 1;
+            Ticket "KT1ThEdxfUcWUwqsdergy3QnbCWGHSUHeHJq" string "green" 1
           };
           Elt 2 {
-            Pair "KT1ThEdxfUcWUwqsdergy3QnbCWGHSUHeHJq" "blue" 1 ;
-            Pair "KT1ThEdxfUcWUwqsdergy3QnbCWGHSUHeHJq" "orange" 1
+            Ticket "KT1ThEdxfUcWUwqsdergy3QnbCWGHSUHeHJq" string "blue" 1;
+            Ticket "KT1ThEdxfUcWUwqsdergy3QnbCWGHSUHeHJq" string "orange" 1
           }
         }
       |}
@@ -483,12 +487,12 @@ let test_tickets_in_pair_big_map_and_list_strict_only () =
       {|
         Pair
           {
-            Elt 1 (Pair "KT1ThEdxfUcWUwqsdergy3QnbCWGHSUHeHJq" "red" 1);
-            Elt 2 (Pair "KT1ThEdxfUcWUwqsdergy3QnbCWGHSUHeHJq" "green" 1)
+            Elt 1 (Ticket "KT1ThEdxfUcWUwqsdergy3QnbCWGHSUHeHJq" string "red" 1);
+            Elt 2 (Ticket "KT1ThEdxfUcWUwqsdergy3QnbCWGHSUHeHJq" string "green" 1)
           }
           {
-            Pair "KT1ThEdxfUcWUwqsdergy3QnbCWGHSUHeHJq" "blue" 1;
-            Pair "KT1ThEdxfUcWUwqsdergy3QnbCWGHSUHeHJq" "orange" 1
+            Ticket "KT1ThEdxfUcWUwqsdergy3QnbCWGHSUHeHJq" string "blue" 1;
+            Ticket "KT1ThEdxfUcWUwqsdergy3QnbCWGHSUHeHJq" string "orange" 1
           }
       |}
     ~expected:
@@ -503,7 +507,8 @@ let test_tickets_in_or_left () =
     ~loc:__LOC__
     ~include_lazy:false
     ~type_exp:"or (ticket string) int"
-    ~value_exp:{| Left (Pair "KT1ThEdxfUcWUwqsdergy3QnbCWGHSUHeHJq" "red" 1) |}
+    ~value_exp:
+      {| Left (Ticket "KT1ThEdxfUcWUwqsdergy3QnbCWGHSUHeHJq" string "red" 1) |}
     ~expected:[("KT1ThEdxfUcWUwqsdergy3QnbCWGHSUHeHJq", "red", 1)]
 
 (** Test that tickets from the left side of an or-expression with zero amount
@@ -513,7 +518,8 @@ let test_tickets_in_or_left_with_zero_amount () =
     ~loc:__LOC__
     ~include_lazy:false
     ~type_exp:"or (ticket string) int"
-    ~value_exp:{| Left (Pair "KT1ThEdxfUcWUwqsdergy3QnbCWGHSUHeHJq" "red" 0) |}
+    ~value_exp:
+      {| Left (Ticket "KT1ThEdxfUcWUwqsdergy3QnbCWGHSUHeHJq" string "red" 0) |}
 
 (** Test that tickets can be extracted from the right side of an or-expression. *)
 let test_tickets_in_or_right () =
@@ -521,7 +527,8 @@ let test_tickets_in_or_right () =
     ~loc:__LOC__
     ~include_lazy:false
     ~type_exp:"or int (ticket string)"
-    ~value_exp:{| Right (Pair "KT1ThEdxfUcWUwqsdergy3QnbCWGHSUHeHJq" "red" 1) |}
+    ~value_exp:
+      {| Right (Ticket "KT1ThEdxfUcWUwqsdergy3QnbCWGHSUHeHJq" string "red" 1) |}
     ~expected:[("KT1ThEdxfUcWUwqsdergy3QnbCWGHSUHeHJq", "red", 1)]
 
 (*
@@ -549,9 +556,9 @@ let test_tickets_in_non_empty_big_map_ref () =
     ~loc:__LOC__
     ~pre_populated:
       [
-        (1, {|Pair "KT1ThEdxfUcWUwqsdergy3QnbCWGHSUHeHJq" "red" 1|});
-        (2, {|Pair "KT1ThEdxfUcWUwqsdergy3QnbCWGHSUHeHJq" "green" 1|});
-        (3, {|Pair "KT1ThEdxfUcWUwqsdergy3QnbCWGHSUHeHJq" "blue" 1|});
+        (1, {|Ticket "KT1ThEdxfUcWUwqsdergy3QnbCWGHSUHeHJq" string "red" 1|});
+        (2, {|Ticket "KT1ThEdxfUcWUwqsdergy3QnbCWGHSUHeHJq" string "green" 1|});
+        (3, {|Ticket "KT1ThEdxfUcWUwqsdergy3QnbCWGHSUHeHJq" string "blue" 1|});
       ]
     ~big_map_exp:(Printf.sprintf "%s")
     [
@@ -573,7 +580,7 @@ let test_tickets_overlay_in_empty_big_map_ref () =
     ~pre_populated:[]
     ~big_map_exp:
       (Printf.sprintf
-         {|Pair %s { Elt 1 (Some (Pair "KT1ThEdxfUcWUwqsdergy3QnbCWGHSUHeHJq" "red" 1))}|})
+         {|Pair %s { Elt 1 (Some (Ticket "KT1ThEdxfUcWUwqsdergy3QnbCWGHSUHeHJq" string "red" 1))}|})
 
 (** Test tickets from non-empty big-map when passed as a pair of identifier
     and overrides. The scanned tickets are contained in the context as well as
@@ -588,15 +595,15 @@ let test_tickets_overlay_in_non_empty_in_big_map_ref () =
     ~loc:__LOC__
     ~pre_populated:
       [
-        (1, {|Pair "KT1ThEdxfUcWUwqsdergy3QnbCWGHSUHeHJq" "red" 1|});
-        (2, {|Pair "KT1ThEdxfUcWUwqsdergy3QnbCWGHSUHeHJq" "green" 1|});
-        (3, {|Pair "KT1ThEdxfUcWUwqsdergy3QnbCWGHSUHeHJq" "blue" 1|});
+        (1, {|Ticket "KT1ThEdxfUcWUwqsdergy3QnbCWGHSUHeHJq" string "red" 1|});
+        (2, {|Ticket "KT1ThEdxfUcWUwqsdergy3QnbCWGHSUHeHJq" string "green" 1|});
+        (3, {|Ticket "KT1ThEdxfUcWUwqsdergy3QnbCWGHSUHeHJq" string "blue" 1|});
       ]
     ~big_map_exp:
       (Printf.sprintf
          {| Pair
             %s
-            { Elt 4 (Some (Pair "KT1ThEdxfUcWUwqsdergy3QnbCWGHSUHeHJq" "orange" 1))}
+            { Elt 4 (Some (Ticket "KT1ThEdxfUcWUwqsdergy3QnbCWGHSUHeHJq" string "orange" 1))}
        |})
 
 (** Test tickets from non-empty big-map when passed as a pair of identifier
@@ -610,12 +617,12 @@ let test_tickets_replace_overlay_in_non_empty_in_big_map_ref () =
   assert_fail_non_empty_overlay_with_big_map_ref
     ~loc:__LOC__
     ~pre_populated:
-      [(1, {|Pair "KT1ThEdxfUcWUwqsdergy3QnbCWGHSUHeHJq" "red" 1|})]
+      [(1, {|Ticket "KT1ThEdxfUcWUwqsdergy3QnbCWGHSUHeHJq" string "red" 1|})]
     ~big_map_exp:
       (Printf.sprintf
          {| Pair
             %s
-            { Elt 1 (Some (Pair "KT1ThEdxfUcWUwqsdergy3QnbCWGHSUHeHJq" "green" 1))}
+            { Elt 1 (Some (Ticket "KT1ThEdxfUcWUwqsdergy3QnbCWGHSUHeHJq" string "green" 1))}
        |})
 
 (** Test tickets from non-empty big-map when passed as a pair of identifier
@@ -629,72 +636,72 @@ let test_tickets_remove_overlay_in_non_empty_in_big_map_ref () =
   assert_fail_non_empty_overlay_with_big_map_ref
     ~loc:__LOC__
     ~pre_populated:
-      [(1, {|Pair "KT1ThEdxfUcWUwqsdergy3QnbCWGHSUHeHJq" "red" 1|})]
+      [(1, {|Ticket "KT1ThEdxfUcWUwqsdergy3QnbCWGHSUHeHJq" string "red" 1|})]
     ~big_map_exp:(Printf.sprintf {| Pair %s { Elt 1 None} |})
 
 let tests =
   [
+    Tztest.tztest "tickets in unit ticket" `Quick test_tickets_in_unit_ticket;
+    Tztest.tztest "tickets in list" `Quick test_tickets_in_list;
     Tztest.tztest
-      "Test tickets in unit ticket"
-      `Quick
-      test_tickets_in_unit_ticket;
-    Tztest.tztest "Test tickets in list" `Quick test_tickets_in_list;
-    Tztest.tztest
-      "Test tickets in list with zero amount"
+      "tickets in list with zero amount"
       `Quick
       test_tickets_in_list_with_zero_amount;
-    Tztest.tztest "Test tickets in pair" `Quick test_tickets_in_pair;
+    Tztest.tztest "tickets in pair" `Quick test_tickets_in_pair;
     Tztest.tztest
-      "Test tickets in pair with zero amount"
+      "tickets in pair with zero amount"
       `Quick
       test_tickets_in_pair_with_zero_amount;
-    Tztest.tztest "Test tickets in map" `Quick test_tickets_in_map;
+    Tztest.tztest "tickets in map" `Quick test_tickets_in_map;
     Tztest.tztest
-      "Test tickets in map with zero amount"
+      "tickets in map with zero amount"
       `Quick
       test_tickets_in_map_with_zero_amount;
-    Tztest.tztest "Test tickets in big map" `Quick test_tickets_in_big_map;
+    Tztest.tztest "tickets in big map" `Quick test_tickets_in_big_map;
     Tztest.tztest
-      "Test tickets in big map with include lazy set to false"
+      "tickets in big map with include lazy set to false"
       `Quick
       test_tickets_in_big_map_strict_only;
     Tztest.tztest
-      "Test tickets in list in big map"
+      "tickets in list in big map"
       `Quick
       test_tickets_in_list_in_big_map;
     Tztest.tztest
-      "Test tickets in a pair of big-map and list with include lazy set to \
-       false"
+      "tickets in a pair of big-map and list with include lazy set to false"
       `Quick
       test_tickets_in_pair_big_map_and_list_strict_only;
-    Tztest.tztest "Test tickets in or left" `Quick test_tickets_in_or_left;
+    Tztest.tztest "tickets in or left" `Quick test_tickets_in_or_left;
     Tztest.tztest
-      "Test tickets in or left with zero amount"
+      "tickets in or left with zero amount"
       `Quick
       test_tickets_in_or_left_with_zero_amount;
-    Tztest.tztest "Test tickets in or right" `Quick test_tickets_in_or_right;
+    Tztest.tztest "tickets in or right" `Quick test_tickets_in_or_right;
     Tztest.tztest
-      "Test tickets in empty big-map ref"
+      "tickets in empty big-map ref"
       `Quick
       test_tickets_overlay_in_empty_big_map_ref;
     Tztest.tztest
-      "Test tickets in big-map ref"
+      "tickets in big-map ref"
       `Quick
       test_tickets_in_empty_big_map_ref;
     Tztest.tztest
-      "Test tickets in non-empty big-map ref"
+      "tickets in non-empty big-map ref"
       `Quick
       test_tickets_in_non_empty_big_map_ref;
     Tztest.tztest
-      "Test tickets in non-empty big-map ref with overlay"
+      "tickets in non-empty big-map ref with overlay"
       `Quick
       test_tickets_overlay_in_non_empty_in_big_map_ref;
     Tztest.tztest
-      "Test tickets replace existing value from overlay"
+      "tickets replace existing value from overlay"
       `Quick
       test_tickets_replace_overlay_in_non_empty_in_big_map_ref;
     Tztest.tztest
-      "Test tickets remove existing value from overlay"
+      "tickets remove existing value from overlay"
       `Quick
       test_tickets_remove_overlay_in_non_empty_in_big_map_ref;
   ]
+
+let () =
+  Alcotest_lwt.run ~__FILE__ Protocol.name [("ticket scanner", tests)]
+  |> Lwt_main.run

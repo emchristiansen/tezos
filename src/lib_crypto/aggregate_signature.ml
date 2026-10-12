@@ -461,16 +461,17 @@ let pp ppf t = Format.fprintf ppf "%s" (to_b58check t)
 let zero = Bls12_381 Bls.zero
 
 let sign ?watermark (Secret_key.Bls12_381 sk) bytes =
-  Bls12_381 (Bls.sign ?watermark sk bytes)
+  Bls12_381 (Bls.sign_aug ?watermark sk bytes)
 
 let check ?watermark pk signature message =
   match (pk, signature) with
   | Public_key.Bls12_381 pk, Unknown signature ->
       Bls.of_bytes_opt signature
-      |> Option.map (fun signature -> Bls.check ?watermark pk signature message)
+      |> Option.map (fun signature ->
+             Bls.check_aug ?watermark pk signature message)
       |> Option.value ~default:false
   | Public_key.Bls12_381 pk, Bls12_381 signature ->
-      Bls.check ?watermark pk signature message
+      Bls.check_aug ?watermark pk signature message
 
 let generate_key ?seed () =
   let pkh, pk, sk = Bls.generate_key ?seed () in
@@ -498,7 +499,7 @@ let aggregate_check pks signature =
       |> Option.map (Bls.aggregate_check pks)
       |> Option.value ~default:false
 
-let aggregate_signature_opt signatures =
+let aggregate_signature_opt ?subgroup_check signatures =
   let open Result_syntax in
   let aux acc s =
     match s with
@@ -509,6 +510,34 @@ let aggregate_signature_opt signatures =
   in
   match List.fold_left_e aux [] signatures with
   | Ok signatures ->
-      Bls.aggregate_signature_opt signatures
+      Bls.aggregate_signature_opt ?subgroup_check signatures
       |> Option.map (fun s -> Bls12_381 s)
   | Error _ -> None
+
+let aggregate_signature_weighted_opt ?subgroup_check signatures_with_weights =
+  let open Result_syntax in
+  let aux acc (w, s) =
+    match s with
+    | Bls12_381 s -> return @@ ((w, s) :: acc)
+    | Unknown s ->
+        let* s = Bls.of_bytes s in
+        return ((w, s) :: acc)
+  in
+  match List.fold_left_e aux [] signatures_with_weights with
+  | Ok signatures ->
+      Bls.aggregate_signature_weighted_opt ?subgroup_check signatures
+      |> Option.map (fun s -> Bls12_381 s)
+  | Error _ -> None
+
+let aggregate_public_key_opt ?subgroup_check pks =
+  List.map (function Public_key.Bls12_381 s -> s) pks
+  |> Bls.aggregate_public_key_opt ?subgroup_check
+  |> Option.map (fun s -> Public_key.Bls12_381 s)
+
+let aggregate_public_key_weighted_opt ?subgroup_check pks_with_weights =
+  List.map (function w, Public_key.Bls12_381 s -> (w, s)) pks_with_weights
+  |> Bls.aggregate_public_key_weighted_opt ?subgroup_check
+  |> Option.map (fun s -> Public_key.Bls12_381 s)
+
+let pop_verify (Bls12_381 pubkey : public_key) ?msg proof =
+  Bls12_381_signature.MinPk.Pop.pop_verify pubkey ?msg proof

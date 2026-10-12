@@ -448,6 +448,50 @@ instructions:
         input: '(Pair -1  (Pair 1 (Pair "foobar" (Pair 0x00AABBCC (Pair 1000 (Pair False (Pair "tz1cxcwwnzENRdhe2Kb8ZdTrdNy4bFNyScx5" (Pair "2019-09-09T08:35:33Z" "tz1cxcwwnzENRdhe2Kb8ZdTrdNy4bFNyScx5"))))))))'
         initial_storage: 'Unit'
         final_storage: 'Unit'
+  INDEX_ADDRESS:
+    category: blockchain
+    proposed-in: ['ProtoALphaALphaALphaALphaALphaALphaALphaALphaDdp3zK']
+    since: ProtoALphaALphaALphaALphaALphaALphaALphaALphaDdp3zK
+    documentation_short: Returns a unique identifier for a given address
+    documentation: |
+      Returns a unique identifier for a given address, that can be used to store
+      an address more efficiently in a contract storage. The identifier is
+      global to the chain. The first time an address is indexed, the chain
+      generates a fresh identifier. Afterwards, any call to ``INDEX_ADDRESS``
+      will return the same identifier.
+
+      ``INDEX_ADDRESS`` cannot be used in views.
+    examples:
+      - name: Store addresses
+        description: |
+          This example demonstrates how the ``INDEX_ADDRESS`` instruction can be
+          used to store an address in the storage, using only the bytes to
+          represent the identifier.
+        path: opcodes/index_address_024.tz
+        input: '"tz1cxcwwnzENRdhe2Kb8ZdTrdNy4bFNyScx5"'
+        initial_storage: "None"
+        final_storage: "(Some 1)"
+  GET_ADDRESS_INDEX:
+    category: blockchain
+    proposed-in: ['ProtoALphaALphaALphaALphaALphaALphaALphaALphaDdp3zK']
+    since: ProtoALphaALphaALphaALphaALphaALphaALphaALphaDdp3zK
+    documentation_short: Find the unique identifier for a given address if any
+    documentation: |
+      Find the unique identifier for a given address if any, that can be used to store
+      an address more efficiently in a contract storage. The identifier is
+      global to the chain. The first time an address is indexed via ``INDEX_ADDRESS``,
+      the chain generates a fresh identifier. Afterwards, any call to ``GET_ADDRESS_INDEX``
+      will return its identifier.
+    examples:
+      - name: Find address' index
+        description: |
+          This example demonstrates how the ``GET_ADDRESS_INDEX`` instruction can be
+          used to retrieve an index.
+        path: opcodes/get_address_index_024.tz
+        input: '"tz1Ke2h7sDdakHJQh8WX4Z372du1KChsksyU"'
+        initial_storage: "None"
+        final_storage: "(Some 0)"
+
   BLAKE2B:
     category: crypto
     proposed-in: ['PtCJ7pwoxe8JasnHY8YonnLYjcVHmhiARPJvqcC6VfHT5s8k8sY']
@@ -546,7 +590,7 @@ instructions:
 
       When ``AND`` is used for bytes operands, the result bytes has the same length as the shorter operand.
       The prefix of the longer operand is cut to match with the length of the shorter one before taking the bitwise AND.
-      
+
     examples:
     - name: Boolean AND
       description: This contracts takes a pair of booleans, and computes and stores their conjunction.
@@ -709,7 +753,7 @@ instructions:
 
       The ``CONTRACT ty`` instruction has a variant ``CONTRACT %entrypoint ty``.
       It allows the specification of a specific
-      `entrypoint <http://tezos.gitlab.io/whitedoc/michelson.html#entrypoints>`_.
+      `entrypoint <http://octez.tezos.com/docs/active/michelson.html#entrypoints>`_.
       In addition to the requirements above, this variant is only
       well-typed if the address is a contract with an entrypoint named
       ``%entrypoint``. This works as follows:
@@ -843,7 +887,7 @@ instructions:
       initial_storage: 'Unit'
       final_storage:  'Unit'
       hide_final_storage: True
-        
+
   CREATE_ACCOUNT:
     category: deprecated
     proposed-in: ['PtCJ7pwoxe8JasnHY8YonnLYjcVHmhiARPJvqcC6VfHT5s8k8sY']
@@ -1141,7 +1185,7 @@ instructions:
     documentation_short: Create an implicit account
     documentation: |
       Push on the stack the contract value corresponding to the
-      `implicit account <http://tezos.gitlab.io/user/glossary.html#implicit-account>`_
+      `implicit account <http://octez.tezos.com/docs/active/glossary.html#user-account>`_
       of a public key hash. These contracts always have type ``unit``.
 
   ITER:
@@ -1194,16 +1238,16 @@ instructions:
     documentation_short: Logically left shift of a natural number and a byte sequence
     documentation: |
 
-      For natural numbers, the ``LSL`` instruction consumes two natural 
-      numbers and produces the first number logically left-shifted 
+      For natural numbers, the ``LSL`` instruction consumes two natural
+      numbers and produces the first number logically left-shifted
       by second number. This instruction is only defined if the second number
       is less than or equal to 256.
 
-      For bytes, the ``LSL`` instruction consumes one chunk of bytes and 
-      one natural number and produces the bytes logically left-shifted by 
-      the natural number using big-endian encoding. The vacated bits on 
-      the right are filled with 0s. The shifted bits are 0-padded 
-      on the left in order to keep all the original bits: for example, 
+      For bytes, the ``LSL`` instruction consumes one chunk of bytes and
+      one natural number and produces the bytes logically left-shifted by
+      the natural number using big-endian encoding. The vacated bits on
+      the right are filled with 0s. The shifted bits are 0-padded
+      on the left in order to keep all the original bits: for example,
       ``0x1234 LSL 1`` is ``0x002468``, instead of ``0x2468`` (the left most
       bit is lost) or ``0x00002468`` (not minimal padding). The length of
       the returned bytes by ``LSL`` is ``l + (s + 7) / 8`` bytes where ``l``
@@ -1403,7 +1447,7 @@ instructions:
       the ``SELF`` instruction has a variant ``SELF %entrypoint``,
       that is only well-typed if the current contract has an entrypoint named ``%entrypoint``.
       It returns the ``contract ty1`` corresponding to a specific
-      `entrypoint <http://tezos.gitlab.io/whitedoc/michelson.html#entrypoints>`_
+      `entrypoint <http://octez.tezos.com/docs/active/michelson.html#entrypoints>`_
       of the current contract, where ``ty1`` is the type of the ``%entrypoint``.
       Unlike for ``CONTRACT``, ``SELF %default`` is allowed and is
       strictly equal to ``SELF``.
@@ -1738,7 +1782,7 @@ instructions:
       ``BYTES`` encodes an integer or a natural number to bytes using the big-endian encoding.
       For integers, negative numbers are considered in `two's complement representation
       <https://en.wikipedia.org/wiki/Two's_complement>`_.
-  
+
   SAPLING_VERIFY_UPDATE:
     category: crypto
     proposed-in: ['PtEdoTezd3RHSC31mpxxo1npxFjoWWcFgQtxapi51Z8TLu6v6Uq']
@@ -1785,7 +1829,7 @@ instructions:
       Lastly the instruction pushes the updated state and balance as an ``option``
       on the stack.
 
-      Please see the `Sapling integration <https://tezos.gitlab.io/008/sapling.html>`_
+      Please see the `Sapling integration <https://octez.tezos.com/docs/active/sapling.html>`_
       page for a more comprehensive description of the Sapling protocol.
 
   SAPLING_EMPTY_STATE:
@@ -1796,7 +1840,7 @@ instructions:
       ``SAPLING_EMPTY_STATE ms`` pushes the empty Sapling state (i.e. no one can spend tokens from it)
       with memo size ``ms``.
 
-      Please see the `Sapling integration <https://tezos.gitlab.io/008/sapling.html>`_
+      Please see the `Sapling integration <https://octez.tezos.com/docs/active/sapling.html>`_
       page for a more comprehensive description of the Sapling protocol.
 
   TICKET:
@@ -2382,7 +2426,7 @@ types:
       ``sapling_transaction_deprecated ms`` is the type of Sapling
       transactions of memo-size ``ms``.
 
-      Please see the `Sapling integration <https://tezos.gitlab.io/008/sapling.html>`_
+      Please see the `Sapling integration <https://octez.tezos.com/docs/active/sapling.html>`_
       page for a more comprehensive description of the Sapling protocol.
     insertions:
       - 'sapling_transaction_deprecated 8'
@@ -2401,7 +2445,7 @@ types:
       ``sapling_state ms`` is the type of Sapling
       states of memo-size ``ms``.
 
-      Please see the `Sapling integration <https://tezos.gitlab.io/008/sapling.html>`_
+      Please see the `Sapling integration <https://octez.tezos.com/docs/active/sapling.html>`_
       page for a more comprehensive description of the Sapling protocol.
     examples:
       - ['{}', 'sapling_state 8']

@@ -51,9 +51,9 @@ module State = struct
   type t = Accepted | Running | Disconnected
 
   let pp_digram ppf = function
-    | Accepted -> Format.fprintf ppf "⚎"
-    | Running -> Format.fprintf ppf "⚌"
-    | Disconnected -> Format.fprintf ppf "⚏"
+    | Accepted -> Format.fprintf ppf "@{<fg_yellow>⚎@}"
+    | Running -> Format.fprintf ppf "@{<fg_green>⚌@}"
+    | Disconnected -> Format.fprintf ppf "@{<fg_red>⚏@}"
 
   let encoding =
     let open Data_encoding in
@@ -116,7 +116,8 @@ module Info = struct
              last_disconnection;
              last_seen;
              last_miss;
-           } ->
+           }
+         ->
         ( (score, trusted, conn_metadata, peer_metadata, state, id_point, stat),
           ( last_failed_connection,
             last_rejected_connection,
@@ -136,7 +137,8 @@ module Info = struct
                last_established_connection,
                last_disconnection,
                last_seen,
-               last_miss ) ) ->
+               last_miss ) )
+         ->
         {
           score;
           trusted;

@@ -1,0 +1,258 @@
+# Release site
+
+`release_site` is the component that owns the whole release website served at
+[`/releases/`](https://octez.tezos.com/releases/). It contains one tab for Octez
+and one for each other component (rollup node, teztale, grafazos, …), rendered
+from the components' `versions.json` manifests.
+
+The release assets are distributed either all at once (typically with Octez major releases) or for individual components (typically with Octez minor releases).
+
+To make these assets easily accessible, release pages can be generated using the `release_site/release_page.ml` script.
+This script enables the creation of release pages for any given component, specifying a set of asset types and the storage location where the assets are distributed.
+
+## Vocabulary and naming convention
+
+To remove the ambiguity between "the whole site" and "one component's page", we fix the following vocabulary:
+
+- **Release site**: the whole website served at `/releases/`. It is owned by the `release_site` component.
+- **Tab**: the per-component section of the release site (one for Octez, one per component). A tab is rendered from that component's `versions.json`.
+- **Assets**: the released files of a component together with its `versions.json` manifest.
+- **Deployment**: uploading a component's assets to the storage bucket. A deployment does not render any HTML.
+- **Rendering**: producing the release site's HTML from every component's `versions.json`. This is the responsibility of `release_site`.
+
+In Cacio, a job's fully-qualified name is prefixed by the name of the component that owns it, so the prefix tells us which component is responsible for the job:
+
+- A job prefixed by a component name acts only on that component's own assets.
+  In particular, each component owns a `<component>.deploy-assets` job that uploads its assets and updates its own `versions.json`, because deploying assets is the component's concern.
+- A job prefixed by `release_site` acts on the whole site.
+  In particular, `release_site.render` re-renders the entire site from every component's `versions.json`, because rendering is owned by the `release_site` component.
+
+Consequently there is no per-component render/publish job (e.g. no `teztale.release-page-publish`): components only deploy their assets, and the site is always rendered as a whole by `release_site`.
+
+## Usage
+
+Details on the usage are available with:
+
+```shell
+release_page --help
+```
+
+## Example
+
+```shell
+release_page --component rollup-node --title "Rollup Node Releases" --bucket release-page-test.nomadic-labs.com --path releases/ changelog binaries packages
+```
+
+will create a release page titled `Rollup Node Releases` for the `rollup-node` component.
+The page will contain asset sections for each version, read from `release-page-test.nomadic-labs.com/releases/rollup-node/versions.json`.
+The sections will contain:
+  - A link to the changelogs.
+  - A list of links to download binaries stored in `release-page-test.nomadic-labs.com/releases/rollup-node/rollup-node-vx.y/binaries/`.
+  - A link to the packages install instructions.
+
+## Rendering the whole site
+
+The invocations above render a single component's page. To render the whole
+release site at once, use `--site`:
+
+```shell
+release_page --site --bucket BUCKET --url URL --path PATH --output-dir DIR
+```
+
+This renders every component from the built-in catalog (`site_catalog` in
+`release_site/src/release_page.ml`), each from its published `versions.json`,
+into `DIR`: octez at the root, each other component under its own
+subdirectory. The catalog is the single source of truth for which components
+belong to the site and which asset types each one publishes.
+
+This is what the `release_site.render` CI job runs (through
+`release_site/scripts/render_release_site.sh`, which also generates the octez
+RSS feed, uploads the site and invalidates the CDN). Rendering is owned by
+`release_site` and always operates on the whole site, as described in the
+vocabulary section above; components only deploy their own assets.
+
+Because the render always rebuilds the whole site, every component's release
+pipeline re-renders and re-uploads every tab (including octez's). This keeps the
+site consistent, but it also means any component's release depends on every
+other component's published `versions.json` being readable: a malformed
+`versions.json` for one component would fail the render of any component's
+release.
+
+The script lists the assets by reading the contents of directories in
+`s3://release-page-test.nomadic-labs.com/releases/`.
+
+## Storage
+
+Currently, the release page uses S3 buckets for asset storage.
+
+As mentioned in the usage documentation, you should use the `--bucket BUCKET` and `--path PATH` arguments to specify the bucket and path where the release page assets are stored. `BUCKET` is the address of the bucket, and `PATH` is the location within the bucket where the assets are kept.
+The `PATH` argument is optional; if not provided, the root of the bucket will be used.
+
+The `version_manager` tool operates on a local `versions.json` file specified by `--file`. To interact with remote storage, use the `download` and `upload` subcommands with `--path`:
+
+```shell
+# Download versions.json from remote storage
+version_manager --file versions.json download --path BUCKET/PATH
+
+# Operate on local file (no remote access needed)
+version_manager --file versions.json add --major 25 --minor 0
+version_manager --file versions.json set-latest --major 25 --minor 0
+
+# Upload versions.json back to remote storage
+version_manager --file versions.json upload --path BUCKET/PATH
+```
+
+### RSS Feed
+
+The `version_manager` tool can generate an RSS feed for the releases:
+
+```shell
+version_manager --file versions.json generate-rss --path octez.tezos.com/releases --output feed.xml
+```
+
+- `--path PATH` (required): used to construct the default feed link (`https://PATH`) unless `--base-url` is provided.
+- `--base-url URL` (optional): overrides the base URL used for feed links.
+- `--output FILE` (optional): path to write the RSS feed to. Defaults to `feed.xml` in the current directory.
+
+The `release_page` script makes the following assumptions:
+
+  - Each component `COMPONENT` has a base path of `BUCKET/PATH/COMPONENT`, which we refer to as `COMPONENT_LOCATION`.
+    The only exception is component `octez`, for which the base path is `BUCKET/PATH`.
+  - For each component, `COMPONENT_LOCATION/versions.json` contains the list of released versions for this component.
+  - For each component, assets for this component are stored in `COMPONENT_LOCATION/COMPONENT-VERSION/`.
+    For instance, executables are stored in `COMPONENT_LOCATION/COMPONENT-VERSION/binaries/ARCH`.
+  -  `COMPONENT_LOCATION/COMPONENT-VERSION/binaries/arch` contains a `sha256sums.txt` file listing the executables checksums.
+
+Thus, the bucket structure should look like this:
+
+```
+s3://<BUCKET>/<PATH>/
+├── versions.json
+├── octez-vX.Y
+│   ├── binaries/x86_64/
+│   │   ├── sha256sums.txt
+│   │   ├── exe1
+│   │   ├── ...
+│   ├── binaries/arm64/
+│   │   ├── sha256sums.txt
+│   │   ├── exe1
+│   │   ├── ...
+│   └── .../
+├── ...
+├── COMPONENT/
+│   ├── versions.json
+│   ├── COMPONENT-vX.Y/
+│   │   ├── binaries/x86_64/
+│   │   │   ├── sha256sums.txt
+│   │   │   ├── exe1
+│   │   │   ├── ...
+│   │   ├── binaries/arm64/
+│   │   ├── .../
+│   └── .../
+```
+
+## Version
+
+As detailed in the previous section, each component are required to have `COMPONENT_LOCATION/versions.json`.
+
+This file is a JSON file with the following schema:
+
+```
+{
+  "type": "array",
+  "items": {
+    "type": "object",
+    "properties": {
+      "major": { "type": "integer" },
+      "minor": { "type": "integer" },
+      "prerelease": {
+        "type": "object",
+        "properties": {
+          "kind": { "type": "string", "enum": ["rc", "beta"] },
+          "number": { "type": "integer" }
+        },
+        "required": ["kind", "number"]
+      },
+      "revisions": {
+        "type": "array",
+        "items": {
+          "type": "object",
+          "properties": {
+            "buildNumber": { "type": "integer" },
+            "revisionDate": { "type": "number" }
+          },
+          "required": ["buildNumber", "revisionDate"]
+        }
+      },
+      "latest": { "type": "boolean" },
+      "active": { "type": "boolean" },
+      "announcement": { "type": "string" },
+      "pubDate": { "type": "number" }
+    },
+    "required": ["major", "minor"]
+  }
+}
+```
+
+For backward compatibility, the parser also accepts the legacy flat fields `rc` (integer) and `beta` (integer) instead of the `prerelease` object.
+
+Each item of the array represents a version `<major>.<minor>[~rc<N>|~beta<N>]`.
+If `latest` is `true`, the version will be identified as "latest" in the generated page, for instance by appending "(latest)" to its section title. Only one version should be identified as latest, although this is not enforced by the script.
+
+The `revisions` field is an optional array that tracks packaging revisions. Each time a packaging revision tag (e.g. `octez-v20.0-1`, `octez-v20.0-2`) is processed, a new entry is appended with the revision's `buildNumber` and `revisionDate`. This preserves the full history of packaging revisions. The version string and S3 paths are not affected. The RSS feed generates a distinct entry for each revision alongside the original release entry.
+
+For backward compatibility, the parser also accepts the legacy flat fields `buildNumber` (integer) and `revisionDate` (number) and converts them into a single-element `revisions` list.
+
+For instance, a valid JSON would look like:
+
+```
+[
+  {
+    "major": 22,
+    "minor": 1,
+    "active": true,
+    "announcement": "https://octez.tezos.com/docs/releases/version-22.html"
+  },
+  {
+    "major": 23,
+    "minor": 0,
+    "prerelease": { "kind": "beta", "number": 1 },
+    "announcement": "https://octez.tezos.com/docs/releases/version-23.html"
+  },
+  {
+    "major": 23,
+    "minor": 0,
+    "prerelease": { "kind": "rc", "number": 1 },
+    "announcement": "https://octez.tezos.com/docs/releases/version-23.html"
+  },
+  {
+    "major": 23,
+    "minor": 0,
+    "latest": true,
+    "active": true,
+    "revisions": [
+      { "buildNumber": 1, "revisionDate": 1740000000.0 },
+      { "buildNumber": 2, "revisionDate": 1741000000.0 }
+    ],
+    "announcement": "https://octez.tezos.com/docs/releases/version-23.html"
+  }
+]
+```
+
+## Assets
+
+There are 3 types of assets that can be represented in the release page:
+  - `changelog`
+  - `packages`
+  - `binaries`
+  - `dashboards`
+
+The `changelog` will simply be represented by a section with a link to the changelog of the version.
+
+The `packages` will be described by a section for each architecture containing a link to the instruction to install or update the packages (Debian, …).
+
+The `binaries` will be represented as a list of links to download each binary, along with its associated checksum.
+The binaries are those listed in `BUCKET/PATH/COMPONENT/COMPONENT-vX.Y/binaries/ARCH/`.
+
+The `dashboards` will be represented as a list of links to download each dashboard JSON file, along with its associated checksum.
+The JSON files are those listed in `BUCKET/PATH/COMPONENT/COMPONENT-vX.Y/dashboards/`.

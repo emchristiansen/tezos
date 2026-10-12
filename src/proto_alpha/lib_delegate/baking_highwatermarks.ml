@@ -42,9 +42,9 @@ let pp_highwatermark fmt {round; level} =
 
 type error += Block_previously_baked of highwatermark
 
-type error += Block_previously_preendorsed of highwatermark
+type error += Block_previously_preattested of highwatermark
 
-type error += Block_previously_endorsed of highwatermark
+type error += Block_previously_attested of highwatermark
 
 let () =
   register_error_kind
@@ -65,44 +65,43 @@ let () =
     (fun highwatermark -> Block_previously_baked highwatermark) ;
   register_error_kind
     `Permanent
-    ~id:"highwatermarks.block_previously_preendorsed"
-    ~title:"Block previously preendorsed"
-    ~description:
-      "Trying to preendorse a block at a level previously preendorsed"
+    ~id:"highwatermarks.block_previously_preattested"
+    ~title:"Block previously preattested"
+    ~description:"Trying to preattest a block at a level previously preattested"
     ~pp:(fun ppf highwatermark ->
       Format.fprintf
         ppf
-        "A preendorsement with a higher watermark than the current one (%a) \
+        "A preattestation with a higher watermark than the current one (%a) \
          was already produced."
         pp_highwatermark
         highwatermark)
     highwatermark_encoding
     (function
-      | Block_previously_preendorsed highwatermark -> Some highwatermark
+      | Block_previously_preattested highwatermark -> Some highwatermark
       | _ -> None)
-    (fun highwatermark -> Block_previously_preendorsed highwatermark) ;
+    (fun highwatermark -> Block_previously_preattested highwatermark) ;
   register_error_kind
     `Permanent
-    ~id:"highwatermarks.block_previously_endorsed"
-    ~title:"Block previously endorsed"
-    ~description:"Trying to endorse a block at a level previously endorsed"
+    ~id:"highwatermarks.block_previously_attested"
+    ~title:"Block previously attested"
+    ~description:"Trying to attest a block at a level previously attested"
     ~pp:(fun ppf highwatermark ->
       Format.fprintf
         ppf
-        "An endorsement with a higher watermark than the current one (%a) was \
+        "An attestation with a higher watermark than the current one (%a) was \
          already produced."
         pp_highwatermark
         highwatermark)
     highwatermark_encoding
     (function
-      | Block_previously_endorsed highwatermark -> Some highwatermark
+      | Block_previously_attested highwatermark -> Some highwatermark
       | _ -> None)
-    (fun highwatermark -> Block_previously_endorsed highwatermark)
+    (fun highwatermark -> Block_previously_attested highwatermark)
 
 module DelegateMap = Map.Make (struct
-  type t = Signature.Public_key_hash.t
+  type t = Baking_state_types.Key_id.t
 
-  let compare = Signature.Public_key_hash.compare
+  let compare = Baking_state_types.Key_id.compare
 end)
 
 let highwatermark_delegate_map_encoding =
@@ -113,13 +112,13 @@ let highwatermark_delegate_map_encoding =
       fun l -> List.fold_left (fun map (k, v) -> add k v map) empty l)
     (list
        (obj2
-          (req "delegate" Signature.Public_key_hash.encoding)
+          (req "delegate" Baking_state_types.Key_id.encoding)
           (req "highwatermark" highwatermark_encoding)))
 
 type highwatermarks = {
   blocks : highwatermark DelegateMap.t;
-  preendorsements : highwatermark DelegateMap.t;
-  endorsements : highwatermark DelegateMap.t;
+  preattestations : highwatermark DelegateMap.t;
+  attestations : highwatermark DelegateMap.t;
 }
 
 type t = highwatermarks
@@ -127,20 +126,20 @@ type t = highwatermarks
 let encoding =
   let open Data_encoding in
   conv
-    (fun {blocks; preendorsements; endorsements} ->
-      (blocks, preendorsements, endorsements))
-    (fun (blocks, preendorsements, endorsements) ->
-      {blocks; preendorsements; endorsements})
+    (fun {blocks; preattestations; attestations} ->
+      (blocks, preattestations, attestations))
+    (fun (blocks, preattestations, attestations) ->
+      {blocks; preattestations; attestations})
     (obj3
        (req "blocks" highwatermark_delegate_map_encoding)
-       (req "preendorsements" highwatermark_delegate_map_encoding)
-       (req "endorsements" highwatermark_delegate_map_encoding))
+       (req "preattestations" highwatermark_delegate_map_encoding)
+       (req "attestations" highwatermark_delegate_map_encoding))
 
 let empty =
   {
     blocks = DelegateMap.empty;
-    preendorsements = DelegateMap.empty;
-    endorsements = DelegateMap.empty;
+    preattestations = DelegateMap.empty;
+    attestations = DelegateMap.empty;
   }
 
 (* We do not lock these functions. The caller will be already locked. *)
@@ -165,16 +164,15 @@ let may_sign highwatermarks ~delegate ~level ~round =
 
 let may_sign_block cctxt (location : [`Highwatermarks] Baking_files.location)
     ~delegate ~level ~round =
-  load cctxt location >>=? fun all_highwatermarks ->
+  let open Lwt_result_syntax in
+  let* all_highwatermarks = load cctxt location in
   return @@ may_sign all_highwatermarks.blocks ~delegate ~level ~round
 
-let may_sign_preendorsement cctxt location ~delegate ~level ~round =
-  load cctxt location >>=? fun all_highwatermarks ->
-  return @@ may_sign all_highwatermarks.preendorsements ~delegate ~level ~round
+let may_sign_preattestation all_highwatermarks ~delegate ~level ~round =
+  may_sign all_highwatermarks.preattestations ~delegate ~level ~round
 
-let may_sign_endorsement cctxt location ~delegate ~level ~round =
-  load cctxt location >>=? fun all_highwatermarks ->
-  return @@ may_sign all_highwatermarks.endorsements ~delegate ~level ~round
+let may_sign_attestation all_highwatermarks ~delegate ~level ~round =
+  may_sign all_highwatermarks.attestations ~delegate ~level ~round
 
 let record map ~delegate ~new_level ~new_round =
   DelegateMap.update
@@ -193,20 +191,22 @@ let record map ~delegate ~new_level ~new_round =
 
 let record_block (cctxt : #Protocol_client_context.full) location ~delegate
     ~level ~round =
+  let open Lwt_result_syntax in
   let filename = Baking_files.filename location in
-  load cctxt location >>=? fun highwatermarks ->
+  let* highwatermarks = load cctxt location in
   let new_blocks =
     record highwatermarks.blocks ~delegate ~new_level:level ~new_round:round
   in
   save_highwatermarks cctxt filename {highwatermarks with blocks = new_blocks}
 
-let record_preendorsement (cctxt : #Protocol_client_context.full) location
+let record_preattestation (cctxt : #Protocol_client_context.full) location
     ~delegate ~level ~round =
+  let open Lwt_result_syntax in
   let filename = Baking_files.filename location in
-  load cctxt location >>=? fun highwatermarks ->
-  let new_preendorsements =
+  let* highwatermarks = load cctxt location in
+  let new_preattestations =
     record
-      highwatermarks.preendorsements
+      highwatermarks.preattestations
       ~delegate
       ~new_level:level
       ~new_round:round
@@ -214,15 +214,16 @@ let record_preendorsement (cctxt : #Protocol_client_context.full) location
   save_highwatermarks
     cctxt
     filename
-    {highwatermarks with preendorsements = new_preendorsements}
+    {highwatermarks with preattestations = new_preattestations}
 
-let record_endorsement (cctxt : #Protocol_client_context.full) location
+let record_attestation (cctxt : #Protocol_client_context.full) location
     ~delegate ~level ~round =
+  let open Lwt_result_syntax in
   let filename = Baking_files.filename location in
-  load cctxt location >>=? fun highwatermarks ->
-  let new_endorsements =
+  let* highwatermarks = load cctxt location in
+  let new_attestations =
     record
-      highwatermarks.endorsements
+      highwatermarks.attestations
       ~delegate
       ~new_level:level
       ~new_round:round
@@ -230,4 +231,34 @@ let record_endorsement (cctxt : #Protocol_client_context.full) location
   save_highwatermarks
     cctxt
     filename
-    {highwatermarks with endorsements = new_endorsements}
+    {highwatermarks with attestations = new_attestations}
+
+let record_all_preattestations all_highwatermarks cctxt location ~delegates
+    ~level ~round =
+  let new_preattestations =
+    List.fold_left
+      (fun map delegate ->
+        record map ~delegate ~new_level:level ~new_round:round)
+      all_highwatermarks.preattestations
+      delegates
+  in
+  let filename = Baking_files.filename location in
+  save_highwatermarks
+    cctxt
+    filename
+    {all_highwatermarks with preattestations = new_preattestations}
+
+let record_all_attestations all_highwatermarks cctxt location ~delegates ~level
+    ~round =
+  let new_attestations =
+    List.fold_left
+      (fun map delegate ->
+        record map ~delegate ~new_level:level ~new_round:round)
+      all_highwatermarks.attestations
+      delegates
+  in
+  let filename = Baking_files.filename location in
+  save_highwatermarks
+    cctxt
+    filename
+    {all_highwatermarks with attestations = new_attestations}

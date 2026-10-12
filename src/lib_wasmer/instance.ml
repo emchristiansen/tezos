@@ -23,12 +23,17 @@
 (*                                                                           *)
 (*****************************************************************************)
 
-(* For documentation please refer to the [Tezos_wasmer] module. *)
+(** WebAssembly module instance.
+
+    An instance is a module that has been linked with its imports and is
+    ready to execute. Instantiation resolves imports against a provided
+    set of externs, and runs asynchronously via [Lwt_preemptive]. *)
 
 open Api
 open Vectors
 open Utils
 
+(** Import resolver map keyed by (module, name, extern kind). *)
 module Resolver = Map.Make (struct
   type t = string * string * Types.Externkind.t
 
@@ -41,15 +46,13 @@ module Resolver = Map.Make (struct
     | r, _, _ -> r
 end)
 
-(* TODO: https://gitlab.com/tezos/tezos/-/issues/4026
-   Ensure that ownership and lifetime of [Types.Instance.t] is respected.
-*)
 type t = {
   module_ : Module.t;
   instance : Types.Instance.t Ctypes.ptr;
   clean : unit -> unit;
 }
 
+(** Raised when an import required by the module is not provided. *)
 exception
   Unsatisfied_import of {
     module_ : string;
@@ -57,6 +60,11 @@ exception
     kind : Types.Externkind.t;
   }
 
+(** [resolve_imports store modul resolver] matches the module's import
+    descriptors against the provided [resolver] map and returns the extern
+    vector, a post-instantiation cleanup function, and a final cleanup
+    function. Raises {!Unsatisfied_import} if an import cannot be
+    resolved. *)
 let resolve_imports store modul resolver =
   let lookup import =
     let module_ = Import_type.module_ import in
@@ -67,11 +75,10 @@ let resolve_imports store modul resolver =
     | None -> raise (Unsatisfied_import {module_; name; kind})
     | Some m -> Extern.to_extern store m
   in
-  let imports =
-    Module.imports modul |> Import_type_vector.to_array |> Array.map lookup
-  in
+  let imports_vec = Module.imports modul in
+  let imports = Import_type_vector.to_array imports_vec |> Array.map lookup in
   let externs = Extern_vector.from_array (Array.map fst imports) in
-  let clean =
+  let clean () =
     Array.fold_left
       (fun clean_all (_, clean) ->
         () ;
@@ -80,12 +87,27 @@ let resolve_imports store modul resolver =
           clean x)
       Fun.id
       imports
+      ()
   in
-  (externs, clean)
+  (* There are no references to the imports vector after this, so we can
+     delete it. *)
+  Functions.Importtype_vec.delete (Ctypes.addr imports_vec) ;
+  let clean_after_instantiation () =
+    (* Once the [externs] have been used during instantiation, we can get rid
+       of the handles on our side because the underlying extern objects are
+       kept alive on the Wasmer side. *)
+    Functions.Extern_vec.delete (Ctypes.addr externs)
+  in
+  (externs, clean_after_instantiation, clean)
 
+(** [create store module_ externs] instantiates a WebAssembly module with
+    the given imports. Each element of [externs] is a
+    [(module_name, name, extern)] triple. The instantiation runs in a
+    detached thread via [Lwt_preemptive]. Raises {!Trap.Trap} if a trap
+    occurs during start function execution. *)
 let create store module_ externs =
   let open Lwt.Syntax in
-  let externs_vec, clean =
+  let externs_vec, clean_after_instantiation, clean =
     externs
     |> List.map (fun (module_, name, extern) ->
            ((module_, name, Extern.to_externkind extern), extern))
@@ -96,11 +118,19 @@ let create store module_ externs =
   let trap = Ctypes.allocate_n (Ctypes.ptr Types.Trap.t) ~count:1 in
   Ctypes.(trap <-@ Trap.none) ;
 
-  let+ instance =
+  let instantiate () =
     Lwt_preemptive.detach
       (fun (store, module_, externs_vec, trap) ->
         Functions.Instance.new_ store module_ (Ctypes.addr externs_vec) trap)
       (store, module_, externs_vec, trap)
+  in
+
+  let+ instance =
+    Lwt.finalize instantiate (fun () ->
+        (* At this point we can clean up some objects because the instantiation has
+           acquired its own handles to relevant objects. *)
+        clean_after_instantiation () ;
+        Lwt.return_unit)
   in
 
   let trap = Ctypes.(!@trap) in
@@ -110,6 +140,8 @@ let create store module_ externs =
 
   {module_; instance; clean}
 
+(** [delete inst] destroys the instance and cleans up associated
+    resources. Must not be used after this call. *)
 let delete inst =
   Functions.Instance.delete inst.instance ;
   inst.clean ()

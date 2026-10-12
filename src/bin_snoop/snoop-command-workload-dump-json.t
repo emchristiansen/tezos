@@ -1,23 +1,21 @@
 Run benchmark to dump json data later
-  $ ./main_snoop.exe benchmark proto/alpha/interpreter/N_IBlake2b and save to data.workload --bench-num 2 --nsamples 3 > /dev/null 2> /dev/null
+  $ ./main_snoop.exe benchmark interpreter/N_IBlake2b and save to data.workload --bench-num 2 --nsamples 3 > /dev/null 2> /dev/null
 
 Dump workload json to file
-  $ ./main_snoop.exe workload dump data.workload to data.json 2>&1 |grep -v "already registered for code"
+  $ ./main_snoop.exe workload dump data.workload -o data.json 2>&1 |grep -v "already registered for code"
   Measure.load: loaded data.workload
   Measure.packed_measurement_save_json: saved to data.json
 
 Echo data.json file.
-  $ cat data.json | jq  '(.measurement_data.date |= "DATE") | (.measurement_data.workload_data |= map((.measures |= map("TIME")) | (.workload[0][1][0][1] |= "SIZE")))'
+  $ cat data.json | jq  '(.measurement_data.date |= "DATE") | (.measurement_data.workload_data |= map((.measures |= map("TIME")) | (.workload[0][1][0][1] |= "SIZE"))) | (.measurement_data.benchmark_options.seed |= "SEED")'
   {
     "benchmark_namespace": [
-      "proto",
-      "alpha",
       "interpreter",
       "N_IBlake2b"
     ],
     "measurement_data": {
       "benchmark_options": {
-        "seed": null,
+        "seed": "SEED",
         "samples_per_bench": "3",
         "bench_number": "2",
         "minor_heap_size": "262144",

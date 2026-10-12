@@ -60,8 +60,7 @@ val entrypoint_arg : (Entrypoint.t option, full) Tezos_clic.arg
 
 val default_entrypoint_arg : (Entrypoint.t option, full) Tezos_clic.arg
 
-val delegate_arg :
-  (Tezos_crypto.Signature.Public_key_hash.t option, full) Tezos_clic.arg
+val delegate_arg : (Signature.Public_key_hash.t option, full) Tezos_clic.arg
 
 val max_priority_arg : (int option, full) Tezos_clic.arg
 
@@ -102,15 +101,23 @@ val tez_param :
   ('a, full) Tezos_clic.params ->
   (Tez.t -> 'a, full) Tezos_clic.params
 
-val non_negative_z_parameter : (Z.t, full) Tezos_clic.parameter
+val non_negative_z_parameter :
+  unit -> (Z.t, #Client_context.io) Tezos_clic.parameter
 
 val non_negative_z_param :
   name:string ->
   desc:string ->
-  ('a, full) Tezos_clic.params ->
-  (Z.t -> 'a, full) Tezos_clic.params
+  ('a, (#Client_context.io as 'b)) Tezos_clic.params ->
+  (Z.t -> 'a, 'b) Tezos_clic.params
 
-val non_negative_parameter : (int, full) Tezos_clic.parameter
+val non_negative_parameter :
+  unit -> (int, #Client_context.io) Tezos_clic.parameter
+
+val non_negative_param :
+  name:string ->
+  desc:string ->
+  ('a, (#Client_context.io as 'b)) Tezos_clic.params ->
+  (int -> 'a, 'b) Tezos_clic.params
 
 val global_constant_param :
   name:string ->
@@ -118,7 +125,7 @@ val global_constant_param :
   ('a, full) Tezos_clic.params ->
   (string -> 'a, full) Tezos_clic.params
 
-val signature_parameter : (Tezos_crypto.Signature.t, full) Tezos_clic.parameter
+val signature_parameter : (Signature.t, full) Tezos_clic.parameter
 
 module Daemon : sig
   val baking_switch : (bool, full) Tezos_clic.arg
@@ -153,7 +160,14 @@ val json_parameter : (Data_encoding.Json.t, full) Tezos_clic.parameter
 
 val data_parameter : (Michelson_v1_parser.parsed, full) Tezos_clic.parameter
 
-val raw_level_parameter : (Raw_level.t, full) Tezos_clic.parameter
+val raw_level_parameter :
+  unit -> (Raw_level.t, #Client_context.io) Tezos_clic.parameter
+
+val raw_level_param :
+  name:string ->
+  desc:string ->
+  ('a, (#Client_context.io as 'b)) Tezos_clic.params ->
+  (Raw_level.t -> 'a, 'b) Tezos_clic.params
 
 val unparsing_mode_arg :
   default:string -> (Script_ir_unparser.unparsing_mode, full) Tezos_clic.arg
@@ -249,6 +263,12 @@ end
 
 module Sc_rollup_params : sig
   val sc_rollup_address_parameter : (Sc_rollup.t, full) Tezos_clic.parameter
+
+  val sc_rollup_address_param :
+    ?name:string ->
+    ?desc:string ->
+    ('a, full) Tezos_clic.params ->
+    (Sc_rollup.t -> 'a, full) Tezos_clic.params
 
   val rollup_kind_parameter : (Sc_rollup.Kind.t, full) Tezos_clic.parameter
 

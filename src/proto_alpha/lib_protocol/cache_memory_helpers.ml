@@ -82,8 +82,6 @@ let ( +? ) s x = Saturation_repr.add s !!x
 
 let ( *? ) s x = Saturation_repr.mul s !!x
 
-let ( /? ) s x = Saturation_repr.ediv s !!x
-
 let ( ++ ) (n1, s1) (n2, s2) = (Nodes.add n1 n2, s1 +! s2)
 
 let zero = (Nodes.zero, !!0)
@@ -147,7 +145,7 @@ let option_size_vec some x =
   Option.fold ~none:zero ~some x
 
 let list_cell_size elt_size = header_size +! word_size +! word_size +! elt_size
-  [@@ocaml.inline always]
+[@@ocaml.inline always]
 
 let list_fold_size elt_size list =
   List.fold_left
@@ -156,7 +154,7 @@ let list_fold_size elt_size list =
     list
 
 let boxed_tup2 x y = header_size +! word_size +! word_size +! x +! y
-  [@@ocaml.inline always]
+[@@ocaml.inline always]
 
 let node_size =
   let open Micheline in

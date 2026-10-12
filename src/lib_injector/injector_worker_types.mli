@@ -1,7 +1,8 @@
 (*****************************************************************************)
 (*                                                                           *)
 (* Open Source License                                                       *)
-(* Copyright (c) 2022 Nomadic Labs, <contact@nomadic-labs.com>               *)
+(* Copyright (c) 2023 Nomadic Labs, <contact@nomadic-labs.com>               *)
+(* Copyright (c) 2023 Functori, <contact@functori.com>                       *)
 (*                                                                           *)
 (* Permission is hereby granted, free of charge, to any person obtaining a   *)
 (* copy of this software and associated documentation files (the "Software"),*)
@@ -23,23 +24,31 @@
 (*                                                                           *)
 (*****************************************************************************)
 
-open Injector_common
 open Injector_sigs
 
-module Request (Inj_operation : INJECTOR_OPERATION) : sig
+module Request (Tag : TAG) (L1_operation : INJECTOR_OPERATION) : sig
+  (** Criteria to specify which operation to remove from the
+      injector. *)
+  type removal_criteria =
+    | Operation_tag of Tag.t
+        (** [Operation_tag kind] Clear all operation of type [kind] *)
+    | Order_below of (Z.t * bool)
+        (** [Order_below (order, drop_no_order] Clear all operation
+            that have an order specified below [order]. If
+            [drop_no_order] also clear all operation that has no order
+            specified.  *)
+    | Tag_and_order_below of (Tag.t * Z.t * bool)
+        (** [Tag_and_order_below (kind, order, drop_no_order)] Apply
+            {!Order_below} but only for operation of type [kind]. *)
+
   type ('a, 'b) t =
-    | Add_pending : Inj_operation.t -> (unit, error trace) t
-    | New_tezos_head :
-        (Block_hash.t * int32) * (Block_hash.t * int32) reorg
-        -> (unit, error trace) t
     | Inject : (unit, error trace) t
+    | Clear : removal_criteria option -> (unit, error trace) t
 
   type view = View : _ t -> view
 
   include
-    Worker_intf.REQUEST
+    Octez_telemetry.Worker.REQUEST
       with type ('a, 'request_error) t := ('a, 'request_error) t
        and type view := view
 end
-
-module Name : Worker_intf.NAME with type t = Signature.public_key_hash

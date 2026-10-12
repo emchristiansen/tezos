@@ -26,15 +26,16 @@
 (** Testing
     -------
     Component:  Context Storage
-    Invocation: dune exec \
-                src/proto_alpha/lib_protocol/test/integration/main.exe \
-                -- test storage
+    Invocation: dune exec src/proto_alpha/lib_protocol/test/integration/main.exe \
+                 -- --file test_storage.ml
     Subject:    Test the correctnesss of debug message from storage_functor
  *)
 
 open Protocol
 open Storage_functors
 open Storage_sigs
+
+let register_test = Tezt_helpers.register_test ~__FILE__ ~file_tags:["storage"]
 
 module Int32 = struct
   type t = int32
@@ -218,22 +219,16 @@ let test_register_indexed_subcontext_2 () =
   in
   must_failwith f_prog error
 
-let tests =
-  [
-    Alcotest_lwt.test_case
-      "register single data in existing path"
-      `Quick
-      (fun _ -> test_register_single_data);
-    Alcotest_lwt.test_case
-      "register named subcontext in existing path"
-      `Quick
-      (fun _ -> test_register_named_subcontext);
-    Alcotest_lwt.test_case
-      "register indexed subcontext in existing path"
-      `Quick
-      (fun _ -> test_register_indexed_subcontext);
-    Alcotest_lwt.test_case
-      "register indexed subcontext with existing indexed subcontext"
-      `Quick
-      (fun _ -> test_register_indexed_subcontext_2);
-  ]
+let () =
+  register_test
+    ~title:"register single data in existing path"
+    test_register_single_data ;
+  register_test
+    ~title:"register named subcontext in existing path"
+    test_register_named_subcontext ;
+  register_test
+    ~title:"register indexed subcontext in existing path"
+    test_register_indexed_subcontext ;
+  register_test
+    ~title:"register indexed subcontext with existing indexed subcontext"
+    test_register_indexed_subcontext_2

@@ -45,7 +45,12 @@ type return = unit
 (** Speed levels.
 
     In Alcotest, one can ask not to run slow tests with [-q] from the command-line.
-    In Tezt, the equivalent is [-a quick]. *)
+    In Tezt, the equivalent is [quick].
+
+    Tests registered with [`Slow] or [`Quick] will have respectively the tag
+    ["slow"] or ["quick"].
+    ["slow"] tag may have consequences on how the test will be handled by the
+    CI. More information is given in [src/lib_test/tag.mli]. *)
 type speed_level = [`Quick | `Slow]
 
 (** Test cases.
@@ -69,10 +74,22 @@ type 'a test = string * 'a test_case list
 
     In Tezt, this calls [Test.register] but does not actually run the test suite.
     The name of the test suite is used as the filename for the Tezt test. *)
-val run : string -> unit test list -> return
+val run :
+  __FILE__:string -> ?tags:string list -> string -> unit test list -> return
+
+module type TESTABLE = sig
+  (** The type to test. *)
+  type t
+
+  (** A way to pretty-print the value. *)
+  val pp : Format.formatter -> t -> unit
+
+  (** Test for equality between two values. *)
+  val equal : t -> t -> bool
+end
 
 (** Values that can be tested with {!check}. *)
-type 'a testable = (module Tezt_core.Check.EQUALABLE with type t = 'a)
+type 'a testable = (module TESTABLE with type t = 'a)
 
 (** [testable pp eq] is a new {!type-testable} with the pretty-printer [pp] and
     equality [eq]. *)
@@ -82,8 +99,14 @@ val testable :
 (** [pp t] is [t]'s pretty-printer. *)
 val pp : 'a testable -> Format.formatter -> 'a -> return
 
+(** [of_pp pp] tests values which can be printed using [pp] and compared using {!Stdlib.compare} *)
+val of_pp : (Format.formatter -> 'a -> return) -> 'a testable
+
 (** [equal t] is [t]'s equality. *)
 val equal : 'a testable -> 'a -> 'a -> bool
+
+(** The [unit] testable type. *)
+val unit : unit testable
 
 (** The [string] testable type. *)
 val string : string testable
@@ -121,6 +144,10 @@ val triple :
 
 (** The result testable type. *)
 val result : 'a testable -> 'e testable -> ('a, 'e) result testable
+
+(** The reject testable type.
+    [reject] always fails on values of any type. *)
+val reject : 'a testable
 
 (** The option testable type. *)
 val option : 'a testable -> 'a option testable

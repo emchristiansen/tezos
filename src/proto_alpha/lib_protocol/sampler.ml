@@ -62,6 +62,8 @@ module type S = sig
   val sample : 'a t -> (int_bound:int -> mass_bound:mass -> int * mass) -> 'a
 
   val encoding : 'a Data_encoding.t -> 'a t Data_encoding.t
+
+  val map : ('a -> 'b) -> 'a t -> 'b t
 end
 
 module Make (Mass : SMass) : S with type mass = Mass.t = struct
@@ -113,13 +115,13 @@ module Make (Mass : SMass) : S with type mass = Mass.t = struct
     let fallback, total, measure = check_and_cleanup measure in
     let length = List.length measure in
     let n = Mass.of_int length in
-    let _, small, large =
-      List.fold_left
-        (fun (i, small, large) (_, p) ->
+    let small, large =
+      List.fold_left_i
+        (fun i (small, large) (_, p) ->
           let q = Mass.mul p n in
-          if Mass.(q < total) then (i + 1, (q, i) :: small, large)
-          else (i + 1, small, (q, i) :: large))
-        (0, [], [])
+          if Mass.(q < total) then ((q, i) :: small, large)
+          else (small, (q, i) :: large))
+        ([], [])
         measure
     in
     let support = support ~fallback measure in
@@ -174,6 +176,9 @@ module Make (Mass : SMass) : S with type mass = Mass.t = struct
          (req "support" (array_encoding enc))
          (req "p" mass_array_encoding)
          (req "alias" int_array_encoding))
+
+  let map f ({support; _} as sampler) =
+    {sampler with support = FallbackArray.map f support}
 end
 
 module Internal_for_tests = struct

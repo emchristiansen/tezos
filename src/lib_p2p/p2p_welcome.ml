@@ -25,161 +25,142 @@
 
 module Events = P2p_events.P2p_welcome
 
-type listening_socket_open_failure = {
-  reason : Unix.error;
-  address : P2p_addr.t;
-  port : int;
-}
-
-type error += Failed_to_open_listening_socket of listening_socket_open_failure
-
-let () =
-  register_error_kind
-    `Permanent
-    ~id:"p2p.welcome.failed_to_open_listening_socket"
-    ~title:"Failed to open listening socket"
-    ~description:"The p2p listening socket could not be opened."
-    ~pp:(fun ppf (reason, address, port) ->
-      let tips ppf () =
-        match reason with
-        | Unix.EADDRINUSE ->
-            Format.fprintf
-              ppf
-              "Another tezos node is probably running on this address.@;\
-               Please choose another P2P port using --net-addr."
-        | _ -> Format.fprintf ppf ""
-      in
-      Format.fprintf
-        ppf
-        "@[<v 2>An error occured while initializing P2P server on this \
-         address: %a:%d.@;\
-         Reason: %s.@;\
-         %a@]"
-        P2p_addr.pp
-        address
-        port
-        (Unix.error_message reason)
-        tips
-        ())
-    Data_encoding.(
-      obj3
-        (req "reason" Unix_error.encoding)
-        (req "address" P2p_addr.encoding)
-        (req "port" uint16))
-    (function
-      | Failed_to_open_listening_socket {reason; address; port} ->
-          Some (reason, address, port)
-      | _ -> None)
-    (fun (reason, address, port) ->
-      Failed_to_open_listening_socket {reason; address; port})
-
 type connect_handler =
   | Connect_handler :
       ('msg, 'meta, 'meta_conn) P2p_connect_handler.t
       -> connect_handler
 
-type t = {
-  socket : Lwt_unix.file_descr;
-  canceler : Lwt_canceler.t;
-  connect_handler : connect_handler;
-  mutable worker : unit Lwt.t;
-}
+type state = {socket : Lwt_unix.file_descr; connect_handler : connect_handler}
 
-let rec worker_loop st =
+(* This worker must not be parallelized. The worker loops on {!P2p_fd.accept}
+   then checks if not too many file descriptors are opened. If multiple
+   {!P2p_fd.accept} are ran in parallel, we may crash because of too many opened
+   file descriptors.
+
+   Therefore we declare at toplevel a mutex, that prevents concurrent [accept]. *)
+let accept_lock = Lwt_mutex.create ()
+
+let accept st =
   let open Lwt_syntax in
   let (Connect_handler connect_handler) = st.connect_handler in
   let* () = Lwt.pause () in
-  let* r =
-    protect ~canceler:st.canceler (fun () ->
-        let* r = P2p_fd.accept st.socket in
-        Result.fold
-          ~ok:(fun (fd, addr) ->
-            let point =
-              match addr with
-              | Lwt_unix.ADDR_UNIX _ -> assert false
-              | Lwt_unix.ADDR_INET (addr, port) ->
-                  (Ipaddr_unix.V6.of_inet_addr_exn addr, port)
+  let* () = Lwt_mutex.lock accept_lock in
+  let* res =
+    protect @@ fun () ->
+    let fd_pool =
+      P2p_pool.get_fd_pool @@ P2p_connect_handler.get_pool connect_handler
+    in
+    let* r = P2p_fd.accept ?fd_pool st.socket in
+    Result.fold
+      ~ok:(fun (fd, addr) ->
+        let point =
+          match addr with
+          | Lwt_unix.ADDR_UNIX _ -> assert false
+          | Lwt_unix.ADDR_INET (addr, port) ->
+              (Ipaddr_unix.V6.of_inet_addr_exn addr, port)
+        in
+        P2p_fd.set_point ~point fd ;
+        P2p_connect_handler.accept connect_handler fd point ;
+        Lwt.return_ok ())
+      ~error:(function
+        (* These are temporary system errors, giving some time for
+           the system to recover *)
+        | `System_error ex ->
+            let* () =
+              Events.(emit incoming_error)
+                (TzTrace.make (error_of_exn ex), "system")
             in
-            P2p_connect_handler.accept connect_handler fd point ;
-            Lwt.return_ok ())
-          ~error:(function
-            (* These are temporary system errors, giving some time for
-               the system to recover *)
-            | `System_error ex ->
-                let* () =
-                  Events.(emit incoming_error)
-                    (TzTrace.make (error_of_exn ex), "system")
-                in
-
-                let* () = Lwt_unix.sleep 5. in
-                Lwt.return_ok ()
-            (* These errors are specific to attempted incoming connection,
-               ignoring them. *)
-            | `Socket_error ex ->
-                let* () =
-                  Events.(emit incoming_error)
-                    (TzTrace.make (error_of_exn ex), "socket")
-                in
-                Lwt.return (Ok ())
-            | `Unexpected_error ex ->
-                Lwt.return_error (TzTrace.make (error_of_exn ex)))
-          r)
+            let* () = Lwt_unix.sleep 5. in
+            Lwt.return_ok ()
+        (* These errors are specific to attempted incoming connection,
+           ignoring them. *)
+        | `Socket_error ex ->
+            let* () =
+              Events.(emit incoming_error)
+                (TzTrace.make (error_of_exn ex), "socket")
+            in
+            Lwt.return (Ok ())
+        | ex -> Lwt_result_syntax.tzfail (P2p_fd.accept_error_to_tzerror ex))
+      r
   in
-  match r with
-  | Ok () -> worker_loop st
-  | Error (Canceled :: _) -> Lwt.return_unit
-  | Error err -> Events.(emit unexpected_error) err
+  Lwt_mutex.unlock accept_lock ;
+  return res
 
-let create_listening_socket ~backlog ?(addr = Ipaddr.V6.unspecified) port =
+module Name = P2p_workers.Unique_name_maker (struct
+  let base = ["p2p"; "welcome"]
+end)
+
+module Types = struct
+  type nonrec state = state
+
+  type parameters = {
+    socket : Lwt_unix.file_descr;
+    connect_handler : connect_handler;
+  }
+end
+
+module Worker = P2p_workers.Make (Name) (P2p_workers.Loop_request) (Types)
+
+type t = Worker.activated_worker
+
+module Handlers = struct
+  module Request = Worker.Request
+
+  type self = Worker.callback Worker.t
+
+  type launch_error = tztrace
+
+  let on_request : type r request_error.
+      self -> (r, request_error) Request.t -> (r, request_error) result Lwt.t =
+   fun w Loop -> accept (Worker.state w)
+
+  let on_launch _w () ({socket; connect_handler} : Types.parameters) =
+    Lwt_result_syntax.return {socket; connect_handler}
+
+  let on_error (type a b) _w _st (req : (a, b) Request.t) (errs : b) :
+      [`Shutdown | `Continue] tzresult Lwt.t =
+    let open Lwt_result_syntax in
+    match (req, errs) with
+    | Loop, (Canceled | Exn Lwt.Canceled) :: _ -> return `Shutdown
+    | Loop, trace ->
+        let*! () = Events.(emit unexpected_error) trace in
+        return `Shutdown
+
+  let on_completion _ _ _ _ = Lwt.return_unit
+
+  let on_no_request _ = Lwt.return_unit
+
+  let on_close w =
+    let open Lwt_result_syntax in
+    let state = Worker.state w in
+    let*! r = Lwt_utils_unix.safe_close state.socket in
+    Result.iter_error_s Events.(emit unexpected_error_closing_socket) r
+end
+
+let create ?reuse_port ?addr ~backlog connect_handler port =
   let open Lwt_result_syntax in
   Lwt.catch
     (fun () ->
-      let main_socket = Lwt_unix.(socket PF_INET6 SOCK_STREAM 0) in
-      Lwt_unix.(setsockopt main_socket SO_REUSEADDR true) ;
-      let*! () =
-        Lwt_unix.bind
-          main_socket
-          Unix.(ADDR_INET (Ipaddr_unix.V6.to_inet_addr addr, port))
+      let* socket =
+        P2p_fd.create_listening_socket ?reuse_port ~backlog ?addr port
       in
-      Lwt_unix.listen main_socket backlog ;
-      return main_socket)
-    (function
-      | Unix.Unix_error (err, _, _) ->
-          tzfail
-            (Failed_to_open_listening_socket
-               {reason = err; address = addr; port})
-      | exn -> Lwt.fail exn)
-
-let create ?addr ~backlog connect_handler port =
-  let open Lwt_result_syntax in
-  Lwt.catch
-    (fun () ->
-      let* socket = create_listening_socket ~backlog ?addr port in
-      let canceler = Lwt_canceler.create () in
-      let st =
-        {
-          socket;
-          canceler;
-          connect_handler = Connect_handler connect_handler;
-          worker = Lwt.return_unit;
-        }
-      in
-      Lwt_canceler.on_cancel canceler (fun () ->
-          let*! () = st.worker in
-          let*! r = Lwt_utils_unix.safe_close socket in
-          Result.iter_error_s Events.(emit unexpected_error_closing_socket) r) ;
-      return st)
+      Worker.create
+        ()
+        {socket; connect_handler = Connect_handler connect_handler}
+        (module Handlers))
     (fun exn ->
       let error = error_of_exn exn in
       let*! () = Events.(emit incoming_connection_error) error in
       tzfail error)
 
-let activate st =
-  st.worker <-
-    Lwt_utils.worker
-      "welcome"
-      ~on_event:Internal_event.Lwt_worker_logger.on_event
-      ~run:(fun () -> worker_loop st)
-      ~cancel:(fun () -> Error_monad.cancel_with_exceptions st.canceler)
+let activate w = Worker.activate w
 
-let shutdown st = Error_monad.cancel_with_exceptions st.canceler
+let shutdown (w : t) = Worker.shutdown w
+
+module Internal_for_tests = struct
+  let create ?reuse_port = create ?reuse_port
+end
+
+(* Shadowing of [create] that removes the [?reuse_port] argument *)
+let create ?addr ~backlog connect_handler port =
+  create ?addr ~backlog connect_handler port

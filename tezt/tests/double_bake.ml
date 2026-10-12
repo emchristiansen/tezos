@@ -30,6 +30,7 @@
    Subject:      Detect double baking through the accuser.
 *)
 
+let team = Tag.layer1
 (* This test is duplicated in [remote_tests/double_baking.ml]. Any modification
    to this test should be reported there too. *)
 
@@ -38,10 +39,10 @@ let is_operation_in_operations ops oph =
   let ops_list = ops |=> 2 |> as_list in
   List.exists (fun e -> e |-> "hash" |> as_string = oph) ops_list
 
-let is_operation_in_applied_mempool mempool oph =
+let is_operation_in_validated_mempool mempool oph =
   let open JSON in
-  let applied_list = as_list (mempool |-> "applied") in
-  List.exists (fun e -> e |-> "hash" |> as_string = oph) applied_list
+  let validated_list = as_list (mempool |-> "validated") in
+  List.exists (fun e -> e |-> "hash" |> as_string = oph) validated_list
 
 (* Matches events where the message is of the form:
    "double baking evidence injected <operation_hash>".
@@ -94,9 +95,9 @@ let wait_for_denunciation_injection node client accuser =
   let* _ = Node.wait_for node "request_completed_info.v0" filter in
   let* oph = denunciation_event in
   let* mempool =
-    RPC.Client.call client @@ RPC.get_chain_mempool_pending_operations ()
+    Client.RPC.call client @@ RPC.get_chain_mempool_pending_operations ()
   in
-  if is_operation_in_applied_mempool mempool oph then return oph
+  if is_operation_in_validated_mempool mempool oph then return oph
   else Test.fail "the denunciation operation was rejected by the mempool"
 
 (* This tests aims to detect a double baking evidence with an
@@ -135,7 +136,8 @@ let double_bake =
   Protocol.register_test
     ~__FILE__
     ~title:"double baking with accuser"
-    ~tags:["double"; "baking"; "accuser"; "node"]
+    ~tags:[team; "double"; "baking"; "accuser"; "node"]
+    ~uses:(fun _protocol -> [Constant.octez_accuser])
   @@ fun protocol ->
   let log_step counter msg =
     let color = Log.Color.(bold ++ FG.blue) in
@@ -204,7 +206,9 @@ let double_bake =
   log_step 4 "Run Node 3, bake one block and wait for the accuser to be ready." ;
   let* node_3 = Node.init [Synchronisation_threshold 0; Private_mode] in
   let* client_3 = Client.init ~endpoint:(Node node_3) () in
-  let* accuser_3 = Accuser.init ~protocol node_3 in
+  (* Need to know the protocol for the agnostic accuser to start. *)
+  let* () = Client.activate_protocol ~protocol client_3 in
+  let* accuser_3 = Accuser.init node_3 in
   let denunciation_injection =
     wait_for_denunciation_injection node_3 client_3 accuser_3
   in
@@ -233,7 +237,7 @@ let double_bake =
 
   log_step 8 "Check denunciation is in the last block." ;
   (* Getting the operations of the current head. *)
-  let* ops = RPC.Client.call client_1 @@ RPC.get_chain_block_operations () in
+  let* ops = Client.RPC.call client_1 @@ RPC.get_chain_block_operations () in
   let* () = Accuser.terminate accuser_3 in
   if is_operation_in_operations ops denunciation_oph then unit
   else Test.fail "Double baking evidence was not found"

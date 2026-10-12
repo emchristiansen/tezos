@@ -27,15 +27,14 @@
 (** Testing
     -------
     Component:    Tree_encoding_decoding
-    Invocation:   dune exec  src/lib_scoru_wasm/test/test_scoru_wasm.exe \
-                    -- test "^WASM PVM$"
+    Invocation:   dune exec src/lib_scoru_wasm/test/main.exe -- --file test_wasm_pvm.ml
     Subject:      WASM PVM evaluation tests for the tezos-scoru-wasm library
 *)
 
 open Tezos_scoru_wasm
+open Tezos_scoru_wasm_helpers.Encodings_util
 open Wasm_utils
 open Tztest_helper
-open Encodings_util
 
 let should_boot_unreachable_kernel ~version ~batch_size kernel =
   let open Lwt_syntax in
@@ -50,7 +49,7 @@ let should_boot_unreachable_kernel ~version ~batch_size kernel =
         loop_until_input_required batch_size tree
     | _ -> return tree
   in
-  let* tree = initial_tree ~version ~from_binary:true kernel in
+  let* tree = initial_state ~version ~from_binary:true kernel in
   (* Feeding it with one input *)
   let* tree = set_empty_inbox_step 0l tree in
   (* running until waiting for input *)
@@ -101,7 +100,7 @@ let should_run_debug_kernel ~version () =
  )
 |}
   in
-  let* tree = initial_tree ~version ~from_binary:false module_ in
+  let* tree = initial_state ~version ~from_binary:false module_ in
   (* Feeding it with one input *)
   let* tree = set_empty_inbox_step 0l tree in
   (* running until waiting for input *)
@@ -116,7 +115,9 @@ let add_value ?(content = "a very long value") tree key_steps =
   let value = Chunked_byte_vector.of_string content in
   Tree_encoding_runner.encode
     Tezos_tree_encoding.(
-      scope ("durable" :: List.append key_steps ["@"]) chunked_byte_vector)
+      scope
+        ("durable" :: List.append key_steps ["@"])
+        Chunked_byte_vector.encoding)
     value
     tree
 
@@ -172,7 +173,7 @@ let should_run_store_has_kernel ~version () =
  )
   |}
   in
-  let* tree = initial_tree ~version ~from_binary:false module_ in
+  let* tree = initial_state ~version ~from_binary:false module_ in
   let* tree = add_value tree ["hi"; "bye"] in
   let* tree = add_value tree ["hello"] in
   let* tree = add_value tree ["hello"; "universe"] in
@@ -228,7 +229,7 @@ let should_run_store_list_size_kernel ~version () =
  )
   |}
   in
-  let* tree = initial_tree ~version ~from_binary:false module_ in
+  let* tree = initial_state ~version ~from_binary:false module_ in
   let* tree = add_value tree ["one"] in
   let* tree = add_value tree ["one"; "two"] in
   let* tree = add_value tree ["one"; "three"] in
@@ -286,7 +287,7 @@ let should_run_store_delete_kernel ~version () =
 |}
   in
   let open Lwt_syntax in
-  let* tree = initial_tree ~version ~from_binary:false module_ in
+  let* tree = initial_state ~version ~from_binary:false module_ in
   let* tree = add_value tree ["one"] in
   let* tree = add_value tree ["one"; "two"] in
   let* tree = add_value tree ["three"] in
@@ -359,7 +360,7 @@ let should_run_store_move_kernel ~version () =
       from_path
       to_path
   in
-  let* tree = initial_tree ~version ~from_binary:false module_ in
+  let* tree = initial_state ~version ~from_binary:false module_ in
   let* tree = add_value tree ["a"; "b"] ~content:"ab" in
   let* tree = add_value tree ["a"; "b"; "c"] ~content:"abc" in
   let* tree = add_value tree ["a"; "b"; "d"] ~content:"abd" in
@@ -420,7 +421,7 @@ let should_run_store_copy_kernel ~version () =
       from_path
       to_path
   in
-  let* tree = initial_tree ~version ~from_binary:false module_ in
+  let* tree = initial_state ~version ~from_binary:false module_ in
   let* tree = add_value tree ["a"; "b"] ~content:"ab" in
   let* tree = add_value tree ["a"; "b"; "c"] ~content:"abc" in
   let* tree = add_value tree ["a"; "b"; "d"] ~content:"abd" in
@@ -445,6 +446,66 @@ let should_run_store_copy_kernel ~version () =
   let* () = assert_store_value tree "/e/f" (Some "ef") in
   let* () = assert_store_value tree "/a/b" (Some "ab") in
   return_ok_unit
+
+let nop_module import_name import_params import_results =
+  Format.sprintf
+    {|
+(module
+ (import "smart_rollup_core" "%s"
+         (func $%s (param %s) (result %s)))
+ (memory 1)
+ (export "mem" (memory 0))
+ (func (export "kernel_run")
+    (nop)))
+  |}
+    import_name
+    import_name
+    (String.concat " " import_params)
+    (String.concat " " import_results)
+
+(* Note that import_name, import_params and import_results could be probably
+   read from the host function definition directly in {Host_funcs}, this would
+   ensure the error does not come from an invalid import type. *)
+let try_availability_above_v1_only ~version import_name import_params
+    import_results () =
+  let open Lwt_syntax in
+  let* tree =
+    initial_state
+      ~version
+      ~from_binary:false
+      (nop_module import_name import_params import_results)
+  in
+  let* tree = set_empty_inbox_step 0l tree in
+  let* tree = eval_until_input_or_reveal_requested tree in
+  let* state = Wasm.Internal_for_tests.get_tick_state tree in
+  let predicate state =
+    match version with
+    | Wasm_pvm_state.V0 -> is_stuck state
+    | V1 | V2 | V3 | V4 | V5 | V6 | VExperimental -> not (is_stuck state)
+  in
+  assert (predicate state) ;
+  Lwt_result_syntax.return_unit
+
+let try_run_store_get_hash ~version =
+  try_availability_above_v1_only
+    ~version
+    "__internal_store_get_hash"
+    ["i32"; "i32"; "i32"; "i32"]
+    ["i32"]
+
+let try_run_store_delete_value ~version =
+  try_availability_above_v1_only
+    ~version
+    "store_delete_value"
+    ["i32"; "i32"]
+    ["i32"]
+
+let try_run_store_create ~version =
+  try_availability_above_v1_only
+    ~version
+    "store_create"
+    ["i32"; "i32"; "i32"]
+    ["i32"]
 
 let test_modify_read_only_storage_kernel ~version () =
   let open Lwt_syntax in
@@ -513,7 +574,7 @@ let test_modify_read_only_storage_kernel ~version () =
  )
   |}
   in
-  let* tree = initial_tree ~version ~from_binary:false module_ in
+  let* tree = initial_state ~version ~from_binary:false module_ in
   (* The kernel is not expected to fail, the PVM should not have stuck state on.
       *)
   let* state = Wasm.Internal_for_tests.get_tick_state tree in
@@ -667,7 +728,7 @@ let test_snapshotable_state ~version () =
       )
     |}
   in
-  let*! tree = initial_tree ~version ~from_binary:false module_ in
+  let*! tree = initial_state ~version ~from_binary:false module_ in
   let*! state = Wasm.Internal_for_tests.get_tick_state tree in
   let* () =
     match state with
@@ -709,7 +770,7 @@ let test_rebuild_snapshotable_state ~version () =
       )
     |}
   in
-  let*! tree = initial_tree ~version ~from_binary:false module_ in
+  let*! tree = initial_state ~version ~from_binary:false module_ in
   let*! tree = set_empty_inbox_step 0l tree in
   (* First evaluate until the snapshotable state. *)
   let*! tree_after_eval = eval_to_snapshot tree in
@@ -779,7 +840,7 @@ let test_unkown_host_function_truncated ~version () =
       unknown_function
   in
   (* Let's first init the tree to compute. *)
-  let*! tree = initial_tree ~version ~from_binary:false module_ in
+  let*! tree = initial_state ~version ~from_binary:false module_ in
   (* The tree should be in snapshot state by default, hence in input step. *)
   let*! tree_with_dummy_input = set_empty_inbox_step 0l tree in
   let*! tree_stuck =
@@ -813,12 +874,19 @@ let test_bulk_noops ~version () =
       )
     |}
   in
-  let* base_tree = initial_tree ~version ~ticks_per_snapshot:500L module_ in
+  let* base_tree = initial_state ~version ~ticks_per_snapshot:500L module_ in
   let* base_tree = set_empty_inbox_step 0l base_tree in
 
   let rec goto_snapshot ticks tree_slow =
-    let* tree_fast, _ = Wasm.compute_step_many ~max_steps:ticks base_tree in
-    let* tree_slow = Wasm.compute_step tree_slow in
+    let* tree_fast, _ =
+      Wasm.compute_step_many
+        ~wasm_entrypoint:Constants.wasm_entrypoint
+        ~max_steps:ticks
+        base_tree
+    in
+    let* tree_slow =
+      Wasm.compute_step ~wasm_entrypoint:Constants.wasm_entrypoint tree_slow
+    in
     assert (Context_hash.(Encodings_util.Tree.(hash tree_fast = hash tree_slow))) ;
 
     let* stuck_flag = has_stuck_flag tree_fast in
@@ -890,7 +958,7 @@ let test_durable_store_io ~version () =
       to_path
   in
   (* Let's first init the tree to compute. *)
-  let*! tree = initial_tree ~version ~from_binary:false modul in
+  let*! tree = initial_state ~version ~from_binary:false modul in
 
   (* Add content to '/from/value' key in durable *)
   let content = "abcde" in
@@ -1004,7 +1072,7 @@ let test_reveal_upgrade_kernel_ok ~version () =
   let open Lwt_result_syntax in
   let*! modul = wat2wasm @@ reveal_upgrade_kernel () in
   (* Let's first init the tree to compute. *)
-  let*! tree = initial_tree ~version ~from_binary:true modul in
+  let*! tree = initial_state ~version ~from_binary:true modul in
   let*! state_before_first_message =
     Wasm.Internal_for_tests.get_tick_state tree
   in
@@ -1027,14 +1095,17 @@ let test_reveal_upgrade_kernel_ok ~version () =
   let* () =
     let open Wasm_pvm_state in
     match info.Wasm_pvm_state.input_request with
-    | Wasm_pvm_state.Reveal_required (Reveal_raw_data hash) ->
-        (* The PVM has reached a point where it’s asking for some
-           preimage. Since the memory is left blank, we are looking
-           for the zero hash *)
-        let zero_hash = String.make 33 '\000' in
-        assert (hash = zero_hash) ;
-        return_unit
-    | No_input_required | Input_required | Reveal_required _ -> assert false
+    | Wasm_pvm_state.Reveal_required req -> (
+        match Wasm_pvm_state.Compatibility.of_current_opt req with
+        | Some (Reveal_raw_data hash) ->
+            (* The PVM has reached a point where it’s asking for some
+               preimage. Since the memory is left blank, we are looking
+               for the zero hash *)
+            let zero_hash = String.make 33 '\x00' in
+            assert (hash = zero_hash) ;
+            return_unit
+        | _ -> assert false)
+    | No_input_required | Input_required -> assert false
   in
   let new_kernel =
     {|
@@ -1079,7 +1150,7 @@ let test_reveal_upgrade_kernel_fallsback_on_error ~version ~binary
   let open Lwt_result_syntax in
   let*! modul = wat2wasm @@ reveal_upgrade_kernel () in
   (* Let's first init the tree to compute. *)
-  let*! tree = initial_tree ~version ~from_binary:true modul in
+  let*! tree = initial_state ~version ~from_binary:true modul in
   let*! tree = eval_until_input_or_reveal_requested tree in
   let*! state_before_first_message =
     Wasm.Internal_for_tests.get_tick_state tree
@@ -1107,14 +1178,17 @@ let test_reveal_upgrade_kernel_fallsback_on_error ~version ~binary
     let* () =
       let open Wasm_pvm_state in
       match info.Wasm_pvm_state.input_request with
-      | Wasm_pvm_state.Reveal_required (Reveal_raw_data hash) ->
-          (* The PVM has reached a point where it’s asking for some
-             preimage. Since the memory is left blank, we are looking
-             for the zero hash *)
-          let zero_hash = String.make 33 '\000' in
-          assert (hash = zero_hash) ;
-          return_unit
-      | No_input_required | Input_required | Reveal_required _ -> assert false
+      | Wasm_pvm_state.Reveal_required req -> (
+          match Wasm_pvm_state.Compatibility.of_current_opt req with
+          | Some (Reveal_raw_data hash) ->
+              (* The PVM has reached a point where it’s asking for some
+                 preimage. Since the memory is left blank, we are looking
+                 for the zero hash *)
+              let zero_hash = String.make 33 '\000' in
+              assert (hash = zero_hash) ;
+              return_unit
+          | _ -> assert false)
+      | No_input_required | Input_required -> assert false
     in
     let*! tree = Wasm.reveal_step (Bytes.of_string preimage) tree in
     let*! state_after_reveal = Wasm.Internal_for_tests.get_tick_state tree in
@@ -1204,7 +1278,7 @@ let test_pvm_reboot_counter ~version ~pvm_max_reboots () =
   in
 
   let*! tree =
-    initial_tree
+    initial_state
       ~version
       ~max_reboots:(Z.of_int32 pvm_max_reboots)
       ~from_binary:false
@@ -1214,8 +1288,8 @@ let test_pvm_reboot_counter ~version ~pvm_max_reboots () =
 
   check_counter tree 0l
 
-let test_kernel_reboot_gen ~version ~reboots ~expected_reboots ~pvm_max_reboots
-    =
+let test_kernel_reboot_gen ?hooks ~version ~reboots ~expected_reboots
+    ~pvm_max_reboots () =
   let open Lwt_result_syntax in
   (* Extracted from the kernel, these are the constant values used to build the
      initial memory and the addresses where values are stored. *)
@@ -1357,21 +1431,22 @@ let test_kernel_reboot_gen ~version ~reboots ~expected_reboots ~pvm_max_reboots
       reboot_counter_key_length
       reboot_counter_in_memory_offset
       (* `kernel_run` function *)
-      data_offset_start (* == reboot_key's offset *)
+      data_offset_start
+      (* == reboot_key's offset *)
       reboot_key_length
       reboot_flag_in_memory_offset
       reboots
   in
   (* Let's first init the tree to compute. *)
   let*! tree =
-    initial_tree
+    initial_state
       ~version
       ~max_reboots:(Z.of_int32 pvm_max_reboots)
       ~from_binary:false
       reboot_module
   in
   let*! tree = set_empty_inbox_step 0l tree in
-  let*! tree = eval_until_input_or_reveal_requested tree in
+  let*! tree = eval_until_input_or_reveal_requested tree ?hooks in
   let*! durable = wrap_as_durable_storage tree in
   let durable = Durable.of_storage_exn durable in
   let*! too_many_reboot =
@@ -1407,6 +1482,7 @@ let test_kernel_reboot ~version () =
     ~reboots:5l
     ~expected_reboots:5l
     ~pvm_max_reboots:10l
+    ()
 
 let test_kernel_reboot_failing ~version () =
   (* The kernel doesn't accept more than 10 reboots between two inputs, it will
@@ -1416,6 +1492,30 @@ let test_kernel_reboot_failing ~version () =
     ~reboots:15l
     ~expected_reboots:10l
     ~pvm_max_reboots:10l
+    ()
+
+let test_kernel_reboot_hook ~version () =
+  let ctr = ref 0l in
+  let hooks =
+    Hooks.(
+      no_hooks
+      |> on_pvm_reboot (fun _ticks ->
+             ctr := Int32.succ !ctr ;
+             Lwt.return_unit))
+  in
+  let reboots = 5l in
+  let res =
+    test_kernel_reboot_gen
+      ~version
+      ~reboots
+      ~expected_reboots:reboots
+      ~pvm_max_reboots:10l
+      ~hooks
+      ()
+  in
+  (* 5 reboots and 1 yield for 6 hook calls *)
+  assert (!ctr = Int32.succ reboots) ;
+  res
 
 (* Set a certain number `n` of dummy inputs and check the scheduling is
    consistent:
@@ -1489,7 +1589,7 @@ let test_inbox_cleanup ~version () =
   in
   let max_tick = 1000L in
   let* tree =
-    initial_tree
+    initial_state
       ~version
       ~ticks_per_snapshot:max_tick
       ~from_binary:false
@@ -1499,14 +1599,53 @@ let test_inbox_cleanup ~version () =
   (* Before executing: EOL, Info_per_level and SOL. *)
   let* () = check_messages_count tree 3 in
   (* Go to the very last [Padding] state. *)
-  let* tree, _ = Wasm.compute_step_many ~max_steps:Int64.(pred max_tick) tree in
+  let* tree, _ =
+    Wasm.compute_step_many
+      ~wasm_entrypoint:Constants.wasm_entrypoint
+      ~max_steps:Int64.(pred max_tick)
+      tree
+  in
   (* Before yielding: EOL, Info_per_level and SOL still, since the module does
      not read the content of the inbox. *)
   let* () = check_messages_count tree 3 in
   (* Yield with one more step. *)
-  let* tree = Wasm.compute_step tree in
+  let* tree =
+    Wasm.compute_step ~wasm_entrypoint:Constants.wasm_entrypoint tree
+  in
   (* After yielding, the inbox has been cleared. *)
   let* () = check_messages_count tree 0 in
+  Lwt_result_syntax.return_unit
+
+let test_wasm_entrypoint ~version () =
+  let open Lwt_syntax in
+  let module_ =
+    {|
+      (module
+        (memory 0)
+        (export "mem" (memory 0))
+        (func (export "foo")
+          (nop)
+        )
+      )
+    |}
+  in
+  let max_tick = 1000L in
+  let* tree =
+    initial_state
+      ~version
+      ~ticks_per_snapshot:max_tick
+      ~from_binary:false
+      module_
+  in
+  let* tree = set_empty_inbox_step 0l tree in
+  let* tree, _ =
+    Wasm.compute_step_many
+      ~wasm_entrypoint:"foo"
+      ~max_steps:Int64.(pred max_tick)
+      tree
+  in
+  let* status = Wasm.Internal_for_tests.get_tick_state tree in
+  assert (not @@ is_stuck status) ;
   Lwt_result_syntax.return_unit
 
 let test_scheduling_multiple_inboxes ~version input_numbers =
@@ -1522,8 +1661,8 @@ let test_scheduling_multiple_inboxes ~version input_numbers =
       )
     |}
   in
-  let*! initial_tree = initial_tree ~version ~from_binary:false module_ in
-  let+ (_ : Wasm.tree) =
+  let*! initial_state = initial_state ~version ~from_binary:false module_ in
+  let+ (_ : Wasm.state) =
     List.fold_left_i_es
       (fun level tree input_number ->
         let*! tree = test_set_inputs input_number (Int32.of_int level) tree in
@@ -1543,7 +1682,7 @@ let test_scheduling_multiple_inboxes ~version input_numbers =
         let*! info_after_eval = Wasm.get_info tree in
         assert (info_after_eval.input_request = Input_required) ;
         return tree)
-      initial_tree
+      initial_state
       input_numbers
   in
   ()
@@ -1608,7 +1747,7 @@ let test_outboxes_at_each_level ~version () =
   in
 
   let* tree =
-    initial_tree
+    initial_state
       ~version
       ~ticks_per_snapshot:1000L (* This kernel takes about 838 ticks to run. *)
       ~from_binary:false
@@ -1620,6 +1759,7 @@ let test_outboxes_at_each_level ~version () =
 let test_outbox_validity_period ~version () =
   let open Lwt_syntax in
   let open Tezos_webassembly_interpreter.Output_buffer in
+  let open Tezos_webassembly_interpreter.Output_buffer.Internal_for_tests in
   let output_message = "output_message" in
 
   let outbox_validity_period = 2l in
@@ -1657,7 +1797,7 @@ let test_outbox_validity_period ~version () =
   in
 
   let* tree =
-    initial_tree
+    initial_state
       ~version
       ~ticks_per_snapshot:1000L (* This kernel takes about 838 ticks to run. *)
       ~from_binary:false
@@ -1668,9 +1808,13 @@ let test_outbox_validity_period ~version () =
   return_ok_unit
 
 let tests =
-  tztests_with_pvm
-    ~versions:[V0; V1]
+  tztests_with_all_pvms
     [
+      ( "Test __internal_store_get_hash available",
+        `Quick,
+        try_run_store_get_hash );
+      ("Test store_delete_value available", `Quick, try_run_store_delete_value);
+      ("Test store_create available", `Quick, try_run_store_create);
       ( "Test unreachable kernel (tick per tick)",
         `Quick,
         fun ~version ->
@@ -1713,6 +1857,7 @@ let tests =
         test_pvm_reboot_counter ~pvm_max_reboots:10l );
       ("Test reboot", `Quick, test_kernel_reboot);
       ("Test reboot takes too many reboots", `Quick, test_kernel_reboot_failing);
+      ("Test reboot hook", `Quick, test_kernel_reboot_hook);
       ("Test kernel upgrade ok", `Quick, test_reveal_upgrade_kernel_ok);
       ( "Test kernel upgrade fallsback on decoding error",
         `Quick,
@@ -1747,4 +1892,11 @@ let tests =
       ( "Test outbox validity period clean-up",
         `Quick,
         test_outbox_validity_period );
+      ( "Test can execute arbitrary WASM entrypoint",
+        `Quick,
+        test_wasm_entrypoint );
     ]
+
+let () =
+  Alcotest_lwt.run ~__FILE__ "test lib scoru wasm" [("WASM PVM", tests)]
+  |> Lwt_main.run

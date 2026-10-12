@@ -46,6 +46,12 @@ module type Model_impl = sig
 
   val name : Namespace.t
 
+  (** If [true], the generated function takes
+      [Saturation_repr.may_saturate Saturation_repr.t] as arguments
+      instead of [int]s. Otherwise, the generated function takes [int]s.
+  *)
+  val takes_saturation_reprs : bool
+
   module Def (X : Costlang.S) : sig
     type model_type
 
@@ -106,7 +112,13 @@ type 'workload t =
     }
       -> 'workload t
 
-val make : conv:('a -> 'b) -> model:'b model -> 'a t
+val pp : Format.formatter -> _ t -> unit
+
+(** Build [_ t] from [_ model], with a type conversion fucntion [conv].
+    If [~takes_saturation_reprs: true] is given, its generated code
+    will take [_ Saturation_reprs.t] instead of [int].
+*)
+val make : ?takes_saturation_reprs:bool -> conv:('a -> 'b) -> 'b model -> 'a t
 
 val make_aggregated :
   model:('a -> applied) -> sub_models:packed_model list -> 'a t
@@ -121,7 +133,16 @@ val add_model : 'a t -> 'b t -> ('a * 'b) t
 val precompose : ('a -> 'b) -> 'b t -> 'a t
 
 (** Returns the set of free variables of a model *)
-val get_free_variable_set : 'a model -> Free_variable.Set.t
+val get_free_variable_set : _ model -> Free_variable.Set.t
+
+val get_free_variable_set_of_t : _ t -> Free_variable.Set.t
+
+(** Returns the set of free variables of an applied model
+
+    Note that this can be very different from [get_free_variable_set].
+*)
+val get_free_variable_set_applied :
+  'workload t -> 'workload -> Free_variable.Set.t
 
 (* -------------------------------------------------------------------------- *)
 (** Commonly used abstract models
@@ -141,6 +162,18 @@ val zero : unit model
 *)
 val unknown_const1 : name:Namespace.t -> const:Free_variable.t -> unit model
 
+(** Model ignores the arguments.
+    [fun n -> const]
+*)
+val unknown_const1_skip1 :
+  name:Namespace.t -> const:Free_variable.t -> (int * unit) model
+
+(** Model ignores the arguments.
+    [fun n m -> const]
+*)
+val unknown_const1_skip2 :
+  name:Namespace.t -> const:Free_variable.t -> (int * (int * unit)) model
+
 (** [fun n -> coeff × n] *)
 val linear : name:Namespace.t -> coeff:Free_variable.t -> (int * unit) model
 
@@ -149,6 +182,14 @@ val affine :
   name:Namespace.t ->
   intercept:Free_variable.t ->
   coeff:Free_variable.t ->
+  (int * unit) model
+
+(** [fun n -> intercept + coeff × (n - offset)] *)
+val affine_offset :
+  name:Namespace.t ->
+  intercept:Free_variable.t ->
+  coeff:Free_variable.t ->
+  offset:int ->
   (int * unit) model
 
 (** [fun n -> coeff * n²] *)
@@ -178,6 +219,13 @@ val linear_sum :
   coeff:Free_variable.t ->
   (int * (int * unit)) model
 
+(** [fun a b -> intercept + coeff × (a-b)] *)
+val linear_sat_sub :
+  name:Namespace.t ->
+  intercept:Free_variable.t ->
+  coeff:Free_variable.t ->
+  (int * (int * unit)) model
+
 (** [fun a b -> intercept + coeff × max(a,b)] *)
 val linear_max :
   name:Namespace.t ->
@@ -190,6 +238,14 @@ val linear_min :
   name:Namespace.t ->
   intercept:Free_variable.t ->
   coeff:Free_variable.t ->
+  (int * (int * unit)) model
+
+(** fun a b -> intercept + coeff × (min(a,b) - offset) *)
+val linear_min_offset :
+  name:Namespace.t ->
+  intercept:Free_variable.t ->
+  coeff:Free_variable.t ->
+  offset:int ->
   (int * (int * unit)) model
 
 (** [fun a b -> intercept + coeff × (a×b)] *)
@@ -212,6 +268,13 @@ val bilinear_affine :
   intercept:Free_variable.t ->
   coeff1:Free_variable.t ->
   coeff2:Free_variable.t ->
+  (int * (int * unit)) model
+
+(** [fun a b -> intercept + coeff × b] *)
+val affine_skip1 :
+  name:Namespace.t ->
+  intercept:Free_variable.t ->
+  coeff:Free_variable.t ->
   (int * (int * unit)) model
 
 (** [fun n m -> intercept + coeff × n×log(m)] *)
@@ -238,7 +301,7 @@ val trilinear :
   (int * (int * (int * unit))) model
 
 (** A multi-affine model in two parts. The breakpoint [break] indicates the
-    point at which the slope changes coefficient. 
+    point at which the slope changes coefficient.
 *)
 val breakdown :
   name:Namespace.t ->
@@ -269,3 +332,34 @@ val breakdown2_const :
   break1:int ->
   break2:int ->
   (int * unit) model
+
+(** [breakdown2] with a non-zero value at 0 and offset *)
+val breakdown2_const_offset :
+  name:Namespace.t ->
+  coeff1:Free_variable.t ->
+  coeff2:Free_variable.t ->
+  coeff3:Free_variable.t ->
+  const:Free_variable.t ->
+  break1:int ->
+  break2:int ->
+  offset:int ->
+  (int * unit) model
+
+(* -------------------------------------------------------------------------- *)
+
+module type Binary_operation = sig
+  module Def (X : Costlang.S) : sig
+    val op : X.size X.repr -> X.size X.repr -> X.size X.repr
+  end
+end
+
+(** Synthesize two models of the same signature by the specified binary operation.
+*)
+val synthesize :
+  name:Namespace.t ->
+  binop:(module Binary_operation) ->
+  x_label:string ->
+  x_model:'a model ->
+  y_label:string ->
+  y_model:'a model ->
+  'a model

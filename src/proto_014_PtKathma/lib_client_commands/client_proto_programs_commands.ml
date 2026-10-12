@@ -85,19 +85,19 @@ let commands () =
       ~default:"0.05"
   in
   let source_arg =
-    ContractAlias.destination_arg
+    Contract_alias.destination_arg
       ~name:"source"
       ~doc:"name of the source (i.e. SENDER) contract for the transaction"
       ()
   in
   let payer_arg =
-    ContractAlias.destination_arg
+    Contract_alias.destination_arg
       ~name:"payer"
       ~doc:"name of the payer (i.e. SOURCE) contract for the transaction"
       ()
   in
   let self_arg =
-    OriginatedContractAlias.destination_arg
+    Originated_contract_alias.destination_arg
       ~name:"self-address"
       ~doc:"address of the contract (i.e. SELF_ADDRESS) for the transaction"
       ()
@@ -275,7 +275,8 @@ let commands () =
            program
            storage
            input
-           cctxt ->
+           cctxt
+         ->
         Lwt.return @@ Micheline_parser.no_parsing_error program
         >>=? fun program ->
         let show_source = not no_print_source in
@@ -328,7 +329,8 @@ let commands () =
       (fun (emacs_mode, no_print_source, original_gas, legacy)
            program
            storage
-           cctxt ->
+           cctxt
+         ->
         let setup = (emacs_mode, no_print_source) in
         resolve_max_gas cctxt cctxt#block original_gas >>=? fun original_gas ->
         handle_parsing_error "size" cctxt setup program @@ fun program ->
@@ -355,7 +357,8 @@ let commands () =
       (prefixes ["typecheck"; "script"] @@ Program.source_param @@ stop)
       (fun (show_types, emacs_mode, no_print_source, original_gas, legacy)
            program
-           cctxt ->
+           cctxt
+         ->
         let setup = (emacs_mode, no_print_source) in
         handle_parsing_error "types" cctxt setup program @@ fun program ->
         resolve_max_gas cctxt cctxt#block original_gas >>=? fun original_gas ->
@@ -493,50 +496,52 @@ let commands () =
       (prefixes ["hash"; "script"] @@ seq_of_param @@ file_or_literal_param ())
       (fun (check, display_names, scriptable)
            expr_strings
-           (cctxt : Protocol_client_context.full) ->
-        if List.compare_length_with expr_strings 0 = 0 then
-          cctxt#warning "No scripts were specified on the command line" >|= ok
-        else
-          List.mapi_ep
-            (fun i (src, expr_string) ->
-              let program =
-                Michelson_v1_parser.parse_toplevel ~check expr_string
-              in
-              Micheline_parser.no_parsing_error program >>?= fun program ->
-              let code = program.expanded in
-              let bytes =
-                Data_encoding.Binary.to_bytes_exn
-                  Alpha_context.Script.expr_encoding
-                  code
-              in
-              let hash =
-                Format.asprintf
-                  "%a"
-                  Script_expr_hash.pp
-                  (Script_expr_hash.hash_bytes [bytes])
-              in
-              let name =
-                Option.value
-                  src
-                  ~default:("Literal script " ^ string_of_int (i + 1))
-              in
-              return (hash, name))
-            expr_strings
-          >>=? fun hash_name_rows ->
-          Tezos_clic_unix.Scriptable.output
-            scriptable
-            ~for_human:(fun () ->
-              List.iter_s
-                (fun (hash, name) ->
-                  if display_names then cctxt#answer "%s\t%s" hash name
-                  else cctxt#answer "%s" hash)
-                hash_name_rows
-              >|= ok)
-            ~for_script:(fun () ->
-              List.map
-                (fun (hash, name) ->
-                  if display_names then [hash; name] else [hash])
-                hash_name_rows));
+           (cctxt : Protocol_client_context.full)
+         ->
+        match expr_strings with
+        | [] ->
+            cctxt#warning "No scripts were specified on the command line" >|= ok
+        | _ :: _ ->
+            List.mapi_ep
+              (fun i (src, expr_string) ->
+                let program =
+                  Michelson_v1_parser.parse_toplevel ~check expr_string
+                in
+                Micheline_parser.no_parsing_error program >>?= fun program ->
+                let code = program.expanded in
+                let bytes =
+                  Data_encoding.Binary.to_bytes_exn
+                    Alpha_context.Script.expr_encoding
+                    code
+                in
+                let hash =
+                  Format.asprintf
+                    "%a"
+                    Script_expr_hash.pp
+                    (Script_expr_hash.hash_bytes [bytes])
+                in
+                let name =
+                  Option.value
+                    src
+                    ~default:("Literal script " ^ string_of_int (i + 1))
+                in
+                return (hash, name))
+              expr_strings
+            >>=? fun hash_name_rows ->
+            Tezos_clic_unix.Scriptable.output
+              scriptable
+              ~for_human:(fun () ->
+                List.iter_s
+                  (fun (hash, name) ->
+                    if display_names then cctxt#answer "%s\t%s" hash name
+                    else cctxt#answer "%s" hash)
+                  hash_name_rows
+                >|= ok)
+              ~for_script:(fun () ->
+                List.map
+                  (fun (hash, name) ->
+                    if display_names then [hash; name] else [hash])
+                  hash_name_rows));
     command
       ~group
       ~desc:
@@ -548,9 +553,9 @@ let commands () =
       @@ stop)
       (fun () bytes cctxt ->
         (if Bytes.get bytes 0 != '\005' then
-         failwith
-           "Not a piece of packed Michelson data (must start with `0x05`)"
-        else return_unit)
+           failwith
+             "Not a piece of packed Michelson data (must start with `0x05`)"
+         else return_unit)
         >>=? fun () ->
         (* Remove first byte *)
         let bytes = Bytes.sub bytes 1 (Bytes.length bytes - 1) in
@@ -687,7 +692,8 @@ let commands () =
            bytes
            (_, (key_locator, _))
            signature
-           (cctxt : #Protocol_client_context.full) ->
+           (cctxt : #Protocol_client_context.full)
+         ->
         Client_keys_v0.check key_locator signature bytes >>=? function
         | false -> cctxt#error "invalid signature"
         | true ->
@@ -781,7 +787,8 @@ let commands () =
            (_, expr_string)
            from_format
            to_format
-           (cctxt : Protocol_client_context.full) ->
+           (cctxt : Protocol_client_context.full)
+         ->
         (match from_format with
         | `Michelson ->
             let program =
@@ -789,23 +796,23 @@ let commands () =
             in
             Lwt.return @@ Micheline_parser.no_parsing_error program
             >>=? fun program ->
-            (typecheck_program
-               cctxt
-               ~chain:cctxt#chain
-               ~block:cctxt#block
-               ~legacy
-               ~show_types:true
-               program
-             >>= function
-             | Error _ as res ->
-                 print_typecheck_result
-                   ~emacs:false
-                   ~show_types:true
-                   ~print_source_on_error:true
-                   program
-                   res
-                   cctxt
-             | Ok _ -> return_unit)
+            ( typecheck_program
+                cctxt
+                ~chain:cctxt#chain
+                ~block:cctxt#block
+                ~legacy
+                ~show_types:true
+                program
+            >>= function
+              | Error _ as res ->
+                  print_typecheck_result
+                    ~emacs:false
+                    ~show_types:true
+                    ~print_source_on_error:true
+                    program
+                    res
+                    cctxt
+              | Ok _ -> return_unit )
             >>=? fun () -> return program.expanded
         | `JSON -> (
             match Data_encoding.Json.from_string expr_string with
@@ -857,7 +864,8 @@ let commands () =
            (_, data_string)
            from_format
            to_format
-           (cctxt : Protocol_client_context.full) ->
+           (cctxt : Protocol_client_context.full)
+         ->
         let micheline_of_expr expr =
           Micheline_printer.printable
             Michelson_v1_primitives.string_of_prim
@@ -950,7 +958,7 @@ let commands () =
            ~desc:"the name of the view"
            entrypoint_parameter
       @@ prefixes ["on"; "contract"]
-      @@ OriginatedContractAlias.destination_param
+      @@ Originated_contract_alias.destination_param
            ~name:"contract"
            ~desc:"viewed contract"
       @@ prefixes ["with"; "input"]
@@ -960,7 +968,8 @@ let commands () =
            entrypoint
            contract
            input
-           cctxt ->
+           cctxt
+         ->
         Client_proto_programs.run_view
           cctxt
           ~chain:cctxt#chain
@@ -986,14 +995,15 @@ let commands () =
       (prefixes ["run"; "view"]
       @@ param ~name:"view" ~desc:"the name of the view" string_parameter
       @@ prefixes ["on"; "contract"]
-      @@ OriginatedContractAlias.destination_param
+      @@ Originated_contract_alias.destination_param
            ~name:"contract"
            ~desc:"the contract containing the view"
       @@ stop)
       (fun (source, payer, gas, unlimited_gas, unparsing_mode, now, level)
            view
            contract
-           cctxt ->
+           cctxt
+         ->
         Micheline_parser.no_parsing_error
         @@ Michelson_v1_parser.parse_expression "Unit"
         >>?= fun input ->
@@ -1023,7 +1033,7 @@ let commands () =
       (prefixes ["run"; "view"]
       @@ param ~name:"view" ~desc:"the name of the view" string_parameter
       @@ prefixes ["on"; "contract"]
-      @@ OriginatedContractAlias.destination_param
+      @@ Originated_contract_alias.destination_param
            ~name:"contract"
            ~desc:"the contract containing the view"
       @@ prefixes ["with"; "input"]
@@ -1036,7 +1046,8 @@ let commands () =
            view
            contract
            input
-           cctxt ->
+           cctxt
+         ->
         Client_proto_programs.run_script_view
           cctxt
           ~chain:cctxt#chain

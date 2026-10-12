@@ -7,30 +7,30 @@
  (instrumentation (backend bisect_ppx))
  (libraries
   str
-  tezos-stdlib
-  tezos-base
-  tezos-error-monad
+  octez-libs.stdlib
+  octez-libs.base
+  octez-libs.error-monad
   tezos-protocol-alpha.parameters
-  tezos-lazy-containers
+  octez-libs.lazy-containers
   tezos-benchmark
   tezos-benchmark-alpha
   tezos-benchmark-type-inference-alpha
-  tezos-protocol-alpha
-  tezos-crypto
-  tezos-shell-benchmarks
-  tezos-micheline
-  tezos-alpha-test-helpers
-  tezos-sapling
-  tezos-client-alpha
-  tezos-protocol-plugin-alpha
-  tezos-protocol-environment)
+  tezos-protocol-alpha.protocol
+  octez-libs.crypto
+  octez-shell-libs.shell-benchmarks
+  octez-libs.micheline
+  octez-protocol-alpha-libs.test-helpers
+  octez-libs.tezos-sapling
+  octez-protocol-alpha-libs.client
+  octez-protocol-alpha-libs.plugin
+  octez-proto-libs.protocol-environment
+  octez-libs.smart-rollup-wasm-in-memory)
  (library_flags (:standard -linkall))
  (flags
   (:standard)
   -open Tezos_stdlib
   -open Tezos_base
   -open Tezos_base.TzPervasives
-  -open Tezos_base.TzPervasives.Error_monad.Legacy_monad_globals
   -open Tezos_error_monad
   -open Tezos_protocol_alpha_parameters
   -open Tezos_lazy_containers
@@ -43,3 +43,10 @@
   -open Tezos_alpha_test_helpers
   -open Tezos_client_alpha
   -open Tezos_protocol_plugin_alpha))
+
+(rule
+ (targets signature.ml)
+ (action
+  (write-file
+   %{targets}
+   "  module Bls = Tezos_crypto.Signature.Bls\n  module Ed25519 = Tezos_crypto.Signature.Ed25519\n  module P256 = Tezos_crypto.Signature.P256\n  module Secp256k1 = Tezos_crypto.Signature.Secp256k1\nmodule Mldsa44 = Tezos_crypto.Signature.Mldsa44\n  include Tezos_crypto.Signature.V3")))

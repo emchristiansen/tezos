@@ -1,81 +1,324 @@
 #!/bin/sh
 
-set -e
+set -ex
 
 script_dir="$(cd "$(dirname "$0")" && echo "$(pwd -P)/")"
 src_dir="$(dirname "$script_dir")"
 cd "$src_dir"
 
+# shellcheck source=scripts/version.sh
 . "$script_dir"/version.sh
 
-image_name="${1:-tezos-}"
-image_version="${2:-latest}"
-build_deps_image_name=${3:-registry.gitlab.com/tezos/opam-repository}
-build_deps_image_version=${4:-$opam_repository_tag}
-executables=${5:-$(cat script-inputs/released-executables)}
-commit_short_sha="${6:-$(git rev-parse --short HEAD)}"
-commit_datetime="${7:-$(git show -s --pretty=format:%ci HEAD)}"
-commit_tag="${8:-$(git describe --tags --always)}"
+# defaults
+image_name="tezos-"
+image_version="latest"
+# shellcheck disable=SC2154
+arch=${ARCH:-amd64}
+# Use the version of the CI images that corresponds to the state of the repo.
+# The image will be fetched from 'ci_image_name' from 'scripts/version.sh'.
+ci_image_version=${arch}--$(./images/image_tag.sh images/ci)
+executables=$(cat script-inputs/released-executables)
+commit_short_sha=$(git rev-parse --short HEAD)
+variants="debug bare minimal"
+commit_datetime=$(git show -s --pretty=format:%ci HEAD)
+commit_tag=$(git describe --tags --always)
+sccache_bucket=""
+cargo_mirror=""
+# Full image references (name:tag) for the runtime and build-dependencies images
+# the distribution builds FROM. Default (after option parsing) to the images
+# matching the local checkout (via 'ci_image_name'/version.sh); overridable via
+# --runtime-image / --build-deps-image (the distribution jobs pass them
+# explicitly).
+runtime_image=""
+build_deps_image=""
+push="false"
 
-build_image_name="${image_name}build"
+# usage and help
+usage() {
+  cat << EOF
+Usage:  $(basename "$0") [-h|--help]
+  [--image-name <IMAGE_NAME> ]
+  [--image-version <IMAGE_TAG> ]
+  [--runtime-image <IMAGE> ]
+  [--build-deps-image <IMAGE> ]
+  [--variants VARIANTS]
+  [--executables <EXECUTABLES> ]
+  [--commit-short-sha <COMMIT_SHA> ]
+  [--commit-datetime <DATETIME> ]
+  [--commit-tag <COMMIT_TAG> ]
+  [--sccache-bucket <BUCKET> ]
+  [--cargo-mirror]
+  [--push]
+
+DESCRIPTION
+    Builds the Octez Docker distribution.
+
+    By default, the distribution is built in three VARIANTS, built under the names:
+     - IMAGE_NAME-debug:IMAGE_TAG    (debug variant)
+     - IMAGE_NAME-bare:IMAGE_TAG     (bare variant)
+     - IMAGE_NAME:IMAGE_TAG          (minimal variant)
+    For the default value of IMAGE_NAME, IMAGE_TAG and the other
+    parameters, see below. The difference between the three variants
+    of the distribution are documented at
+    https://hub.docker.com/r/tezos/tezos.
+
+    The build starts FROM a runtime image (base of the variants) and a
+    build-dependencies image (build environment). By default these are the
+    images/ci runtime and build images matching the local checkout, resolved
+    via scripts/version.sh and images/image_tag.sh; they can be overridden with
+    --runtime-image and --build-deps-image.
+
+    The built distribution includes the set of executables defined by
+    EXECUTABLES: for a set of valid values, see
+    script-inputs/{released,experimental,dev}-executables. By default,
+    the distribution contains the released executables.
+
+    The version reported by the built Octez binaries are controlled
+    through the arguments COMMIT_SHA, COMMIT_DATETIME, and COMMIT_TAG.
+
+OPTIONS
+    Image naming
+        --image-name IMAGE_NAME
+            Base for the name of the built images.
+
+        --image-version IMAGE_TAG
+            Tag of built images.
+
+    Base image location
+        --runtime-image IMAGE
+            Full reference (name:tag) of the runtime image the variants are
+            built FROM. Default: the images/ci runtime image matching the
+            local checkout.
+
+        --build-deps-image IMAGE
+            Full reference (name:tag) of the build-dependencies image (build
+            environment, also used by the stripper stage). Default: the
+            images/ci build image matching the local checkout.
+
+    Image contents
+        --executables EXECUTABLES
+            Set of executables to include.
+
+        --variants VARIANTS
+            Distribution variants to build. A space-separated list of
+            values from: "debug", "bare" and "minimal". If empty
+            (i.e. '--variants ""'), then no variant image is produced:
+            only the intermediate build stage of 'build.Dockerfile' is
+            computed into the build cache (it is exported as
+            'type=cacheonly', so nothing is loaded into the local image
+            store). Default: "debug bare minimal". The minimal variant
+            is tagged IMAGE_NAME:IMAGE_TAG whereas the others are tagged
+            IMAGE_NAME-VARIANT:IMAGE_TAG.
+
+    Image metadata
+        --commit-short-sha COMMIT_SHA
+            Git commit short SHA for the Octez version string.
+        --commit-datetime COMMIT_DATETIME
+            Git date time for the Octez version string.
+        --commit-tag COMMIT_TAG
+            Git tags for the Octez version string.
+
+    Compilation cache
+        --sccache-bucket BUCKET
+            GCS bucket for sccache Rust compilation caching. When set,
+            RUSTC_WRAPPER=sccache is activated in build.Dockerfile,
+            caching Rust artifacts in GCS across builds.
+
+        --cargo-mirror
+            Route crates.io through the CI mirror proxy. The proxy is an
+            in-cluster service, so this is for CI builds only; without it
+            cargo fetches from crates.io directly.
+
+    Output
+        --push
+            Push the built variants to the registry instead of loading
+            them into the local image store.
+
+CURRENT VALUES
+    IMAGE_NAME: $image_name
+    IMAGE_VERSION: $image_version
+    RUNTIME_IMAGE (default): $ci_image_name/runtime:$ci_image_version
+    BUILD_DEPS_IMAGE (default): $ci_image_name/build:$ci_image_version
+    VARIANTS: $variants
+    EXECUTABLES: $(echo "$executables" | tr "\n" " ")
+    COMMIT_SHORT_SHA: $commit_short_sha
+    COMMIT_DATETIME: $commit_datetime
+    COMMIT_TAG: $commit_tag
+    SCCACHE_BUCKET: $sccache_bucket
+    CARGO_MIRROR: $cargo_mirror
+    PUSH: $push
+
+SEE ALSO
+    For more information, see 'images/README.md' and
+    'docs/introduction/howtoget.rst'.
+EOF
+}
+
+options=$(getopt -o h \
+  -l help,image-name:,image-version:,runtime-image:,build-deps-image:,executables:,commit-short-sha:,variants:,commit-datetime:,commit-tag:,sccache-bucket:,cargo-mirror,push -- "$@")
+eval set - "$options"
+# parse options and flags
+while true; do
+  case "$1" in
+  --image-name)
+    shift
+    image_name="$1"
+    ;;
+  --image-version)
+    shift
+    image_version="$1"
+    ;;
+  --executables)
+    shift
+    executables="$1"
+    ;;
+  --commit-short-sha)
+    shift
+    commit_short_sha="$1"
+    ;;
+  --variants)
+    shift
+    variants="$1"
+    for variant in $variants; do
+      case "$variant" in
+      debug | minimal | bare) ;;
+      *)
+        echo "Invalid variant '$variant'. Should be one of 'debug', 'minimal', or 'bare'. See --help."
+        exit 1
+        ;;
+      esac
+    done
+
+    ;;
+  --runtime-image)
+    shift
+    runtime_image="$1"
+    ;;
+  --build-deps-image)
+    shift
+    build_deps_image="$1"
+    ;;
+  --commit-datetime)
+    shift
+    commit_datetime="$1"
+    ;;
+  --commit-tag)
+    shift
+    commit_tag="$1"
+    ;;
+  --sccache-bucket)
+    shift
+    sccache_bucket="$1"
+    ;;
+  --cargo-mirror)
+    cargo_mirror="true"
+    ;;
+  --push)
+    push="true"
+    ;;
+  -h | --help)
+    usage
+    exit 1
+    ;;
+  --)
+    # This artificial option is added by 'getopt' and is required to recognize
+    # the end arguments.
+    shift
+    break
+    ;;
+  :) # If expected argument omitted:
+    usage
+    exit 1
+    ;;
+  *) # If unknown (any other) option:
+    usage
+    exit 1
+    ;;
+  esac
+  shift
+done
 
 echo "Executables to include in Docker images:"
 for executable in $executables; do
-    echo "- $executable"
+  echo "- $executable"
 done
 
-echo "### Building tezos..."
+# Default the image references to the ones matching the local checkout (via
+# 'ci_image_name'/version.sh) when not overridden, so callers that omit the
+# '--*-image' options keep working unchanged.
+runtime_image="${runtime_image:-${ci_image_name}/runtime:${ci_image_version}}"
+build_deps_image="${build_deps_image:-${ci_image_name}/build:${ci_image_version}}"
 
-docker build \
-  -t "$build_image_name:$image_version" \
-  -f build.Dockerfile \
-  --cache-from "$build_image_name:$image_version" \
-  --build-arg "BASE_IMAGE=$build_deps_image_name" \
-  --build-arg "BASE_IMAGE_VERSION=runtime-build-dependencies--$build_deps_image_version" \
-  --build-arg "OCTEZ_EXECUTABLES=${executables}" \
-  --build-arg "GIT_SHORTREF=${commit_short_sha}" \
-  --build-arg "GIT_DATETIME=${commit_datetime}" \
-  --build-arg "GIT_VERSION=${commit_tag}" \
-  "$src_dir"
+image_test="${build_deps_image}"
+if ! docker inspect --type=image "$image_test" > /dev/null 2>&1; then
+  echo "Image $image_test does not exist locally, attempt pull."
+  # This pull is just to check whether the image exists
+  # remotely. Although costly, it would've been pulled regardless in
+  # the docker builds below.
+  if ! docker pull "$image_test" > /dev/null 2>&1; then
+    echo "Failed to pull image $image_test."
+    echo "If you have modified any inputs to the CI images, then you have to rebuild them locally through ./images/create_ci_images.sh."
+    exit 1
+  else
+    echo "Pull of $image_test succeeded"
+  fi
+fi
 
-echo "### Successfully built docker image: $build_image_name:$image_version"
+# The whole distribution is built by a single `docker buildx bake` invocation
+# (see docker-bake.hcl). The intermediate build image (build.Dockerfile) is
+# computed once and consumed in-graph by the variant builds (Dockerfile) via a
+# build context, so it never round-trips through a registry. bake reads its
+# inputs from the environment, one variable per `variable` block.
+#
+# Notes:
+# - $GIT_SHORTREF / $GIT_DATETIME / $GIT_VERSION are used by libversion to
+#   assign the correct version to the octez binaries at compile time.
+# - [--allow network.host] is needed because build.Dockerfile has
+#   [RUN --network=host] (for sccache). Cf. the matching comment in
+#   build.Dockerfile.
+# - CI_PIPELINE_ID / CI_PIPELINE_URL / CI_JOB_ID / CI_JOB_URL / CI_COMMIT_SHA
+#   are exported by GitLab CI and picked up by bake automatically.
 
-docker build \
-  -t "${image_name}debug:$image_version" \
-  --build-arg "BASE_IMAGE=$build_deps_image_name" \
-  --build-arg "BASE_IMAGE_VERSION=runtime-dependencies--$build_deps_image_version" \
-  --build-arg "BASE_IMAGE_VERSION_NON_MIN=runtime-build-dependencies--$build_deps_image_version" \
-  --build-arg "BUILD_IMAGE=${build_image_name}" \
-  --build-arg "BUILD_IMAGE_VERSION=${image_version}" \
-  --build-arg "COMMIT_SHORT_SHA=${commit_short_sha}" \
-  --target=debug \
-  "$src_dir"
+# Map the requested variants to bake targets. With no variants
+# (--variants ""), only the intermediate "build" target is computed; it is
+# exported as type=cacheonly, so no image is loaded into the local store.
+if [ -z "$variants" ]; then
+  bake_targets="build"
+else
+  bake_targets="$variants"
+fi
 
-echo "### Successfully built docker image: ${image_name}debug:$image_version"
+echo "### Building tezos via docker buildx bake (targets: ${bake_targets})..."
 
-docker build \
-  -t "${image_name}bare:$image_version" \
-  --build-arg "BASE_IMAGE=$build_deps_image_name" \
-  --build-arg "BASE_IMAGE_VERSION=runtime-dependencies--$build_deps_image_version" \
-  --build-arg "BASE_IMAGE_VERSION_NON_MIN=runtime-build-dependencies--$build_deps_image_version" \
-  --build-arg "BUILD_IMAGE=${build_image_name}" \
-  --build-arg "BUILD_IMAGE_VERSION=${image_version}" \
-  --build-arg "COMMIT_SHORT_SHA=${commit_short_sha}" \
-  --target=bare \
-  "$src_dir"
+# The attestation and push exporters require the docker-container buildx
+# driver, which the default builder does not provide. The entitlement is for
+# build.Dockerfile's [RUN --network=host] (sccache).
+builder_arg=""
+if [ "$push" = "true" ]; then
+  docker buildx inspect octez-bake > /dev/null 2>&1 ||
+    docker buildx create --name octez-bake --driver docker-container \
+      --buildkitd-flags "--allow-insecure-entitlement network.host" > /dev/null
+  builder_arg="--builder octez-bake"
+fi
 
+# shellcheck disable=SC2086
+IMAGE_NAME="$image_name" \
+  MINIMAL_IMAGE_NAME="${image_name%?}" \
+  IMAGE_VERSION="$image_version" \
+  RUNTIME_IMAGE="$runtime_image" \
+  BUILD_DEPS_IMAGE="$build_deps_image" \
+  OCTEZ_EXECUTABLES="$executables" \
+  GIT_SHORTREF="$commit_short_sha" \
+  GIT_DATETIME="$commit_datetime" \
+  GIT_VERSION="$commit_tag" \
+  COMMIT_SHORT_SHA="$commit_short_sha" \
+  SCCACHE_GCS_BUCKET="$sccache_bucket" \
+  CARGO_MIRROR="$cargo_mirror" \
+  PUSH="$push" \
+  docker buildx bake \
+  $builder_arg \
+  --allow network.host \
+  -f "$src_dir/docker-bake.hcl" \
+  $bake_targets
 
-echo "### Successfully built docker image: ${image_name}bare:$image_version"
-
-docker build \
-  -t "${image_name%?}:$image_version" \
-  --build-arg "BASE_IMAGE=$build_deps_image_name" \
-  --build-arg "BASE_IMAGE_VERSION=runtime-dependencies--$build_deps_image_version" \
-  --build-arg "BASE_IMAGE_VERSION_NON_MIN=runtime-build-dependencies--$build_deps_image_version" \
-  --build-arg "BUILD_IMAGE=${build_image_name}" \
-  --build-arg "BUILD_IMAGE_VERSION=${image_version}" \
-  --build-arg "COMMIT_SHORT_SHA=${commit_short_sha}" \
-  --target=minimal \
-  "$src_dir"
-
-echo "### Successfully built docker image: ${image_name%?}:$image_version"
+echo "### Successfully ran docker buildx bake (targets: ${bake_targets})"

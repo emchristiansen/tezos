@@ -30,17 +30,18 @@
 (** A contract is simply an account on the blockchain ledger. There are two
     types of contracts:
     - implicit contracts represent accounts of users of the blockchain;
+    hence, they are commonly called "user accounts" in the documentation;
     - originated are special accounts with a Michelson script attached to
     them. Every time a transaction is sent to an originated account, its
     associated script is run in order to trigger some action in response.
+    These scripted accounts are commonly called "smart contracts" in the
+    documentation.
 
     An implicit account is identified by the hash of the public key which was
     used to create it. The owner of the corresponding private key is the
     holder of the account. An originated contract's hash is derived from its
     origination nonce (see below). *)
-type t =
-  | Implicit of Signature.Public_key_hash.t
-  | Originated of Contract_hash.t
+type t = Implicit of Implicit_account_repr.t | Originated of Contract_hash.t
 
 include Compare.S with type t := t
 
@@ -77,12 +78,14 @@ val pp_short : Format.formatter -> t -> unit
 
 val encoding : t Data_encoding.t
 
-(** [implicit_encoding] is an encoding for public key hashes that is
-    compatible with the [encoding] of contracts for implicit accounts. *)
-val implicit_encoding : Signature.Public_key_hash.t Data_encoding.t
+(** [implicit_encoding] is an encoding for public key hashes
+    compatible with the [encoding] of contracts in the specific case
+    of implicit accounts. *)
+val implicit_encoding : Implicit_account_repr.t Data_encoding.t
 
 (** [originated_encoding] is an encoding for contract hashes that is
-    compatible with the [encoding] of contracts for originated accounts. *)
+    compatible with the [encoding] of contracts in the specific case
+    of originated accounts. *)
 val originated_encoding : Contract_hash.t Data_encoding.t
 
 (** [cases f g] exports the {!type-Data_encoding.case}s used to define
@@ -96,3 +99,6 @@ val cases : ('a -> t option) -> (t -> 'a) -> 'a Data_encoding.case list
 val rpc_arg : t RPC_arg.arg
 
 module Index : Storage_description.INDEX with type t = t
+
+(** A value [zero] for type {!t}. It's equal to [Implicit Implicit_account_repr.zero]. *)
+val zero : t

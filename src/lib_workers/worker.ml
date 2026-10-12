@@ -51,6 +51,12 @@ module type T = sig
 
   type dropbox
 
+  type callback
+
+  type scope
+
+  type metadata = {scope : scope option}
+
   type 'a message_error =
     | Closed of error list option
     | Request_error of 'a
@@ -65,8 +71,9 @@ module type T = sig
           dropbox t -> any_request -> any_request option -> any_request option;
       }
         -> dropbox buffer_kind
+    | Callback : (unit -> any_request Lwt.t) -> callback buffer_kind
 
-  and any_request = Any_request : _ Request.t -> any_request
+  and any_request = Any_request : _ Request.t * metadata -> any_request
 
   (** Create a table of workers. *)
   val create_table : 'kind buffer_kind -> 'kind table
@@ -101,18 +108,19 @@ module type T = sig
     (** A function called when terminating a worker. *)
     val on_close : self -> unit Lwt.t
 
-    (** A function called at the end of the worker loop in case of an
-        abnormal error. This function can handle the error by
-        returning [Ok ()], or leave the default unexpected error
-        behaviour by returning its parameter. A possibility is to
-        handle the error for ad-hoc logging, and still use
+    (** A function called at the end of the worker loop in case of an abnormal
+        error. This function can handle the error by returning [Ok `Continue]
+        for the worker loop to continue and take the next request, [Ok
+        `Shutdown] and stop the worker loop without crashing, or leave the
+        default unexpected error behaviour by returning its parameter. A
+        possibility is to handle the error for ad-hoc logging, and still use
         {!trigger_shutdown} to kill the worker. *)
     val on_error :
       self ->
       Worker_types.request_status ->
       ('a, 'request_error) Request.t ->
       'request_error ->
-      unit tzresult Lwt.t
+      [`Continue | `Shutdown] tzresult Lwt.t
 
     (** A function called at the end of the worker loop in case of a
         successful treatment of the current request. *)
@@ -139,6 +147,9 @@ module type T = sig
   (** Triggers a worker termination and waits for its completion.
       Cannot be called from within the handlers.  *)
   val shutdown : _ t -> unit Lwt.t
+
+  (** Waits for completion, but doesn't trigger the shutdown. *)
+  val wait_for_completion : _ t -> unit Lwt.t
 
   module type BOX = sig
     type t
@@ -185,8 +196,14 @@ module type T = sig
   (** Triggers a worker termination. *)
   val trigger_shutdown : _ t -> unit
 
+  (** Returns true if the worker is shutting down. *)
+  val is_shutting_down : _ t -> bool
+
   (** Access the internal state, once initialized. *)
   val state : _ t -> Types.state
+
+  (** Access the internal state if available. *)
+  val state_opt : _ t -> Types.state option
 
   val with_state :
     _ t -> (Types.state -> (unit, 'b) result Lwt.t) -> (unit, 'b) result Lwt.t
@@ -217,9 +234,10 @@ module Make_internal
     (Name : Worker_intf.NAME)
     (Request : Worker_intf.REQUEST)
     (Types : Worker_intf.TYPES)
-    (Worker_events : Worker_events.S
-                       with type view = Request.view
-                        and type critical_error = tztrace) =
+    (Worker_events :
+      Worker_events.S
+        with type view = Request.view
+         and type critical_error = tztrace) =
 struct
   module Name = Name
   module Request = Request
@@ -242,6 +260,10 @@ struct
 
   let base_name = String.concat "-" Name.base
 
+  type scope = Opentelemetry.Scope.t
+
+  type metadata = {scope : scope option}
+
   type 'a message_error =
     | Closed of error list option
     | Request_error of 'a
@@ -249,7 +271,9 @@ struct
 
   type message =
     | Message :
-        ('a, 'b) Request.t * ('a, 'b message_error) result Lwt.u option
+        ('a, 'b) Request.t
+        * metadata
+        * ('a, 'b message_error) result Lwt.u option
         -> message
 
   type 'a queue
@@ -260,6 +284,8 @@ struct
 
   type dropbox
 
+  type callback
+
   type _ buffer_kind =
     | Queue : infinite queue buffer_kind
     | Bounded : {size : int} -> bounded queue buffer_kind
@@ -268,8 +294,9 @@ struct
           dropbox t -> any_request -> any_request option -> any_request option;
       }
         -> dropbox buffer_kind
+    | Callback : (unit -> any_request Lwt.t) -> callback buffer_kind
 
-  and any_request = Any_request : _ Request.t -> any_request
+  and any_request = Any_request : _ Request.t * metadata -> any_request
 
   and _ buffer =
     | Queue_buffer :
@@ -279,6 +306,7 @@ struct
         (Time.System.t * message) Lwt_pipe.Bounded.t
         -> bounded queue buffer
     | Dropbox_buffer : (Time.System.t * message) Lwt_dropbox.t -> dropbox buffer
+    | Callback_buffer : (unit -> any_request Lwt.t) -> callback buffer
 
   and 'kind t = {
     timeout : Time.System.Span.t option;
@@ -306,36 +334,38 @@ struct
     | Worker_types.Launching _ | Running _ | Closing _ -> None
     | Closed (_, _, errs) -> errs
 
-  let queue_item ?u r = (Time.System.now (), Message (r, u))
+  let queue_item ~metadata ?u r = (Time.System.now (), Message (r, metadata, u))
 
-  let drop_request w merge message_box request =
+  let drop_request w merge message_box request metadata =
     try
       match
         match Lwt_dropbox.peek message_box with
-        | None -> merge w (Any_request request) None
-        | Some (_, Message (old, _)) ->
+        | None -> merge w (Any_request (request, metadata)) None
+        | Some (_, Message (old, old_metadata, _)) ->
             Lwt.ignore_result (Lwt_dropbox.take message_box) ;
-            merge w (Any_request request) (Some (Any_request old))
+            merge
+              w
+              (Any_request (request, metadata))
+              (Some (Any_request (old, old_metadata)))
       with
       | None -> ()
-      | Some (Any_request neu) ->
-          Lwt_dropbox.put message_box (Time.System.now (), Message (neu, None))
+      | Some (Any_request (neu, neu_metadata)) ->
+          Lwt_dropbox.put
+            message_box
+            (Time.System.now (), Message (neu, neu_metadata, None))
     with Lwt_dropbox.Closed -> ()
 
-  let drop_request_and_wait w message_box request =
+  let drop_request_and_wait w message_box request metadata =
     let t, u = Lwt.wait () in
     Lwt.catch
       (fun () ->
-        Lwt_dropbox.put message_box (queue_item ~u request) ;
+        Lwt_dropbox.put message_box (queue_item ~metadata ~u request) ;
         t)
       (function
         | Lwt_dropbox.Closed ->
             Lwt.return_error (Closed (extract_status_errors w))
         | exn ->
-            (* [Lwt_dropbox.put] can only raise [Closed] which is caught above.
-               We don't want to catch any other exception but we cannot use an
-               incomplete pattern like we would in a [try]-[with] construct so
-               we must explicitly match and re-raise [exn]. *)
+            (* [Lwt_dropbox.put] can only raise [Closed] which is caught above. *)
             Lwt.return_error (Any exn))
 
   module type BOX = sig
@@ -364,24 +394,45 @@ struct
     val pending_requests_length : 'a t -> int
   end
 
+  let make_metadata () =
+    (* This pattern is equivalent to:
+       ```
+       let scope =
+         if "ppx is enabled" then
+           Opentelemetry.Scope.get_ambient_scope ()
+         else
+           None
+       ```
+    *)
+    let scope =
+      (None
+      [@profiler.overwrite
+        {driver_ids = [Opentelemetry]}
+          (Opentelemetry.Scope.get_ambient_scope ())])
+    in
+    {scope}
+
   module Dropbox = struct
     let put_request (w : dropbox t) request =
       let (Dropbox {merge}) = w.table.buffer_kind in
       let (Dropbox_buffer message_box) = w.buffer in
-      drop_request w merge message_box request
+      let metadata = make_metadata () in
+      drop_request w merge message_box request metadata
 
     let put_request_and_wait (w : dropbox t) request =
       let (Dropbox_buffer message_box) = w.buffer in
-      drop_request_and_wait w message_box request
+      let metadata = make_metadata () in
+      drop_request_and_wait w message_box request metadata
   end
 
   module Queue = struct
     let push_request (type a) (w : a queue t) request =
+      let metadata = make_metadata () in
       match w.buffer with
       | Queue_buffer message_queue ->
           if Lwt_pipe.Unbounded.is_closed message_queue then Lwt.return_false
           else (
-            Lwt_pipe.Unbounded.push message_queue (queue_item request) ;
+            Lwt_pipe.Unbounded.push message_queue (queue_item ~metadata request) ;
             (* because pushing on an unbounded pipe is immediate, we return within
                Lwt explicitly for compatibility with the other case *)
             Lwt.return_true)
@@ -390,21 +441,25 @@ struct
           else
             let open Lwt_syntax in
             let* () =
-              Lwt_pipe.Bounded.push message_queue (queue_item request)
+              Lwt_pipe.Bounded.push message_queue (queue_item ~metadata request)
             in
             Lwt.return_true
 
     let push_request_now (w : infinite queue t) request =
+      let metadata = make_metadata () in
       let (Queue_buffer message_queue) = w.buffer in
       if Lwt_pipe.Unbounded.is_closed message_queue then ()
-      else Lwt_pipe.Unbounded.push message_queue (queue_item request)
+      else Lwt_pipe.Unbounded.push message_queue (queue_item ~metadata request)
 
     let push_request_and_wait (type a) (w : a queue t) request =
+      let metadata = make_metadata () in
       match w.buffer with
       | Queue_buffer message_queue -> (
           try
             let t, u = Lwt.wait () in
-            Lwt_pipe.Unbounded.push message_queue (queue_item ~u request) ;
+            Lwt_pipe.Unbounded.push
+              message_queue
+              (queue_item ~metadata ~u request) ;
             t
           with Lwt_pipe.Closed ->
             Lwt.return_error (Closed (extract_status_errors w)))
@@ -412,7 +467,9 @@ struct
           let t, u = Lwt.wait () in
           Lwt.try_bind
             (fun () ->
-              Lwt_pipe.Bounded.push message_queue (queue_item ~u request))
+              Lwt_pipe.Bounded.push
+                message_queue
+                (queue_item ~metadata ~u request))
             (fun () -> t)
             (function
               | Lwt_pipe.Closed ->
@@ -429,7 +486,9 @@ struct
               Lwt_pipe.Bounded.peek_all_now message_queue
         with Lwt_pipe.Closed -> []
       in
-      List.map (function t, Message (req, _) -> (t, Request.view req)) peeked
+      List.map
+        (function t, Message (req, _, _) -> (t, Request.view req))
+        peeked
 
     let pending_requests_length (type a) (w : a queue t) =
       let pipe_length (type a) (q : a buffer) =
@@ -437,15 +496,16 @@ struct
         | Queue_buffer queue -> Lwt_pipe.Unbounded.length queue
         | Bounded_buffer queue -> Lwt_pipe.Bounded.length queue
         | Dropbox_buffer _ -> 1
+        | Callback_buffer _ -> 1
       in
       pipe_length w.buffer
   end
 
   let close (type a) (w : a t) =
     let wakeup = function
-      | _, Message (_, Some u) ->
+      | _, Message (_, _, Some u) ->
           Lwt.wakeup_later u (Error (Closed (extract_status_errors w)))
-      | _, Message (_, None) -> ()
+      | _, Message (_, _, None) -> ()
     in
     let close_queue message_queue =
       let messages = Lwt_pipe.Bounded.pop_all_now message_queue in
@@ -464,6 +524,7 @@ struct
         (try Option.iter wakeup (Lwt_dropbox.peek message_box)
          with Lwt_dropbox.Closed -> ()) ;
         Lwt_dropbox.close message_box
+    | Callback_buffer _ -> ()
 
   let pop (type a) (w : a t) =
     let open Lwt_syntax in
@@ -487,6 +548,21 @@ struct
             (Systime_os.sleep timeout)
             message_queue
     in
+    let pop_from_callback (read : unit -> any_request Lwt.t) =
+      let take () =
+        let* (Any_request (request, metadata)) = read () in
+        let time = Time.System.now () in
+        return_some (time, Message (request, metadata, None))
+      in
+      match w.timeout with
+      | None -> take ()
+      | Some timeout ->
+          let sleeper =
+            let* () = Systime_os.sleep timeout in
+            Lwt.return_none
+          in
+          Lwt.pick [sleeper; take ()]
+    in
     match w.buffer with
     | Queue_buffer message_queue -> pop_unbounded_queue message_queue
     | Bounded_buffer message_queue -> pop_queue message_queue
@@ -498,10 +574,13 @@ struct
         | Some timeout ->
             Lwt_dropbox.take_with_timeout (Systime_os.sleep timeout) message_box
         )
+    | Callback_buffer read -> pop_from_callback read
 
   let trigger_shutdown w = Lwt.ignore_result (Lwt_canceler.cancel w.canceler)
 
   let canceler {canceler; _} = canceler
+
+  let is_shutting_down w = Lwt_canceler.canceling w.canceler
 
   module type HANDLERS = sig
     type self
@@ -528,7 +607,7 @@ struct
       Worker_types.request_status ->
       ('a, 'request_error) Request.t ->
       'request_error ->
-      unit tzresult Lwt.t
+      [`Shutdown | `Continue] tzresult Lwt.t
 
     val on_completion :
       self ->
@@ -564,101 +643,115 @@ struct
     let (module Handlers : HANDLERS with type self = kind t) = handlers in
     let open Lwt_syntax in
     let rec loop () =
-      (* The call to [protect] here allows the call to [pop] (responsible
-         for fetching the next request) to be canceled by the use of the
-         [canceler].
+      (* Yield at the top of every iteration so the Lwt scheduler always gets
+         at least one scheduling step between iterations, regardless of how
+         the previous iteration ended.
 
-         These cancellations cannot affect the processing of ongoing requests.
-         This is due to the limited scope of the argument of [protect]. As a
-         result, ongoing requests are never canceled by this mechanism.
-
-         In the case when the [canceler] is canceled whilst a request is being
-         processed, the processing eventually resolves, at which point a
-         recursive call to this [loop] at which point this call to [protect]
-         fails immediately with [Canceled]. *)
+         Without this yield, a Callback worker whose [pop]/[read] resolves
+         immediately (e.g. on a closed TCP fd) and whose [on_error] or
+         [on_request] also returns without yielding will spin in a tight loop
+         that starves [Worker.shutdown] and every other Lwt promise
+         indefinitely.  The yield here makes that impossible: no matter which
+         path led back to [loop ()], other promises get a chance to run. *)
+      let* () = Lwt.pause () in
       let* popped = protect_result (fun () -> pop w) in
       match popped with
       | Error exn -> raise exn
       | Ok None ->
           let* () = Handlers.on_no_request w in
           loop ()
-      | Ok (Some (pushed, Message (request, u))) -> (
-          let current_request = Request.view request in
-          let treated = Time.System.now () in
-          w.current_request <- Some (pushed, treated, current_request) ;
-          let* r =
-            match u with
-            | None -> (
-                let open Lwt_result_syntax in
-                let*! res = Handlers.on_request w request in
-                match res with
-                | Error err -> Lwt.return_error err
-                | Ok res ->
-                    let completed = Time.System.now () in
-                    w.current_request <- None ;
-                    let status = Worker_types.{pushed; treated; completed} in
-                    let*! () = Handlers.on_completion w request res status in
-                    let*! () =
-                      Worker_events.(emit request_no_errors)
-                        (current_request, status)
-                    in
-                    return_unit)
-            | Some u -> (
-                (* [res] is a result. But the side effect [wakeup]
-                   needs to happen regardless of success (Ok) or failure
-                   (Error). To that end, we treat it locally like a regular
-                   promise (which happens to carry a [result]) within the Lwt
-                   monad. *)
-                let* res = Handlers.on_request w request in
-                match res with
-                | Error err ->
-                    Lwt.wakeup_later u (Error (Request_error err)) ;
-                    Lwt.return (Error err)
-                | Ok res ->
-                    Lwt.wakeup_later u (Ok res) ;
-                    let completed = Time.System.now () in
-                    let status = Worker_types.{pushed; treated; completed} in
-                    w.current_request <- None ;
-                    let* () = Handlers.on_completion w request res status in
-                    let* () =
-                      Worker_events.(emit request_no_errors)
-                        (current_request, status)
-                    in
-                    return (Ok ()))
-          in
-          match r with
-          | Ok () -> loop ()
-          | Error err -> (
-              let* r =
-                match w.current_request with
-                | Some (pushed, treated, _request_view) ->
-                    let completed = Time.System.now () in
-                    w.current_request <- None ;
-                    Handlers.on_error
-                      w
-                      Worker_types.{pushed; treated; completed}
-                      request
-                      err
-                | None -> assert false
-              in
-              match r with
-              | Ok () -> loop ()
-              | Error errs ->
-                  let* () = Worker_events.(emit crashed) errs in
-                  close handlers w (Some errs)))
+      | Ok (Some (pushed, Message (request, {scope = _scope}, u))) -> (
+          (let current_request = Request.view request in
+           let treated = Time.System.now () in
+           w.current_request <- Some (pushed, treated, current_request) ;
+           let* r =
+             match u with
+             | None -> (
+                 let open Lwt_result_syntax in
+                 let*! res = Handlers.on_request w request in
+                 match res with
+                 | Error err -> Lwt.return_error err
+                 | Ok res ->
+                     let completed = Time.System.now () in
+                     w.current_request <- None ;
+                     let status = Worker_types.{pushed; treated; completed} in
+                     let*! () = Handlers.on_completion w request res status in
+                     let*! () =
+                       Worker_events.(emit request_no_errors)
+                         (current_request, status)
+                     in
+                     return_unit)
+             | Some u -> (
+                 (* [res] is a result. But the side effect [wakeup]
+                    needs to happen regardless of success (Ok) or failure
+                    (Error). To that end, we treat it locally like a regular
+                    promise (which happens to carry a [result]) within the Lwt
+                    monad. *)
+                 let* res = Handlers.on_request w request in
+                 match res with
+                 | Error err ->
+                     Lwt.wakeup_later u (Error (Request_error err)) ;
+                     Lwt.return (Error err)
+                 | Ok res ->
+                     Lwt.wakeup_later u (Ok res) ;
+                     let completed = Time.System.now () in
+                     let status = Worker_types.{pushed; treated; completed} in
+                     w.current_request <- None ;
+                     let* () = Handlers.on_completion w request res status in
+                     let* () =
+                       Worker_events.(emit request_no_errors)
+                         (current_request, status)
+                     in
+                     return (Ok ()))
+           in
+           match r with
+           | Ok () -> loop ()
+           | Error err -> (
+               let* r =
+                 match w.current_request with
+                 | Some (pushed, treated, _request_view) ->
+                     let completed = Time.System.now () in
+                     w.current_request <- None ;
+                     Handlers.on_error
+                       w
+                       Worker_types.{pushed; treated; completed}
+                       request
+                       err
+                 | None -> assert false
+               in
+               match r with
+               | Ok `Continue -> loop ()
+               | Ok `Shutdown ->
+                   let* () = Worker_events.(emit terminated) () in
+                   close handlers w None
+               | Error errs ->
+                   let* () = Worker_events.(emit crashed) errs in
+                   close handlers w (Some errs)))
+          [@profiler.wrap_f
+            {driver_ids = [Opentelemetry]}
+              (Tezos_profiler_complex_backends.Opentelemetry_profiler
+               .update_scope
+                 _scope)])
     in
     let* r = protect_result ~canceler:w.canceler (fun () -> loop ()) in
     match r with
     | Ok () -> Lwt.return_unit
-    | Error Lwt.Canceled | Error Lwt_pipe.Closed | Error Lwt_dropbox.Closed ->
+    | Error (Lwt.Canceled | Lwt_pipe.Closed | Lwt_dropbox.Closed) ->
+        (* Explicit cancellation or closed buffer *)
+        let* () = Worker_events.(emit terminated) () in
+        close handlers w None
+    | Error
+        (Unix.Unix_error
+           ((Unix.EPIPE | Unix.ECONNRESET | Unix.ECONNREFUSED), _, _))
+      when is_shutting_down w ->
+        (* Only suppress socket errors during shutdown *)
         let* () = Worker_events.(emit terminated) () in
         close handlers w None
     | Error exn ->
         let* () = Worker_events.(emit crashed) [Exn exn] in
         raise exn
 
-  let launch :
-      type kind launch_error.
+  let launch : type kind launch_error.
       kind table ->
       ?timeout:Time.System.Span.t ->
       Name.t ->
@@ -695,6 +788,7 @@ struct
                  ~compute_size:(fun _ -> 1)
                  ())
         | Dropbox _ -> Dropbox_buffer (Lwt_dropbox.create ())
+        | Callback read -> Callback_buffer read
       in
       let w =
         {
@@ -730,13 +824,13 @@ struct
 
   let shutdown w =
     (* The actual cancellation ([Lwt_canceler.cancel w.canceler]) resolves
-       immediately because no hooks are registered on the canceler. However, the
-       worker ([w.worker]) resolves only once the ongoing request has resolved
-       (if any) and some clean-up operations have completed. *)
+       immediately because no hooks are registered on the canceler. *)
     let open Lwt_syntax in
     let* () = Worker_events.(emit triggering_shutdown) () in
     let* () = Error_monad.cancel_with_exceptions w.canceler in
     w.worker
+
+  let wait_for_completion w = w.worker
 
   let state w =
     match (w.state, w.status) with
@@ -756,6 +850,8 @@ struct
              w.name)
     | None, _ -> assert false
     | Some state, _ -> state
+
+  let state_opt w = w.state
 
   let with_state :
       _ t -> (Types.state -> (unit, 'b) result Lwt.t) -> (unit, 'b) result Lwt.t
@@ -779,7 +875,8 @@ struct
         (match w.buffer with
         | Queue_buffer pipe -> Lwt_pipe.Unbounded.length pipe
         | Bounded_buffer pipe -> Lwt_pipe.Bounded.length pipe
-        | Dropbox_buffer _ -> 1);
+        | Dropbox_buffer _ -> 1
+        | Callback_buffer _ -> 1);
     }
 
   let list {instances; _} =

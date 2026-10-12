@@ -23,23 +23,39 @@
 (*                                                                           *)
 (*****************************************************************************)
 
+type launch_mode = Socket | Local | Http
+
 module Parameters = struct
   type persistent_state = {
     runner : Runner.t option;
     base_dir : string;
     uri : Uri.t;
+    launch_mode : launch_mode option;
     keys : Account.key list;
+    magic_byte : string option;
+    check_highwatermark : bool;
+    allow_list_known_keys : bool;
+    allow_to_prove_possession : bool;
+    require_authentication : bool;
     mutable pending_ready : unit option Lwt.u list;
   }
 
   type session_state = {mutable ready : bool}
 
-  let signer_path = "./octez-signer"
-
   let base_default_name = "signer"
 
-  let default_uri () =
-    Uri.make ~scheme:"http" ~host:"localhost" ~port:(Port.fresh ()) ()
+  let default_http_uri () =
+    Uri.make ~scheme:"http" ~host:Constant.default_host ~port:(Port.fresh ()) ()
+
+  let default_tcp_uri () =
+    Uri.make ~scheme:"tcp" ~host:Constant.default_host ~port:(Port.fresh ()) ()
+
+  let default_unix_uri () =
+    let path =
+      Temp.file
+        (Filename.temp_file ~temp_dir:Filename.current_dir_name "" "socket")
+    in
+    Uri.make ~scheme:"unix" ~path ()
 
   let default_colors =
     Log.Color.
@@ -50,6 +66,8 @@ open Parameters
 include Daemon.Make (Parameters)
 
 let uri signer = signer.persistent_state.uri
+
+let base_dir signer = signer.persistent_state.base_dir
 
 let trigger_ready signer value =
   let pending = signer.persistent_state.pending_ready in
@@ -63,7 +81,11 @@ let set_ready signer =
   trigger_ready signer (Some ())
 
 let handle_readiness signer (event : event) =
-  if event.name = "signer_listening.v0" then set_ready signer
+  if
+    event.name = "signer_listening.v0"
+    || event.name = "accepting_tcp_requests.v0"
+    || event.name = "accepting_unix_requests.v0"
+  then set_ready signer
 
 let base_dir_arg client = ["--base-dir"; client.base_dir]
 
@@ -85,7 +107,7 @@ let spawn_import_secret_key signer (key : Account.key) =
   let sk_uri =
     match key.secret_key with
     | Unencrypted sk -> "unencrypted:" ^ sk
-    | Encrypted _ ->
+    | Encrypted _ | Remote _ ->
         Test.fail "[spawn_import_secret_key] expected an unencrypted key"
   in
   spawn_command signer ["import"; "secret"; "key"; key.alias; sk_uri]
@@ -93,23 +115,91 @@ let spawn_import_secret_key signer (key : Account.key) =
 let import_secret_key signer (key : Account.key) =
   spawn_import_secret_key signer key |> Process.check
 
-let create ?name ?color ?event_pipe ?base_dir ?uri ?runner
+let add_authorized_key signer (key : Account.key) =
+  spawn_command
+    signer
+    ["add"; "authorized"; "key"; key.public_key; "--name"; key.alias]
+  |> Process.check
+
+let id = Atomic.make 0
+
+let fresh_alias () = sf "signer_%d" (Atomic.fetch_and_add id 1)
+
+let spawn_gen_keys ?alias ?sig_alg signer =
+  let alias = Option.value ~default:(fresh_alias ()) alias in
+  let sig_args = match sig_alg with Some s -> ["--sig"; s] | None -> [] in
+  spawn_command signer (["gen"; "keys"; alias] @ sig_args)
+
+let gen_keys ?alias ?sig_alg signer =
+  let alias = Option.value ~default:(fresh_alias ()) alias in
+  let* () = spawn_gen_keys ~alias ?sig_alg signer |> Process.check in
+  return alias
+
+let spawn_show_address ~alias signer =
+  spawn_command signer ["show"; "address"; alias; "--show-secret"]
+
+let show_address ~alias signer =
+  let* output =
+    spawn_show_address ~alias signer |> Process.check_and_read_stdout
+  in
+  match output =~* rex "Hash: (\\S+)" with
+  | Some pkh -> return pkh
+  | None ->
+      Test.fail "Could not extract public key hash from show address output"
+
+let spawn_bls_prove_possession ?override_pk ~sk_uri signer =
+  let args = ["create"; "bls"; "proof"; "for"; sk_uri] in
+  let args =
+    match override_pk with
+    | None -> args
+    | Some pk -> args @ ["--override-public-key"; pk]
+  in
+  spawn_command signer args
+
+let bls_prove_possession ?override_pk ~sk_uri signer =
+  let* output =
+    spawn_bls_prove_possession ?override_pk ~sk_uri signer
+    |> Process.check_and_read_stdout
+  in
+  return (String.trim output)
+
+let create ?name ?color ?event_pipe ?base_dir ?launch_mode ?uri ?runner
+    ?(check_highwatermark = true) ?magic_byte ?(allow_list_known_keys = false)
+    ?(allow_to_prove_possession = false) ?(require_authentication = false)
     ?(keys = [Constant.bootstrap1]) () =
   let name = match name with None -> fresh_name () | Some name -> name in
   let base_dir =
     match base_dir with None -> Temp.dir name | Some dir -> dir
   in
   let uri =
-    match uri with None -> Parameters.default_uri () | Some uri -> uri
+    match uri with
+    | Some uri -> uri
+    | None -> (
+        match launch_mode with
+        | None | Some Http -> Parameters.default_http_uri ()
+        | Some Socket -> Parameters.default_tcp_uri ()
+        | Some Local -> Parameters.default_unix_uri ())
   in
   let signer =
     create
-      ~path:signer_path
+      ~path:(Uses.path Constant.octez_signer)
       ?name:(Some name)
       ?color
       ?event_pipe
       ?runner
-      {runner; base_dir; uri; keys; pending_ready = []}
+      {
+        runner;
+        base_dir;
+        launch_mode;
+        uri;
+        keys;
+        pending_ready = [];
+        check_highwatermark;
+        magic_byte;
+        allow_list_known_keys;
+        allow_to_prove_possession;
+        require_authentication;
+      }
   in
   on_event signer (handle_readiness signer) ;
   let* () = Lwt_list.iter_s (import_secret_key signer) keys in
@@ -120,25 +210,58 @@ let run signer =
   | Not_running -> ()
   | Running _ -> Test.fail "signer %s is already running" signer.name) ;
   let runner = signer.persistent_state.runner in
-  let host =
-    Option.value ~default:"localhost" (Uri.host signer.persistent_state.uri)
+  let base_dir_arg = ["--base-dir"; signer.persistent_state.base_dir] in
+  let require_authentication_args =
+    if signer.persistent_state.require_authentication then
+      ["--require-authentication"]
+    else []
+  in
+  let host_args =
+    match Uri.host signer.persistent_state.uri with
+    | None -> []
+    | Some address -> ["--address"; address]
   in
   let port_args =
     match Uri.port signer.persistent_state.uri with
     | None -> []
     | Some port -> ["--port"; Int.to_string port]
   in
+  let launch_mode_args =
+    match signer.persistent_state.launch_mode with
+    | None | Some Http -> ["launch"; "http"; "signer"] @ host_args @ port_args
+    | Some Socket -> ["launch"; "socket"; "signer"] @ host_args @ port_args
+    | Some Local ->
+        let socket_args =
+          match Uri.path signer.persistent_state.uri with
+          | "" -> []
+          | path -> ["--socket"; path]
+        in
+        ["launch"; "local"; "signer"] @ socket_args
+  in
+  let check_highwatermark_args =
+    if signer.persistent_state.check_highwatermark then
+      ["--check-high-watermark"]
+    else []
+  in
+  let magic_bytes_args =
+    match signer.persistent_state.magic_byte with
+    | None -> []
+    | Some magic_byte -> ["--magic-bytes"; magic_byte]
+  in
+  let allow_list_known_keys_args =
+    if signer.persistent_state.allow_list_known_keys then
+      ["--allow-list-known-keys"]
+    else []
+  in
+  let allow_to_prove_possession_args =
+    if signer.persistent_state.allow_to_prove_possession then
+      ["--allow-to-prove-possession"]
+    else []
+  in
   let arguments =
-    [
-      "--base-dir";
-      signer.persistent_state.base_dir;
-      "launch";
-      "http";
-      "signer";
-      "--address";
-      host;
-    ]
-    @ port_args
+    base_dir_arg @ require_authentication_args @ launch_mode_args
+    @ check_highwatermark_args @ magic_bytes_args @ allow_list_known_keys_args
+    @ allow_to_prove_possession_args
   in
   let arguments =
     if !passfile = "" then arguments
@@ -168,9 +291,25 @@ let wait_for_ready signer =
         resolver :: signer.persistent_state.pending_ready ;
       check_event signer "Signer started." promise
 
-let init ?name ?color ?event_pipe ?base_dir ?uri ?runner ?keys () =
+let init ?name ?color ?event_pipe ?base_dir ?launch_mode ?uri ?runner ?keys
+    ?check_highwatermark ?magic_byte ?allow_list_known_keys
+    ?allow_to_prove_possession ?require_authentication () =
   let* signer =
-    create ?name ?color ?event_pipe ?base_dir ?uri ?runner ?keys ()
+    create
+      ?name
+      ?color
+      ?event_pipe
+      ?base_dir
+      ?launch_mode
+      ?uri
+      ?runner
+      ?keys
+      ?check_highwatermark
+      ?magic_byte
+      ?allow_list_known_keys
+      ?allow_to_prove_possession
+      ?require_authentication
+      ()
   in
   let* () = run signer in
   let* () = wait_for_ready signer in

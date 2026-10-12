@@ -27,6 +27,8 @@
 module Message = Distributed_db_message
 module P2p_reader_event = Distributed_db_event.P2p_reader_event
 
+module Profiler = (val Profiler.wrap Shell_profiling.p2p_reader_profiler)
+
 type p2p = (Message.t, Peer_metadata.t, Connection_metadata.t) P2p.net
 
 type connection =
@@ -52,6 +54,44 @@ type chain_db = {
   active_connections : connection P2p_peer.Table.t;
 }
 
+(** Per-message-type throttle state, stored per peer connection. *)
+
+type throttle_entry = {
+  mutable count : int;
+      (** Number of messages received in the current window. *)
+  mutable window_start : Time.System.t option;
+      (** [None] until the first message has been handled. [Some ts] otherwise,
+          where [ts] is the last time the window has been reset. A window is
+          reset with the first message outside the previous window, if any. *)
+  params : (int * float * float) option;
+      (** [None] = no rate limiting.
+          [Some (n, window_s, cooldown_s)] = allow at most [n] messages per
+          [window_s] seconds; sleep [cooldown_s] seconds when exceeded. *)
+}
+
+type throttle_state = {
+  get_block_headers : throttle_entry;
+  block_header : throttle_entry;
+  get_current_branch : throttle_entry;
+  current_branch : throttle_entry;
+  get_current_head : throttle_entry;
+  current_head : throttle_entry;
+  deactivate : throttle_entry;
+  get_operations : throttle_entry;
+  operation : throttle_entry;
+  get_operations_for_blocks : throttle_entry;
+  operations_for_block : throttle_entry;
+  get_protocols : throttle_entry;
+  protocol : throttle_entry;
+  (* Unused *)
+  get_checkpoint : throttle_entry;
+  checkpoint : throttle_entry;
+  get_predecessor_header : throttle_entry;
+  predecessor_header : throttle_entry;
+  get_protocol_branch : throttle_entry;
+  protocol_branch : throttle_entry;
+}
+
 type t = {
   p2p : p2p;
   gid : P2p_peer.Id.t;  (** remote peer id *)
@@ -64,7 +104,151 @@ type t = {
   active_chains : chain_db Chain_id.Table.t;
       (** All chains managed by this peer **)
   unregister : unit -> unit;
+  throttle : throttle_state;
+  conn_lost : unit Lwt.t;
+      (** Resolves when the underlying TCP connection is lost (either the read
+          or the write side fails). *)
+  mutable deactivated : bool;
+      (** Set to [true] once [deactivate]/[unregister] have been called,
+          so that [on_close] does not repeat them. *)
 }
+
+let make_entry ~threshold ~window_s ~cooldown_s =
+  {
+    count = 0;
+    window_start = None;
+    params = Some (threshold, window_s, cooldown_s);
+  }
+
+let entry_of_msg (d : throttle_state) msg =
+  let open Message in
+  match msg with
+  | Get_block_headers _ -> d.get_block_headers
+  | Block_header _ -> d.block_header
+  | Get_current_branch _ -> d.get_current_branch
+  | Current_branch _ -> d.current_branch
+  | Get_current_head _ -> d.get_current_head
+  | Current_head _ -> d.current_head
+  | Deactivate _ -> d.deactivate
+  | Get_operations _ -> d.get_operations
+  | Operation _ -> d.operation
+  | Get_operations_for_blocks _ -> d.get_operations_for_blocks
+  | Operations_for_block _ -> d.operations_for_block
+  | Get_protocols _ -> d.get_protocols
+  | Protocol _ -> d.protocol
+  | Get_checkpoint _ -> d.get_checkpoint
+  | Checkpoint _ -> d.checkpoint
+  | Get_predecessor_header _ -> d.get_predecessor_header
+  | Predecessor_header _ -> d.predecessor_header
+  | Get_protocol_branch _ -> d.get_protocol_branch
+  | Protocol_branch _ -> d.protocol_branch
+
+(** [throttle state msg] checks the rate-limiting state for the message type of
+    [msg] within [state.throttle]. If the message count in the current window
+    exceeds the threshold, it sleeps for [cooldown_s] (or until the connection
+    is lost, whichever comes first) and returns [true] to signal the caller that
+    the message was throttled. Otherwise it increments the counter and returns
+    [false]. *)
+let throttle t msg =
+  let open Lwt_syntax in
+  let entry = entry_of_msg t.throttle msg in
+  match entry.params with
+  | None -> return false
+  | Some (n, window_s, cooldown_s) ->
+      let now = Time.System.now () in
+      let in_window =
+        match entry.window_start with
+        | None -> false
+        | Some ws ->
+            Ptime.Span.compare
+              (Ptime.diff now ws)
+              (Time.System.Span.of_seconds_exn window_s)
+            < 0
+      in
+      if not in_window then (
+        entry.window_start <- Some now ;
+        entry.count <- 1 ;
+        return false)
+      else (
+        entry.count <- entry.count + 1 ;
+        if entry.count > n then
+          let* () =
+            Lwt.choose
+              [
+                Lwt_unix.sleep cooldown_s;
+                (let* () = t.conn_lost in
+                 (* We also watch for connection loss: without this, a dead peer
+                 with a full message buffer would keep us busy sleeping and
+                 processing for a long time.
+
+                 The [Lwt.pause] after [conn_lost] gives the worker shutdown
+                 path (which reacts to the same signal) a chance to cancel us
+                 before we loop back and pick up the next buffered message. In
+                 the worst case we handle one extra message before being
+                 cancelled. *)
+                 Lwt.pause ());
+              ]
+          in
+          return true
+        else return false)
+
+(** No throttling; messages of this type are always processed immediately. *)
+let no_throttle () = {count = 0; window_start = None; params = None}
+
+(** Safety-net entry for message types no longer used by the protocol. Limits to
+    1 per 10 s so that unexpected occurrences do not cause a busy loop. *)
+let unused_entry () = make_entry ~threshold:1 ~window_s:10. ~cooldown_s:10.
+
+let make_throttle_state () =
+  {
+    (* get_block_headers: no throttle, it's naturally spamming (bootstrap)*)
+    get_block_headers = no_throttle ();
+    (* block_header: no throttle, it's naturally spamming (bootstrap)*)
+    block_header = no_throttle ();
+    (* get_current_branch: Only sent at connection establishment, or received
+       block with no predecessor. *)
+    get_current_branch = make_entry ~threshold:1 ~window_s:4. ~cooldown_s:4.;
+    (* current_branch: should only come as a response to get_current_branch,
+       i.e. once per connection establishment or missing predecessor. *)
+    current_branch = make_entry ~threshold:1 ~window_s:4. ~cooldown_s:4.;
+    (* get_current_head only sent on RPC call or new protocol has been fetched
+       and compiled. *)
+    get_current_head = make_entry ~threshold:1 ~window_s:4. ~cooldown_s:4.;
+    (* current_head: no throttle. Don't delay preattestation arriving just after
+       new head *)
+    current_head = no_throttle ();
+    (* deactivate is either peer deconnection or side-chain deactivation *)
+    deactivate = make_entry ~threshold:1 ~window_s:4. ~cooldown_s:4.;
+    (* get_operations: no throttle, it's naturally spamming*)
+    get_operations = no_throttle ();
+    (* operation: no throttle, it's naturally spamming*)
+    operation = no_throttle ();
+    (* get_operations_for_blocks: no throttle, it's naturally spamming*)
+    get_operations_for_blocks = no_throttle ();
+    (* operations_for_blocks: no throttle, it's naturally spamming*)
+    operations_for_block = no_throttle ();
+    (* get_protocols: the message can carry a batch of protocol hashes, but in
+       practice we only request one unknown protocol at a time. Serving more
+       than one such batch per 10 s from the same peer makes no sense. *)
+    get_protocols = make_entry ~threshold:1 ~window_s:10. ~cooldown_s:10.;
+    (* protocol: carries a single protocol in response to get_protocols.
+       We only fetch one unknown protocol at a time so more than one per
+       second from the same peer is unexpected. *)
+    protocol = make_entry ~threshold:1 ~window_s:1. ~cooldown_s:1.;
+    (* Unused *)
+    (* get_checkpoint: not used.*)
+    get_checkpoint = unused_entry ();
+    (* checkpoint: not used anymore.*)
+    checkpoint = unused_entry ();
+    (* get_predecessor_header: not used.*)
+    get_predecessor_header = unused_entry ();
+    (* predecessor_header: not used.*)
+    predecessor_header = unused_entry ();
+    (* get_protocol_branch: not used.*)
+    get_protocol_branch = unused_entry ();
+    (* protocol_branch: not used.*)
+    protocol_branch = unused_entry ();
+  }
 
 (* performs [f chain_db] if the chain is active for the remote peer
    and [chain_db] is the chain_db corresponding to this chain id, otherwise
@@ -79,7 +263,7 @@ let may_handle state chain_id f =
 
 (* performs [f chain_db] if [chain_id] is active and [chain_db] is the
    chain_db corresponding to this chain id. *)
-let may_handle_global state chain_id f =
+let may_handle_global (state : t) chain_id f =
   match Chain_id.Table.find state.active_chains chain_id with
   | None -> Lwt.return_unit
   | Some chain_db -> f chain_db
@@ -96,7 +280,7 @@ let find_pending_operation {peer_active_chains; _} h =
   |> Seq.find (fun chain_db ->
          Distributed_db_requester.Raw_operation.pending chain_db.operation_db h)
 
-let read_operation state h =
+let read_operation (state : t) h =
   let open Lwt_syntax in
   Seq_s.of_seq (Chain_id.Table.to_seq state.active_chains)
   |> Seq_s.S.find_map (fun (chain_id, chain_db) ->
@@ -107,7 +291,7 @@ let read_operation state h =
          in
          Option.map (fun bh -> (chain_id, bh)) v)
 
-let read_block {disk; _} h =
+let read_block ({disk; _} : t) h =
   let open Lwt_syntax in
   let* chain_stores = Store.all_chain_stores disk in
   List.find_map_s
@@ -129,7 +313,7 @@ let read_block_header db h =
   | Some (chain_id, block) ->
       Lwt.return_some (chain_id, Store.Block.header block)
 
-let read_predecessor_header {disk; _} h offset =
+let read_predecessor_header ({disk; _} : t) h offset =
   Option.catch_os (fun () ->
       let open Lwt_syntax in
       let offset = Int32.to_int offset in
@@ -164,33 +348,41 @@ let activate state chain_id chain_db =
       P2p_peer.Table.add chain_db.active_connections state.gid state.conn ;
       Chain_id.Table.add state.peer_active_chains chain_id chain_db
 
-let my_peer_id state = P2p.peer_id state.p2p
+let my_peer_id (state : t) = P2p.peer_id state.p2p
 
-let handle_msg state msg =
+let handle_msg (state : t) msg =
   let open Lwt_syntax in
   let open Message in
   let meta = P2p.get_peer_metadata state.p2p state.gid in
   let* () =
     P2p_reader_event.(emit read_message) (state.gid, P2p_message.Message msg)
   in
+  let* throttled = throttle state msg in
   match msg with
   | Get_current_branch chain_id ->
-      Peer_metadata.incr meta @@ Received_request Branch ;
-      may_handle_global state chain_id @@ fun chain_db ->
-      activate state chain_id chain_db ;
-      let seed =
-        {Block_locator.receiver_id = state.gid; sender_id = my_peer_id state}
-      in
-      let* current_head = Store.Chain.current_head chain_db.chain_store in
-      let* locator =
-        Store.Chain.compute_locator chain_db.chain_store current_head seed
-      in
-      Peer_metadata.update_responses meta Branch
-      @@ P2p.try_send state.p2p state.conn
-      @@ Current_branch (chain_id, locator) ;
-      Lwt.return_unit
-  | Current_branch (chain_id, locator) ->
-      may_handle state chain_id @@ fun chain_db ->
+      (Peer_metadata.incr meta @@ Received_request Branch ;
+       may_handle_global state chain_id @@ fun chain_db ->
+       activate state chain_id chain_db ;
+       let seed =
+         {Block_locator.receiver_id = state.gid; sender_id = my_peer_id state}
+       in
+       let* current_head = Store.Chain.current_head chain_db.chain_store in
+       let* locator =
+         (Store.Chain.compute_locator
+            chain_db.chain_store
+            current_head
+            seed
+          [@profiler.span_s
+            {verbosity = Info}
+              ["Get_current_branch"; "compute_current_branch_locator"]])
+       in
+       Peer_metadata.update_responses meta Branch
+       @@ P2p.try_send state.p2p state.conn
+       @@ Current_branch (chain_id, locator) ;
+       Lwt.return_unit)
+      [@profiler.span_s {verbosity = Notice} ["Get_current_branch"]]
+  | Current_branch (chain_id, locator) -> (
+      (may_handle state chain_id @@ fun chain_db ->
       let {Block_locator.head_hash; head_header; history} = locator in
       let* known_invalid =
         List.exists_p
@@ -198,7 +390,12 @@ let handle_msg state msg =
           (head_hash :: history)
       in
       if known_invalid then (
-        let* () = P2p.disconnect state.p2p state.conn in
+        let* () =
+          P2p.disconnect
+            ~reason:"invalid current branch has been received"
+            state.p2p
+            state.conn
+        in
         P2p.greylist_peer state.p2p state.gid ;
         Lwt.return_unit)
       else if
@@ -212,14 +409,16 @@ let handle_msg state msg =
         (* TODO discriminate between received advertisements
            and responses? *)
         Peer_metadata.incr meta @@ Received_advertisement Branch ;
-        Lwt.return_unit)
-  | Deactivate chain_id ->
-      may_handle state chain_id @@ fun chain_db ->
+        Lwt.return_unit))
+      [@profiler.span_s {verbosity = Notice} ["Current_branch"]])
+  | Deactivate chain_id -> (
+      (may_handle state chain_id @@ fun chain_db ->
       deactivate state.gid chain_db ;
       Chain_id.Table.remove state.peer_active_chains chain_id ;
-      Lwt.return_unit
-  | Get_current_head chain_id ->
-      may_handle state chain_id @@ fun chain_db ->
+      Lwt.return_unit)
+      [@profiler.span_s {verbosity = Notice} ["Deactivate"]])
+  | Get_current_head chain_id -> (
+      (may_handle state chain_id @@ fun chain_db ->
       Peer_metadata.incr meta @@ Received_request Head ;
       let {Connection_metadata.disable_mempool; _} =
         P2p.connection_remote_metadata state.p2p state.conn
@@ -234,9 +433,10 @@ let handle_msg state msg =
       Peer_metadata.update_responses meta Head
       @@ P2p.try_send state.p2p state.conn
       @@ Current_head (chain_id, head, mempool) ;
-      Lwt.return_unit
-  | Current_head (chain_id, header, mempool) ->
-      may_handle state chain_id @@ fun chain_db ->
+      Lwt.return_unit)
+      [@profiler.span_s {verbosity = Notice} ["Get_current_head"]])
+  | Current_head (chain_id, header, mempool) -> (
+      (may_handle state chain_id @@ fun chain_db ->
       let header_hash = Block_header.hash header in
       let* known_invalid =
         Store.Block.is_known_invalid chain_db.chain_store header_hash
@@ -251,7 +451,12 @@ let handle_msg state msg =
            probably warrant a reduction of the sender's score. *)
       in
       if known_invalid then (
-        let* () = P2p.disconnect state.p2p state.conn in
+        let* () =
+          P2p.disconnect
+            ~reason:"invalid current head has been received"
+            state.p2p
+            state.conn
+        in
         P2p.greylist_peer state.p2p state.gid ;
         Lwt.return_unit)
       else if
@@ -264,111 +469,145 @@ let handle_msg state msg =
         (* TODO discriminate between received advertisements
            and responses? *)
         Peer_metadata.incr meta @@ Received_advertisement Head ;
-        Lwt.return_unit)
+        Lwt.return_unit))
+      [@profiler.span_s {verbosity = Notice} ["Current_head"]])
   | Get_block_headers hashes ->
-      Peer_metadata.incr meta @@ Received_request Block_header ;
-      List.iter_p
-        (fun hash ->
-          let* o = read_block_header state hash in
-          match o with
-          | None ->
-              Peer_metadata.incr meta @@ Unadvertised Block ;
-              Lwt.return_unit
-          | Some (_chain_id, header) ->
-              Peer_metadata.update_responses meta Block_header
-              @@ P2p.try_send state.p2p state.conn
-              @@ Block_header header ;
-              Lwt.return_unit)
-        hashes
+      (Peer_metadata.incr meta @@ Received_request Block_header ;
+       List.iter_p
+         (fun hash ->
+           let* o = read_block_header state hash in
+           match o with
+           | None ->
+               Peer_metadata.incr meta @@ Unadvertised Block ;
+               Lwt.return_unit
+           | Some (_chain_id, header) ->
+               Peer_metadata.update_responses meta Block_header
+               @@ P2p.try_send state.p2p state.conn
+               @@ Block_header header ;
+               Lwt.return_unit)
+         hashes)
+      [@profiler.span_s {verbosity = Notice} ["Get_block_headers"]]
   | Block_header block -> (
-      let hash = Block_header.hash block in
-      match find_pending_block_header state hash with
-      | None ->
-          Peer_metadata.incr meta Unexpected_response ;
-          Lwt.return_unit
-      | Some chain_db ->
-          let* () =
-            Distributed_db_requester.Raw_block_header.notify
-              chain_db.block_header_db
-              state.gid
-              hash
-              block
-          in
-          Peer_metadata.incr meta @@ Received_response Block_header ;
-          Lwt.return_unit)
+      (let hash = Block_header.hash block in
+       match find_pending_block_header state hash with
+       | None ->
+           Peer_metadata.incr meta Unexpected_response ;
+           Lwt.return_unit
+       | Some chain_db ->
+           let* () =
+             Distributed_db_requester.Raw_block_header.notify
+               chain_db.block_header_db
+               state.gid
+               hash
+               block
+           in
+           Peer_metadata.incr meta @@ Received_response Block_header ;
+           Lwt.return_unit)
+      [@profiler.span_s {verbosity = Notice} ["Block_header"]])
   | Get_operations hashes ->
-      Peer_metadata.incr meta @@ Received_request Operations ;
-      List.iter_p
-        (fun hash ->
-          let* o = read_operation state hash in
-          match o with
-          | None ->
-              Peer_metadata.incr meta @@ Unadvertised Operations ;
-              Lwt.return_unit
-          | Some (_chain_id, op) ->
-              Peer_metadata.update_responses meta Operations
-              @@ P2p.try_send state.p2p state.conn
-              @@ Operation op ;
-              Lwt.return_unit)
-        hashes
+      (Peer_metadata.incr meta @@ Received_request Operations ;
+       List.iter_p
+         (fun hash ->
+           let* o = read_operation state hash in
+           match o with
+           | None ->
+               Peer_metadata.incr meta @@ Unadvertised Operations ;
+               Lwt.return_unit
+           | Some (_chain_id, op) ->
+               Peer_metadata.update_responses meta Operations
+               @@ P2p.try_send state.p2p state.conn
+               @@ Operation op ;
+               Lwt.return_unit)
+         hashes
+       [@profiler.span_s
+         {verbosity = Info}
+           ["Get_operations"; P2p_peer_id.to_short_b58check state.gid]])
+      [@profiler.span_s {verbosity = Notice} ["Get_operations"]]
   | Operation operation -> (
-      let hash = Operation.hash operation in
-      match find_pending_operation state hash with
-      | None ->
-          Peer_metadata.incr meta Unexpected_response ;
-          Lwt.return_unit
-      | Some chain_db ->
-          let* () =
-            Distributed_db_requester.Raw_operation.notify
-              chain_db.operation_db
-              state.gid
-              hash
-              operation
-          in
-          Peer_metadata.incr meta @@ Received_response Operations ;
-          Lwt.return_unit)
+      (let hash = Operation.hash operation in
+       let[@warning "-26"] operation_type =
+         match Char.code (Bytes.get operation.proto 0) with
+         | 0x14 -> "preattestation"
+         | 0x15 -> "attestation"
+         | _ -> "other"
+       in
+       match[@profiler.span_s {verbosity = Info} ["Operation"; operation_type]]
+         find_pending_operation
+           state
+           hash
+         [@profiler.span_f
+           {verbosity = Debug}
+             [
+               "Operation";
+               operation_type;
+               P2p_peer_id.to_short_b58check state.gid;
+             ]]
+       with
+       | None ->
+           Peer_metadata.incr meta Unexpected_response ;
+           Lwt.return_unit
+       | Some chain_db ->
+           let* () =
+             Distributed_db_requester.Raw_operation.notify
+               chain_db.operation_db
+               state.gid
+               hash
+               operation
+           in
+           Peer_metadata.incr meta @@ Received_response Operations ;
+           Lwt.return_unit)
+      [@profiler.span_s {verbosity = Notice} ["Operation"]])
   | Get_protocols hashes ->
-      Peer_metadata.incr meta @@ Received_request Protocols ;
-      List.iter_p
-        (fun hash ->
-          let* o = Store.Protocol.read state.disk hash in
-          match o with
-          | None ->
-              Peer_metadata.incr meta @@ Unadvertised Protocol ;
-              Lwt.return_unit
-          | Some p ->
-              Peer_metadata.update_responses meta Protocols
-              @@ P2p.try_send state.p2p state.conn
-              @@ Protocol p ;
-              Lwt.return_unit)
-        hashes
+      (Peer_metadata.incr meta @@ Received_request Protocols ;
+       (* Debouncing: serving protocol data is expensive; drop the request if
+          the peer is sending too many. *)
+       if throttled then return_unit
+       else
+         List.iter_p
+           (fun hash ->
+             let* o = Store.Protocol.read state.disk hash in
+             match o with
+             | None ->
+                 Peer_metadata.incr meta @@ Unadvertised Protocol ;
+                 Lwt.return_unit
+             | Some p ->
+                 Peer_metadata.update_responses meta Protocols
+                 @@ P2p.try_send state.p2p state.conn
+                 @@ Protocol p ;
+                 Lwt.return_unit)
+           hashes)
+      [@profiler.span_s {verbosity = Notice} ["Get_protocols"]]
   | Protocol protocol ->
-      let hash = Protocol.hash protocol in
-      let* () =
-        Distributed_db_requester.Raw_protocol.notify
-          state.protocol_db
-          state.gid
-          hash
-          protocol
-      in
-      Peer_metadata.incr meta @@ Received_response Protocols ;
-      Lwt.return_unit
+      (let hash = Protocol.hash protocol in
+       let* () =
+         Distributed_db_requester.Raw_protocol.notify
+           state.protocol_db
+           state.gid
+           hash
+           protocol
+       in
+       Peer_metadata.incr meta @@ Received_response Protocols ;
+       Lwt.return_unit)
+      [@profiler.span_s {verbosity = Notice} ["Protocol"]]
   | Get_operations_for_blocks blocks ->
-      Peer_metadata.incr meta @@ Received_request Operations_for_block ;
-      List.iter_p
-        (fun (hash, ofs) ->
-          let* o = read_block state hash in
-          match o with
-          | None -> Lwt.return_unit
-          | Some (_, block) ->
-              let ops, path = Store.Block.operations_path block ofs in
-              Peer_metadata.update_responses meta Operations_for_block
-              @@ P2p.try_send state.p2p state.conn
-              @@ Operations_for_block (hash, ofs, ops, path) ;
-              Lwt.return_unit)
-        blocks
+      (Peer_metadata.incr meta @@ Received_request Operations_for_block ;
+       List.iter_p
+         (fun (hash, ofs) ->
+           let* o = read_block state hash in
+           match o with
+           | None -> Lwt.return_unit
+           | Some (_, block) ->
+               let ops, path = Store.Block.operations_path block ofs in
+               Peer_metadata.update_responses meta Operations_for_block
+               @@ P2p.try_send state.p2p state.conn
+               @@ Operations_for_block (hash, ofs, ops, path) ;
+               Lwt.return_unit)
+         blocks)
+      [@profiler.span_s {verbosity = Notice} ["Get_operations_for_blocks"]]
   | Operations_for_block (block, ofs, ops, path) -> (
-      match find_pending_operations state block ofs with
+      match[@profiler.span_s {verbosity = Notice} ["Operations_for_block"]]
+        find_pending_operations state block ofs
+      with
       | None ->
           Peer_metadata.incr meta Unexpected_response ;
           Lwt.return_unit
@@ -383,87 +622,168 @@ let handle_msg state msg =
           Peer_metadata.incr meta @@ Received_response Operations_for_block ;
           Lwt.return_unit)
   | Get_checkpoint chain_id -> (
-      Peer_metadata.incr meta @@ Received_request Checkpoint ;
-      may_handle_global state chain_id @@ fun chain_db ->
-      let* checkpoint_hash, _ = Store.Chain.checkpoint chain_db.chain_store in
-      let* o =
-        Store.Block.read_block_opt chain_db.chain_store checkpoint_hash
-      in
-      match o with
-      | None -> Lwt.return_unit
-      | Some checkpoint ->
-          let checkpoint_header = Store.Block.header checkpoint in
-          Peer_metadata.update_responses meta Checkpoint
-          @@ P2p.try_send state.p2p state.conn
-          @@ Checkpoint (chain_id, checkpoint_header) ;
-          Lwt.return_unit)
+      (Peer_metadata.incr meta @@ Received_request Checkpoint ;
+       may_handle_global state chain_id @@ fun chain_db ->
+       let* checkpoint_hash, _ = Store.Chain.checkpoint chain_db.chain_store in
+       let* o =
+         Store.Block.read_block_opt chain_db.chain_store checkpoint_hash
+       in
+       match o with
+       | None -> Lwt.return_unit
+       | Some checkpoint ->
+           let checkpoint_header = Store.Block.header checkpoint in
+           Peer_metadata.update_responses meta Checkpoint
+           @@ P2p.try_send state.p2p state.conn
+           @@ Checkpoint (chain_id, checkpoint_header) ;
+           Lwt.return_unit)
+      [@profiler.span_s {verbosity = Notice} ["Get_checkpoint"]])
   | Checkpoint _ ->
       (* This message is currently unused: it will be used for future
          bootstrap heuristics. *)
-      Peer_metadata.incr meta @@ Received_response Checkpoint ;
-      Lwt.return_unit
+      (Peer_metadata.incr meta @@ Received_response Checkpoint ;
+       Lwt.return_unit)
+      [@profiler.span_s {verbosity = Notice} ["Checkpoint"]]
   | Get_protocol_branch (chain_id, proto_level) -> (
-      Peer_metadata.incr meta @@ Received_request Protocol_branch ;
-      may_handle_global state chain_id @@ fun chain_db ->
-      activate state chain_id chain_db ;
-      let seed =
-        {Block_locator.receiver_id = state.gid; sender_id = my_peer_id state}
-      in
-      let* o =
-        Store.Chain.compute_protocol_locator
-          chain_db.chain_store
-          ~proto_level
-          seed
-      in
-      match o with
-      | Some locator ->
-          Peer_metadata.update_responses meta Protocol_branch
-          @@ P2p.try_send state.p2p state.conn
-          @@ Protocol_branch (chain_id, proto_level, locator) ;
-          Lwt.return_unit
-      | None -> Lwt.return_unit)
+      (Peer_metadata.incr meta @@ Received_request Protocol_branch ;
+       may_handle_global state chain_id @@ fun chain_db ->
+       activate state chain_id chain_db ;
+       let seed =
+         {Block_locator.receiver_id = state.gid; sender_id = my_peer_id state}
+       in
+       let* o =
+         Store.Chain.compute_protocol_locator
+           chain_db.chain_store
+           ~proto_level
+           seed
+       in
+       match o with
+       | Some locator ->
+           Peer_metadata.update_responses meta Protocol_branch
+           @@ P2p.try_send state.p2p state.conn
+           @@ Protocol_branch (chain_id, proto_level, locator) ;
+           Lwt.return_unit
+       | None -> Lwt.return_unit)
+      [@profiler.span_s {verbosity = Notice} ["Get_protocol_branch"]])
   | Protocol_branch (_chain, _proto_level, _locator) ->
       (* This message is currently unused: it will be used for future
          multipass. *)
-      Peer_metadata.incr meta @@ Received_response Protocol_branch ;
-      Lwt.return_unit
+      (Peer_metadata.incr meta @@ Received_response Protocol_branch ;
+       Lwt.return_unit)
+      [@profiler.span_s {verbosity = Notice} ["Protocol_branch"]]
   | Get_predecessor_header (block_hash, offset) -> (
-      Peer_metadata.incr meta @@ Received_request Predecessor_header ;
-      let* o = read_predecessor_header state block_hash offset in
-      match o with
-      | None ->
-          (* The peer is not expected to request blocks that are beyond
-             our locator. *)
-          Peer_metadata.incr meta @@ Unadvertised Block ;
-          Lwt.return_unit
-      | Some header ->
-          Peer_metadata.update_responses meta Predecessor_header
-          @@ P2p.try_send state.p2p state.conn
-          @@ Predecessor_header (block_hash, offset, header) ;
-          Lwt.return_unit)
+      (Peer_metadata.incr meta @@ Received_request Predecessor_header ;
+       let* o = read_predecessor_header state block_hash offset in
+       match o with
+       | None ->
+           (* The peer is not expected to request blocks that are beyond
+              our locator. *)
+           Peer_metadata.incr meta @@ Unadvertised Block ;
+           Lwt.return_unit
+       | Some header ->
+           Peer_metadata.update_responses meta Predecessor_header
+           @@ P2p.try_send state.p2p state.conn
+           @@ Predecessor_header (block_hash, offset, header) ;
+           Lwt.return_unit)
+      [@profiler.span_s {verbosity = Notice} ["Get_predecessor_header"]])
   | Predecessor_header (_block_hash, _offset, _header) ->
       (* This message is currently unused: it will be used to improve
          bootstrapping. *)
-      Peer_metadata.incr meta @@ Received_response Predecessor_header ;
-      Lwt.return_unit
+      (Peer_metadata.incr meta @@ Received_response Predecessor_header ;
+       Lwt.return_unit)
+      [@profiler.span_s {verbosity = Notice} ["Predecessor_header"]]
 
-let rec worker_loop state =
-  let open Lwt_syntax in
-  let* o =
-    protect ~canceler:state.canceler (fun () -> P2p.recv state.p2p state.conn)
-  in
-  match o with
-  | Ok msg ->
-      let* () = handle_msg state msg in
-      worker_loop state
-  | Error _ ->
-      Chain_id.Table.iter
-        (fun _ -> deactivate state.gid)
-        state.peer_active_chains ;
-      state.unregister () ;
-      Lwt.return_unit
+let on_error state =
+  if Lwt.is_sleeping state.conn_lost then Lwt_result.return `Shutdown
+  else
+    (* TCP connection already dropped.
+       Worker.shutdown is en route via [Lwt.on_success conn_lost / dont_wait].
+       Return [`Continue] so the worker loop drives itself to termination via
+       the canceler rather than calling [close] here and racing with the
+       already-scheduled shutdown.  The unconditional [Lwt.pause ()] at the
+       top of [Worker.loop ()] guarantees the scheduler gets a turn before the
+       next [pop_from_callback] call, so [Worker.shutdown] can be scheduled. *)
+    Lwt_result.return `Continue
 
-let run ~register ~unregister p2p disk protocol_db active_chains gid conn =
+(** Call [deactivate] and [unregister] at most once per connection.
+    Guards against double-calls when both [on_error] (protocol-error path)
+    and [on_close] (conn_lost / normal shutdown path) execute. *)
+let deactivate_once state =
+  if not state.deactivated then (
+    state.deactivated <- true ;
+    Chain_id.Table.iter (fun _ -> deactivate state.gid) state.peer_active_chains ;
+    state.unregister ())
+
+type (_, _) req = Message : Message.t tzresult -> (unit, tztrace) req
+[@@ocaml.unboxed]
+
+type view = View : ('a, 'b) req -> view
+
+module Request :
+  Worker_intf.REQUEST with type ('a, 'b) t = ('a, 'b) req and type view = view =
+struct
+  type ('a, 'b) t = ('a, 'b) req =
+    | Message : Message.t tzresult -> (unit, tztrace) t
+  [@@ocaml.unboxed]
+
+  type nonrec view = view
+
+  let make_encoding (p2p_cases : 'msg P2p_params.app_message_encoding list) =
+    let to_data_encoding_case
+        (P2p_params.Encoding {tag; title; encoding; wrap; unwrap; _}) =
+      Data_encoding.case ~title (Tag tag) encoding unwrap wrap
+    in
+    Data_encoding.union @@ List.map to_data_encoding_case p2p_cases
+
+  let encoding =
+    let open Data_encoding in
+    conv
+      (fun (View (Message msg)) -> msg)
+      (fun msg -> View (Message msg))
+      (Error_monad.result_encoding (make_encoding Message.encoding))
+
+  let pp ppf (View (Message msg)) =
+    match msg with
+    | Ok msg -> Message.pp_json ppf msg
+    | Error trace -> Error_monad.pp_print_trace ppf trace
+
+  let view msg = View msg
+end
+
+type parameters = {
+  p2p : p2p;
+  conn : connection;
+  disk : Store.t;
+  protocol_db : Distributed_db_requester.Raw_protocol.t;
+  active_chains : chain_db Chain_id.Table.t;
+  unregister : unit -> unit;
+}
+
+module Types :
+  Worker_intf.TYPES with type state = t and type parameters = parameters =
+struct
+  type state = t
+
+  type nonrec parameters = parameters
+end
+
+module Name : Worker_intf.NAME with type t = P2p_peer.Id.t = struct
+  let base = ["db_network_reader"]
+
+  type t = P2p_peer.Id.t
+
+  let encoding = P2p_peer.Id.encoding
+
+  let pp = P2p_peer.Id.pp
+
+  let equal = P2p_peer.Id.equal
+end
+
+module Worker = Worker.MakeSingle (Name) (Request) (Types)
+
+type worker = Worker.callback Worker.t
+
+let on_launch (_ : worker) gid
+    {p2p; conn; disk; protocol_db; active_chains; unregister} =
   let canceler = Lwt_canceler.create () in
   let state =
     {
@@ -477,6 +797,10 @@ let run ~register ~unregister p2p disk protocol_db active_chains gid conn =
       peer_active_chains = Chain_id.Table.create 17;
       worker = Lwt.return_unit;
       unregister;
+      conn_lost =
+        Lwt.choose [P2p.wait_reader_closed conn; P2p.wait_writer_closed conn];
+      throttle = make_throttle_state ();
+      deactivated = false;
     }
   in
   Chain_id.Table.iter
@@ -494,12 +818,68 @@ let run ~register ~unregister p2p disk protocol_db active_chains gid conn =
         (fun exc ->
           Format.eprintf "Uncaught exception: %s\n%!" (Printexc.to_string exc)))
     active_chains ;
-  state.worker <-
-    Lwt_utils.worker
-      (Format.asprintf "db_network_reader.%a" P2p_peer.Id.pp_short gid)
-      ~on_event:Internal_event.Lwt_worker_logger.on_event
-      ~run:(fun () -> worker_loop state)
-      ~cancel:(fun () -> Error_monad.cancel_with_exceptions canceler) ;
-  register state
+  state
 
-let shutdown s = Error_monad.cancel_with_exceptions s.canceler
+(* Temporarily disable warning *)
+[@@@ocaml.warning "-32"]
+
+module Handlers = struct
+  type self = worker
+
+  type launch_error = error trace
+
+  let on_launch (self : self) gid parameters : (t, launch_error) result Lwt.t =
+    let state = on_launch self gid parameters in
+    let () =
+      Lwt.on_success state.conn_lost (fun () ->
+          Lwt.dont_wait (fun () -> Worker.shutdown self) (fun _exn -> ()))
+    in
+    Lwt_result.return state
+
+  let on_request : type res err.
+      self -> (res, err) req -> (res, err) result Lwt.t =
+   fun self (Message msg) ->
+    let open Lwt_result_syntax in
+    match msg with
+    | Ok msg ->
+        let*! () = handle_msg (Worker.state self) msg in
+        return_unit
+    | Error trace -> fail trace
+
+  let on_no_request _ = Lwt.return_unit
+
+  let on_close self =
+    let state = Worker.state self in
+    (* No-op if already called from on_error (protocol-error path).
+       Runs for real on the conn_lost / normal-shutdown path. *)
+    deactivate_once state ;
+    Lwt.return_unit
+
+  let on_error : type res err.
+      self -> _ -> (res, err) req -> err -> [> `Shutdown] tzresult Lwt.t =
+   fun self _ (Message _) _ -> on_error (Worker.state self)
+
+  let on_completion _ _ _ _ = Lwt.return_unit
+end
+
+let run_worker ~register ~unregister p2p disk protocol_db active_chains gid conn
+    =
+  let open Lwt_result_syntax in
+  let table =
+    Worker.create_table
+      (Callback
+         (fun () ->
+           let*! parsed_message_result = P2p.recv p2p conn in
+           Lwt.return
+             (Worker.Any_request (Message parsed_message_result, {scope = None}))))
+  in
+  let* worker =
+    Worker.launch
+      table
+      gid
+      {p2p; conn; disk; protocol_db; active_chains; unregister}
+      (module Handlers)
+  in
+  return (register worker)
+
+let shutdown_worker w = Worker.shutdown w

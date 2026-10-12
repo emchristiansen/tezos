@@ -35,7 +35,7 @@ type event = {name : string; value : JSON.t; timestamp : float}
 
     This function just creates the [t] value, it does not call [run].
 
-    The path to accuser binary is chosen from the [protocol].
+    [path] provides the path to the accuser binary.
 
     The standard output and standard error output of the accuser will
     be logged with prefix [name] and color [color].
@@ -52,14 +52,18 @@ type event = {name : string; value : JSON.t; timestamp : float}
     will communicate with it.
 
     If [runner] is specified, the accuser will be spawned on this
-    runner using SSH. *)
+    runner using SSH.
+
+    [preserved_levels] is the number of effective levels kept in the accuser's
+    memory*)
 val create :
-  protocol:Protocol.t ->
+  ?path:string ->
   ?name:string ->
   ?color:Log.Color.t ->
   ?event_pipe:string ->
   ?base_dir:string ->
   ?runner:Runner.t ->
+  ?preserved_levels:int ->
   Node.t ->
   t
 
@@ -83,7 +87,7 @@ val kill : t -> unit Lwt.t
 
     The resulting promise is fulfilled as soon as the accuser has been spawned.
     It continues running in the background. *)
-val run : t -> unit Lwt.t
+val run : ?event_level:Daemon.Level.default_level -> t -> unit Lwt.t
 
 (** {2 Events} *)
 
@@ -108,13 +112,19 @@ exception
 val wait_for_ready : t -> unit Lwt.t
 
 (** See [Daemon.Make.wait_for]. *)
-val wait_for : ?where:string -> t -> string -> (JSON.t -> 'a option) -> 'a Lwt.t
+val wait_for :
+  ?timeout:float ->
+  ?where:string ->
+  t ->
+  string ->
+  (JSON.t -> 'a option) ->
+  'a Lwt.t
 
 (** See [Daemon.Make.on_event]. *)
 val on_event : t -> (event -> unit) -> unit
 
 (** See [Daemon.Make.log_events]. *)
-val log_events : t -> unit
+val log_events : ?max_length:int -> t -> unit
 
 (** {2 High-Level Functions} *)
 
@@ -128,7 +138,7 @@ val log_events : t -> unit
     does not want to wait for the node to be ready, it is necessary to
     use [create] and then [run].
 
-    The path to accuser binary is chosen from the [protocol].
+    [path] is the path to accuser binary.
 
     The standard output and standard error output of the accuser will
     be logged with prefix [name] and color [color].
@@ -136,6 +146,9 @@ val log_events : t -> unit
     Default [event_pipe] is a temporary file whose name is derived
     from [name]. It will be created as a named pipe so that accuser
     events can be received.
+
+    [event_level] specifies the verbosity of the file descriptor sink.
+    The default value is [`Info].
 
     [base_dir] corresponds to the (useless) "--base-dir" argument of
     the octez-accuser command.
@@ -145,14 +158,19 @@ val log_events : t -> unit
     will communicate with it.
 
     If [runner] is specified, the accuser will be spawned on this
-    runner using SSH. *)
+    runner using SSH.
+
+    [preserved_levels] is the number of effective levels kept in the accuser's
+    memory *)
 val init :
-  protocol:Protocol.t ->
+  ?path:string ->
   ?name:string ->
   ?color:Log.Color.t ->
   ?event_pipe:string ->
+  ?event_level:Daemon.Level.default_level ->
   ?base_dir:string ->
   ?runner:Runner.t ->
+  ?preserved_levels:int ->
   Node.t ->
   t Lwt.t
 

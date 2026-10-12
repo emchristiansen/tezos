@@ -23,17 +23,14 @@
 (*                                                                           *)
 (*****************************************************************************)
 
-type t =
-  | Implicit of Signature.Public_key_hash.t
-  | Originated of Contract_hash.t
+type t = Implicit of Implicit_account_repr.t | Originated of Contract_hash.t
 
 include Compare.Make (struct
   type nonrec t = t
 
   let compare l1 l2 =
     match (l1, l2) with
-    | Implicit pkh1, Implicit pkh2 ->
-        Signature.Public_key_hash.compare pkh1 pkh2
+    | Implicit pkh1, Implicit pkh2 -> Implicit_account_repr.compare pkh1 pkh2
     | Originated h1, Originated h2 -> Contract_hash.compare h1 h2
     | Implicit _, Originated _ -> -1
     | Originated _, Implicit _ -> 1
@@ -42,29 +39,22 @@ end)
 let in_memory_size =
   let open Cache_memory_helpers in
   function
+  (* FIXME-PA: change memory size for implicit accounts *)
   | Implicit _ -> h1w +! public_key_hash_in_memory_size
   | Originated _ -> h1w +! blake2b_hash_size
 
 type error += Invalid_contract_notation of string (* `Permanent *)
 
 let to_b58check = function
-  | Implicit pbk -> Signature.Public_key_hash.to_b58check pbk
+  | Implicit pbk -> Implicit_account_repr.to_b58check pbk
   | Originated h -> Contract_hash.to_b58check h
-
-let implicit_of_b58data : Base58.data -> Signature.public_key_hash option =
-  function
-  | Ed25519.Public_key_hash.Data h -> Some (Signature.Ed25519 h)
-  | Secp256k1.Public_key_hash.Data h -> Some (Signature.Secp256k1 h)
-  | P256.Public_key_hash.Data h -> Some (Signature.P256 h)
-  | Bls.Public_key_hash.Data h -> Some (Signature.Bls h)
-  | _ -> None
 
 let originated_of_b58data = function
   | Contract_hash.Data h -> Some h
   | _ -> None
 
 let contract_of_b58data data =
-  match implicit_of_b58data data with
+  match Implicit_account_repr.of_b58data data with
   | Some pkh -> Some (Implicit pkh)
   | None -> (
       match originated_of_b58data data with
@@ -72,26 +62,27 @@ let contract_of_b58data data =
       | None -> None)
 
 let of_b58check_gen ~of_b58data s =
+  let open Result_syntax in
   match Base58.decode s with
   | Some data -> (
       match of_b58data data with
-      | Some c -> ok c
-      | None -> error (Invalid_contract_notation s))
-  | None -> error (Invalid_contract_notation s)
+      | Some c -> return c
+      | None -> tzfail (Invalid_contract_notation s))
+  | None -> tzfail (Invalid_contract_notation s)
 
 let of_b58check = of_b58check_gen ~of_b58data:contract_of_b58data
 
 let pp ppf = function
-  | Implicit pbk -> Signature.Public_key_hash.pp ppf pbk
+  | Implicit pbk -> Implicit_account_repr.pp ppf pbk
   | Originated h -> Contract_hash.pp ppf h
 
 let pp_short ppf = function
-  | Implicit pbk -> Signature.Public_key_hash.pp_short ppf pbk
+  | Implicit pbk -> Implicit_account_repr.pp_short ppf pbk
   | Originated h -> Contract_hash.pp_short ppf h
 
 let implicit_case ~proj ~inj =
   let open Data_encoding in
-  case (Tag 0) ~title:"Implicit" Signature.Public_key_hash.encoding proj inj
+  case (Tag 0) ~title:"Implicit" Implicit_account_repr.encoding proj inj
 
 let originated_case ~proj ~inj =
   let open Data_encoding in
@@ -150,8 +141,8 @@ let implicit_encoding =
     ~title_extra:" -- implicit account"
     ~can_be:"implicit contract hash."
     ~cases:(fun proj inj -> [implicit_case ~proj ~inj])
-    ~to_b58check:Signature.Public_key_hash.to_b58check
-    ~of_b58data:implicit_of_b58data
+    ~to_b58check:Implicit_account_repr.to_b58check
+    ~of_b58data:Implicit_account_repr.of_b58data
 
 let originated_encoding =
   encoding_gen
@@ -182,7 +173,7 @@ let originated_contracts
       Origination_nonce.{origination_index = first; operation_hash = first_hash}
     ~until:
       (Origination_nonce.{origination_index = last; operation_hash = last_hash}
-      as origination_nonce) =
+       as origination_nonce) =
   assert (Operation_hash.equal first_hash last_hash) ;
   let rec contracts acc origination_index =
     if Compare.Int32.(origination_index < first) then acc
@@ -232,3 +223,5 @@ end
 (* Renamed exports. *)
 
 let of_b58data = contract_of_b58data
+
+let zero = Implicit Implicit_account_repr.zero

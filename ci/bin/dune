@@ -1,0 +1,20 @@
+; This file was automatically generated, do not edit.
+; Edit file manifest/main.ml instead.
+
+(executable
+ (name main)
+ (libraries
+  gitlab_ci
+  tezos_ci
+  tezos_ci_jobs
+  release_site_ci
+  grafazos_ci
+  teztale_ci
+  rollup_node_ci
+  sdk_bindings_ci
+  etherlink_ci
+  documentation_ci)
+ (flags
+  (:standard)
+  -open Gitlab_ci.Base
+  -open Tezos_ci_jobs))

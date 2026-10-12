@@ -26,8 +26,7 @@
 (** Testing
     -------
     Component:    Protocol (type-checking)
-    Invocation:   cd src/proto_alpha/lib_protocol/test/regression && \
-                  dune exec ./main.exe
+    Invocation:   dune exec src/proto_alpha/lib_protocol/test/regression/main.exe
     Subject:      Type-checking
  *)
 
@@ -141,7 +140,7 @@ let pp_trace fmt = function
 
 let logger () :
     (unit -> trace_element list tzresult Lwt.t) * Script_typed_ir.logger =
-  let open Lwt_result_syntax in
+  let open Lwt_result_wrap_syntax in
   let open Script_typed_ir in
   let log : log_element list ref = ref [] in
   let logger =
@@ -163,14 +162,12 @@ let logger () :
       end)
   in
   let assemble_log () =
-    let open Environment.Error_monad in
     let+ l =
       List.map_es
         (function
           | With_stack (ctxt, instr, loc, stack, stack_ty, indent) ->
-              let+ stack =
-                Lwt.map Environment.wrap_tzresult
-                @@ Traced_interpreter.unparse_stack ctxt (stack, stack_ty)
+              let+@ stack =
+                Traced_interpreter.unparse_stack ctxt (stack, stack_ty)
               in
               TInstr (loc, Gas.level ctxt, instr, stack, indent)
           | Ctrl cont -> return @@ TCtrl cont)
@@ -210,7 +207,11 @@ let run_script transaction () =
   let* parameter, ctxt =
     match transaction with
     | With_lib {lib = {filename; storage}; parameter; _} ->
-        let* block, baker, _contract, _src2 = Contract_helpers.init () in
+        let* block, baker, _contract, _src2 =
+          Contract_helpers.init
+            ~hard_gas_limit_per_block:(Gas.Arith.integral_of_int_exn 10_000_000)
+            ()
+        in
         let sender = Contract.Implicit baker in
         let* src_addr, _script, block =
           Contract_helpers.originate_contract_from_string_hash
@@ -223,7 +224,7 @@ let run_script transaction () =
         let* incr = Incremental.begin_construction block in
         return (parameter src_addr, Incremental.alpha_ctxt incr)
     | Simple {parameter; _} ->
-        let* b, _contract = Context.init1 ~consensus_threshold:0 () in
+        let* b, _contract = Context.init1 ~consensus_threshold_size:0 () in
         let* inc = Incremental.begin_construction b in
         let ctxt = Incremental.alpha_ctxt inc in
         let ctxt =
@@ -257,7 +258,7 @@ let fail_on_error f () =
   let open Lwt_syntax in
   let* result = f () in
   match result with
-  | Ok () -> return ()
+  | Ok () -> return_unit
   | Error e -> Test.fail "%a" Error_monad.pp_print_trace e
 
 (* Make sure that after a snapshot the snapshotted version of the test

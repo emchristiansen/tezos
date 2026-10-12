@@ -1,0 +1,356 @@
+# This file was automatically generated, do not edit.
+# Edit file ci/bin/main.ml instead.
+
+stages:
+- start
+- build
+- publish
+
+datadog_pipeline_trace:
+  image: datadog/ci:v5.18.0@sha256:07475bc65fc5efec461feeaca7a16cc32c13742393db6cce5352fc5f7e1bd5a2
+  stage: start
+  tags:
+  - gcp
+  needs: []
+  dependencies: []
+  allow_failure: true
+  timeout: 60 minutes
+  interruptible: false
+  before_script:
+  - SCRIPT_STEP_BEGIN=$(date +%s)
+  - . ./scripts/ci/datadog_send_job_info.sh
+  - . ./scripts/ci/datadog_send_job_cache_info.sh 'before'
+  script:
+  - CI_MERGE_REQUEST_IID=${CI_MERGE_REQUEST_IID:-none}
+  - DATADOG_SITE=datadoghq.eu datadog-ci tag --level pipeline --tags pipeline_type:$PIPELINE_TYPE
+    --tags mr_number:$CI_MERGE_REQUEST_IID
+  - . ./scripts/ci/datadog_send_job_script_step_time.sh || true
+  after_script:
+  - . ./scripts/ci/datadog_send_job_cache_info.sh 'after'
+
+documentation.build_all:
+  image: ${GCP_PROTECTED_REGISTRY}/tezos/tezos/alpine-test:master-18884dda
+  stage: build
+  tags:
+  - gcp
+  needs:
+  - documentation.odoc
+  - documentation.manuals
+  - documentation.docgen
+  dependencies:
+  - documentation.odoc
+  - documentation.manuals
+  - documentation.docgen
+  timeout: 60 minutes
+  interruptible: false
+  before_script:
+  - SCRIPT_STEP_BEGIN=$(date +%s)
+  - . ./scripts/ci/datadog_send_job_info.sh
+  - . ./scripts/ci/datadog_send_job_cache_info.sh 'before'
+  script:
+  - eval $(opam env)
+  - . $HOME/.venv/bin/activate
+  - make -C docs -j sphinx
+  - make -C docs -j _build/octezdoc.txt
+  - . ./scripts/ci/datadog_send_job_script_step_time.sh || true
+  after_script:
+  - . ./scripts/ci/datadog_send_job_cache_info.sh 'after'
+  artifacts:
+    expire_in: 1 week
+    paths:
+    - docs/_build/
+    expose_as: Documentation - excluding old protocols
+
+documentation.docgen:
+  image: ${GCP_PROTECTED_REGISTRY}/tezos/tezos/alpine-test:master-18884dda
+  stage: build
+  tags:
+  - gcp_very_high_cpu
+  needs: []
+  dependencies: []
+  timeout: 60 minutes
+  cache:
+    key: cargo-$CI_JOB_NAME_SLUG
+    paths:
+    - $CI_PROJECT_DIR/.cargo/registry/cache
+    - $CI_PROJECT_DIR/.cargo/registry/index
+    - $CI_PROJECT_DIR/.cargo/registry/src
+    policy: pull-push
+  interruptible: false
+  before_script:
+  - SCRIPT_STEP_BEGIN=$(date +%s)
+  - . ./scripts/ci/datadog_send_job_info.sh
+  - . ./scripts/ci/sccache-start.sh
+  - . ./scripts/ci/datadog_send_job_cache_info.sh 'before'
+  script:
+  - eval $(opam env)
+  - make -C docs -j docexes-gen
+  - . ./scripts/ci/datadog_send_job_script_step_time.sh || true
+  after_script:
+  - . ./scripts/ci/datadog_send_job_cache_info.sh 'after'
+  - ./scripts/ci/sccache-stop.sh
+  variables:
+    CARGO_INCREMENTAL: "0"
+    CARGO_NET_OFFLINE: "false"
+    SCCACHE_GCS_BUCKET: $GCP_SCCACHE_BUCKET
+    SCCACHE_GCS_KEY_PREFIX: sccache
+    SCCACHE_GCS_RW_MODE: READ_ONLY
+    SCCACHE_IDLE_TIMEOUT: "0"
+    SCCACHE_IGNORE_SERVER_IO_ERROR: "1"
+  artifacts:
+    expire_in: 1 week
+    paths:
+    - docs/alpha/rpc.rst
+    - docs/shell/rpc.rst
+    - docs/user/default-acl.json
+    - docs/api/errors.rst
+    - docs/shell/p2p_api.rst
+
+documentation.manuals:
+  image: ${GCP_PROTECTED_REGISTRY}/tezos/tezos/alpine-test:master-18884dda
+  stage: build
+  tags:
+  - gcp
+  needs:
+  - oc.build_x86_64-released
+  - oc.build_x86_64-extra-dev
+  dependencies:
+  - oc.build_x86_64-released
+  - oc.build_x86_64-extra-dev
+  timeout: 60 minutes
+  interruptible: false
+  before_script:
+  - SCRIPT_STEP_BEGIN=$(date +%s)
+  - . ./scripts/ci/datadog_send_job_info.sh
+  - . ./scripts/ci/datadog_send_job_cache_info.sh 'before'
+  script:
+  - eval $(opam env)
+  - make -C docs -j octez-gen
+  - . ./scripts/ci/datadog_send_job_script_step_time.sh || true
+  after_script:
+  - . ./scripts/ci/datadog_send_job_cache_info.sh 'after'
+  artifacts:
+    expire_in: 1 week
+    paths:
+    - docs/*/octez-*.html
+    - docs/api/octez-*.txt
+    - docs/developer/metrics.csv
+    - docs/developer/rollup_metrics.csv
+    - docs/user/node-config.json
+
+documentation.odoc:
+  image: ${GCP_PROTECTED_REGISTRY}/tezos/tezos/alpine-test:master-18884dda
+  stage: build
+  tags:
+  - gcp_very_high_cpu
+  needs: []
+  dependencies: []
+  timeout: 60 minutes
+  cache:
+    key: cargo-$CI_JOB_NAME_SLUG
+    paths:
+    - $CI_PROJECT_DIR/.cargo/registry/cache
+    - $CI_PROJECT_DIR/.cargo/registry/index
+    - $CI_PROJECT_DIR/.cargo/registry/src
+    policy: pull-push
+  interruptible: false
+  before_script:
+  - SCRIPT_STEP_BEGIN=$(date +%s)
+  - . ./scripts/ci/datadog_send_job_info.sh
+  - . ./scripts/ci/sccache-start.sh
+  - . ./scripts/ci/datadog_send_job_cache_info.sh 'before'
+  script:
+  - eval $(opam env)
+  - make -C docs odoc
+  - . ./scripts/ci/datadog_send_job_script_step_time.sh || true
+  after_script:
+  - . ./scripts/ci/datadog_send_job_cache_info.sh 'after'
+  - ./scripts/ci/sccache-stop.sh
+  variables:
+    CARGO_INCREMENTAL: "0"
+    CARGO_NET_OFFLINE: "false"
+    SCCACHE_GCS_BUCKET: $GCP_SCCACHE_BUCKET
+    SCCACHE_GCS_KEY_PREFIX: sccache
+    SCCACHE_GCS_RW_MODE: READ_ONLY
+    SCCACHE_IDLE_TIMEOUT: "0"
+    SCCACHE_IGNORE_SERVER_IO_ERROR: "1"
+  artifacts:
+    expire_in: 4 hours
+    paths:
+    - docs/_build/api/odoc/
+    - docs/odoc.log
+    when: always
+
+documentation.publish:
+  image: ${GCP_PROTECTED_REGISTRY}/tezos/tezos/alpine-test:master-18884dda
+  stage: publish
+  tags:
+  - gcp_not_interruptible
+  needs:
+  - documentation.build_all
+  dependencies:
+  - documentation.build_all
+  timeout: 60 minutes
+  cache:
+    key: cargo-$CI_JOB_NAME_SLUG
+    paths:
+    - $CI_PROJECT_DIR/.cargo/registry/cache
+    - $CI_PROJECT_DIR/.cargo/registry/index
+    - $CI_PROJECT_DIR/.cargo/registry/src
+    policy: pull-push
+  interruptible: false
+  before_script:
+  - SCRIPT_STEP_BEGIN=$(date +%s)
+  - . ./scripts/ci/datadog_send_job_info.sh
+  - . ./scripts/ci/sccache-start.sh
+  - . ./scripts/ci/datadog_send_job_cache_info.sh 'before'
+  script:
+  - test -n "${CI_PK_GITLAB_DOC}" || { echo "CI_PK_GITLAB_DOC is empty"; exit 1; }
+  - test -n "${CI_KH}" || { echo "CI_KH is empty"; exit 1; }
+  - test -n "${AWS_ACCESS_KEY_ID}" || { echo "AWS_ACCESS_KEY_ID is empty"; exit 1;
+    }
+  - test -n "${AWS_SECRET_ACCESS_KEY}" || { echo "AWS_SECRET_ACCESS_KEY is empty";
+    exit 1; }
+  - eval $(opam env)
+  - . $HOME/.venv/bin/activate
+  - echo "${CI_PK_GITLAB_DOC}" > ~/.ssh/id_ed25519
+  - echo "${CI_KH}" > ~/.ssh/known_hosts
+  - chmod 400 ~/.ssh/id_ed25519
+  - ./scripts/ci/doc_publish.sh
+  - . ./scripts/ci/datadog_send_job_script_step_time.sh || true
+  after_script:
+  - . ./scripts/ci/datadog_send_job_cache_info.sh 'after'
+  - ./scripts/ci/sccache-stop.sh
+  variables:
+    CARGO_INCREMENTAL: "0"
+    CARGO_NET_OFFLINE: "false"
+    SCCACHE_GCS_BUCKET: $GCP_SCCACHE_BUCKET
+    SCCACHE_GCS_KEY_PREFIX: sccache
+    SCCACHE_GCS_RW_MODE: READ_ONLY
+    SCCACHE_IDLE_TIMEOUT: "0"
+    SCCACHE_IGNORE_SERVER_IO_ERROR: "1"
+  environment:
+    name: documentation
+    action: access
+  retry: 0
+
+oc.build_x86_64-extra-dev:
+  image: ${GCP_PROTECTED_REGISTRY}/tezos/tezos/alpine-build:master-18884dda
+  stage: build
+  tags:
+  - gcp_very_high_cpu
+  needs: []
+  dependencies: []
+  timeout: 60 minutes
+  cache:
+  - key: cargo-$CI_JOB_NAME_SLUG
+    paths:
+    - $CI_PROJECT_DIR/.cargo/registry/cache
+    - $CI_PROJECT_DIR/.cargo/registry/index
+    - $CI_PROJECT_DIR/.cargo/registry/src
+    policy: pull-push
+  - key: dune_cache-$CI_JOB_NAME_SLUG
+    paths:
+    - $CI_PROJECT_DIR/_dune_cache
+    policy: pull-push
+  interruptible: false
+  before_script:
+  - SCRIPT_STEP_BEGIN=$(date +%s)
+  - . ./scripts/ci/datadog_send_job_info.sh
+  - . ./scripts/ci/sccache-start.sh
+  - . ./scripts/ci/datadog_send_job_cache_info.sh 'before'
+  script:
+  - ./scripts/ci/take_ownership.sh
+  - . ./scripts/version.sh
+  - eval $(opam env)
+  - ./scripts/ci/build_full_unreleased.sh
+  - . ./scripts/ci/datadog_send_job_script_step_time.sh || true
+  after_script:
+  - . ./scripts/ci/datadog_send_job_cache_info.sh 'after'
+  - ./scripts/ci/sccache-stop.sh
+  - eval $(opam env)
+  - dune cache trim --size=5GB
+  variables:
+    BUILD_EXTRA: src/bin_tps_evaluation/main_tps_evaluation.exe src/bin_octogram/octogram_main.exe
+      tezt/tests/main.exe contrib/octez_injector_server/octez_injector_server.exe
+    CARGO_INCREMENTAL: "0"
+    CARGO_NET_OFFLINE: "false"
+    DUNE_CACHE: enabled
+    DUNE_CACHE_ROOT: $CI_PROJECT_DIR/_dune_cache
+    DUNE_CACHE_STORAGE_MODE: hardlink
+    EXECUTABLE_FILES: script-inputs/dev-executables
+    SCCACHE_GCS_BUCKET: $GCP_SCCACHE_BUCKET
+    SCCACHE_GCS_KEY_PREFIX: sccache
+    SCCACHE_GCS_RW_MODE: READ_WRITE
+    SCCACHE_IDLE_TIMEOUT: "0"
+    SCCACHE_IGNORE_SERVER_IO_ERROR: "1"
+  artifacts:
+    name: build-x86_64-$CI_COMMIT_REF_SLUG
+    expire_in: 1 day
+    paths:
+    - octez-protocol-compiler
+    - octez-snoop
+    - _build/default/src/bin_tps_evaluation/main_tps_evaluation.exe
+    - _build/default/src/bin_octogram/octogram_main.exe
+    - _build/default/tezt/tests/main.exe
+    - _build/default/contrib/octez_injector_server/octez_injector_server.exe
+    - src/proto_*/parameters/*.json
+    - _build/default/src/lib_protocol_compiler/bin/main_native.exe
+    when: on_success
+
+oc.build_x86_64-released:
+  image: ${GCP_PROTECTED_REGISTRY}/tezos/tezos/alpine-build:master-18884dda
+  stage: build
+  tags:
+  - gcp_very_high_cpu
+  needs: []
+  dependencies: []
+  timeout: 60 minutes
+  cache:
+    key: cargo-$CI_JOB_NAME_SLUG
+    paths:
+    - $CI_PROJECT_DIR/.cargo/registry/cache
+    - $CI_PROJECT_DIR/.cargo/registry/index
+    - $CI_PROJECT_DIR/.cargo/registry/src
+    policy: pull-push
+  interruptible: false
+  before_script:
+  - SCRIPT_STEP_BEGIN=$(date +%s)
+  - . ./scripts/ci/datadog_send_job_info.sh
+  - . ./scripts/ci/sccache-start.sh
+  - . ./scripts/ci/datadog_send_job_cache_info.sh 'before'
+  script:
+  - ./scripts/ci/take_ownership.sh
+  - . ./scripts/version.sh
+  - eval $(opam env)
+  - ./scripts/ci/build_full_unreleased.sh
+  - . ./scripts/ci/datadog_send_job_script_step_time.sh || true
+  after_script:
+  - . ./scripts/ci/datadog_send_job_cache_info.sh 'after'
+  - ./scripts/ci/sccache-stop.sh
+  variables:
+    CARGO_INCREMENTAL: "0"
+    CARGO_NET_OFFLINE: "false"
+    EXECUTABLE_FILES: script-inputs/released-executables
+    SCCACHE_GCS_BUCKET: $GCP_SCCACHE_BUCKET
+    SCCACHE_GCS_KEY_PREFIX: sccache
+    SCCACHE_GCS_RW_MODE: READ_WRITE
+    SCCACHE_IDLE_TIMEOUT: "0"
+    SCCACHE_IGNORE_SERVER_IO_ERROR: "1"
+  artifacts:
+    name: build-x86_64-$CI_COMMIT_REF_SLUG
+    expire_in: 1 day
+    paths:
+    - octez-smart-rollup-node
+    - octez-dal-node
+    - octez-signer
+    - octez-codec
+    - octez-client
+    - octez-admin-client
+    - octez-accuser
+    - octez-baker
+    - octez-node
+    - octez-accuser-PsUshuai
+    - octez-baker-PsUshuai
+    - src/proto_*/parameters/*.json
+    when: on_success

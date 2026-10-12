@@ -33,7 +33,8 @@
 (* Simple tests to check support for the following operations-related options
    for baking
    - --ignore-node-mempool
-   - --operations-pool [file|uri] *)
+   - --operations-pool [file|uri]
+   - --record-state *)
 
 type http_path_mapping = Present | Absent
 
@@ -103,7 +104,7 @@ let test_ignore_node_mempool =
   Protocol.register_test
     ~__FILE__
     ~title:"Ignore node mempool"
-    ~tags:["ignore"; "node"; "mempool"]
+    ~tags:[Tag.layer1; "ignore"; "node"; "mempool"]
   @@ fun protocol ->
   let* node, client = Client.init_with_protocol ~protocol `Client () in
   let sender = Constant.bootstrap4 in
@@ -126,7 +127,7 @@ let test_ignore_node_mempool =
   in
   let* () = Client.bake_for_and_wait ~ignore_node_mempool:true client in
   let* mempool = Mempool.get_mempool client in
-  Mempool.check_mempool ~applied:[oph] mempool ;
+  Mempool.check_mempool ~validated:[oph] mempool ;
   let* balance1 = Client.get_balance_for ~account:sender.alias client in
   Check.(
     (balance1 = balance0)
@@ -138,17 +139,15 @@ let test_ignore_node_mempool =
      next block *)
   let* () = Client.bake_for_and_wait ~ignore_node_mempool:false client in
   let* mempool = Mempool.get_mempool client in
-  Mempool.check_mempool ~applied:[] mempool ;
+  Mempool.check_mempool ~validated:[] mempool ;
   let* balance2 = Client.get_balance_for ~account:sender.alias client in
+  let* level = Node.get_level node in
   Check.(
     (balance2 = Tez.(balance0 - amount - fee))
       Tez.typ
       ~__LOC__
       ~error_msg:"Expected the balance of sender to be %R, but got %L" ;
-    (Node.get_level node = 3)
-      int
-      ~__LOC__
-      ~error_msg:"Expected level %R, got %L") ;
+    (level = 3) int ~__LOC__ ~error_msg:"Expected level %R, got %L") ;
   unit
 
 let with_http_server file presence f =
@@ -159,7 +158,7 @@ let with_http_server file presence f =
   in
   Lwt.finalize
     (fun () ->
-      let base_uri = sf "http://localhost:%d/" port in
+      let base_uri = sf "http://%s:%d/" Constant.default_host port in
       f base_uri)
     (fun () ->
       Lwt.wakeup_later http_server_stopper () ;
@@ -197,7 +196,7 @@ let all_empty block =
   |> List.for_all @@ fun l ->
      l |> as_list |> function [] -> true | _ -> false
 
-let only_has_endorsements block =
+let only_has_consensus block =
   let open JSON in
   List.for_all
     Fun.id
@@ -207,17 +206,17 @@ let only_has_endorsements block =
        else l |> as_list |> function [] -> true | _ -> false)
 
 let check_block_all_empty ~__LOC__ client =
-  let* head = RPC.Client.call client @@ RPC.get_chain_block () in
+  let* head = Client.RPC.call client @@ RPC.get_chain_block () in
   Check.is_true
     (all_empty head)
     ~__LOC__
     ~error_msg:"Expected an empty operation list." ;
   unit
 
-let check_block_only_has_endorsements ?block ~__LOC__ client =
-  let* head = RPC.Client.call client @@ RPC.get_chain_block ?block () in
+let check_block_only_has_consensus ?block ~__LOC__ client =
+  let* head = Client.RPC.call client @@ RPC.get_chain_block ?block () in
   Check.is_true
-    (only_has_endorsements head)
+    (only_has_consensus head)
     ~__LOC__
     ~error_msg:"Expected an empty operation list." ;
   unit
@@ -236,12 +235,13 @@ let test_bake_empty_operations protocols =
      register_external_mempool
        ~title:("missing operations (" ^ description ^ ")")
        ~mempool
-       ~tags:["empty"]
+       ~tags:[Tag.layer1; "empty"]
        (fun node client mempool ->
-         let level = Node.get_level node in
+         let* level = Node.get_level node in
          let* () = Client.bake_for_and_wait ~mempool client in
+         let* new_level = Node.get_level node in
          Check.(
-           (Node.get_level node = level + 1)
+           (new_level = level + 1)
              int
              ~__LOC__
              ~error_msg:"Expected level %R, got %L") ;
@@ -252,18 +252,19 @@ let test_bake_empty_operations protocols =
 type mempool_op = {branch : string; contents : JSON.t list; signature : string}
 
 let get_operations client =
-  let to_op applied_op =
+  let to_op validated_op =
     JSON.
       {
-        branch = applied_op |-> "branch" |> as_string;
-        contents = applied_op |-> "contents" |> as_list;
-        signature = applied_op |-> "signature" |> as_string;
+        branch = validated_op |-> "branch" |> as_string;
+        contents = validated_op |-> "contents" |> as_list;
+        signature = validated_op |-> "signature" |> as_string;
       }
   in
   let* mempool =
-    RPC.Client.call client @@ RPC.get_chain_mempool_pending_operations ()
+    Client.RPC.call client
+    @@ RPC.get_chain_mempool_pending_operations ~version:"2" ()
   in
-  return JSON.(mempool |-> "applied" |> as_list |> List.map to_op)
+  return JSON.(mempool |-> "validated" |> as_list |> List.map to_op)
 
 let encode_operations ops =
   let encode_operation op =
@@ -313,7 +314,7 @@ let test_bake_singleton_operations =
   in
   register_external_mempool
     ~title:"singleton operation"
-    ~tags:["singleton"]
+    ~tags:[Tag.layer1; "singleton"]
     ~mempool
   @@ fun _node client mempool ->
   (* Bake the file obtained through mempool, and note the balance diff it generates *)
@@ -327,23 +328,29 @@ let test_bake_singleton_operations =
     (balance1 = Tez.(balance0 - amount - fee))
       Tez.typ
       ~__LOC__
-      ~error_msg:
-        "Expected the new balance balance difference (%L) to be equal (%R)") ;
+      ~error_msg:"Expected the new balance difference (%L) to be equal (%R)") ;
   unit
 
-(* Test adding an external operations source (file) {}to a baker daemon *)
+(* Test adding an external operations source (file) to a baker
+   daemon *)
 let test_baker_external_operations =
   Protocol.register_test
     ~__FILE__
     ~title:"Baker external operations"
-    ~tags:["baker"; "external"; "operations"]
+    ~tags:[Tag.layer1; "baker"; "external"; "operations"]
+    ~uses:(fun _protocol -> [Constant.octez_agnostic_baker])
   @@ fun protocol ->
   Log.info "Init" ;
   let node_args = Node.[Synchronisation_threshold 0] in
+  (* We define minimal_block_delay and delay_increment_per_round to 1
+     as it is the lowest value that is accepted by the protocol that
+     minimizes the test duration. *)
+  let minimal_block_delay = 1 in
+  let delay_increment_per_round = 1 in
   let parameters =
     [
-      (["minimal_block_delay"], `String_of_int 1);
-      (["delay_increment_per_round"], `String_of_int 1);
+      (["minimal_block_delay"], `String_of_int minimal_block_delay);
+      (["delay_increment_per_round"], `String_of_int delay_increment_per_round);
     ]
   in
   let* parameter_file =
@@ -376,14 +383,14 @@ let test_baker_external_operations =
   in
   let* () = Client.bake_for_and_wait ~keys client in
   let* () = Client.bake_for_and_wait ~keys client in
-  let level = Node.get_level node in
+  let* level = Node.get_level node in
   Check.((level = 4) int ~__LOC__ ~error_msg:"Expected level %R, got %L") ;
   let* pending_ops = get_operations client in
   Check.(
     (List.length pending_ops = 0)
       int
       ~__LOC__
-      ~error_msg:"Expected exactly one pending ops, got %L") ;
+      ~error_msg:"Expected exactly zero pending ops, got %L") ;
   let transfer_value = Tez.of_int 2 in
   let* () =
     Client.transfer
@@ -401,14 +408,25 @@ let test_baker_external_operations =
   (* Restart the node and add a baker daemon *)
   Log.info "Start baker" ;
   let* () = Node.run node node_args in
-  let* _baker = Baker.init ~protocol ~operations_pool node client in
+  (* The baker may propose at level 4 or 5 depending on whether the
+     round 0 at level 4 has ended or not. We make sure that round 0
+     has ended by waiting the duration of round 0 (and a bit more) --
+     that is minimal_block_delay + delay_increment_per_round (2
+     second). In this way we are sure the operation will be in the
+     block (re-proposed) at level 4. *)
+  let* () =
+    Lwt_unix.sleep
+      (float_of_int (minimal_block_delay + delay_increment_per_round))
+  in
+  let* _baker = Agnostic_baker.init ~operations_pool node client in
   (* Wait until we have seen enough blocks. This should not take much time. *)
   Log.info "Wait until high enough level" ;
-  let* (_ : int) = Node.wait_for_level node (level * 2) in
-  (* Check that block exactly contains the operations that we put into  our operations file *)
+  let* (_ : int) = Node.wait_for_level node (level + 1) in
+  (* Check that block exactly contains the operations that we put into
+     our operations file *)
   Log.info "Check block baked" ;
   let* block =
-    RPC.Client.call client
+    Client.RPC.call client
     @@ RPC.get_chain_block ~block:(string_of_int level) ()
   in
   let manager_ops = JSON.(block |-> "operations" |=> 3) in
@@ -430,15 +448,74 @@ let test_baker_external_operations =
   let level_succ = level + 1 in
   let* (_ : int) = Node.wait_for_level node level_succ in
   let* () =
-    check_block_only_has_endorsements
+    check_block_only_has_consensus
       ~__LOC__
       ~block:(string_of_int level_succ)
       client
   in
   unit
 
+(* Test that baking a block results in the generation of the
+   "record_state" file in the client directory or not, depending
+   on the [state_recorder] input argument. *)
+let test_baker_state_recorder protocol state_recorder =
+  let* node, client =
+    Client.init_with_protocol ~timestamp:Now ~protocol `Client ()
+  in
+  let keys =
+    Array.map
+      (fun Account.{public_key_hash; _} -> public_key_hash)
+      Account.Bootstrap.keys
+    |> Array.to_list
+  in
+  (* Bake an empty block *)
+  let* () = Client.bake_for_and_wait ~keys client in
+  let* level = Node.get_level node in
+  (* Initialise a baker *)
+  let* _baker =
+    if state_recorder then Agnostic_baker.init ~state_recorder node client
+    else Agnostic_baker.init node client
+  in
+  (* Wait for chain to process the empty block *)
+  let* (_ : int) = Node.wait_for_level node (level + 1) in
+  (* Obtain the "record_state" file name *)
+  let* chain_id = Client.RPC.call client (RPC.get_chain_chain_id ()) in
+  let chain_id =
+    Tezos_crypto.Hashed.Chain_id.to_short_b58check
+      (Tezos_crypto.Hashed.Chain_id.of_b58check_exn chain_id)
+  in
+  let state_recorder_file = chain_id ^ "_baker_state" in
+  let base_dir = Client.base_dir client in
+  let dir_contents = Array.to_list @@ Sys.readdir base_dir in
+  Check.(
+    (List.mem state_recorder_file dir_contents = state_recorder)
+      bool
+      ~__LOC__
+      ~error_msg:
+        "The state_recorder file presence: %L, but its presence should have \
+         been: %R") ;
+  unit
+
+let test_baker_state_recorder_memory =
+  Protocol.register_test
+    ~__FILE__
+    ~title:"Baker state recorder - memory case"
+    ~tags:[Tag.layer1; "baker"; "state"; "recorder"; "memory"]
+    ~uses:(fun _protocol -> [Constant.octez_agnostic_baker])
+  @@ fun protocol -> test_baker_state_recorder protocol false
+
+let test_baker_state_recorder_filesystem =
+  Protocol.register_test
+    ~__FILE__
+    ~title:"Baker state recorder - filesystem case"
+    ~tags:[Tag.layer1; "baker"; "state"; "recorder"; "filesystem"]
+    ~uses:(fun _protocol -> [Constant.octez_agnostic_baker])
+  @@ fun protocol -> test_baker_state_recorder protocol true
+
 let register ~protocols =
   test_ignore_node_mempool protocols ;
   test_bake_empty_operations protocols ;
   test_bake_singleton_operations protocols ;
-  test_baker_external_operations protocols
+  test_baker_external_operations protocols ;
+  test_baker_state_recorder_memory protocols ;
+  test_baker_state_recorder_filesystem protocols

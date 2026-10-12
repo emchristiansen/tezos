@@ -74,6 +74,15 @@ module Handler = struct
       ~msg:"signing data for key {key}"
       ("key", Data_encoding.string)
 
+  let signing_data_failure =
+    declare_2
+      ~section
+      ~level:Error
+      ~name:"signing_data_failure"
+      ~msg:"Failed to sign data for key {key}: {failure}"
+      ("key", Data_encoding.string)
+      ("failure", Data_encoding.string)
+
   let request_for_deterministic_nonce =
     declare_2
       ~section
@@ -141,7 +150,7 @@ module Handler = struct
   let not_found_public_key =
     declare_1
       ~section
-      ~level
+      ~level:Warning
       ~name:"not_found_public_key"
       ~msg:"no public key found for hash {hash}"
       ("hash", Tezos_crypto.Signature.Public_key_hash.encoding)
@@ -154,6 +163,22 @@ module Handler = struct
       ~msg:"found public key for hash {hash} (name: {name})"
       ("hash", Tezos_crypto.Signature.Public_key_hash.encoding)
       ("name", Data_encoding.string)
+
+  let request_for_known_keys =
+    declare_0
+      ~section
+      ~level
+      ~name:"request_for_known_keys"
+      ~msg:"request for known keys"
+      ()
+
+  let request_for_proof_of_possession =
+    declare_1
+      ~section
+      ~level
+      ~name:"request_for_proof_of_possession"
+      ~msg:"Request for proof of possession of {pkh}"
+      ("pkh", Tezos_crypto.Signature.Public_key_hash.encoding)
 end
 
 module Socket_daemon = struct

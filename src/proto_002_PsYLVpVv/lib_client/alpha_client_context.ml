@@ -23,18 +23,18 @@
 (*                                                                           *)
 (*****************************************************************************)
 
-module Alpha_block_services = Block_services.Make (Protocol) (Protocol)
+module Lifted_protocol = Tezos_protocol_002_PsYLVpVv_lifted.Lifted_protocol
+module Alpha_block_services =
+  Block_services.Make (Lifted_protocol) (Lifted_protocol)
 
 (** Client RPC context *)
 
-class type rpc_context =
-  object
-    inherit Tezos_rpc.Context.generic
+class type rpc_context = object
+  inherit Tezos_rpc.Context.generic
 
-    inherit
-      [Shell_services.chain * Shell_services.block] Environment.RPC_context
-                                                    .simple
-  end
+  inherit
+    [Shell_services.chain * Shell_services.block] Environment.RPC_context.simple
+end
 
 class wrap_rpc_context (t : Tezos_rpc.Context.generic) : rpc_context =
   object
@@ -42,24 +42,24 @@ class wrap_rpc_context (t : Tezos_rpc.Context.generic) : rpc_context =
 
     method generic_media_type_call = t#generic_media_type_call
 
-    method call_service
-        : 'm 'p 'q 'i 'o.
-          (([< Resto.meth] as 'm), unit, 'p, 'q, 'i, 'o) Tezos_rpc.Service.t ->
-          'p ->
-          'q ->
-          'i ->
-          'o tzresult Lwt.t =
+    method call_service :
+        'm 'p 'q 'i 'o.
+        (([< Resto.meth] as 'm), unit, 'p, 'q, 'i, 'o) Tezos_rpc.Service.t ->
+        'p ->
+        'q ->
+        'i ->
+        'o tzresult Lwt.t =
       t#call_service
 
-    method call_streamed_service
-        : 'm 'p 'q 'i 'o.
-          (([< Resto.meth] as 'm), unit, 'p, 'q, 'i, 'o) Tezos_rpc.Service.t ->
-          on_chunk:('o -> unit) ->
-          on_close:(unit -> unit) ->
-          'p ->
-          'q ->
-          'i ->
-          (unit -> unit) tzresult Lwt.t =
+    method call_streamed_service :
+        'm 'p 'q 'i 'o.
+        (([< Resto.meth] as 'm), unit, 'p, 'q, 'i, 'o) Tezos_rpc.Service.t ->
+        on_chunk:('o -> unit) ->
+        on_close:(unit -> unit) ->
+        'p ->
+        'q ->
+        'i ->
+        (unit -> unit) tzresult Lwt.t =
       t#call_streamed_service
 
     inherit
@@ -68,17 +68,15 @@ class wrap_rpc_context (t : Tezos_rpc.Context.generic) : rpc_context =
         Shell_services.Blocks.path
   end
 
-class type full =
-  object
-    inherit Client_context.full
+class type full = object
+  inherit Client_context.full
 
-    inherit
-      [Shell_services.chain * Shell_services.block] Environment.RPC_context
-                                                    .simple
+  inherit
+    [Shell_services.chain * Shell_services.block] Environment.RPC_context.simple
 
-    inherit
-      [Shell_services.chain, Shell_services.block] Environment.proto_rpc_context
-  end
+  inherit
+    [Shell_services.chain, Shell_services.block] Environment.proto_rpc_context
+end
 
 class wrap_full (t : Client_context.full) : full =
   object

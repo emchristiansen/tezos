@@ -1,0 +1,230 @@
+(*****************************************************************************)
+(*                                                                           *)
+(* SPDX-License-Identifier: MIT                                              *)
+(* SPDX-FileCopyrightText: 2026 Nomadic Labs <contact@nomadic-labs.com>      *)
+(*                                                                           *)
+(*****************************************************************************)
+
+(* Testing
+   -------
+   Requirement:  make -f etherlink.mk build
+                 make octez-node octez-client octez-smart-rollup-node octez-evm-node
+   Invocation:   dune exec etherlink/tezt/tests/main.exe -- --file faults.ml
+   Subject:      Exercise the kernel's behaviour when an operation
+                 deliberately triggers an unrecoverable WASM trap, submitted
+                 directly or through the delayed inbox, and the operator's
+                 recovery from a delayed one.
+ *)
+
+open Test_helpers
+open Rpc.Syntax
+
+type fault = Panic | Stack_overflow
+
+let string_of_fault = function
+  | Panic -> "panic"
+  | Stack_overflow -> "stack_overflow"
+
+(** [craft_tx ~fault ~sequencer ~nonce] builds a signed transaction from the
+    first bootstrap account that calls the [fault] method of the debug
+    precompile. *)
+let craft_tx ~fault ~sequencer ~nonce =
+  let*@ chain_id = Rpc.get_chain_id sequencer in
+  let sender = Eth_account.bootstrap_accounts.(0) in
+  Cast.craft_tx
+    ~source_private_key:sender.private_key
+    ~chain_id
+    ~nonce
+    ~value:Wei.zero
+    ~gas:1_000_000
+    ~gas_price:1_000_000_000
+    ~address:Solidity_contracts.Precompile.panic
+    ~signature:(sf "%s()" (string_of_fault fault))
+    ()
+
+module Self_tests = struct
+  (* When the [enable_debug_precompiles] flag is left unset, the precompile is
+   not registered: its address is a plain, code-less account. Calling
+   [panic()] is therefore an inert no-op that is included successfully,
+   instead of trapping. *)
+  let test_panic_precompile_absent () =
+    register_sandbox
+      ~__FILE__
+      ~tags:["evm"; "precompile"; "panic"; "fault"; "debug"]
+      ~title:"Panic debug precompile is inert when the flag is unset"
+    @@ fun sequencer ->
+    let* raw_tx = craft_tx ~sequencer ~nonce:0 ~fault:Panic in
+    let*@ tx_hash = Rpc.send_raw_transaction ~raw_tx sequencer in
+    let*@ _ = Rpc.produce_block sequencer in
+    let* receipt =
+      wait_for_transaction_receipt
+        ~evm_node:sequencer
+        ~transaction_hash:tx_hash
+        ()
+    in
+    Check.is_true
+      receipt.status
+      ~error_msg:
+        "Expected the panic() call to be included as a plain no-op, but the \
+         transaction failed" ;
+    unit
+
+  (* With [enable_debug_precompiles] set, the precompile is live. The transaction
+   queue only validates transactions (it does not execute the callee), so the
+   [panic()] transaction is accepted without ever being simulated. Executing it
+   at block production reaches the [unreachable] trap, which is unrecoverable
+   and takes the whole sequencer process down. *)
+  let test_panic_precompile_crashes_sequencer () =
+    register_sandbox
+      ~__FILE__
+      ~enable_debug_precompiles:true
+        (* The private RPC to produce blocks will *not* terminate the node,
+           this only happens when the sequencer loop is receiving the error
+           from the block producer. *)
+      ~time_between_blocks:6.0
+      ~tags:["evm"; "precompile"; "panic"; "fault"; "debug"]
+      ~title:"Panic debug precompile crashes the sequencer at block production"
+    @@ fun sequencer ->
+    let* raw_tx = craft_tx ~sequencer ~nonce:0 ~fault:Panic in
+    (* Wait for the transaction to reach the queue before producing the block,
+     so the block that triggers the crash actually contains it. *)
+    let added =
+      Evm_node.wait_for_tx_queue_add_transaction ~timeout:30. sequencer
+    in
+    let terminated = Evm_node.wait_termination sequencer in
+    let* _ = Rpc.send_raw_transaction ~raw_tx sequencer in
+    let* (_ : string) = added in
+    (* Producing the block runs [panic()] and crashes the kernel. The RPC call
+     fails as the sequencer's connection drops, which we tolerate. *)
+    Evm_node.resolve_or_timeout
+      ~timeout:60.
+      sequencer
+      ~name:"sequencer crash on panic precompile"
+      terminated
+
+  let register () =
+    test_panic_precompile_absent () ;
+    test_panic_precompile_crashes_sequencer ()
+end
+
+(* Wrap [raw_tx] and post it to the L1 delayed transaction bridge, then bake an
+   L1 level so the rollup node -- and thus the sequencer's follower -- pick it
+   up. *)
+let send_raw_tx_to_delayed_inbox ~sc_rollup_node ~client ~l1_contracts
+    ~sc_rollup_address raw_tx =
+  let* () =
+    Client.transfer
+      ~arg:(sf "Pair %S 0x%s" sc_rollup_address raw_tx)
+      ~amount:Tez.one
+      ~giver:Constant.bootstrap2.public_key_hash
+      ~receiver:l1_contracts.Setup.delayed_transaction_bridge
+      ~burn_cap:Tez.one
+      client
+  in
+  let* _ = Rollup.next_rollup_node_level ~sc_rollup_node ~client in
+  unit
+
+(* A faulty transaction reaching the block producer through the delayed inbox
+   takes the sequencer down, exactly like one submitted directly. This
+   exercises the operator's recovery path: manually flushing the delayed inbox
+   with [--force] publishes a blueprint the kernel drops on the trap,
+   unblocking the rollup node so the sequencer can be restarted and able to
+   produce blocks again.
+
+   The [Stack_overflow] variant additionally pins the call-depth guard injected
+   by [smart-rollup-instrument]: its recursion spills only a scalar per frame,
+   so the host stack — not the kernel's 1 MiB shadow stack — is what runs out
+   first. Without the guard that is not a WASM trap, the PVM has nothing to
+   absorb, and it goes Stuck: the flush never drains the delayed inbox and this
+   test times out. See [stack_overflow] in the debug precompile. *)
+let test_recover_crashing_delayed_transaction fault =
+  Setup.register_test
+    ~__FILE__
+    ~time_between_blocks:Nothing
+    ~kernel:Kernel.Latest
+    ~enable_dal:false
+    ~enable_debug_precompiles:true
+    ~da_fee:Wei.zero
+    ~tags:
+      [
+        "evm";
+        "precompile";
+        string_of_fault fault;
+        "fault";
+        "debug";
+        "delayed_inbox";
+      ]
+    ~title:
+      (sf
+         "Recover from a delayed %s() transaction with a forced flush"
+         (string_of_fault fault))
+  @@
+  fun {sequencer; sc_rollup_node; client; l1_contracts; sc_rollup_address; _}
+      _protocol
+    ->
+  (* Submit the faulty transaction through the delayed inbox. *)
+  let* raw_tx = craft_tx ~fault ~sequencer ~nonce:0 in
+  let* () =
+    send_raw_tx_to_delayed_inbox
+      ~sc_rollup_node
+      ~client
+      ~l1_contracts
+      ~sc_rollup_address
+      raw_tx
+  in
+  (* Advance the layer 1 to make sure the sequencer fetches the delayed item. *)
+  let* () =
+    repeat 3 (fun () ->
+        let* _ = Rollup.next_rollup_node_level ~sc_rollup_node ~client in
+        unit)
+  in
+  (* This should fail *)
+  let*@? _ = Rpc.produce_block ~with_delayed_transactions:true sequencer in
+  (* While the sequencer is down, flush the delayed inbox with [--force]: the
+     blueprint is published even though applying it traps. *)
+  let* () = Evm_node.terminate sequencer in
+  let*! () =
+    Evm_node.flush_delayed_inbox
+      ~wallet_dir:(Client.base_dir client)
+      ~force:true
+      sequencer
+  in
+  (* Bake until the rollup node has processed the forced blueprint and its
+     delayed inbox is empty again. *)
+  let* () =
+    bake_until
+      ~timeout:120.
+      ~timeout_in_blocks:20
+      ~bake:(fun () ->
+        let* _ = Rollup.next_rollup_node_level ~sc_rollup_node ~client in
+        unit)
+      ~result_f:(fun () ->
+        let* size = Delayed_inbox.size (Sc_rollup_node sc_rollup_node) in
+        if size = 0 then return (Some ()) else return None)
+      ()
+  in
+
+  (* Restart the sequencer to create a block *)
+  let* () = Evm_node.run sequencer in
+  (* Advance the layer 1 to make sure the sequencer fetches the dropped
+     transaction event. *)
+  let* l = Rollup.next_rollup_node_level ~sc_rollup_node ~client in
+  let wait_for =
+    Evm_node.wait_for_processed_l1_level ~level:(l + 2) sequencer
+  in
+  let* () =
+    repeat 4 (fun () ->
+        let* _ = Rollup.next_rollup_node_level ~sc_rollup_node ~client in
+        unit)
+  in
+  let* _ = wait_for in
+
+  let*@ _ = Rpc.produce_block sequencer in
+
+  bake_until_sync ~sc_rollup_node ~sequencer ~client ()
+
+let () =
+  Self_tests.register () ;
+  List.iter
+    (fun fault -> test_recover_crashing_delayed_transaction fault [Alpha])
+    [Panic; Stack_overflow]

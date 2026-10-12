@@ -252,14 +252,12 @@ module Make (E : MENV) = struct
       ~predecessor
       ~cache
 
-  let op_data_encoding = E.Protocol.operation_data_encoding
-
   let op_encoding =
     Data_encoding.(
       dynamic_size
       @@ obj2
            (req "shell_header" Operation.shell_header_encoding)
-           (req "protocol_data" op_data_encoding))
+           (req "protocol_data" E.Protocol.operation_data_encoding))
 
   let ops_encoding = Data_encoding.Variable.list op_encoding
 
@@ -337,12 +335,16 @@ module Make (E : MENV) = struct
   module Mempool = Rw (Files.Mempool)
   module Trashpool = Rw (Files.Trashpool)
 
-  let to_applied (shell_header, operation_data) =
+  let to_validated (shell_header, operation_data) =
     let open Lwt_result_syntax in
     let op =
       {E.Protocol.shell = shell_header; protocol_data = operation_data}
     in
-    match Data_encoding.Binary.to_bytes op_data_encoding operation_data with
+    match
+      Data_encoding.Binary.to_bytes
+        E.Protocol.operation_data_encoding
+        operation_data
+    with
     | Error _ -> failwith "mockup pending_operations"
     | Ok proto ->
         let operation_hash =
@@ -366,10 +368,10 @@ module Make (E : MENV) = struct
         let*! pending_operations =
           let* () = check_chain chain in
           let* pooled_operations = Mempool.read () in
-          let* applied = List.map_es to_applied pooled_operations in
+          let* validated = List.map_es to_validated pooled_operations in
           let pending_operations =
             {
-              E.Block_services.Mempool.applied;
+              E.Block_services.Mempool.validated;
               refused = Operation_hash.Map.empty;
               outdated = Operation_hash.Map.empty;
               branch_refused = Operation_hash.Map.empty;
@@ -382,9 +384,7 @@ module Make (E : MENV) = struct
         match pending_operations with
         | Error errs -> Tezos_rpc.Answer.fail errs
         | Ok pending_operations ->
-            E.Block_services.Mempool.pending_operations_version_dispatcher
-              ~version:params#version
-              pending_operations)
+            Tezos_rpc.Answer.return (params#version, pending_operations))
 
   let shell_header () =
     Directory.prefix
@@ -483,7 +483,8 @@ module Make (E : MENV) = struct
                  let* validation_passes, proto_state, preapply_results =
                    List.fold_left_es
                      (fun (validation_passes, proto_state, validation_result)
-                          operations ->
+                          operations
+                        ->
                        let* state, result =
                          List.fold_left_es
                            simulate_operation
@@ -567,7 +568,7 @@ module Make (E : MENV) = struct
          Directory.empty
          (* /chains/<chain_id>/blocks/<block_id>/helpers/preapply/operations *)
          E.Block_services.S.Helpers.Preapply.operations
-         (fun ((_, chain), _block) () op_list ->
+         (fun ((_, chain), _block) params op_list ->
            with_chain ~caller_name:"preapply operations" chain (fun () ->
                let*! outcome =
                  let* proto_state = partial_construction ~cache:`Lazy () in
@@ -591,7 +592,7 @@ module Make (E : MENV) = struct
                  return (List.rev acc)
                in
                match outcome with
-               | Ok result -> Tezos_rpc.Answer.return result
+               | Ok result -> Tezos_rpc.Answer.return (params#version, result)
                | Error errs -> Tezos_rpc.Answer.fail errs)))
 
   let hash_op (shell, proto) =
@@ -605,7 +606,8 @@ module Make (E : MENV) = struct
     Block_hash.equal
       a_shell_header.Operation.branch
       b_shell_header.Operation.branch
-    && (* FIXME: the protocol should export equality/comparison functions for
+    &&
+    (* FIXME: the protocol should export equality/comparison functions for
           its abstract types such as operation_data.  WARNING: the following
           expression causes an exception to be raised, complaining about
           functional values Stdlib.( = ) a_operation_data b_operation_data *)
@@ -735,7 +737,7 @@ module Make (E : MENV) = struct
               (List.fold_left_es (fun (proto_state, results) op ->
                    match
                      Data_encoding.Binary.of_bytes
-                       op_data_encoding
+                       E.Protocol.operation_data_encoding
                        op.Operation.proto
                    with
                    | Error _ -> failwith "Cannot parse"
@@ -801,7 +803,9 @@ module Make (E : MENV) = struct
           List.fold_left_es
             (fun map ((shell_header, operation_data) as v) ->
               match
-                Data_encoding.Binary.to_bytes op_data_encoding operation_data
+                Data_encoding.Binary.to_bytes
+                  E.Protocol.operation_data_encoding
+                  operation_data
               with
               | Error _ ->
                   failwith "mockup inject block: byte encoding operation failed"
@@ -959,10 +963,10 @@ module Make (E : MENV) = struct
     @@ Directory.register
          Directory.empty
          E.Block_services.S.Operations.operations
-         (fun (((), chain), _block) _query () ->
+         (fun (((), chain), _block) query () ->
            with_chain ~caller_name:"operations" chain (fun () ->
                (* FIXME: Better answer here *)
-               Tezos_rpc.Answer.return [[]; []; []; []]))
+               Tezos_rpc.Answer.return (query#version, [[]; []; []; []])))
 
   let monitor_operations () =
     let open Lwt_syntax in
@@ -971,7 +975,7 @@ module Make (E : MENV) = struct
       (E.Block_services.S.Mempool.monitor_operations
       @@ Block_services.mempool_path Block_services.chain_path)
       (* FIXME: Return real operations from the mempool *)
-        (fun (_, chain) o () ->
+      (fun (_, chain) o () ->
         with_chain ~caller_name:"monitor operations" chain (fun () ->
             let on b msg =
               if b then L.(S.emit (warn msg)) () else Lwt.return_unit
@@ -979,7 +983,7 @@ module Make (E : MENV) = struct
             let* () = on o#branch_delayed "branch_delayed ignored" in
             let* () = on o#branch_refused "branch_refused ignored" in
             let* () = on o#refused "refused ignored" in
-            let _ = o#applied in
+            let _ = o#validated in
             Tezos_rpc.Answer.(
               return_stream
                 {next = (fun () -> Lwt.return_none); shutdown = (fun () -> ())})))

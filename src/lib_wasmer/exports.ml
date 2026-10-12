@@ -23,11 +23,16 @@
 (*                                                                           *)
 (*****************************************************************************)
 
-(* For documentation please refer to the [Tezos_wasmer] module. *)
+(** WebAssembly module instance exports.
+
+    Provides access to exported functions and memories from an
+    instantiated module. Exports are resolved by name and extern kind
+    using an internal map. *)
 
 open Api
 open Vectors
 
+(** Export resolver map keyed by (name, extern kind). *)
 module Resolver = Map.Make (struct
   type t = string * Types.Externkind.t
 
@@ -37,43 +42,58 @@ module Resolver = Map.Make (struct
     | r, _ -> r
 end)
 
-type t =
-  (* TODO: https://gitlab.com/tezos/tezos/-/issues/4026
-     Ensure that ownership and lifetime of each [Types.Extern.t] is respected.
-  *)
-  Types.Extern.t Ctypes.ptr Resolver.t
+type t = {resolved : Types.Extern.t Ctypes.ptr Resolver.t; clean : unit -> unit}
 
+(** [from_instance inst] extracts the exports from the given instance. *)
 let from_instance inst =
-  let exports =
-    Module.exports inst.Instance.module_ |> Export_type_vector.to_list
+  let exports_vec = Module.exports inst.Instance.module_ in
+  let exports = Export_type_vector.to_list exports_vec in
+  let externs_vec = Extern_vector.empty () in
+  Functions.Instance.exports inst.instance (Ctypes.addr externs_vec) ;
+  let externs = Extern_vector.to_list externs_vec in
+  let resolved =
+    List.fold_right2
+      (fun export extern tail ->
+        let name = Export_type.name export in
+        let kind = Export_type.type_ export |> Functions.Externtype.kind in
+        Resolver.add (name, kind) extern tail)
+      exports
+      externs
+      Resolver.empty
   in
-  let externs = Extern_vector.empty () in
-  Functions.Instance.exports inst.instance (Ctypes.addr externs) ;
-  let externs = Extern_vector.to_list externs in
-  List.fold_right2
-    (fun export extern tail ->
-      let name = Export_type.name export in
-      let kind = Export_type.type_ export |> Functions.Externtype.kind in
-      Resolver.add (name, kind) extern tail)
-    exports
-    externs
-    Resolver.empty
+  (* The exports vector is consumed in read-only or copying fashion, therefore
+     there are no references to it at this point. We can clean it up. *)
+  Functions.Exporttype_vec.delete (Ctypes.addr exports_vec) ;
+  let clean () =
+    (* This function shall be called when the user no longer needs to interact
+       with the instance exports. Only then may we free the extern objects. *)
+    Functions.Extern_vec.delete (Ctypes.addr externs_vec)
+  in
+  {resolved; clean}
 
+(** [delete exports] frees the extern objects backing the exports.
+    Previously extracted functions and memories must not be used after
+    this call. *)
+let delete exports = exports.clean ()
+
+(** Raised when a requested export is not found. *)
 exception Export_not_found of {name : string; kind : Unsigned.uint8}
 
 let () =
   Printexc.register_printer (function
-      | Export_not_found {name; kind} ->
-          Some
-            (Format.asprintf
-               "Export %S (%i) not found"
-               name
-               (Unsigned.UInt8.to_int kind))
-      | _ -> None)
+    | Export_not_found {name; kind} ->
+        Some
+          (Format.asprintf
+             "Export %S (%i) not found"
+             name
+             (Unsigned.UInt8.to_int kind))
+    | _ -> None)
 
+(** [fn exports name typ] looks up a function export called [name] and
+    type-checks it against [typ]. Raises {!Export_not_found} if absent. *)
 let fn exports name typ =
   let kind = Types.Externkind.func in
-  let extern = Resolver.find_opt (name, kind) exports in
+  let extern = Resolver.find_opt (name, kind) exports.resolved in
   let extern =
     match extern with
     | None -> raise (Export_not_found {name; kind})
@@ -87,6 +107,8 @@ let fn exports name typ =
      entirely separate. *)
   f
 
+(** [mem_of_extern extern] converts a raw extern pointer to a {!Memory.t}
+    by extracting the backing data, limits, and size. *)
 let mem_of_extern extern =
   let mem = Functions.Extern.as_memory extern in
   let mem_type = Functions.Memory.type_ mem in
@@ -104,16 +126,21 @@ let mem_of_extern extern =
       (Functions.Memory.data mem)
       (Functions.Memory.data_size mem |> Unsigned.Size_t.to_int)
   in
+  (* The memory type is no longer used after this, so we must delete it. *)
+  Functions.Memory_type.delete mem_type ;
   Memory.{raw; min; max}
 
+(** [mem exports name] looks up a memory export called [name]. *)
 let mem exports name =
   let kind = Types.Externkind.memory in
-  let extern = Resolver.find (name, kind) exports in
+  let extern = Resolver.find (name, kind) exports.resolved in
   mem_of_extern extern
 
+(** [mem0 exports] returns the first memory export found. The order is
+    unspecified; only use this when the module exports a single memory. *)
 let mem0 exports =
   let _, extern =
-    Resolver.bindings exports
+    Resolver.bindings exports.resolved
     |> List.find (fun ((_, kind), extern) -> kind = Types.Externkind.memory)
   in
   mem_of_extern extern

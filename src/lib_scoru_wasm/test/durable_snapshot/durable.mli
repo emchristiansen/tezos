@@ -23,7 +23,7 @@
 (*                                                                           *)
 (*****************************************************************************)
 
-(* Version of durable storage corresponding to
+(* Version of durable storage initially corresponding to
    https://gitlab.com/tezos/tezos/-/blob/668fe735aa20ce0c68b9f836208e57fa15d389c1/src/lib_scoru_wasm/durable.mli
 *)
 
@@ -166,4 +166,6 @@ val read_value_exn : t -> key -> int64 -> int64 -> string Lwt.t
 
 module Internal_for_tests : sig
   val key_is_readonly : key -> bool
+
+  val key_to_list : key -> string list
 end

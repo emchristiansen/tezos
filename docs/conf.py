@@ -39,7 +39,53 @@ sys.path.insert(0, os.path.abspath('.') + '/_extensions')
 # Add any Sphinx extension module names here, as strings. They can be
 # extensions coming with Sphinx (named 'sphinx.ext.*') or your custom
 # ones.
-extensions = ['sphinx.ext.extlinks', 'tezos_custom_roles', 'michelsonlexer']
+extensions = [
+    'sphinx.ext.extlinks',
+    'tezos_custom_roles',
+    'michelsonlexer',
+    'sphinxcontrib.jquery',
+    'sphinx_copybutton',
+    'sphinx_sitemap',
+    'sphinx_pushfeedback',
+    'sphinxcontrib.mermaid',
+    'sphinx_biel',
+]
+
+# mermaid_verbose = True
+# mermaid_params = ['--theme', 'forest', '--width', '300', '--backgroundColor',
+# 'transparent']
+
+# Sitemap
+sitemap_url_scheme = '{link}'
+html_baseurl = 'https://octez.tezos.com/docs/'
+
+# pushfeedback.com
+pushfeedback_project = '42c4fpgh27'
+pushfeedback_message_placeholder = (
+    'Comments on specific points and/or aspects'
+    ' (out of date, wrong, incomplete, ...)'
+)
+pushfeedback_email_placeholder = 'Email/Slack (optional)'
+pushfeedback_modal_title = 'Provide feedback'
+pushfeedback_footer_text = (
+    "For information about providing feedback"
+    " and the kinds of feedback that we are interested in, see"
+    " <a href='https://octez.tezos.com/docs/developer/contributing.html"
+    "#providing-feedback-on-documentation'"
+    " target='_blank'>Providing feedback on documentation</a>."
+)
+
+# biel.ai
+biel_project = 'w30c27l8fg'
+biel_header_title = 'Tezos documentation chatbot (beta)'
+biel_version = 'latest'
+biel_button_position = 'center-right'
+biel_footer_text = (
+    "AI-generated answers may contain errors. "
+    + "Verify the information before use. For more information, see "
+    + "<a href='https://docs.tezos.com/overview/chatbot' target='_blank'>"
+    + "Using the chatbot</a>."
+)
 
 # Add any paths that contain templates here, relative to this directory.
 templates_path = ['_templates']
@@ -55,8 +101,8 @@ master_doc = 'index'
 
 # General information about the project.
 project = 'Tezos'
-copyright = '2018-2023, Nomadic Labs <contact@nomadic-labs.com>'
-author = 'Nomadic Labs <contact@nomadic-labs.com>'
+copyright = '2018-2026'
+author = 'Contributors to the Octez & Tezos protocol documentation'
 
 # The version info for the project you're documenting, acts as replacement for
 # |version| and |release|, also used in various other places throughout the
@@ -77,7 +123,7 @@ release = (
 #
 # This is also used if you do content translation via gettext catalogs.
 # Usually you set "language" from the command line for these cases.
-language = None
+language = "en"
 
 # List of patterns, relative to source directory, that match files and
 # directories to ignore when looking for source files.
@@ -88,9 +134,9 @@ exclude_patterns = [
     'Thumbs.db',
     '.DS_Store',
     'doc_gen',
-    'lima',
+    'ushuaia',
 ]
-# TODO tezos/tezos#2170: exclude the active protocol 'NNN' above
+# TODO #2170: update the active protocol folder above
 
 # The name of the Pygments (syntax highlighting) style to use.
 pygments_style = 'sphinx'
@@ -109,24 +155,62 @@ todo_include_todos = False
 # The theme to use for HTML and HTML Help pages.  See the documentation for
 # a list of builtin themes.
 #
-html_theme = "sphinx_rtd_theme"
+html_theme = "sphinx_book_theme"
 
 # Theme options are theme-specific and customize the look and feel of a theme
 # further.  For a list of options available for each theme, see the
 # documentation.
 #
-html_theme_options = {'logo_only': True}
+html_theme_options = {
+    'path_to_docs': 'docs/',
+    'repository_url': 'https://gitlab.com/tezos/tezos',
+    'repository_branch': 'master',
+    'use_repository_button': True,
+    'use_issues_button': True,
+    'use_download_button': False,
+    'use_fullscreen_button': True,
+    'use_source_button': True,
+    "icon_links": [
+        {
+            "name": "Up to Tezos docs",
+            "url": "https://docs.tezos.com/",
+            "icon": "_static/tezosdocs.png",
+            "type": "local",
+        },
+        {
+            "name": "Documentation map",
+            "url": "https://docs.tezos.com/overview/resources/"
+            "#documentation-map",
+            "icon": "_static/map.png",
+            "type": "local",
+        },
+    ],
+}
+
+html_theme_options["analytics"] = {
+    "google_analytics_id": "G-KT3Z3X4Y82",
+}
+
 html_logo = "logo.svg"
 # Add any paths that contain custom static files (such as style sheets) here,
 # relative to this directory. They are copied after the builtin static files,
 # so a file named "default.css" will overwrite the builtin "default.css".
-html_static_path = ['_static']
-
+html_static_path = ['_static', 'api/static']
+html_title = "Octez & Protocol products documentation"
 html_css_files = [
     'css/custom.css',
 ]
 
-html_extra_path = ['404.html', '_redirects']
+html_js_files = [
+    'js/custom.js',
+]
+
+html_extra_path = [
+    '404.html',
+    '_redirects',
+    '_redirects.s3',
+    # manually copy images that are only included in raw HTML directives:
+]
 
 # Custom sidebar templates, must be a dictionary that maps document names
 # to template names.
@@ -204,16 +288,29 @@ texinfo_documents = [
 
 # -- Ignore fragments in linkcheck
 
+# Check the existence of given anchors (suffixes of the form "#label") in URLs
 linkcheck_anchors = False
+# linkcheck_report_timeouts_as_broken = False  # (default)
+# linkcheck_timeout = 30  # (default)
+linkcheck_retries = 2
 linkcheck_ignore = [
     # links which may fail for lack of access rights:
-    'https://gitlab.com/nomadic-labs/tezos/-/merge_requests/',
-    r'http(s)?://localhost:\d+/?',
+    r'^https://gitlab\.com/nomadic-labs/tezos/-/merge_requests/',
+    r'^http(s)?://localhost:\d+/?',
+    r'^https://grafana\.nomadic-labs\.cloud/',
+    r'^https://github\.com/jsonnet-bundler/jsonnet-bundler/',
+    r'^https://medium\.com/metastatedev/meanwhile-at-cryptium-labs-1-part-',
+    r'^https://medium\.com/protofire-blog/recommendations-to-enhance-security-'
+    + 'of-tezos-smart-contracts-d14c0e53a6d3',
+    r'^https://medium\.com/the-cryptonomic-aperiodical/the-magic-and-mystery-'
+    + 'of-the-micheline-binary-format-33bf85699bef',
     # local files, e.g. ../api/api-inline.html#*', \.\./CHANGES.html#version-*
     # (interpreted by linkcheck as external links, generating false positives)
     r'^\.\./',
     # flaky servers, to remove one day if they got more predictable
     r'^https://opentezos\.com/',
+    r'^https://crates\.io/crates/tezos-smart-rollup',
+    r'^https://gitlab\.com/tezos/tezos/-/merge_requests/',
 ]
 linkcheck_allowed_redirects = dict(
     [
@@ -222,7 +319,6 @@ linkcheck_allowed_redirects = dict(
             r'https://www\.sphinx-doc\.org/.*',
             r'https://www\.sphinx-doc\.org/en/master/.*',
         ),
-        (r'https://docs\.pytest\.org/', r'https://docs\.pytest\.org/en/.*'),
         (
             r'https://tools\.ietf\.org/html/.*',
             r'https://datatracker\.ietf\.org/doc/.*',
@@ -232,6 +328,22 @@ linkcheck_allowed_redirects = dict(
             r'https://github\.com/serokell/tezos-packaging/releases/latest',
             r'https://github\.com/serokell/tezos-packaging/releases/tag/.*',
         ),
+        (
+            r'https://www\.reddit\.com/r/tezos/',
+            r'https://www\.reddit\.com/r/tezos/[?]rdt=[0-9]+',
+        ),
+        (
+            r'https://ocaml\.org/api/.*',
+            r'https://ocaml\.org/manual/[0-9.]+/api/.*',
+        ),
+        (
+            r'https://ocaml\.org/manual/.*',
+            r'https://ocaml\.org/manual/[0-9.]+/.*',
+        ),
+        (
+            r'https://dune\.readthedocs\.io/',
+            r'https://dune\.readthedocs\.io/en/stable',
+        ),
         # 2. permanent redidections, maybe fix one day
         (r'https://bitheap\.org/cram/', r'https://github\.com/aiiie/cram'),
     ]
@@ -240,3 +352,13 @@ linkcheck_allowed_redirects = dict(
 
 # Python module index generation is broken, deactivate it.
 html_domain_indices = False
+
+default_role = 'default'
+
+html_favicon = 'favicon.ico'
+
+# Suppress some specific warnings
+# suppress_warnings = [
+#     'toc.not_readable',
+#     'ref.doc',
+# ]

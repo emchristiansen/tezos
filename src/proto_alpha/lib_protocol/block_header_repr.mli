@@ -30,8 +30,7 @@ type contents = {
   payload_round : Round_repr.t;
   seed_nonce_hash : Nonce_hash.t option;
   proof_of_work_nonce : bytes;
-  liquidity_baking_toggle_vote :
-    Liquidity_baking_repr.liquidity_baking_toggle_vote;
+  per_block_votes : Per_block_votes_repr.per_block_votes;
 }
 
 type protocol_data = {contents : contents; signature : Signature.t}
@@ -113,22 +112,4 @@ val begin_validate_block_header :
   round_durations:Round_repr.Durations.t ->
   proof_of_work_threshold:int64 ->
   expected_commitment:bool ->
-  unit tzresult
-
-type locked_round_evidence = {
-  preendorsement_round : Round_repr.t;
-  preendorsement_count : int;
-}
-
-type checkable_payload_hash =
-  | No_check
-  | Expected_payload_hash of Block_payload_hash.t
-
-val finalize_validate_block_header :
-  block_header_contents:contents ->
-  round:Round_repr.t ->
-  fitness_locked_round:Round_repr.t option ->
-  checkable_payload_hash:checkable_payload_hash ->
-  locked_round_evidence:locked_round_evidence option ->
-  consensus_threshold:int ->
   unit tzresult

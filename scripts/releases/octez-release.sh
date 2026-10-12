@@ -1,0 +1,92 @@
+#!/bin/sh
+
+## Sourceable file with common variables for other scripts related to release
+
+# shellcheck disable=SC2034
+architectures='x86_64 arm64'
+
+current_dir=$(cd "$(dirname "${0}")" && pwd)
+scripts_dir=$(dirname "$current_dir")
+src_dir=$(dirname "$scripts_dir")
+script_inputs_dir="$src_dir/script-inputs"
+
+binaries="$(cat "$script_inputs_dir/released-executables")"
+
+octez_source_content="$script_inputs_dir/octez-source-content"
+
+### Compute GitLab release names from git tags
+
+# Git tags for octez releases are on the form `octez-vX.Y`, `octez-vX.Y-rcZ` or `octez-vX.Y-betaZ`.
+
+# Full octez release tag
+# octez-vX.Y, octez-vX.Y-rcZ or octez-vX.Y-betaZ
+gitlab_release=$(echo "${CI_COMMIT_TAG}" | grep -oE '^octez-v([0-9]+)\.([0-9]+)(-(rc|beta)?([0-9]+))?$' || :)
+
+# Strips the leading 'octez-v'
+# X.Y, X.Y-rcZ or X.Y-betaZ
+gitlab_release_no_v=$(echo "${gitlab_release}" | sed -e 's/^octez-v//g')
+
+# Replace '.' with '-'
+# X-Y or X-Y-rcZ
+# shellcheck disable=SC2034
+gitlab_release_no_dot=$(echo "${gitlab_release_no_v}" | sed -e 's/\./-/g')
+
+# X
+gitlab_release_major_version=$(echo "${CI_COMMIT_TAG}" | sed -nE 's/^octez-v([0-9]+)\.([0-9]+)((-[0-9]+)?|(-rc[0-9]+)?|(-beta[0-9]+)?)$/\1/p')
+# Y
+gitlab_release_minor_version=$(echo "${CI_COMMIT_TAG}" | sed -nE 's/^octez-v([0-9]+)\.([0-9]+)((-[0-9]+)?|(-rc[0-9]+)?|(-beta[0-9]+)?)$/\2/p')
+# Z
+gitlab_release_rc_version=$(echo "${CI_COMMIT_TAG}" | sed -nE 's/^octez-v([0-9]+)\.([0-9]+)(-rc)?([0-9]+)?$/\4/p')
+# Beta
+gitlab_release_beta_version=$(echo "${CI_COMMIT_TAG}" | sed -nE 's/^octez-v([0-9]+)\.([0-9]+)(-beta)?([0-9]+)?$/\4/p')
+# Revision
+gitlab_packaging_revision_version=$(echo "${CI_COMMIT_TAG}" | sed -nE 's/^octez-v([0-9]+)\.([0-9]+)-([0-9]+)?$/\3/p')
+
+# Is this a release candidate?
+if [ -n "${gitlab_release_rc_version}" ]; then
+  # Yes, release name: X.Y~rcZ
+  # shellcheck disable=SC2034
+  gitlab_release_name="Octez Release Candidate ${gitlab_release_major_version}.${gitlab_release_minor_version}~rc${gitlab_release_rc_version}"
+  opam_release_tag="${gitlab_release_major_version}.${gitlab_release_minor_version}~rc${gitlab_release_rc_version}"
+# Is this a beta ?
+elif [ -n "${gitlab_release_beta_version}" ]; then
+  gitlab_release_name="Octez Beta ${gitlab_release_major_version}.${gitlab_release_minor_version}~beta${gitlab_release_beta_version}"
+  opam_release_tag="${gitlab_release_major_version}.${gitlab_release_minor_version}~beta${gitlab_release_beta_version}"
+else
+  # No, release name: Octez Release X.Y
+  # shellcheck disable=SC2034
+  gitlab_release_name="Octez Release ${gitlab_release_major_version}.${gitlab_release_minor_version}"
+  opam_release_tag="${gitlab_release_major_version}.${gitlab_release_minor_version}"
+fi
+
+### Compute GitLab generic package names
+
+if [ -n "${gitlab_release_no_v}" ]; then
+  suffix="${gitlab_release_no_v}"
+  gitlab_octez_binaries_package_name="octez-binaries-${suffix}"
+  gitlab_octez_source_package_name="octez-source-${suffix}"
+else
+  suffix=$(date +'%Y%m%d%H%M')+$CI_COMMIT_SHORT_SHA
+  gitlab_octez_binaries_package_name="octez-binaries-${suffix}"
+  gitlab_octez_source_package_name="octez-source-${suffix}"
+fi
+
+# X.Y or X.Y-rcZ
+gitlab_package_version="${suffix}"
+
+# https://docs.gitlab.com/ee/api/packages.html#within-a-project
+# :gitlab_api_url/projects/:id/packages
+package_web_path() {
+  f_package_name="$1"
+  ret=$(curl -fsSL -X GET \
+    -H "JOB-TOKEN: ${CI_JOB_TOKEN}" \
+    "${CI_API_V4_URL}/projects/${CI_PROJECT_ID}/packages?sort=desc&package_name=${f_package_name}" |
+    jq -r ".[] | select(.version==\"${gitlab_package_version}\") | ._links.web_path")
+
+  if [ -z "${ret}" ]; then
+    echo "Error: ${f_package_name} could not find package matching version ${gitlab_package_version}"
+    exit 1
+  else
+    echo "https://${CI_SERVER_HOST}${ret}"
+  fi
+}

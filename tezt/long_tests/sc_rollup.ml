@@ -26,13 +26,17 @@
 
 (* Testing
    -------
-   Component:    Smart Contract Optimistic Rollups
+   Component:    Smart Optimistic Rollups
    Invocation:   dune exec tezt/long_tests/main.exe -- --file sc_rollup.ml
 *)
+
+let team = Team.etherlink
 
 open Base
 
 let hooks = Tezos_regression.hooks
+
+let rpc_hooks = Tezos_regression.rpc_hooks
 
 (*
 
@@ -81,16 +85,15 @@ let make_parameter name = function
   | None -> []
   | Some value -> [([name], `Int value)]
 
-let regression_test ~executors ~__FILE__ ?(tags = []) title f =
+let regression_test ~executors ~__FILE__ ?(tags = []) ?uses title f =
   let tags = "sc_rollup" :: tags in
-  Protocol.register_long_test ~executors ~__FILE__ ~title ~tags f
+  Protocol.register_long_test ~executors ~__FILE__ ~title ~team ~tags ?uses f
 
 let setup ?commitment_period ?challenge_window ?timeout f ~protocol =
   let parameters =
-    make_parameter "sc_rollup_commitment_period_in_blocks" commitment_period
-    @ make_parameter "sc_rollup_challenge_window_in_blocks" challenge_window
-    @ make_parameter "sc_rollup_timeout_period_in_blocks" timeout
-    @ [(["sc_rollup_enable"], `Bool true)]
+    make_parameter "smart_rollup_commitment_period_in_blocks" commitment_period
+    @ make_parameter "smart_rollup_challenge_window_in_blocks" challenge_window
+    @ make_parameter "smart_rollup_timeout_period_in_blocks" timeout
   in
   let base = Either.right (protocol, None) in
   let* parameter_file = Protocol.write_parameter_file ~base parameters in
@@ -113,27 +116,21 @@ let send_message client msg =
   in
   Client.bake_for_and_wait client
 
-let originate_sc_rollup ?(hooks = hooks) ?(burn_cap = Tez.(of_int 9999999))
-    ?(src = "bootstrap1") ?(kind = "arith") ?(parameters_ty = "string")
-    ~boot_sector client =
-  let* sc_rollup =
-    Client.Sc_rollup.(
-      originate ~hooks ~burn_cap ~src ~kind ~parameters_ty ~boot_sector client)
-  in
-  let* () = Client.bake_for_and_wait client in
-  return sc_rollup
-
-let with_fresh_rollup ~protocol ?kind ~boot_sector f tezos_node tezos_client
+let with_fresh_rollup ?(kind = "arith") ~boot_sector f tezos_node tezos_client
     operator =
   let* sc_rollup =
-    originate_sc_rollup ?kind ~boot_sector ~src:operator tezos_client
+    Sc_rollup_helpers.originate_sc_rollup
+      ~kind
+      ~boot_sector
+      ~src:operator
+      tezos_client
   in
   let sc_rollup_node =
     Sc_rollup_node.create
-      ~protocol
       Operator
       tezos_node
       ~base_dir:(Client.base_dir tezos_client)
+      ~kind
       ~default_operator:operator
   in
   let* configuration_filename =
@@ -141,32 +138,16 @@ let with_fresh_rollup ~protocol ?kind ~boot_sector f tezos_node tezos_client
   in
   f sc_rollup sc_rollup_node configuration_filename
 
-(** This helper injects an SC rollup origination via octez-client. Then it
-    bakes to include the origination in a block. It returns the address of the
-    originated rollup *)
-let originate_sc_rollup ?(hooks = hooks) ?(burn_cap = Tez.(of_int 9999999))
-    ?(src = "bootstrap1") ?(kind = "arith") ?(parameters_ty = "string")
-    ~boot_sector client =
-  let* sc_rollup =
-    Client.Sc_rollup.(
-      originate ~hooks ~burn_cap ~src ~kind ~parameters_ty ~boot_sector client)
-  in
-  let* () = Client.bake_for_and_wait client in
-  return sc_rollup
-
 let test_rollup_node_advances_pvm_state protocols ~test_name ~boot_sector
     ~internal ~kind =
-  let go ~protocol ~internal client sc_rollup sc_rollup_node =
+  let go ~internal client sc_rollup sc_rollup_node =
     let* genesis_info =
-      RPC.Client.call ~hooks client
+      Client.RPC.call ~hooks client
       @@ RPC.get_chain_block_context_smart_rollups_smart_rollup_genesis_info
            sc_rollup
     in
     let init_level = JSON.(genesis_info |-> "level" |> as_int) in
-
-    let* () = Sc_rollup_node.run sc_rollup_node [] in
-    let sc_rollup_client = Sc_rollup_client.create ~protocol sc_rollup_node in
-
+    let* () = Sc_rollup_node.run sc_rollup_node sc_rollup [] in
     let* level =
       Sc_rollup_node.wait_for_level ~timeout:30. sc_rollup_node init_level
     in
@@ -195,10 +176,14 @@ let test_rollup_node_advances_pvm_state protocols ~test_name ~boot_sector
     in
     (* Called with monotonically increasing [i] *)
     let test_message i =
-      let*! prev_state_hash =
-        Sc_rollup_client.state_hash ~hooks sc_rollup_client
+      let* prev_state_hash =
+        Sc_rollup_node.RPC.call sc_rollup_node
+        @@ Sc_rollup_rpc.get_global_block_state_hash ()
       in
-      let*! prev_ticks = Sc_rollup_client.total_ticks ~hooks sc_rollup_client in
+      let* prev_ticks =
+        Sc_rollup_node.RPC.call ~rpc_hooks sc_rollup_node
+        @@ Sc_rollup_rpc.get_global_block_total_ticks ()
+      in
       let message = sf "%d %d + value" i ((i + 2) * 2) in
       let* () =
         match forwarder with
@@ -213,7 +198,7 @@ let test_rollup_node_advances_pvm_state protocols ~test_name ~boot_sector
                 ~amount:Tez.zero
                 ~giver:Constant.bootstrap1.alias
                 ~receiver:forwarder
-                ~arg:(sf "Pair %S %S" sc_rollup message)
+                ~arg:(sf "Pair %S %S" message sc_rollup)
             in
             Client.bake_for_and_wait client
       in
@@ -223,11 +208,9 @@ let test_rollup_node_advances_pvm_state protocols ~test_name ~boot_sector
       let* () =
         match kind with
         | "arith" ->
-            let*! encoded_value =
-              Sc_rollup_client.state_value
-                ~hooks
-                sc_rollup_client
-                ~key:"vars/value"
+            let* encoded_value =
+              Sc_rollup_node.RPC.call sc_rollup_node
+              @@ Sc_rollup_rpc.get_global_block_state ~key:"vars/value" ()
             in
             let value =
               match Data_encoding.(Binary.of_bytes int31) @@ encoded_value with
@@ -256,13 +239,18 @@ let test_rollup_node_advances_pvm_state protocols ~test_name ~boot_sector
             return ()
         | _otherwise -> raise (Invalid_argument kind)
       in
-
-      let*! state_hash = Sc_rollup_client.state_hash ~hooks sc_rollup_client in
+      let* state_hash =
+        Sc_rollup_node.RPC.call sc_rollup_node
+        @@ Sc_rollup_rpc.get_global_block_state_hash ()
+      in
       Check.(state_hash <> prev_state_hash)
         Check.string
         ~error_msg:"State hash has not changed (%L <> %R)" ;
 
-      let*! ticks = Sc_rollup_client.total_ticks ~hooks sc_rollup_client in
+      let* ticks =
+        Sc_rollup_node.RPC.call ~rpc_hooks sc_rollup_node
+        @@ Sc_rollup_rpc.get_global_block_total_ticks ()
+      in
       Check.(ticks >= prev_ticks)
         Check.int
         ~error_msg:"Tick counter did not advance (%L >= %R)" ;
@@ -278,15 +266,15 @@ let test_rollup_node_advances_pvm_state protocols ~test_name ~boot_sector
     regression_test
       ~__FILE__
       ~tags:["sc_rollup"; "run"; "node"; kind]
+      ~uses:(fun _protocol -> [Constant.octez_smart_rollup_node])
       test_name
       (fun protocol ->
         setup ~protocol @@ fun node client ->
         with_fresh_rollup
-          ~protocol
           ~kind
           ~boot_sector
           (fun sc_rollup_address sc_rollup_node _filename ->
-            go ~protocol ~internal:false client sc_rollup_address sc_rollup_node)
+            go ~internal:false client sc_rollup_address sc_rollup_node)
           node
           client)
       protocols
@@ -294,15 +282,15 @@ let test_rollup_node_advances_pvm_state protocols ~test_name ~boot_sector
     regression_test
       ~__FILE__
       ~tags:["sc_rollup"; "run"; "node"; "internal"; kind]
+      ~uses:(fun _protocol -> [Constant.octez_smart_rollup_node])
       test_name
       (fun protocol ->
         setup ~protocol @@ fun node client ->
         with_fresh_rollup
-          ~protocol
           ~kind
           ~boot_sector
           (fun sc_rollup_address sc_rollup_node _filename ->
-            go ~protocol ~internal:true client sc_rollup_address sc_rollup_node)
+            go ~internal:true client sc_rollup_address sc_rollup_node)
           node
           client)
       protocols

@@ -36,8 +36,6 @@ type error += Bad_minimal_fees of string
 
 type error += Bad_max_waiting_time of string
 
-type error += Bad_endorsement_delay of string
-
 type error += Bad_preserved_levels of string
 
 type error += Forbidden_Negative_int of string
@@ -95,20 +93,6 @@ let () =
     (fun parameter -> Bad_max_waiting_time parameter) ;
   register_error_kind
     `Permanent
-    ~id:"badEndorsementDelayArg"
-    ~title:"Bad -endorsement-delay arg"
-    ~description:"invalid duration in -endorsement-delay"
-    ~pp:(fun ppf literal ->
-      Format.fprintf
-        ppf
-        "Bad argument value for -endorsement-delay. Expected an integer, but \
-         given '%s'"
-        literal)
-    Data_encoding.(obj1 (req "parameter" string))
-    (function Bad_endorsement_delay parameter -> Some parameter | _ -> None)
-    (fun parameter -> Bad_endorsement_delay parameter) ;
-  register_error_kind
-    `Permanent
     ~id:"badPreservedLevelsArg"
     ~title:"Bad -preserved-levels arg"
     ~description:"invalid number of levels in -preserved-levels"
@@ -136,15 +120,26 @@ let () =
     (function Forbidden_Negative_int str -> Some str | _ -> None)
     (fun str -> Forbidden_Negative_int str)
 
-let string_parameter = Tezos_clic.parameter (fun _ x -> return x)
+let string_parameter =
+  let open Lwt_result_syntax in
+  Tezos_clic.parameter (fun _ x -> return x)
 
 let int_parameter =
+  let open Lwt_result_syntax in
   Tezos_clic.parameter (fun (cctxt : #Client_context.full) p ->
       try return (int_of_string p) with _ -> cctxt#error "Cannot read int")
 
-let uri_parameter = Tezos_clic.parameter (fun _ x -> return (Uri.of_string x))
+let z_parameter =
+  let open Lwt_result_syntax in
+  Tezos_clic.parameter (fun (cctxt : #Client_context.full) p ->
+      try return (Z.of_string p) with _ -> cctxt#error "Cannot read integer")
+
+let uri_parameter =
+  let open Lwt_result_syntax in
+  Tezos_clic.parameter (fun _ x -> return (Uri.of_string x))
 
 let bytes_of_prefixed_string (cctxt : #Client_context.full) s =
+  let open Lwt_result_syntax in
   match
     if String.length s < 2 || s.[0] <> '0' || s.[1] <> 'x' then None
     else Hex.to_bytes (`Hex (String.sub s 2 (String.length s - 2)))
@@ -189,6 +184,7 @@ let file_or_text_parameter ~from_text () =
   |> Tezos_clic.map_parameter ~f:content_of_file_or_text
 
 let json_with_origin_parameter =
+  let open Lwt_result_syntax in
   let from_text (cctxt : #Client_context.full) s =
     match Data_encoding.Json.from_string s with
     | Ok json -> return json
@@ -201,9 +197,8 @@ let json_parameter =
   Tezos_clic.map_parameter ~f:content_of_file_or_text json_with_origin_parameter
 
 let data_parameter =
-  let open Lwt_syntax in
   let from_text (_cctxt : #Client_context.full) input =
-    return @@ Tezos_micheline.Micheline_parser.no_parsing_error
+    Lwt.return @@ Tezos_micheline.Micheline_parser.no_parsing_error
     @@ Michelson_v1_parser.parse_expression input
   in
   file_or_text_parameter ~from_text ()
@@ -256,6 +251,14 @@ let binary_encoded_parameter ~name encoding =
   in
   file_or_text_parameter ~from_text ()
 
+let parse_micheline_parameter source =
+  Lwt.return @@ Tezos_micheline.Micheline_parser.no_parsing_error
+  @@ Michelson_v1_parser.expand_expression source
+
+let micheline_parameter =
+  Tezos_clic.parameter (fun (_ : full) source ->
+      parse_micheline_parameter source)
+
 let entrypoint_parameter =
   Tezos_clic.parameter (fun _ str ->
       Lwt.return @@ Environment.wrap_tzresult @@ Entrypoint.of_string_lax str)
@@ -267,6 +270,40 @@ let init_arg =
     ~doc:"initial value of the contract's storage"
     ~default:"Unit"
     string_parameter
+
+let other_contracts_parameter =
+  file_or_text_parameter
+    ~from_text:(fun _ source ->
+      let open Lwt_result_syntax in
+      let* parsed = parse_micheline_parameter source in
+      let*? l = Michelson_v1_stack.parse_other_contracts parsed in
+      return l)
+    ()
+
+let other_contracts_arg =
+  Tezos_clic.arg
+    ~doc:
+      {|types and addresses of extra contracts, formatted as {Contract "KT1..." <ty1>; Contract "KT1..." <ty2>; ...}|}
+    ~long:"other-contracts"
+    ~placeholder:"contracts"
+    other_contracts_parameter
+
+let extra_big_maps_parameter =
+  file_or_text_parameter
+    ~from_text:(fun _ source ->
+      let open Lwt_result_syntax in
+      let* parsed = parse_micheline_parameter source in
+      let*? l = Michelson_v1_stack.parse_extra_big_maps parsed in
+      return l)
+    ()
+
+let extra_big_maps_arg =
+  Tezos_clic.arg
+    ~doc:
+      {|identifier and content of extra big maps, formatted as {Big_map <index> <key_type> <value_type> {Elt <key1> <value1>; Elt <key2> <value2>; ...}}|}
+    ~long:"extra-big-maps"
+    ~placeholder:"big maps"
+    extra_big_maps_parameter
 
 let global_constant_param ~name ~desc next =
   Tezos_clic.param ~name ~desc string_parameter next
@@ -323,11 +360,22 @@ let force_switch =
        of block without a fitness greater than the  current head."
     ()
 
-let no_endorse_switch =
+let force_reproposal =
   Tezos_clic.switch
-    ~long:"no-endorse"
-    ~doc:"Do not let the client automatically endorse a block that it baked."
+    ~long:"force-reproposal"
+    ~doc:
+      "Force baking a reproposal by crafting a prequorum proof with the \
+       available delegates"
     ()
+
+let force_round_arg =
+  Tezos_clic.arg
+    ~long:"force-round"
+    ~placeholder:"round"
+    ~doc:
+      "Bake exactly at the given round assuming that it is held by one of your \
+       delegates"
+    int_parameter
 
 let minimal_timestamp_switch =
   Tezos_clic.switch
@@ -343,10 +391,23 @@ let tez_format =
    are allowed."
 
 let tez_parameter param =
+  let open Lwt_result_syntax in
   Tezos_clic.parameter (fun _ s ->
       match Tez.of_string s with
       | Some tez -> return tez
-      | None -> fail (Bad_tez_arg (param, s)))
+      | None -> tzfail (Bad_tez_arg (param, s)))
+
+let everything_tez_parameter param =
+  let open Lwt_result_syntax in
+  Tezos_clic.parameter (fun _ s ->
+      match s with
+      | "everything" -> return Tez.max_mutez
+      | _ -> tzfail (Bad_tez_arg (param, s)))
+
+let everything_or_tez_parameter param =
+  Tezos_clic.compose_parameters
+    (tez_parameter param)
+    (everything_tez_parameter param)
 
 let tez_arg ~default ~parameter ~doc =
   Tezos_clic.default_arg
@@ -370,28 +431,53 @@ let tez_param ~name ~desc next =
     (tez_parameter name)
     next
 
-let non_negative_z_parameter =
-  Tezos_clic.parameter (fun (cctxt : #Client_context.full) s ->
-      try
-        let v = Z.of_string s in
-        error_when Compare.Z.(v < Z.zero) (Forbidden_Negative_int s)
-        >>?= fun () -> return v
-      with _ -> cctxt#error "Invalid number, must be a non negative number.")
+let everything_or_tez_param ~name ~desc next =
+  Tezos_clic.param
+    ~name
+    ~desc:(desc ^ " in \xEA\x9C\xA9 (or everything)\n" ^ tez_format)
+    (everything_or_tez_parameter name)
+    next
+
+let non_negative_z_parser (cctxt : #Client_context.io) s =
+  match Z.of_string s with
+  | exception Invalid_argument _ -> cctxt#error "Expected number"
+  | v when Compare.Z.(v < Z.zero) ->
+      cctxt#error "Invalid number, must be a non negative number."
+  | v -> Lwt_result_syntax.return v
+
+let non_negative_z_parameter () = Tezos_clic.parameter non_negative_z_parser
 
 let non_negative_z_param ~name ~desc next =
-  Tezos_clic.param ~name ~desc non_negative_z_parameter next
+  Tezos_clic.param ~name ~desc (non_negative_z_parameter ()) next
 
 let counter_parameter =
+  let open Lwt_result_syntax in
   Tezos_clic.parameter (fun (cctxt : #Client_context.full) s ->
       match Manager_counter.Internal_for_injection.of_string s with
       | None -> cctxt#error "Invalid counter, must be a non-negative number."
       | Some c -> return c)
 
-let non_negative_parameter =
-  Tezos_clic.parameter (fun _ s ->
-      match int_of_string_opt s with
-      | Some i when i >= 0 -> return i
-      | _ -> failwith "Parameter should be a non-negative integer literal")
+let non_negative_parser (cctxt : #Client_context.io) s =
+  let open Lwt_result_syntax in
+  match int_of_string_opt s with
+  | Some i when i >= 0 -> return i
+  | _ -> cctxt#error "Parameter should be a non-negative integer literal"
+
+let non_negative_parameter () = Tezos_clic.parameter non_negative_parser
+
+let non_negative_param ~name ~desc next =
+  Tezos_clic.param ~name ~desc (non_negative_parameter ()) next
+
+let positive_int_parser (cctxt : #Client_context.io) s =
+  let open Lwt_result_syntax in
+  match int_of_string_opt s with
+  | Some i when i > 0 -> return i
+  | _ -> cctxt#error "Parameter should be a positive integer literal"
+
+let positive_int_parameter () = Tezos_clic.parameter positive_int_parser
+
+let positive_int_param ~name ~desc next =
+  Tezos_clic.param ~name ~desc (positive_int_parameter ()) next
 
 let fee_arg =
   Tezos_clic.arg
@@ -408,6 +494,7 @@ let default_fee_arg =
     (tez_parameter "--default-fee")
 
 let level_kind =
+  let open Lwt_result_syntax in
   Tezos_clic.parameter (fun (cctxt : #Client_context.full) s ->
       match Option.bind (Script_int.of_string s) Script_int.is_nat with
       | Some n -> return n
@@ -420,17 +507,22 @@ let level_arg =
     ~doc:"Set the level to be returned by the LEVEL instruction"
     level_kind
 
-let raw_level_parameter =
-  Tezos_clic.parameter (fun (cctxt : #Client_context.full) s ->
-      match Int32.of_string_opt s with
-      | Some i when i >= 0l ->
-          Lwt.return @@ Environment.wrap_tzresult (Raw_level.of_int32 i)
-      | _ ->
-          cctxt#error
-            "'%s' is not a valid level (should be a non-negative int32 value)"
-            s)
+let raw_level_parser (cctxt : #Client_context.io) s =
+  match Int32.of_string_opt s with
+  | Some i when i >= 0l ->
+      Lwt.return @@ Environment.wrap_tzresult (Raw_level.of_int32 i)
+  | _ ->
+      cctxt#error
+        "'%s' is not a valid level (should be a non-negative int32 value)"
+        s
+
+let raw_level_parameter () = Tezos_clic.parameter raw_level_parser
+
+let raw_level_param ~name ~desc next =
+  Tezos_clic.param ~name ~desc (raw_level_parameter ()) next
 
 let timestamp_parameter =
+  let open Lwt_result_syntax in
   Tezos_clic.parameter (fun (cctxt : #Client_context.full) s ->
       match Script_timestamp.of_string s with
       | Some time -> return time
@@ -449,6 +541,7 @@ let now_arg =
     timestamp_parameter
 
 let gas_limit_kind =
+  let open Lwt_result_syntax in
   Tezos_clic.parameter (fun (cctxt : #Client_context.full) s ->
       try
         let v = Z.of_string s in
@@ -475,21 +568,36 @@ let default_gas_limit_arg =
        client decide based on a simulation"
     gas_limit_kind
 
+let safety_guard_arg =
+  Tezos_clic.arg
+    ~long:"safety-guard"
+    ~placeholder:"extra_gas"
+    ~doc:
+      "Amount of gas to add to value computed by simulation. The gas safety \
+       guard allows operations that consume a little more gas than expected to \
+       be successful"
+    gas_limit_kind
+
 let run_gas_limit_arg =
   Tezos_clic.arg
     ~long:"gas"
     ~short:'G'
-    ~doc:"Initial quantity of gas for typechecking and execution"
+    ~doc:
+      "Initial quantity of gas for typechecking and execution. Defaults to the \
+       gas limit of an operation. Ignored if --unlimited-gas is given"
     ~placeholder:"gas"
     gas_limit_kind
 
 let unlimited_gas_arg =
   Tezos_clic.switch
     ~long:"unlimited-gas"
-    ~doc:"Allows interpretation with virtually unlimited gas"
+    ~doc:
+      "Allows typechecking and interpretation with virtually unlimited gas. \
+       Takes precedence over --gas"
     ()
 
 let storage_limit_kind =
+  let open Lwt_result_syntax in
   Tezos_clic.parameter (fun (cctxt : #Client_context.full) s ->
       try
         let v = Z.of_string s in
@@ -527,21 +635,26 @@ let counter_arg =
     counter_parameter
 
 let max_priority_arg =
+  let open Lwt_result_syntax in
   Tezos_clic.arg
     ~long:"max-priority"
     ~placeholder:"slot"
     ~doc:"maximum allowed baking slot"
     (Tezos_clic.parameter (fun _ s ->
-         try return (int_of_string s) with _ -> fail (Bad_max_priority s)))
+         try return (int_of_string s) with _ -> tzfail (Bad_max_priority s)))
+
+let timelock_locked_value_arg =
+  Tezos_clic.arg
+    ~long:"timelock-locked-valuec"
+    ~placeholder:"timelock-locked"
+    ~doc:"Timelock RSA group modulus"
+    string_parameter
 
 let default_minimal_fees =
   match Tez.of_mutez 100L with None -> assert false | Some t -> t
 
-let default_minimal_nanotez_per_gas_unit = Q.of_int 100
-
-let default_minimal_nanotez_per_byte = Q.of_int 1000
-
 let minimal_fees_arg =
+  let open Lwt_result_syntax in
   Tezos_clic.default_arg
     ~long:"minimal-fees"
     ~placeholder:"amount"
@@ -550,29 +663,33 @@ let minimal_fees_arg =
     (Tezos_clic.parameter (fun _ s ->
          match Tez.of_string s with
          | Some t -> return t
-         | None -> fail (Bad_minimal_fees s)))
+         | None -> tzfail (Bad_minimal_fees s)))
+
+let nanotez_parameter =
+  let open Lwt_result_syntax in
+  Tezos_clic.parameter (fun _ s ->
+      try return (Q.of_string s)
+      with Invalid_argument _ | Failure _ -> tzfail (Bad_minimal_fees s))
 
 let minimal_nanotez_per_gas_unit_arg =
-  Tezos_clic.default_arg
+  Tezos_clic.arg
     ~long:"minimal-nanotez-per-gas-unit"
     ~placeholder:"amount"
     ~doc:
-      "exclude operations with fees per gas lower than this threshold (in \
-       nanotez)"
-    ~default:(Q.to_string default_minimal_nanotez_per_gas_unit)
-    (Tezos_clic.parameter (fun _ s ->
-         try return (Q.of_string s) with _ -> fail (Bad_minimal_fees s)))
+      "Set the fee per gas unit threshold (in nanotez) used to compute \
+       operation fees. If not provided, the value is fetched from the node's \
+       mempool filter configuration."
+    nanotez_parameter
 
 let minimal_nanotez_per_byte_arg =
-  Tezos_clic.default_arg
+  Tezos_clic.arg
     ~long:"minimal-nanotez-per-byte"
     ~placeholder:"amount"
-    ~default:(Q.to_string default_minimal_nanotez_per_byte)
     ~doc:
-      "exclude operations with fees per byte lower than this threshold (in \
-       nanotez)"
-    (Tezos_clic.parameter (fun _ s ->
-         try return (Q.of_string s) with _ -> fail (Bad_minimal_fees s)))
+      "Set the fee per byte threshold (in nanotez) used to compute operation \
+       fees. If not provided, the value is fetched from the node's mempool \
+       filter configuration."
+    nanotez_parameter
 
 let replace_by_fees_arg =
   Tezos_clic.switch
@@ -592,6 +709,7 @@ let successor_level_arg =
     ()
 
 let preserved_levels_arg =
+  let open Lwt_result_syntax in
   Tezos_clic.default_arg
     ~long:"preserved-levels"
     ~placeholder:"threshold"
@@ -599,10 +717,10 @@ let preserved_levels_arg =
     ~default:"200"
     (Tezos_clic.parameter (fun _ s ->
          try
-           let preserved_cycles = int_of_string s in
-           if preserved_cycles < 0 then fail (Bad_preserved_levels s)
-           else return preserved_cycles
-         with _ -> fail (Bad_preserved_levels s)))
+           let preserved_levels = int_of_string s in
+           if preserved_levels < 0 then tzfail (Bad_preserved_levels s)
+           else return preserved_levels
+         with _ -> tzfail (Bad_preserved_levels s)))
 
 let no_print_source_flag =
   Tezos_clic.switch
@@ -615,6 +733,14 @@ let no_print_source_flag =
        This option disables this behaviour."
     ()
 
+let keep_going_flag =
+  Tezos_clic.switch
+    ~long:"keep-going"
+    ~doc:
+      "don't stop on errors. This is useful to measure the number of successes \
+       and failures."
+    ()
+
 let no_confirmation =
   Tezos_clic.switch
     ~long:"no-confirmation"
@@ -622,12 +748,14 @@ let no_confirmation =
     ()
 
 let signature_parameter =
+  let open Lwt_result_syntax in
   Tezos_clic.parameter (fun (cctxt : #Client_context.full) s ->
       match Signature.of_b58check_opt s with
       | Some s -> return s
       | None -> cctxt#error "Not given a valid signature")
 
 let unparsing_mode_parameter =
+  let open Lwt_result_syntax in
   Tezos_clic.parameter
     ~autocomplete:(fun _cctxt ->
       return ["Readable"; "Optimized"; "Optimized_legacy"])
@@ -676,41 +804,84 @@ let display_names_flag =
     ~doc:"Print names of scripts passed to this command"
     ()
 
-module Daemon = struct
-  let baking_switch =
-    Tezos_clic.switch ~long:"baking" ~short:'B' ~doc:"run the baking daemon" ()
+let fixed_point_parameter =
+  let open Lwt_result_syntax in
+  let rec remove_trailing_zeroes ~decimals ~right i =
+    if i < decimals then Some (String.sub right 0 decimals)
+    else if right.[i] <> '0' then None
+    else (remove_trailing_zeroes [@ocaml.tailcall]) ~decimals ~right (i - 1)
+  in
+  let parse ~decimals p =
+    let open Option_syntax in
+    let* left, right =
+      match String.split_on_char '.' p with
+      | [left; right] -> Some (left, right)
+      | [left] -> Some (left, "")
+      | _ -> None
+    in
+    let* right =
+      if String.length right > decimals then
+        remove_trailing_zeroes ~decimals ~right (String.length right - 1)
+      else Some (right ^ String.make (decimals - String.length right) '0')
+    in
+    int_of_string_opt (left ^ right)
+  in
+  let parse ~decimals p =
+    if decimals >= 2 && String.length p > 0 && p.[String.length p - 1] = '%'
+    then parse ~decimals:(decimals - 2) (String.sub p 0 (String.length p - 1))
+    else parse ~decimals p
+  in
+  fun ~decimals ->
+    if decimals < 0 then
+      raise (Invalid_argument "fixed_point_parameter: negative decimals")
+    else fun ~name ->
+      Tezos_clic.parameter (fun (cctxt : #Client_context.full) p ->
+          match parse ~decimals p with
+          | Some res -> return res
+          | None ->
+              cctxt#error
+                "Cannot read %s parameter: expecting a fixed point number with \
+                 at most %d decimals, or a fixed point number with at most %d \
+                 decimals followed by a %% sign."
+                name
+                decimals
+                (decimals - 2))
 
-  let endorsement_switch =
-    Tezos_clic.switch
-      ~long:"endorsement"
-      ~short:'E'
-      ~doc:"run the endorsement daemon"
-      ()
+let limit_of_staking_over_baking_millionth_arg =
+  Tezos_clic.arg
+    ~long:"limit-of-staking-over-baking"
+    ~placeholder:"limit"
+    ~doc:
+      "Limits the total amount of stake for the source's delegators as a \
+       proportion of the source's own stake. Any amount exceeding this limit \
+       is considered as delegation in the stake of the delegate. The value \
+       should be between 0 and 5 (default 0 if not set). If this parameter is \
+       0, as is the default, any staking operation from the source's \
+       delegators are forbidden and will fail (unstaking operations are still \
+       allowed)."
+    ((* TODO #6162: should we check it's between 0 and 5 million? *)
+     fixed_point_parameter
+       ~decimals:6
+       ~name:"limit of staking over baking")
 
-  let denunciation_switch =
-    Tezos_clic.switch
-      ~long:"denunciation"
-      ~short:'D'
-      ~doc:"run the denunciation daemon"
-      ()
-end
+let edge_of_baking_over_staking_billionth_arg =
+  Tezos_clic.arg
+    ~long:"edge-of-baking-over-staking"
+    ~placeholder:"edge"
+    ~doc:
+      "Sets the portion of the delegate's stakers rewards that goes to the \
+       delegate. This edge, taken from the staker's rewards, is accrued to the \
+       delegate's own frozen balance. This value must be between 0 and 1 (e.g. \
+       0.05 for the delegate to receive 5% of the staker's rewards). Default \
+       value is 1 (delegate receives all staker's rewards)."
+    ((* TODO #6162: check it's between 0 and 1 billion *)
+     fixed_point_parameter
+       ~decimals:9
+       ~name:"edge of baking over staking")
 
 module Sc_rollup_params = struct
-  let sc_rollup_address_parameter =
-    Tezos_clic.parameter (fun (cctxt : #Client_context.full) s ->
-        match Alpha_context.Sc_rollup.Address.of_b58check_opt s with
-        | Some c -> return c
-        | None ->
-            cctxt#error
-              "Parameter '%s' is an invalid smart rollup address encoded in a \
-               base58 string."
-              s)
-
-  let sc_rollup_address_param ?(name = "smart rollup address")
-      ?(desc = "the address of the targeted smart rollup") next =
-    Tezos_clic.param ~name ~desc sc_rollup_address_parameter next
-
   let rollup_kind_parameter =
+    let open Lwt_result_syntax in
     Tezos_clic.parameter (fun (cctxt : #Client_context.full) name ->
         match Sc_rollup.Kind.of_string name with
         | None ->
@@ -721,6 +892,7 @@ module Sc_rollup_params = struct
         | Some k -> return k)
 
   let boot_sector_parameter =
+    let open Lwt_result_syntax in
     let from_text (cctxt : #Client_context.full) s =
       return (fun (Sc_rollup.PVM.Packed (module R)) ->
           R.parse_boot_sector s |> function
@@ -766,6 +938,7 @@ module Sc_rollup_params = struct
           p)
 
   let commitment_hash_parameter =
+    let open Lwt_result_syntax in
     Tezos_clic.parameter (fun (cctxt : #Client_context.full) commitment_hash ->
         match Sc_rollup.Commitment.Hash.of_b58check_opt commitment_hash with
         | None ->
@@ -775,9 +948,11 @@ module Sc_rollup_params = struct
         | Some hash -> return hash)
 
   let unchecked_payload_parameter =
+    let open Lwt_result_syntax in
     file_or_text_parameter ~from_text:(fun _cctxt -> return) ()
 
   let compressed_state_parameter =
+    let open Lwt_result_syntax in
     Tezos_clic.parameter (fun (cctxt : #Client_context.full) state_hash ->
         match Sc_rollup.State_hash.of_b58check_opt state_hash with
         | None ->
@@ -787,6 +962,7 @@ module Sc_rollup_params = struct
         | Some hash -> return hash)
 
   let number_of_ticks_parameter =
+    let open Lwt_result_syntax in
     Tezos_clic.parameter (fun (cctxt : #Client_context.full) nb_of_ticks ->
         match Int64.of_string_opt nb_of_ticks with
         | Some nb_of_ticks -> (
@@ -801,7 +977,22 @@ module Sc_rollup_params = struct
             | Some nb_of_ticks -> return nb_of_ticks)
         | None ->
             cctxt#error "'%s' is not valid, should be a int64 value" nb_of_ticks)
+
+  let whitelist =
+    json_encoded_parameter
+      ~name:"Whitelist for private rollups"
+      Sc_rollup.Whitelist.encoding
 end
+
+let whitelist_arg =
+  Tezos_clic.arg
+    ~long:"whitelist"
+    ~short:'W'
+    ~placeholder:"whitelist"
+    ~doc:
+      "Whitelist for private rollups. Members of the whitelist are stakers \
+       that are allowed to publish commitments."
+    Sc_rollup_params.whitelist
 
 module Zk_rollup_params = struct
   let address_parameter =
@@ -835,8 +1026,44 @@ module Zk_rollup_params = struct
       Zk_rollup.Account.circuits_info_encoding
 end
 
+module Dal = struct
+  let commitment_parameter =
+    let open Lwt_result_syntax in
+    Tezos_clic.parameter (fun (cctxt : #Client_context.full) commitment_hash ->
+        match Dal_slot_repr.Commitment.of_b58check_opt commitment_hash with
+        | None ->
+            cctxt#error
+              "Parameter '%s' is not a valid B58-encoded DAL commitment"
+              commitment_hash
+        | Some commitment -> return commitment)
+
+  let commitment_proof_parameter =
+    let open Lwt_result_syntax in
+    Tezos_clic.parameter
+      (fun (cctxt : #Client_context.full) commitment_proof_hex ->
+        match Hex.to_string (`Hex commitment_proof_hex) with
+        | None ->
+            cctxt#error
+              "Commitment proof parameter '%s' is not a valid hexadecimal \
+               string"
+              commitment_proof_hex
+        | Some commitment_proof_bin -> (
+            match
+              Data_encoding.Binary.of_string_opt
+                Dal_slot_repr.Commitment_proof.encoding
+                commitment_proof_bin
+            with
+            | None ->
+                cctxt#error
+                  "Commitment proof parameter '%s' is not a valid DAL \
+                   commitment proof"
+                  commitment_proof_hex
+            | Some commitment_proof -> return commitment_proof))
+end
+
 let fee_parameter_args =
   let open Tezos_clic in
+  let open Lwt_result_syntax in
   let force_low_fee_arg =
     switch
       ~long:"force-low-fee"
@@ -866,14 +1093,15 @@ let fee_parameter_args =
            | None -> cctxt#error "Bad burn cap"))
   in
   Tezos_clic.map_arg
-    ~f:
-      (fun _cctxt
-           ( minimal_fees,
-             minimal_nanotez_per_byte,
-             minimal_nanotez_per_gas_unit,
-             force_low_fee,
-             fee_cap,
-             burn_cap ) ->
+    ~f:(fun
+        _cctxt
+        ( minimal_fees,
+          minimal_nanotez_per_byte,
+          minimal_nanotez_per_gas_unit,
+          force_low_fee,
+          fee_cap,
+          burn_cap )
+      ->
       return
         {
           Injection.minimal_fees;
@@ -891,3 +1119,27 @@ let fee_parameter_args =
           force_low_fee_arg
           fee_cap_arg
           burn_cap_arg))
+
+let bls_key_pop_arg ~long =
+  let open Lwt_result_syntax in
+  Tezos_clic.arg
+    ~long
+    ~placeholder:"proof-of-possession"
+    ~doc:
+      "Proof of possession (PoP) for a BLS key (tz4 address), encoded in \
+       Base58. This is a BLS signature over the public key, proving control of \
+       the corresponding private key. If no proof is provided, the client can \
+       generate one, assuming the associated private key is available in your \
+       wallet."
+    (Tezos_clic.parameter (fun (cctxt : #Client_context.full) s ->
+         match Signature.of_b58check_opt s with
+         | Some (Bls s) -> return s
+         | Some _ | None ->
+             cctxt#error "The provided proof is not a BLS signature"))
+
+let consensus_key_pop_arg = bls_key_pop_arg ~long:"consensus-key-pop"
+
+let companion_key_pop_arg = bls_key_pop_arg ~long:"companion-key-pop"
+
+let initial_stake_arg =
+  tez_opt_arg ~parameter:"initial-stake" ~doc:"Amount staked from source"

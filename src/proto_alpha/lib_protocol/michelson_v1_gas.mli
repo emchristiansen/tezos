@@ -33,7 +33,20 @@
 open Alpha_context
 
 module Cost_of : sig
+  (* The [manager_operation] cost is consumed each time a manager
+     operation (internal or external alike) is applied. This cost is
+     meant to cover the resources used in {!Apply} either directly
+     (dispatching on operation kinds) or indirectly (in particular in
+     the production of operation results). *)
   val manager_operation : Gas.cost
+
+  (* The [transfer_operation] cost is consumed each time a transfer
+     operation (internal or external alike) is applied. This cost is
+     meant to cover the I/O accesses required to fetch and modify the
+     spendable balance storage. Hence this cost doesn't apply for calls.
+     It is also not used for the staking operations, since their cost is already
+     covered by those defined in [adaptive_issuance_costs.ml]. *)
+  val transfer_operation : Gas.cost
 
   module Interpreter : sig
     val drop : Gas.cost
@@ -226,6 +239,14 @@ module Cost_of : sig
 
     val dip : Gas.cost
 
+    type algo = Ed25519 | Secp256k1 | P256 | Bls | Mldsa44
+
+    val algo_of_public_key : Signature.public_key -> algo
+
+    val algo_of_public_key_hash : Implicit_account_repr.t -> algo
+
+    val check_signature_on_algo : algo -> int -> Gas.cost
+
     val check_signature : Signature.public_key -> bytes -> Gas.cost
 
     val blake2b : bytes -> Gas.cost
@@ -300,7 +321,9 @@ module Cost_of : sig
 
     val halt : Gas.cost
 
-    val const : Gas.cost
+    val push : Gas.cost
+
+    val unit : Gas.cost
 
     val empty_big_map : Gas.cost
 
@@ -326,11 +349,23 @@ module Cost_of : sig
 
     val view_get : Script_string.t -> Script_typed_ir.view_map -> Gas.cost
 
+    val native_view_get :
+      Script_string.t -> 'storage Script_native_types.view_map -> Gas.cost
+
     val view_update : Script_string.t -> Script_typed_ir.view_map -> Gas.cost
+
+    val native_view_update :
+      Script_string.t -> 'storage Script_native_types.view_map -> Gas.cost
 
     val transfer_tokens : Gas.cost
 
     val implicit_account : Gas.cost
+
+    val is_implicit_account : Gas.cost
+
+    val index_address : Gas.cost
+
+    val get_address_index : Gas.cost
 
     val create_contract : Gas.cost
 
@@ -410,7 +445,7 @@ module Cost_of : sig
 
       val list_exit_body : Gas.cost
 
-      val map_enter_body : Gas.cost
+      val map_enter_body : ('k, 'v) Script_typed_ir.map -> Gas.cost
 
       val map_exit_body : 'k -> ('k, 'v) Script_typed_ir.map -> Gas.cost
     end
@@ -447,7 +482,9 @@ module Cost_of : sig
 
     val check_printable : string -> Gas.cost
 
-    val merge_cycle : Gas.cost
+    val ty_eq : _ Script_typed_ir.ty -> _ Script_typed_ir.ty -> Gas.cost
+
+    val ty_eq_prim : Gas.cost
 
     val parse_type_cycle : Gas.cost
 
@@ -464,8 +501,6 @@ module Cost_of : sig
     val unit : Gas.cost
 
     val timestamp_readable : string -> Gas.cost
-
-    val tx_rollup_l2_address : Gas.cost
 
     val contract_exists : Gas.cost
 
@@ -514,8 +549,6 @@ module Cost_of : sig
     val unparse_data_cycle : Gas.cost
 
     val unit : Gas.cost
-
-    val tx_rollup_l2_address : Gas.cost
 
     val operation : bytes -> Gas.cost
 

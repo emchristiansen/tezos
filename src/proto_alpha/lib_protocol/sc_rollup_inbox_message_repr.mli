@@ -53,7 +53,7 @@ type internal_inbox_message =
       sender : Contract_hash.t;
           (** The contract hash of an Layer 1 originated contract sending a message
           to the rollup. *)
-      source : Signature.public_key_hash;
+      source : Implicit_account_repr.t;
           (** The implicit account that originated the transaction. *)
       destination : Sc_rollup_repr.Address.t;
           (** The destination, as a rollup address, for the message. *)
@@ -69,6 +69,18 @@ type internal_inbox_message =
           (** Predecessor of the block this message is pushed. *)
     }
   | Protocol_migration of string
+  | Dal_attested_slots of {
+      published_level : Raw_level_repr.t;
+      number_of_slots : int;
+      slot_size : int;
+      page_size : int;
+      slots_by_publisher :
+        Dal_slot_index_repr.t list Implicit_account_repr.Map.t;
+    }
+      (** Internal message communicating the attested slots for the given
+          [published_level]. Attested slots are grouped by
+          [slots_by_publisher]. A slot is attested if and only if it appears in
+          the map's codomain. *)
 
 (** A type representing messages from Layer 1 to Layer 2. Internal ones are
     originated from Layer 1 smart-contracts and external ones are messages from
@@ -101,3 +113,50 @@ val start_of_level_serialized : serialized
 
 (** {!serialized} representation of [Internal [End_of_level]]. *)
 val end_of_level_serialized : serialized
+
+(** {!info_per_level_serialized ~predecessor_timestamp ~predecessor} is the serialized representation of the internal message for {!Info_per_level}. *)
+val info_per_level_serialized :
+  predecessor_timestamp:Time.t -> predecessor:Block_hash.t -> serialized
+
+(** [dal_attested_slots_serialized ~published_level ~number_of_slots ~slot_size
+    ~page_size ~slots_by_publisher] is the serialized representation of the
+    internal message for {!Dal_attested_slots}. *)
+val dal_attested_slots_serialized :
+  published_level:Raw_level_repr.t ->
+  number_of_slots:int ->
+  slot_size:int ->
+  page_size:int ->
+  slots_by_publisher:Dal_slot_index_repr.t list Implicit_account_repr.Map.t ->
+  serialized
+
+(** [dal_attested_slots_messages_of_cells ~number_of_slots ~slot_size ~page_size
+    cells] constructs a list of [Dal_attested_slots] internal inbox messages
+    from skip list cells. The cells contain information about which slots were
+    protocol attested and who published them. Only slots published by implicit
+    accounts that are protocol attested are included.
+
+    Returns a list of messages, one or more per published level found in the cells,
+    ordered by increasing published levels. Only includes levels where at least
+    one slot is attested (non-empty [slots_by_publisher]).
+
+    This function ensures that both the protocol and rollup node use identical
+    logic to construct these messages from DAL skip list cells. *)
+val dal_attested_slots_messages_of_cells :
+  (published_level:Raw_level_repr.t -> (int * int * int) tzresult Lwt.t) ->
+  (Dal_slot_repr.History.Pointer_hash.t * Dal_slot_repr.History.t) list ->
+  internal_inbox_message list tzresult Lwt.t
+
+module Internal_for_tests : sig
+  (** [dal_attested_slots_messages_for_level ~published_level ~number_of_slots
+      ~slot_size ~page_size ~slots_by_publisher] splits DAL attested slots
+      information for one [published_level] into one or more
+      {!Dal_attested_slots} messages that each fit the inbox message size
+      constraints. *)
+  val dal_attested_slots_messages_for_level :
+    published_level:Raw_level_repr.t ->
+    number_of_slots:int ->
+    slot_size:int ->
+    page_size:int ->
+    slots_by_publisher:Dal_slot_index_repr.t list Implicit_account_repr.Map.t ->
+    internal_inbox_message list tzresult
+end

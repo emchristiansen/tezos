@@ -2857,21 +2857,6 @@ val log2up: t -> int
 external size: t -> int = "ml_z_size" [@@noalloc]
 (** Returns the number of machine words used to represent the number. *)
 
-external extract: t -> int -> int -> t = "ml_z_extract"
-(** [extract a off len] returns a nonnegative number corresponding to bits
-    [off] to [off]+[len]-1 of [b].
-    Negative [a] are considered in infinite-length 2's complement
-    representation.
- *)
-
-val signed_extract: t -> int -> int -> t
-(** [signed_extract a off len] extracts bits [off] to [off]+[len]-1 of [b],
-    as [extract] does, then sign-extends bit [len-1] of the result
-    (that is, bit [off + len - 1] of [a]).  The result is between
-    [- 2{^[len]-1}] (included) and [2{^[len]-1}] (excluded),
-    and equal to [extract a off len] modulo [2{^len}].
- *)
-
 external to_bits: t -> string = "ml_z_to_bits"
 (** Returns a binary representation of the argument.
     The string result should be interpreted as a sequence of bytes,
@@ -3253,7 +3238,7 @@ let () =
       Lwt_io.(read_line stdin)
       (fun line -> Lwt_io.printl line)
   in
-  Lwt_main.run p_3
+  Tezos_base_unix.Event_loop.main_run p_3
 
 (* ocamlfind opt -linkpkg -thread -package lwt.unix code.ml && ./a.out *)
 ]}
@@ -3287,7 +3272,7 @@ let () =
 
 {[
 let () =
-  Lwt_main.run begin
+  Tezos_base_unix.Event_loop.main_run begin
     Lwt.bind Lwt_io.(read_line stdin) (fun line ->
       Lwt.bind (Lwt_unix.sleep 1.) (fun () ->
         Lwt_io.printf "One second ago, you entered %s\n" line))
@@ -3301,7 +3286,7 @@ let () =
 
 {[
 let () =
-  Lwt_main.run begin
+  Tezos_base_unix.Event_loop.main_run begin
     let%lwt line = Lwt_io.(read_line stdin) in
     let%lwt () = Lwt_unix.sleep 1. in
     Lwt_io.printf "One second ago, you entered %s\n" line
@@ -3321,7 +3306,7 @@ let () =
 open Lwt.Infix
 
 let () =
-  Lwt_main.run begin
+  Tezos_base_unix.Event_loop.main_run begin
     Lwt_io.(read_line stdin) >>= fun line ->
     Lwt_unix.sleep 1. >>= fun () ->
     Lwt_io.printf "One second ago, you entered %s\n" line
@@ -3365,7 +3350,7 @@ let read_int : unit -> int Lwt.t = fun () ->
     Lwt_io.(read_line stdin)
 
 let () =
-  Lwt_main.run begin
+  Tezos_base_unix.Event_loop.main_run begin
     let%lwt number = read_int () in
     Lwt_io.printf "%i\n" number
   end
@@ -6612,28 +6597,14 @@ val assoc : equal:('a -> 'a -> bool) -> 'a -> ('a * 'b) list -> 'b option
     {!Stdlib.List}. *)
 val assoc_opt : equal:('a -> 'a -> bool) -> 'a -> ('a * 'b) list -> 'b option
 
-(** [assq k kvs] is the same as [assoc ~equal:Stdlib.( == ) k kvs]: it uses
-    the physical equality. *)
-val assq : 'a -> ('a * 'b) list -> 'b option
-
-(** [assq_opt] is an alias for [assq] provided for compatibility with
-    {!Stdlib.List}. *)
-val assq_opt : 'a -> ('a * 'b) list -> 'b option
-
 (** [mem_assoc ~equal k l] is equivalent to
     [Option.is_some @@ assoc ~equal k l]. *)
 val mem_assoc : equal:('a -> 'a -> bool) -> 'a -> ('a * 'b) list -> bool
-
-(** [mem_assq k l] is [mem_assoc ~equal:Stdlib.( == ) k l]. *)
-val mem_assq : 'a -> ('a * 'b) list -> bool
 
 (** [remove_assoc ~equal k l] is [l] without the first element [(k', _)] such
     that [equal k k']. *)
 val remove_assoc :
   equal:('a -> 'a -> bool) -> 'a -> ('a * 'b) list -> ('a * 'b) list
-
-(** [remove_assoq k l] is [remove_assoc ~equal:Stdlib.( == ) k l]. *)
-val remove_assq : 'a -> ('a * 'b) list -> ('a * 'b) list
 
 (** {3 Initialisation} *)
 
@@ -6787,21 +6758,6 @@ val fold_left2 :
   'b list ->
   'c list ->
   ('a, 'trace) result
-
-(** [fold_right2 ~when_different_lengths f xs ys init] is
-    [f x0 y0 (f x1 y1 (…))].
-
-    This function is not tail-recursive.
-
-    Note that unlike the left-to-right double-list traversors, [fold_right2]
-    only calls [f] if the lists are of the same length. *)
-val fold_right2 :
-  when_different_lengths:'trace ->
-  ('a -> 'b -> 'c -> 'c) ->
-  'a list ->
-  'b list ->
-  'c ->
-  ('c, 'trace) result
 
 (** [for_all2 ~when_different_lengths f xs ys] is
     [f x0 y0 && f x1 y1 && …].
@@ -7416,23 +7372,6 @@ val fold_left_i_es :
   'b list ->
   ('a, 'trace) result Lwt.t
 
-(** This function is not tail-recursive *)
-val fold_right : ('a -> 'b -> 'b) -> 'a list -> 'b -> 'b
-
-(** This function is not tail-recursive *)
-val fold_right_e :
-  ('a -> 'b -> ('b, 'trace) result) -> 'a list -> 'b -> ('b, 'trace) result
-
-(** This function is not tail-recursive *)
-val fold_right_s : ('a -> 'b -> 'b Lwt.t) -> 'a list -> 'b -> 'b Lwt.t
-
-(** This function is not tail-recursive *)
-val fold_right_es :
-  ('a -> 'b -> ('b, 'trace) result Lwt.t) ->
-  'a list ->
-  'b ->
-  ('b, 'trace) result Lwt.t
-
 (** {3 Double-traversal variants}
 
     As mentioned above, there are no [_p] and [_ep] double-traversors. Use
@@ -7524,33 +7463,6 @@ val fold_left2_es :
   'b list ->
   'c list ->
   ('a, 'trace) result Lwt.t
-
-(** This function is not tail-recursive *)
-val fold_right2_e :
-  when_different_lengths:'trace ->
-  ('a -> 'b -> 'c -> ('c, 'trace) result) ->
-  'a list ->
-  'b list ->
-  'c ->
-  ('c, 'trace) result
-
-(** This function is not tail-recursive *)
-val fold_right2_s :
-  when_different_lengths:'trace ->
-  ('a -> 'b -> 'c -> 'c Lwt.t) ->
-  'a list ->
-  'b list ->
-  'c ->
-  ('c, 'trace) result Lwt.t
-
-(** This function is not tail-recursive *)
-val fold_right2_es :
-  when_different_lengths:'trace ->
-  ('a -> 'b -> 'c -> ('c, 'trace) result Lwt.t) ->
-  'a list ->
-  'b list ->
-  'c ->
-  ('c, 'trace) result Lwt.t
 
 (** {3 Scanning variants} *)
 
@@ -11925,52 +11837,51 @@ end
 
 type t = Updater.rpc_context
 
-class type ['pr] simple =
-  object
-    method call_proto_service0 :
-      'm 'q 'i 'o.
-      (([< RPC_service.meth] as 'm), t, t, 'q, 'i, 'o) RPC_service.t ->
-      'pr ->
-      'q ->
-      'i ->
-      'o Error_monad.shell_tzresult Lwt.t
+class type ['pr] simple = object
+  method call_proto_service0 :
+    'm 'q 'i 'o.
+    (([< RPC_service.meth] as 'm), t, t, 'q, 'i, 'o) RPC_service.t ->
+    'pr ->
+    'q ->
+    'i ->
+    'o Error_monad.shell_tzresult Lwt.t
 
-    method call_proto_service1 :
-      'm 'a 'q 'i 'o.
-      (([< RPC_service.meth] as 'm), t, t * 'a, 'q, 'i, 'o) RPC_service.t ->
-      'pr ->
-      'a ->
-      'q ->
-      'i ->
-      'o Error_monad.shell_tzresult Lwt.t
+  method call_proto_service1 :
+    'm 'a 'q 'i 'o.
+    (([< RPC_service.meth] as 'm), t, t * 'a, 'q, 'i, 'o) RPC_service.t ->
+    'pr ->
+    'a ->
+    'q ->
+    'i ->
+    'o Error_monad.shell_tzresult Lwt.t
 
-    method call_proto_service2 :
-      'm 'a 'b 'q 'i 'o.
-      (([< RPC_service.meth] as 'm), t, (t * 'a) * 'b, 'q, 'i, 'o) RPC_service.t ->
-      'pr ->
-      'a ->
-      'b ->
-      'q ->
-      'i ->
-      'o Error_monad.shell_tzresult Lwt.t
+  method call_proto_service2 :
+    'm 'a 'b 'q 'i 'o.
+    (([< RPC_service.meth] as 'm), t, (t * 'a) * 'b, 'q, 'i, 'o) RPC_service.t ->
+    'pr ->
+    'a ->
+    'b ->
+    'q ->
+    'i ->
+    'o Error_monad.shell_tzresult Lwt.t
 
-    method call_proto_service3 :
-      'm 'a 'b 'c 'q 'i 'o.
-      ( ([< RPC_service.meth] as 'm),
-        t,
-        ((t * 'a) * 'b) * 'c,
-        'q,
-        'i,
-        'o )
-      RPC_service.t ->
-      'pr ->
-      'a ->
-      'b ->
-      'c ->
-      'q ->
-      'i ->
-      'o Error_monad.shell_tzresult Lwt.t
-  end
+  method call_proto_service3 :
+    'm 'a 'b 'c 'q 'i 'o.
+    ( ([< RPC_service.meth] as 'm),
+      t,
+      ((t * 'a) * 'b) * 'c,
+      'q,
+      'i,
+      'o )
+    RPC_service.t ->
+    'pr ->
+    'a ->
+    'b ->
+    'c ->
+    'q ->
+    'i ->
+    'o Error_monad.shell_tzresult Lwt.t
+end
 
 val make_call0 :
   ([< RPC_service.meth], t, t, 'q, 'i, 'o) RPC_service.t ->

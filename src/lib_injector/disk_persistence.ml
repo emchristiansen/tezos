@@ -31,6 +31,7 @@ type error +=
   | Io_error of [`Close | `Open] Lwt_utils_unix.io_error
   | Unix_error of Unix.error
   | Decoding_error of Data_encoding.Binary.read_error
+  | Heap_insertion_failed of string
 
 let () =
   register_error_kind
@@ -126,6 +127,15 @@ let () =
     Data_encoding.(obj1 (req "error" Data_encoding.Binary.read_error_encoding))
     (function Decoding_error e -> Some e | _ -> None)
     (fun e -> Decoding_error e) ;
+  register_error_kind
+    ~id:"disk_persistence.heap_insertion_failed"
+    ~title:"Heap insertion failed"
+    ~description:"Heap insertion failed"
+    ~pp:(fun ppf err -> Format.fprintf ppf "Heap insertion failed with %s." err)
+    `Permanent
+    Data_encoding.(obj1 (req "error" string))
+    (function Heap_insertion_failed error -> Some error | _ -> None)
+    (fun error -> Heap_insertion_failed error) ;
   ()
 
 module type H = sig
@@ -151,28 +161,29 @@ let create_dir dir =
   return_unit
 
 let read_value file encoding =
-  let open Lwt_syntax in
+  let open Lwt_result_syntax in
   trace (Cannot_read_file file)
   @@ Lwt.catch
        (fun () ->
          Lwt_io.with_file ~flags:[Unix.O_RDONLY; O_CLOEXEC] ~mode:Input file
          @@ fun channel ->
-         let+ bytes = Lwt_io.read channel in
-         Result.map_error (fun e -> [Decoding_error e])
-         @@ Data_encoding.Binary.of_bytes
-              encoding
-              (Bytes.unsafe_of_string bytes))
+         let*! bytes = Lwt_io.read channel in
+         let*? v =
+           Result.map_error (fun e -> [Decoding_error e])
+           @@ Data_encoding.Binary.of_bytes
+                encoding
+                (Bytes.unsafe_of_string bytes)
+         in
+         return v)
        (function
-         | Unix.Unix_error (e, _, _) -> fail (Unix_error e) | e -> fail (Exn e))
+         | Unix.Unix_error (e, _, _) -> tzfail (Unix_error e)
+         | e -> fail_with_exn e)
 
 let maybe_read_value ~warn file encoding =
   let open Lwt_syntax in
   let* v = read_value file encoding in
-  match v with
-  | Error e ->
-      let+ () = warn file e in
-      None
-  | Ok v -> return_some v
+  let* () = Result.iter_error_s (warn file) v in
+  return (Result.to_option v)
 
 let write_value file encoding value =
   trace (Cannot_write_file file)
@@ -189,7 +200,12 @@ let delete_file file =
   @@ protect
   @@ fun () ->
   let open Lwt_result_syntax in
-  let*! () = Lwt_unix.unlink file in
+  let*! () =
+    Lwt.catch
+      (fun () -> Lwt_unix.unlink file)
+      (function
+        | Unix.(Unix_error (ENOENT, _, _)) -> Lwt.return_unit | e -> raise e)
+  in
   return_unit
 
 module Make_table (H : H) = struct
@@ -224,6 +240,8 @@ module Make_table (H : H) = struct
 
   let iter_es f t = H.iter_es f t.table
 
+  let fold f t = H.fold f t.table
+
   let length t = H.length t.table
 
   let replace_seq t seq =
@@ -243,7 +261,7 @@ module Make_table (H : H) = struct
           (fun () ->
             let+ f = Lwt_unix.readdir d in
             Some f)
-          (function End_of_file -> return_none | e -> raise e)
+          (function End_of_file -> return_none | e -> Lwt.reraise e)
       in
       match filename with
       | None -> return_unit
@@ -273,39 +291,52 @@ module Make_table (H : H) = struct
     t
 end
 
-module Make_queue (N : sig
-  val name : string
-end)
-(K : Tezos_crypto.Intfs.HASH) (V : sig
-  type t
+module Make_heap
+    (N : sig
+      val name : string
+    end)
+    (K : Tezos_crypto.Intfs.HASH)
+    (V : sig
+      type t
 
-  val encoding : t Data_encoding.t
-end) =
+      val id : t -> K.t
+
+      val compare : t -> t -> int
+
+      val persist : t -> bool
+
+      val encoding : t Data_encoding.t
+    end) =
 struct
-  module Q = Hash_queue.Make (K) (V)
+  module H = Bounded_min_heap.Make (K) (V)
 
-  type t = {path : string; metadata_path : string; queue : Q.t}
+  type t = {path : string; metadata_path : string; heap : H.t}
 
   let counter = ref min_int
 
-  let filedata q k = Filename.concat q.path (K.to_b58check k)
+  let filedata h k = Filename.concat h.path (K.to_b58check k)
 
-  let filemetadata q k = Filename.concat q.metadata_path (K.to_b58check k)
+  let filemetadata h k = Filename.concat h.metadata_path (K.to_b58check k)
 
   let create ~data_dir n =
     let open Lwt_result_syntax in
-    let queue = Q.create n in
+    let heap = H.create n in
     let path = Filename.concat data_dir N.name in
     let metadata_path = Filename.concat path "metadata" in
     let* () = create_dir path in
     let+ () = create_dir metadata_path in
-    {path; metadata_path; queue}
+    {path; metadata_path; heap}
 
-  let remove q k =
+  let remove_persitant_data h k =
     let open Lwt_result_syntax in
-    Q.remove q.queue k ;
-    let* () = delete_file (filedata q k)
-    and* () = delete_file (filemetadata q k) in
+    let* () = delete_file (filedata h k)
+    and* () = delete_file (filemetadata h k) in
+    return_unit
+
+  let remove h k =
+    let open Lwt_result_syntax in
+    H.remove h.heap k ;
+    let* () = remove_persitant_data h k in
     return_unit
 
   let create_metadata () =
@@ -322,25 +353,77 @@ struct
       (fun (d, ps, c) -> (Int64.to_int d, ps, Int64.to_int c))
     @@ tup3 int64 int64 int64
 
-  let replace q k v =
+  let heap_insert h v =
+    Result.map_error (fun err_msg -> [Heap_insertion_failed err_msg])
+    @@ H.insert v h.heap
+
+  let insert h k v =
     let open Lwt_result_syntax in
-    Q.replace q.queue k v ;
-    let* () = write_value (filedata q k) V.encoding v
+    let*? () = heap_insert h v in
+    if V.persist v then
+      let* () = write_value (filedata h k) V.encoding v
+      and* () =
+        write_value (filemetadata h k) metadata_encoding (create_metadata ())
+      in
+      return_unit
+    else return_unit
+
+  let pop h =
+    let open Lwt_result_syntax in
+    let elt_opt = H.pop h.heap in
+    let* () =
+      Option.iter_es
+        (fun v ->
+          let k = V.id v in
+          remove_persitant_data h k)
+        elt_opt
+    in
+    return elt_opt
+
+  let clear h =
+    let open Lwt_syntax in
+    H.clear h.heap ;
+    (* Remove the persistent elements from the disk. *)
+    let elts = Lwt_unix.files_of_directory h.path in
+    let metadata_elts = Lwt_unix.files_of_directory h.metadata_path in
+    let unlink file =
+      Lwt.catch
+        (fun () ->
+          if Sys.is_directory file then return_unit else Lwt_unix.unlink file)
+        (fun e ->
+          Format.ksprintf
+            Stdlib.failwith
+            "Error in unlink %s: %s"
+            file
+            (Printexc.to_string e))
+    in
+    let* () =
+      Lwt_stream.iter_s (fun f -> unlink (Filename.concat h.path f)) elts
     and* () =
-      write_value (filemetadata q k) metadata_encoding (create_metadata ())
+      Lwt_stream.iter_s
+        (fun m -> unlink (Filename.concat h.metadata_path m))
+        metadata_elts
     in
     return_unit
 
-  let fold f q = Q.fold f q.queue
+  let peek_min h = H.peek_min h.heap
 
-  let length q = Q.length q.queue
+  let length h = H.length h.heap
 
-  let find_opt q k = Q.find_opt q.queue k
+  let find_opt h k = H.find_opt k h.heap
+
+  let elements h = H.elements h.heap
+
+  let remove_predicate f h =
+    let open Lwt_result_syntax in
+    let removed_id = H.remove_predicate f h.heap in
+    let* () = List.iter_es (remove_persitant_data h) removed_id in
+    return_unit
 
   let load_from_disk ~warn_unreadable ~capacity ~data_dir ~filter =
     let open Lwt_result_syntax in
-    let* q = create ~data_dir capacity in
-    let*! d = Lwt_unix.opendir q.path in
+    let* h = create ~data_dir capacity in
+    let*! d = Lwt_unix.opendir h.path in
     let rec browse acc =
       let*! filename =
         let open Lwt_syntax in
@@ -348,7 +431,7 @@ struct
           (fun () ->
             let+ f = Lwt_unix.readdir d in
             Some f)
-          (function End_of_file -> return_none | e -> raise e)
+          (function End_of_file -> return_none | e -> Lwt.reraise e)
       in
       match filename with
       | None -> return acc
@@ -360,18 +443,18 @@ struct
                 let+ v_meta =
                   match warn_unreadable with
                   | None ->
-                      let* v = read_value (filedata q k) V.encoding
+                      let* v = read_value (filedata h k) V.encoding
                       and* meta =
-                        read_value (filemetadata q k) metadata_encoding
+                        read_value (filemetadata h k) metadata_encoding
                       in
                       return_some (v, meta)
                   | Some warn ->
                       let open Lwt_syntax in
-                      let* v = maybe_read_value ~warn (filedata q k) V.encoding
+                      let* v = maybe_read_value ~warn (filedata h k) V.encoding
                       and* meta =
                         maybe_read_value
                           ~warn
-                          (filemetadata q k)
+                          (filemetadata h k)
                           metadata_encoding
                       in
                       return_ok @@ Option.bind v
@@ -390,6 +473,6 @@ struct
         (fun (_, _, meta1) (_, _, meta2) -> Stdlib.compare meta1 meta2)
         list
     in
-    List.iter (fun (k, v, _) -> Q.replace q.queue k v) list ;
-    return q
+    let*? () = List.iter_e (fun (_k, v, _) -> heap_insert h v) list in
+    return h
 end

@@ -28,7 +28,8 @@ open Client_keys
 let scheme = "remote"
 
 module Make
-    (RPC_client : RPC_client.S) (S : sig
+    (RPC_client : RPC_client.S)
+    (S : sig
       val default : Uri.t
 
       val authenticate :
@@ -104,10 +105,12 @@ struct
     let*? v = Client_keys.make_pk_uri (sk_uri : sk_uri :> Uri.t) in
     return v
 
-  let sign ?watermark sk_uri msg =
+  let list_known_keys path = Client_keys.list_known_keys path
+
+  let sign ?version ?watermark sk_uri msg =
     let open Lwt_result_syntax in
     let*? sk_uri = Client_keys.make_sk_uri (key (sk_uri : sk_uri :> Uri.t)) in
-    Remote.sign ?watermark sk_uri msg
+    Remote.sign ?version ?watermark sk_uri msg
 
   let deterministic_nonce sk_uri msg =
     let open Lwt_result_syntax in
@@ -123,6 +126,11 @@ struct
     let open Lwt_result_syntax in
     let*? v = Client_keys.make_sk_uri (key (sk_uri : sk_uri :> Uri.t)) in
     Remote.supports_deterministic_nonces v
+
+  let bls_prove_possession ?override_pk sk_uri =
+    let open Lwt_result_syntax in
+    let*? sk_uri = Client_keys.make_sk_uri (key (sk_uri : sk_uri :> Uri.t)) in
+    Remote.bls_prove_possession ?override_pk sk_uri
 end
 
 let make_sk sk =

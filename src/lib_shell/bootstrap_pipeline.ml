@@ -300,7 +300,7 @@ let headers_fetch_worker_loop pipeline =
     let number_of_steps = List.length steps in
     let*! () =
       Bootstrap_pipeline_event.(emit fetching_locator)
-        (locator_length, pipeline.peer_id, number_of_steps)
+        (locator_length, pipeline.peer_id)
     in
     match steps with
     | [] -> tzfail (Too_short_locator (sender_id, pipeline.locator))
@@ -361,9 +361,18 @@ let headers_fetch_worker_loop pipeline =
       in
       Lwt_pipe.Bounded.close pipeline.fetched_headers ;
       Lwt.return_unit
-  | Error (Exn Lwt.Canceled :: _)
-  | Error (Canceled :: _)
-  | Error (Exn Lwt_pipe.Closed :: _) ->
+  | Error (first :: _)
+    when Block_validator.is_canceled_error first || first = Exn Lwt_pipe.Closed
+    ->
+      (* Explicit cancellation or pipe closed *)
+      Lwt.return_unit
+  | Error
+      (Exn
+         (Unix.Unix_error
+            ((Unix.EPIPE | Unix.ECONNRESET | Unix.ECONNREFUSED), _, _))
+      :: _)
+    when Lwt_canceler.canceling pipeline.canceler ->
+      (* Only suppress socket errors during shutdown *)
       Lwt.return_unit
   | Error (Distributed_db.Block_header.Timeout bh :: _) ->
       let*! () =
@@ -449,9 +458,19 @@ let rec operations_fetch_worker_loop pipeline =
   in
   match r with
   | Ok () -> operations_fetch_worker_loop pipeline
-  | Error (Exn Lwt.Canceled :: _)
-  | Error (Canceled :: _)
-  | Error (Exn Lwt_pipe.Closed :: _) ->
+  | Error (first :: _)
+    when Block_validator.is_canceled_error first || first = Exn Lwt_pipe.Closed
+    ->
+      (* Explicit cancellation or pipe closed *)
+      Lwt_pipe.Bounded.close pipeline.fetched_blocks ;
+      Lwt.return_unit
+  | Error
+      (Exn
+         (Unix.Unix_error
+            ((Unix.EPIPE | Unix.ECONNRESET | Unix.ECONNREFUSED), _, _))
+      :: _)
+    when Lwt_canceler.canceling pipeline.canceler ->
+      (* Only suppress socket errors during shutdown *)
       Lwt_pipe.Bounded.close pipeline.fetched_blocks ;
       Lwt.return_unit
   | Error (Distributed_db.Operations.Timeout (bh, n) :: _) ->
@@ -490,10 +509,10 @@ let rec validation_worker_loop pipeline =
     let* () =
       protect ~canceler:pipeline.canceler (fun () ->
           let*! r =
-            Block_validator.validate
+            Block_validator.validate_and_apply
               ~canceler:pipeline.canceler
               ~notify_new_block:pipeline.notify_new_block
-              ~precheck_and_notify:false
+              ~advertise_after_validation:false
               pipeline.block_validator
               pipeline.chain_db
               hash
@@ -501,9 +520,10 @@ let rec validation_worker_loop pipeline =
               operations
           in
           match r with
-          | Block_validator.Invalid errs | Invalid_after_precheck errs ->
+          | Block_validator.Invalid errs ->
               (* Cancel the pipeline if a block is invalid *)
               Lwt.return_error errs
+          | Inapplicable_after_validation errs -> Lwt.return_error errs
           | Valid -> return_unit)
     in
     let*! () =
@@ -513,7 +533,18 @@ let rec validation_worker_loop pipeline =
   in
   match r with
   | Ok () -> validation_worker_loop pipeline
-  | Error ((Exn Lwt.Canceled | Canceled | Exn Lwt_pipe.Closed) :: _) ->
+  | Error (first :: _)
+    when Block_validator.is_canceled_error first || first = Exn Lwt_pipe.Closed
+    ->
+      (* Explicit cancellation or pipe closed *)
+      Lwt.return_unit
+  | Error
+      (Exn
+         (Unix.Unix_error
+            ((Unix.EPIPE | Unix.ECONNRESET | Unix.ECONNREFUSED), _, _))
+      :: _)
+    when Lwt_canceler.canceling pipeline.canceler ->
+      (* Only suppress socket errors during shutdown *)
       Lwt.return_unit
   | Error
       (( Block_validator_errors.Invalid_block _

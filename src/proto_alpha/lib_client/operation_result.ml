@@ -3,6 +3,7 @@
 (* Open Source License                                                       *)
 (* Copyright (c) 2018 Dynamic Ledger Solutions, Inc. <contact@tezos.com>     *)
 (* Copyright (c) 2022 Nomadic Labs <contact@nomadic-labs.com>                *)
+(* Copyright (c) 2023 Marigold, <contact@marigold.dev>                       *)
 (*                                                                           *)
 (* Permission is hereby granted, free of charge, to any person obtaining a   *)
 (* copy of this software and associated documentation files (the "Software"),*)
@@ -43,7 +44,31 @@ let pp_micheline_from_lazy_expr ppf expr =
   in
   pp_micheline_expr ppf expr
 
-let pp_internal_operation ppf (Internal_operation {operation; source; _}) =
+let normalize_internal_operation cctxt unparsing_mode
+    (Internal_operation {operation; sender; nonce}) =
+  let open Lwt_result_syntax in
+  let normalize_op (type kind) :
+      kind internal_operation_contents ->
+      kind internal_operation_contents tzresult Lwt.t = function
+    | Event {ty; tag; payload} ->
+        let+ payload =
+          Plugin.RPC.Scripts.normalize_data
+            cctxt
+            (cctxt#chain, cctxt#block)
+            ~legacy:true
+            ~data:payload
+            ~ty
+            ~unparsing_mode
+            ~other_contracts:None
+            ~extra_big_maps:None
+        in
+        Event {ty; tag; payload}
+    | op -> return op
+  in
+  let+ operation = normalize_op operation in
+  Internal_operation {operation; sender; nonce}
+
+let pp_internal_operation ppf (Internal_operation {operation; sender; _}) =
   (* For now, try to use the same format as in [pp_manager_operation_content]. *)
   Format.fprintf ppf "@[<v 2>Internal " ;
   (match operation with
@@ -55,7 +80,7 @@ let pp_internal_operation ppf (Internal_operation {operation; source; _}) =
         Tez.pp
         amount
         Destination.pp
-        source
+        sender
         Destination.pp
         destination ;
       if not (Entrypoint.is_default entrypoint) then
@@ -71,7 +96,7 @@ let pp_internal_operation ppf (Internal_operation {operation; source; _}) =
         ppf
         "Origination:@,From: %a@,Credit: %s%a"
         Destination.pp
-        source
+        sender
         tez_sym
         Tez.pp
         credit ;
@@ -93,22 +118,18 @@ let pp_internal_operation ppf (Internal_operation {operation; source; _}) =
       match delegate with
       | None -> Format.fprintf ppf "@,No delegate for this contract"
       | Some delegate ->
-          Format.fprintf
-            ppf
-            "@,Delegate: %a"
-            Signature.Public_key_hash.pp
-            delegate)
+          Format.fprintf ppf "@,Delegate: %a" Implicit_account_repr.pp delegate)
   | Delegation delegate_opt -> (
-      Format.fprintf ppf "Delegation:@,Contract: %a@,To: " Destination.pp source ;
+      Format.fprintf ppf "Delegation:@,Contract: %a@,To: " Destination.pp sender ;
       match delegate_opt with
       | None -> Format.pp_print_string ppf "nobody"
-      | Some delegate -> Signature.Public_key_hash.pp ppf delegate)
+      | Some delegate -> Implicit_account_repr.pp ppf delegate)
   | Event {ty; tag; payload} ->
       Format.fprintf
         ppf
         "Event:@,From: %a@,Type: %a"
         Destination.pp
-        source
+        sender
         pp_micheline_expr
         ty ;
       if not (Entrypoint.is_default tag) then
@@ -166,24 +187,30 @@ let pp_manager_operation_content (type kind) source ppf
       match delegate with
       | None -> Format.fprintf ppf "@,No delegate for this contract"
       | Some delegate ->
-          Format.fprintf
-            ppf
-            "@,Delegate: %a"
-            Signature.Public_key_hash.pp
-            delegate)
-  | Reveal key ->
+          Format.fprintf ppf "@,Delegate: %a" Implicit_account_repr.pp delegate)
+  | Reveal {public_key = key; proof} ->
       Format.fprintf
         ppf
-        "Revelation of manager public key:@,Contract: %a@,Key: %a"
+        "Revelation of manager public key:@,Contract: %a@,Key: %a%a"
         Contract.pp
         source
         Signature.Public_key.pp
         key
+        (fun ppf proof ->
+          match proof with
+          | None -> ()
+          | Some proof ->
+              Format.fprintf
+                ppf
+                "@,Proof of possession: %a"
+                Signature.Bls.pp
+                proof)
+        proof
   | Delegation delegate_opt -> (
       Format.fprintf ppf "Delegation:@,Contract: %a@,To: " Contract.pp source ;
       match delegate_opt with
       | None -> Format.pp_print_string ppf "nobody"
-      | Some delegate -> Signature.Public_key_hash.pp ppf delegate)
+      | Some delegate -> Implicit_account_repr.pp ppf delegate)
   | Register_global_constant {value} ->
       Format.fprintf
         ppf
@@ -209,85 +236,24 @@ let pp_manager_operation_content (type kind) source ppf
         source
         Contract_hash.pp
         destination
-  | Update_consensus_key pk ->
+  | Update_consensus_key {public_key = pk; proof; kind} ->
       Format.fprintf
         ppf
-        "Update_consensus_key:@,Public key hash: %a"
+        "Update_%a_key:@,Public key hash: %a%a"
+        Operation_repr.pp_consensus_key_kind
+        kind
         Signature.Public_key_hash.pp
         (Signature.Public_key.hash pk)
-  | Tx_rollup_origination ->
-      Format.fprintf
-        ppf
-        "Transaction rollup origination:@,From: %a"
-        Contract.pp
-        source
-  | Tx_rollup_submit_batch {tx_rollup; content; burn_limit = _} ->
-      Format.fprintf
-        ppf
-        "Transaction rollup transaction:@,\
-         Address:%a@,\
-         Message length: %d bytes@,\
-         From: %a"
-        Tx_rollup.pp
-        tx_rollup
-        (String.length content)
-        Contract.pp
-        source
-  | Tx_rollup_commit {tx_rollup; commitment} ->
-      Format.fprintf
-        ppf
-        "Transaction rollup commitment:@,\
-         Address: %a@,\
-         @[<v 2>Commitment:@,\
-         %a@]@,\
-         From: %a"
-        Tx_rollup.pp
-        tx_rollup
-        Tx_rollup_commitment.Full.pp
-        commitment
-        Contract.pp
-        source
-  | Tx_rollup_return_bond {tx_rollup} ->
-      Format.fprintf
-        ppf
-        "Transaction rollup recover commitment bond:@,Address: %a@,From: %a"
-        Tx_rollup.pp
-        tx_rollup
-        Contract.pp
-        source
-  | Tx_rollup_finalize_commitment {tx_rollup} ->
-      Format.fprintf
-        ppf
-        "Transaction rollup finalize commitment:@,Address: %a@,From: %a"
-        Tx_rollup.pp
-        tx_rollup
-        Contract.pp
-        source
-  | Tx_rollup_remove_commitment {tx_rollup; _} ->
-      Format.fprintf
-        ppf
-        "Transaction rollup remove commitment:@,Address: %a@,From: %a"
-        Tx_rollup.pp
-        tx_rollup
-        Contract.pp
-        source
-  | Tx_rollup_rejection {tx_rollup; _} ->
-      (* FIXME/TORU *)
-      Format.fprintf
-        ppf
-        "Transaction rollup rejection:@,Address: %a@,From: %a"
-        Tx_rollup.pp
-        tx_rollup
-        Contract.pp
-        source
-  | Tx_rollup_dispatch_tickets {tx_rollup; _} ->
-      Format.fprintf
-        ppf
-        "Transaction rollup dispatch tickets:@,Address: %a@,From: %a"
-        Tx_rollup.pp
-        tx_rollup
-        Contract.pp
-        source
+        (fun ppf proof ->
+          match proof with
+          | None -> ()
+          | Some proof ->
+              Format.fprintf
+                ppf
+                "@,Proof of possession: %a"
+                Signature.Bls.pp
+                proof)
+        proof
   | Transfer_ticket {contents; ty; ticketer; amount; destination; entrypoint} ->
       Format.fprintf
         ppf
@@ -314,30 +280,31 @@ let pp_manager_operation_content (type kind) source ppf
         entrypoint
         Contract.pp
         source
-  | Sc_rollup_originate
-      {kind; boot_sector; origination_proof = _; parameters_ty} ->
+  | Sc_rollup_originate {kind; boot_sector; parameters_ty; whitelist} ->
       Format.fprintf
         ppf
         "Smart rollup origination:@,\
          Kind: %a@,\
          Parameter type: %a@,\
-         Kernel Blake2B hash: '%a'"
+         Kernel Blake2B hash: '%a'%a"
         Sc_rollup.Kind.pp
         kind
         pp_micheline_from_lazy_expr
         parameters_ty
         Tezos_crypto.Blake2B.pp
         (Tezos_crypto.Blake2B.hash_string [boot_sector])
+        Format.(
+          pp_print_option (fun ppf ->
+              fprintf ppf "@,Whitelist: %a" Sc_rollup.Whitelist.pp))
+        whitelist
   | Sc_rollup_add_messages {messages = _} ->
       Format.pp_print_string ppf "Smart rollup messages submission:"
-  | Sc_rollup_cement {rollup; commitment} ->
+  | Sc_rollup_cement {rollup} ->
       Format.fprintf
         ppf
-        "Smart rollup commitment cementing:@,Address: %a@,Commitment: %a"
+        "Smart rollup commitment cementing:@,Address: %a"
         Sc_rollup.Address.pp
         rollup
-        Sc_rollup.Commitment.Hash.pp
-        commitment
   | Sc_rollup_publish {rollup; commitment} ->
       Format.fprintf
         ppf
@@ -389,13 +356,13 @@ let pp_manager_operation_content (type kind) source ppf
         "Smart rollup bond retrieval:@,Address: %a@,Staker: %a"
         Sc_rollup.Address.pp
         sc_rollup
-        Signature.Public_key_hash.pp
+        Implicit_account_repr.pp
         staker
-  | Dal_publish_slot_header operation ->
+  | Dal_publish_commitment operation ->
       Format.fprintf
         ppf
         "Data availability slot header publishing:@,Slot: %a"
-        Dal.Operations.Publish_slot_header.pp
+        Dal.Operations.Publish_commitment.pp
         operation
   | Zk_rollup_origination _ ->
       Format.fprintf ppf "Epoxy origination:@,From: %a" Contract.pp source
@@ -410,26 +377,77 @@ let pp_balance_updates ppf balance_updates =
      (tz1Ke2h7sDdakHJQh8WX4Z372du1KChsksyU). Instead of printing this
      key hash, we want to make the result more informative. *)
   let pp_baker ppf baker =
-    if Signature.Public_key_hash.equal baker Signature.Public_key_hash.zero then
+    (* FIXME-PA *)
+    if Implicit_account_repr.(baker = zero) then
       Format.fprintf ppf "the baker who will include this operation"
-    else Signature.Public_key_hash.pp ppf baker
+    else Implicit_account_repr.pp ppf baker
+  in
+  let pp_unstaked_frozen_staker ppf (staker : Receipt.unstaked_frozen_staker) =
+    match staker with
+    | Single (contract, delegate) ->
+        Format.fprintf
+          ppf
+          "%a delegated to %a"
+          Contract.pp
+          contract
+          pp_baker
+          delegate
+    | Shared delegate ->
+        Format.fprintf ppf "shared between delegators of %a" pp_baker delegate
+  in
+  let pp_frozen_staker ppf (staker : Receipt.frozen_staker) =
+    match staker with
+    | Baker baker -> pp_baker ppf baker
+    | Baker_edge baker ->
+        Format.fprintf ppf "baker edge %a" Implicit_account_repr.pp baker
+    | Single_staker {staker; delegate} ->
+        Format.fprintf
+          ppf
+          "%a delegated to %a"
+          Contract.pp
+          staker
+          pp_baker
+          delegate
+    | Shared_between_stakers {delegate} ->
+        Format.fprintf ppf "shared between delegators of %a" pp_baker delegate
+  in
+  let pp_update token ppf = function
+    | Credited amount -> Format.fprintf ppf "+%a" (Token.pp token) amount
+    | Debited amount -> Format.fprintf ppf "-%a" (Token.pp token) amount
   in
   let balance_updates =
     List.map
-      (fun (balance, update, origin) ->
+      (fun (Balance_update_item (balance, update, origin)) ->
+        let token = token_of_balance balance in
         let balance =
           match balance with
           | Contract c -> Format.asprintf "%a" Contract.pp c
           | Block_fees -> "payload fees(the block proposer)"
-          | Deposits pkh -> Format.asprintf "deposits(%a)" pp_baker pkh
+          | Deposits staker ->
+              Format.asprintf "deposits(%a)" pp_frozen_staker staker
+          | Unstaked_deposits (staker, cycle) ->
+              Format.asprintf
+                "unstaked_deposits(%a,%a)"
+                pp_unstaked_frozen_staker
+                staker
+                Cycle.pp
+                cycle
+          | CLST_deposits -> Format.asprintf "clst deposits"
+          | CLST_redeemed_deposits (contract, cycle) ->
+              Format.asprintf
+                "clst_redeemed_deposits(%a,%a)"
+                Contract.pp
+                contract
+                Cycle.pp
+                cycle
           | Nonce_revelation_rewards -> "nonce revelation rewards"
-          | Double_signing_evidence_rewards -> "double signing evidence rewards"
-          | Endorsing_rewards -> "endorsing rewards"
+          | Attesting_rewards -> "attesting rewards"
           | Baking_rewards -> "baking rewards"
           | Baking_bonuses -> "baking bonuses"
+          | Dal_attesting_rewards -> "DAL attesting rewards"
           | Storage_fees -> "storage fees"
           | Double_signing_punishments -> "double signing punishments"
-          | Lost_endorsing_rewards (pkh, p, r) ->
+          | Lost_attesting_rewards (pkh, p, r) ->
               let reason =
                 match (p, r) with
                 | false, false -> ""
@@ -437,7 +455,9 @@ let pp_balance_updates ppf balance_updates =
                 | true, false -> ",participation"
                 | true, true -> ",participation,revelation"
               in
-              Format.asprintf "lost endorsing rewards(%a%s)" pp_baker pkh reason
+              Format.asprintf "lost attesting rewards(%a%s)" pp_baker pkh reason
+          | Lost_dal_attesting_rewards pkh ->
+              Format.asprintf "lost DAL attesting rewards(%a)" pp_baker pkh
           | Liquidity_baking_subsidies -> "liquidity baking subsidies"
           | Burned -> "burned"
           | Commitments bpkh ->
@@ -453,11 +473,19 @@ let pp_balance_updates ppf balance_updates =
                 contract
                 Bond_id.pp
                 bond_id
-          | Tx_rollup_rejection_rewards -> "tx rollup rejection rewards"
-          | Tx_rollup_rejection_punishments -> "tx rollup rejection punishments"
           | Sc_rollup_refutation_punishments ->
               "smart rollup refutation punishments"
           | Sc_rollup_refutation_rewards -> "smart rollup refutation rewards"
+          | Staking_delegator_numerator {delegator} ->
+              Format.asprintf
+                "staking delegator numerator(%a)"
+                Contract.pp
+                delegator
+          | Staking_delegate_denominator {delegate} ->
+              Format.asprintf
+                "staking delegate denominator(%a)"
+                Implicit_account_repr.pp
+                delegate
         in
         let balance =
           match origin with
@@ -465,7 +493,14 @@ let pp_balance_updates ppf balance_updates =
           | Protocol_migration -> Format.asprintf "migration %s" balance
           | Subsidy -> Format.asprintf "subsidy %s" balance
           | Simulation -> Format.asprintf "simulation %s" balance
+          | Delayed_operation {operation_hash} ->
+              Format.asprintf
+                "delayed operation(%a) %s"
+                Operation_hash.pp
+                operation_hash
+                balance
         in
+        let update = Format.asprintf "%a" (pp_update token) update in
         (balance, update))
       balance_updates
   in
@@ -475,14 +510,10 @@ let pp_balance_updates ppf balance_updates =
       0
       balance_updates
   in
-  let pp_update ppf = function
-    | Credited amount -> Format.fprintf ppf "+%s%a" tez_sym Tez.pp amount
-    | Debited amount -> Format.fprintf ppf "-%s%a" tez_sym Tez.pp amount
-  in
   let pp_one ppf (balance, update) =
     let to_fill = column_size + 3 - String.length balance in
     let filler = String.make to_fill '.' in
-    Format.fprintf ppf "%s %s %a" balance filler pp_update update
+    Format.fprintf ppf "%s %s %s" balance filler update
   in
   match balance_updates with
   | [] -> ()
@@ -536,6 +567,17 @@ let pp_ticket_receipt ppf ticket_receipt =
         (Format.pp_print_list pp_item)
         ticket_updates
 
+let pp_whitelist_update ppf whitelist_update =
+  let open Format in
+  fprintf
+    ppf
+    "@,%a"
+    Sc_rollup.Whitelist.(
+      fun ppf -> function
+        | Public -> pp_print_string ppf "Rollup is now public"
+        | Private whitelist -> fprintf ppf "New whitelist: %a" pp whitelist)
+    whitelist_update
+
 let pp_slot_header ppf slot_header =
   Format.fprintf ppf "@,@[%a@]" Dal.Slot.Header.pp slot_header
 
@@ -568,6 +610,19 @@ let pp_lazy_storage_diff ppf = function
             "@,@[<v 2>Updated big_maps:@ %a@]"
             Michelson_v1_printer.print_big_map_diff
             lazy_storage_diff)
+
+let pp_address_registry_diff ppf Address_registry.{address; index} =
+  Format.fprintf ppf "%a: %a" Destination.pp address Z.pp_print index
+
+let pp_address_registry_diff ppf = function
+  | [] -> ()
+  | _ :: _ as l ->
+      Format.fprintf
+        ppf
+        "@,@[<v 2>Updated address registry:@ @[<v 2>%a@]@]"
+        ((Format.pp_print_list ~pp_sep:Format.pp_print_cut)
+           pp_address_registry_diff)
+        l
 
 let pp_origination_result ppf
     {
@@ -604,6 +659,7 @@ let pp_transaction_result ppf = function
         paid_storage_size_diff;
         lazy_storage_diff;
         allocated_destination_contract = _;
+        address_registry_diff;
       } ->
       (match originated_contracts with
       | [] -> ()
@@ -626,13 +682,8 @@ let pp_transaction_result ppf = function
       pp_paid_storage_size_diff ppf paid_storage_size_diff ;
       pp_consumed_gas ppf consumed_gas ;
       pp_balance_updates ppf balance_updates ;
-      pp_ticket_receipt ppf ticket_receipt
-  | Transaction_to_tx_rollup_result
-      {balance_updates; consumed_gas; ticket_hash; paid_storage_size_diff} ->
-      pp_consumed_gas ppf consumed_gas ;
-      pp_balance_updates ppf balance_updates ;
-      Format.fprintf ppf "@,Ticket hash: %a" Ticket_hash.pp ticket_hash ;
-      pp_paid_storage_size_diff ppf paid_storage_size_diff
+      pp_ticket_receipt ppf ticket_receipt ;
+      pp_address_registry_diff ppf address_registry_diff
   | Transaction_to_sc_rollup_result {consumed_gas; ticket_receipt} ->
       pp_consumed_gas ppf consumed_gas ;
       pp_ticket_receipt ppf ticket_receipt
@@ -662,7 +713,7 @@ let pp_operation_result ~operation_name pp_operation_result ppf = function
 let pp_manager_operation_contents_result ppf op_result =
   let pp_register_global_constant_result
       (Register_global_constant_result
-        {balance_updates; consumed_gas; size_of_constant; global_address}) =
+         {balance_updates; consumed_gas; size_of_constant; global_address}) =
     (match balance_updates with
     | [] ->
         (* Not possible - register global constant operation always returns
@@ -678,77 +729,23 @@ let pp_manager_operation_contents_result ppf op_result =
     pp_balance_updates ppf balance_updates ;
     pp_consumed_gas ppf consumed_gas
   in
-  let pp_tx_rollup_origination_result
-      (Tx_rollup_origination_result
-        {balance_updates; consumed_gas; originated_tx_rollup}) =
-    pp_balance_updates ppf balance_updates ;
-    pp_consumed_gas ppf consumed_gas ;
-    Format.fprintf
-      ppf
-      "@,Originated tx rollup: %a"
-      Tx_rollup.pp
-      originated_tx_rollup
-  in
-  let pp_tx_rollup_submit_batch_result
-      (Tx_rollup_submit_batch_result
-        {balance_updates; consumed_gas; paid_storage_size_diff}) =
-    pp_balance_updates ppf balance_updates ;
-    pp_consumed_gas ppf consumed_gas ;
-    pp_paid_storage_size_diff ppf paid_storage_size_diff
-  in
-  let pp_tx_rollup_commit_result
-      (Tx_rollup_commit_result {balance_updates; consumed_gas}) =
-    pp_balance_updates ppf balance_updates ;
-    pp_consumed_gas ppf consumed_gas
-  in
-  let pp_tx_rollup_return_bond_result
-      (Tx_rollup_return_bond_result {balance_updates; consumed_gas}) =
-    pp_balance_updates ppf balance_updates ;
-    pp_consumed_gas ppf consumed_gas
-  in
-  let pp_tx_rollup_finalize_commitment_result
-      (Tx_rollup_finalize_commitment_result
-        {balance_updates; consumed_gas; level}) =
-    pp_balance_updates ppf balance_updates ;
-    pp_consumed_gas ppf consumed_gas ;
-    Format.fprintf ppf "@finalized level:@,  %a" Tx_rollup_level.pp level
-  in
-  let pp_tx_rollup_remove_commitment_result
-      (Tx_rollup_remove_commitment_result
-        {balance_updates; consumed_gas; level}) =
-    pp_balance_updates ppf balance_updates ;
-    pp_consumed_gas ppf consumed_gas ;
-    Format.fprintf ppf "@finalized level:@,  %a" Tx_rollup_level.pp level
-  in
-  let pp_tx_rollup_rejection_result
-      (Tx_rollup_rejection_result {balance_updates; consumed_gas}) =
-    pp_balance_updates ppf balance_updates ;
-    pp_consumed_gas ppf consumed_gas
-  in
-  let pp_tx_rollup_dispatch_tickets_result
-      (Tx_rollup_dispatch_tickets_result
-        {balance_updates; consumed_gas; paid_storage_size_diff}) =
-    pp_paid_storage_size_diff ppf paid_storage_size_diff ;
-    pp_consumed_gas ppf consumed_gas ;
-    pp_balance_updates ppf balance_updates
-  in
   let pp_transfer_ticket_result
       (Transfer_ticket_result
-        {balance_updates; ticket_receipt; consumed_gas; paid_storage_size_diff})
+         {balance_updates; ticket_receipt; consumed_gas; paid_storage_size_diff})
       =
     pp_paid_storage_size_diff ppf paid_storage_size_diff ;
     pp_ticket_receipt ppf ticket_receipt ;
     pp_consumed_gas ppf consumed_gas ;
     pp_balance_updates ppf balance_updates
   in
-  let pp_dal_publish_slot_header_result
-      (Dal_publish_slot_header_result {slot_header; consumed_gas}) =
+  let pp_dal_publish_commitment_result
+      (Dal_publish_commitment_result {slot_header; consumed_gas}) =
     pp_slot_header ppf slot_header ;
     pp_consumed_gas ppf consumed_gas
   in
   let pp_sc_rollup_originate_result
       (Sc_rollup_originate_result
-        {address; genesis_commitment_hash; consumed_gas; size; balance_updates})
+         {address; genesis_commitment_hash; consumed_gas; size; balance_updates})
       =
     pp_consumed_gas ppf consumed_gas ;
     pp_storage_size ppf size ;
@@ -765,13 +762,19 @@ let pp_manager_operation_contents_result ppf op_result =
     pp_consumed_gas ppf consumed_gas
   in
   let pp_sc_rollup_cement_result
-      (Sc_rollup_cement_result {consumed_gas; inbox_level}) =
+      (Sc_rollup_cement_result {consumed_gas; inbox_level; commitment_hash}) =
     pp_consumed_gas ppf consumed_gas ;
-    Format.fprintf ppf "@,Inbox level: %a" Raw_level.pp inbox_level
+    Format.fprintf
+      ppf
+      "@,Inbox level: %a@,Commitment hash: %a"
+      Raw_level.pp
+      inbox_level
+      Sc_rollup.Commitment.Hash.pp
+      commitment_hash
   in
   let pp_sc_rollup_publish_result
       (Sc_rollup_publish_result
-        {consumed_gas; staked_hash; published_at_level; balance_updates}) =
+         {consumed_gas; staked_hash; published_at_level; balance_updates}) =
     pp_consumed_gas ppf consumed_gas ;
     Format.fprintf
       ppf
@@ -807,12 +810,18 @@ let pp_manager_operation_contents_result ppf op_result =
   in
   let pp_sc_rollup_execute_outbox_message_result
       (Sc_rollup_execute_outbox_message_result
-        {balance_updates; ticket_receipt; consumed_gas; paid_storage_size_diff})
-      =
+         {
+           balance_updates;
+           ticket_receipt;
+           whitelist_update;
+           consumed_gas;
+           paid_storage_size_diff;
+         }) =
     pp_paid_storage_size_diff ppf paid_storage_size_diff ;
     pp_consumed_gas ppf consumed_gas ;
     pp_balance_updates ppf balance_updates ;
-    pp_ticket_receipt ppf ticket_receipt
+    pp_ticket_receipt ppf ticket_receipt ;
+    Format.pp_print_option pp_whitelist_update ppf whitelist_update
   in
   let pp_sc_rollup_recover_bond_result
       (Sc_rollup_recover_bond_result {balance_updates; consumed_gas}) =
@@ -821,7 +830,7 @@ let pp_manager_operation_contents_result ppf op_result =
   in
   let pp_zk_rollup_origination_result
       (Zk_rollup_origination_result
-        {consumed_gas; originated_zk_rollup; storage_size; balance_updates}) =
+         {consumed_gas; originated_zk_rollup; storage_size; balance_updates}) =
     pp_consumed_gas ppf consumed_gas ;
     pp_storage_size ppf storage_size ;
     Format.fprintf ppf "@,Address: %a" Zk_rollup.Address.pp originated_zk_rollup ;
@@ -829,14 +838,14 @@ let pp_manager_operation_contents_result ppf op_result =
   in
   let pp_zk_rollup_publish_result
       (Zk_rollup_publish_result
-        {balance_updates; consumed_gas; paid_storage_size_diff}) =
+         {balance_updates; consumed_gas; paid_storage_size_diff}) =
     pp_paid_storage_size_diff ppf paid_storage_size_diff ;
     pp_consumed_gas ppf consumed_gas ;
     pp_balance_updates ppf balance_updates
   in
   let pp_zk_rollup_update_result
       (Zk_rollup_update_result
-        {balance_updates; consumed_gas; paid_storage_size_diff}) =
+         {balance_updates; consumed_gas; paid_storage_size_diff}) =
     pp_consumed_gas ppf consumed_gas ;
     pp_paid_storage_size_diff ppf paid_storage_size_diff ;
     pp_balance_updates ppf balance_updates
@@ -851,19 +860,12 @@ let pp_manager_operation_contents_result ppf op_result =
     | Delegation_result _ -> "delegation"
     | Register_global_constant_result _ -> "global constant registration"
     | Set_deposits_limit_result _ -> "deposits limit modification"
-    | Update_consensus_key_result _ -> "consensus key update"
+    | Update_consensus_key_result {kind; _} ->
+        Format.asprintf
+          "%a key update"
+          Operation_repr.pp_consensus_key_kind
+          kind
     | Increase_paid_storage_result _ -> "paid storage increase"
-    | Tx_rollup_origination_result _ -> "transaction rollup origination"
-    | Tx_rollup_submit_batch_result _ -> "transaction rollup batch submission"
-    | Tx_rollup_commit_result _ -> "transaction rollup commitment"
-    | Tx_rollup_return_bond_result _ -> "transaction rollup bond retrieval"
-    | Tx_rollup_finalize_commitment_result _ ->
-        "transaction rollup commitment finalization"
-    | Tx_rollup_remove_commitment_result _ ->
-        "transaction rollup commitment removal"
-    | Tx_rollup_rejection_result _ -> "transaction rollup commitment rejection"
-    | Tx_rollup_dispatch_tickets_result _ ->
-        "transaction rollup tickets dispatch"
     | Transfer_ticket_result _ -> "tickets transfer"
     | Sc_rollup_originate_result _ -> "smart rollup origination"
     | Sc_rollup_add_messages_result _ -> "smart rollup messages submission"
@@ -874,7 +876,7 @@ let pp_manager_operation_contents_result ppf op_result =
     | Sc_rollup_execute_outbox_message_result _ ->
         "smart output message execution"
     | Sc_rollup_recover_bond_result _ -> "smart rollup bond retrieval"
-    | Dal_publish_slot_header_result _ ->
+    | Dal_publish_commitment_result _ ->
         "data availability slot header publishing"
     | Zk_rollup_origination_result _ -> "epoxy originate"
     | Zk_rollup_publish_result _ -> "epoxy publish"
@@ -884,28 +886,18 @@ let pp_manager_operation_contents_result ppf op_result =
       (result : kind successful_manager_operation_result) =
     match result with
     | Reveal_result {consumed_gas} -> pp_consumed_gas ppf consumed_gas
-    | Delegation_result {consumed_gas} -> pp_consumed_gas ppf consumed_gas
+    | Delegation_result {consumed_gas; balance_updates} ->
+        pp_consumed_gas ppf consumed_gas ;
+        pp_balance_updates ppf balance_updates
     | Set_deposits_limit_result {consumed_gas} ->
         pp_consumed_gas ppf consumed_gas
-    | Update_consensus_key_result {consumed_gas} ->
+    | Update_consensus_key_result {consumed_gas; kind = _} ->
         pp_consumed_gas ppf consumed_gas
     | Transaction_result tx -> pp_transaction_result ppf tx
     | Origination_result op_res -> pp_origination_result ppf op_res
     | Register_global_constant_result _ as op ->
         pp_register_global_constant_result op
     | Increase_paid_storage_result _ as op -> pp_increase_paid_storage_result op
-    | Tx_rollup_origination_result _ as op -> pp_tx_rollup_origination_result op
-    | Tx_rollup_submit_batch_result _ as op ->
-        pp_tx_rollup_submit_batch_result op
-    | Tx_rollup_commit_result _ as op -> pp_tx_rollup_commit_result op
-    | Tx_rollup_return_bond_result _ as op -> pp_tx_rollup_return_bond_result op
-    | Tx_rollup_finalize_commitment_result _ as op ->
-        pp_tx_rollup_finalize_commitment_result op
-    | Tx_rollup_remove_commitment_result _ as op ->
-        pp_tx_rollup_remove_commitment_result op
-    | Tx_rollup_rejection_result _ as op -> pp_tx_rollup_rejection_result op
-    | Tx_rollup_dispatch_tickets_result _ as op ->
-        pp_tx_rollup_dispatch_tickets_result op
     | Transfer_ticket_result _ as op -> pp_transfer_ticket_result op
     | Sc_rollup_originate_result _ as op -> pp_sc_rollup_originate_result op
     | Sc_rollup_add_messages_result _ as op ->
@@ -918,8 +910,8 @@ let pp_manager_operation_contents_result ppf op_result =
         pp_sc_rollup_execute_outbox_message_result op
     | Sc_rollup_recover_bond_result _ as op ->
         pp_sc_rollup_recover_bond_result op
-    | Dal_publish_slot_header_result _ as op ->
-        pp_dal_publish_slot_header_result op
+    | Dal_publish_commitment_result _ as op ->
+        pp_dal_publish_commitment_result op
     | Zk_rollup_origination_result _ as op -> pp_zk_rollup_origination_result op
     | Zk_rollup_publish_result _ as op -> pp_zk_rollup_publish_result op
     | Zk_rollup_update_result _ as op -> pp_zk_rollup_update_result op
@@ -943,8 +935,10 @@ let pp_internal_operation_and_result ppf (Internal_operation_result (op, res)) =
     match result with
     | ITransaction_result tx -> pp_transaction_result ppf tx
     | IOrigination_result op_res -> pp_origination_result ppf op_res
-    | IDelegation_result {consumed_gas} | IEvent_result {consumed_gas} ->
-        pp_consumed_gas ppf consumed_gas
+    | IDelegation_result {consumed_gas; balance_updates} ->
+        pp_consumed_gas ppf consumed_gas ;
+        pp_balance_updates ppf balance_updates
+    | IEvent_result {consumed_gas} -> pp_consumed_gas ppf consumed_gas
   in
   Format.fprintf
     ppf
@@ -971,7 +965,7 @@ let pp_manager_operation_result ppf
       Manager_operation_result
         {balance_updates; operation_result; internal_operation_results} ) =
   Format.fprintf ppf "@[<v 2>Manager signed operations:" ;
-  Format.fprintf ppf "@,From: %a" Signature.Public_key_hash.pp source ;
+  Format.fprintf ppf "@,From: %a" Implicit_account_repr.pp source ;
   Format.fprintf ppf "@,Fee to the baker: %s%a" tez_sym Tez.pp fee ;
   Format.fprintf ppf "@,Expected counter: %a" Manager_counter.pp counter ;
   Format.fprintf ppf "@,Gas limit: %a" Gas.Arith.pp_integral gas_limit ;
@@ -988,173 +982,232 @@ let pp_manager_operation_result ppf
     internal_operation_results ;
   Format.fprintf ppf "@]"
 
-let pp_contents_and_result :
-    type kind. Format.formatter -> kind contents * kind contents_result -> unit
-    =
- fun ppf -> function
-  | Seed_nonce_revelation {level; nonce}, Seed_nonce_revelation_result bus ->
-      Format.fprintf
-        ppf
-        "@[<v 2>Seed nonce revelation:@,\
-         Level: %a@,\
-         Nonce (hash): %a@,\
-         Balance updates:@,\
-         %a@]"
-        Raw_level.pp
-        level
-        Nonce_hash.pp
-        (Nonce.hash nonce)
-        pp_balance_updates
-        bus
-  | Vdf_revelation {solution}, Vdf_revelation_result bus ->
-      Format.fprintf
-        ppf
-        "@[<v 2>Vdf revelation:@,Solution: %a@,Balance updates:@,%a@]"
-        Seed.pp_solution
-        solution
-        pp_balance_updates
-        bus
-  | Double_baking_evidence {bh1; bh2}, Double_baking_evidence_result bus ->
-      Format.fprintf
-        ppf
-        "@[<v 2>Double baking evidence:@,\
-         Exhibit A: %a@,\
-         Exhibit B: %a@,\
-         Balance updates:@,\
-         %a@]"
-        Block_hash.pp
-        (Block_header.hash bh1)
-        Block_hash.pp
-        (Block_header.hash bh2)
-        pp_balance_updates
-        bus
-  | ( Preendorsement {level; _},
-      Preendorsement_result
-        {balance_updates; delegate; consensus_key; preendorsement_power} ) ->
-      Format.fprintf
-        ppf
-        "@[<v 2>Preendorsement:@,\
-         Level: %a@,\
-         Balance updates:%a@,\
-         Delegate: %a@,\
-         Preendorsement Power: %d@]"
-        Raw_level.pp
-        level
-        pp_balance_updates
-        balance_updates
-        Consensus_key.pp
-        {delegate; consensus_pkh = consensus_key}
-        preendorsement_power
-  | ( Endorsement {level; _},
-      Endorsement_result
-        {balance_updates; delegate; consensus_key; endorsement_power} ) ->
-      Format.fprintf
-        ppf
-        "@[<v 2>Endorsement:@,\
-         Level: %a@,\
-         Balance updates:%a@,\
-         Delegate: %a@,\
-         Endorsement power: %d@]"
-        Raw_level.pp
-        level
-        pp_balance_updates
-        balance_updates
-        Consensus_key.pp
-        {delegate; consensus_pkh = consensus_key}
-        endorsement_power
-  | Dal_attestation _, Dal_attestation_result {delegate} ->
-      Format.fprintf
-        ppf
-        "@[<v 2>Slot attestation:@,Delegate: %a@]"
-        Signature.Public_key_hash.pp
-        delegate
-  | ( Double_endorsement_evidence {op1; op2},
-      Double_endorsement_evidence_result bus ) ->
-      Format.fprintf
-        ppf
-        "@[<v 2>Double endorsement evidence:@,\
-         Exhibit A: %a@,\
-         Exhibit B: %a@,\
-         Balance updates:@,\
-        \  %a@]"
-        Operation_hash.pp
-        (Operation.hash op1)
-        Operation_hash.pp
-        (Operation.hash op2)
-        pp_balance_updates
-        bus
-  | ( Double_preendorsement_evidence {op1; op2},
-      Double_preendorsement_evidence_result bus ) ->
-      Format.fprintf
-        ppf
-        "@[<v 2>Double preendorsement evidence:@,\
-         Exhibit A: %a@,\
-         Exhibit B: %a@,\
-         Balance updates:@,\
-        \  %a@]"
-        Operation_hash.pp
-        (Operation.hash op1)
-        Operation_hash.pp
-        (Operation.hash op2)
-        pp_balance_updates
-        bus
-  | Activate_account {id; _}, Activate_account_result bus ->
-      Format.fprintf
-        ppf
-        "@[<v 2>Genesis account activation:@,\
-         Account: %a@,\
-         Balance updates:@,\
-        \  %a@]"
-        Signature.Ed25519.Public_key_hash.pp
-        id
-        pp_balance_updates
-        bus
-  | Proposals {source; period; proposals}, Proposals_result ->
-      Format.fprintf
-        ppf
-        "@[<v 2>Proposals:@,From: %a@,Period: %ld@,Protocols:@,  @[<v 0>%a@]@]"
-        Signature.Public_key_hash.pp
-        source
-        period
-        (Format.pp_print_list Protocol_hash.pp)
-        proposals
-  | Ballot {source; period; proposal; ballot}, Ballot_result ->
-      Format.fprintf
-        ppf
-        "@[<v 2>Ballot:@,From: %a@,Period: %ld@,Protocol: %a@,Vote: %a@]"
-        Signature.Public_key_hash.pp
-        source
-        period
-        Protocol_hash.pp
-        proposal
-        Data_encoding.Json.pp
-        (Data_encoding.Json.construct Vote.ballot_encoding ballot)
-  | ( Drain_delegate {consensus_key; delegate; destination},
-      Drain_delegate_result {balance_updates; allocated_destination_contract} )
-    ->
-      Format.fprintf
-        ppf
-        "@[<v 2>Drain delegate:@,\
-         Consensus key hash: %a@,\
-         Delegate: %a@,\
-         Destination: %a%s%a@]"
-        Signature.Public_key_hash.pp
-        consensus_key
-        Signature.Public_key_hash.pp
-        delegate
-        Signature.Public_key_hash.pp
-        destination
-        (if allocated_destination_contract then " (allocated)" else "")
-        pp_balance_updates
-        balance_updates
-  | Failing_noop _arbitrary, _ ->
-      (* the Failing_noop operation always fails and can't have result *)
-      .
-  | (Manager_operation _ as op), (Manager_operation_result _ as res) ->
-      pp_manager_operation_result ppf (op, res)
+let pp_contents_and_result : type kind.
+    Format.formatter -> kind contents * kind contents_result -> unit =
+  let pp_double_signing_result ppf
+      {punished_delegate; rewarded_delegate; misbehaviour} =
+    Format.fprintf
+      ppf
+      "Misbehaviour: %a@,Punished delegate: %a@,Rewarded delegate: %a"
+      Misbehaviour.pp
+      misbehaviour
+      Implicit_account_repr.pp
+      punished_delegate
+      Implicit_account_repr.pp
+      rewarded_delegate
+  in
+  let pp_committee ppf (delegate, voting_power) =
+    Format.fprintf
+      ppf
+      "(%a, %a)"
+      Consensus_key.pp
+      delegate
+      Attesting_power.pp_result
+      voting_power
+  in
+  fun ppf -> function
+    | Seed_nonce_revelation {level; nonce}, Seed_nonce_revelation_result bus ->
+        Format.fprintf
+          ppf
+          "@[<v 2>Seed nonce revelation:@,\
+           Level: %a@,\
+           Nonce (hash): %a@,\
+           Balance updates:@,\
+           %a@]"
+          Raw_level.pp
+          level
+          Nonce_hash.pp
+          (Nonce.hash nonce)
+          pp_balance_updates
+          bus
+    | Vdf_revelation {solution}, Vdf_revelation_result bus ->
+        Format.fprintf
+          ppf
+          "@[<v 2>Vdf revelation:@,Solution: %a@,Balance updates:@,%a@]"
+          Seed.pp_solution
+          solution
+          pp_balance_updates
+          bus
+    | ( Double_baking_evidence {bh1; bh2},
+        Double_baking_evidence_result double_signing_result ) ->
+        Format.fprintf
+          ppf
+          "@[<v 2>Double baking evidence:@,Exhibit A: %a@,Exhibit B: %a@,%a@]"
+          Block_hash.pp
+          (Block_header.hash bh1)
+          Block_hash.pp
+          (Block_header.hash bh2)
+          pp_double_signing_result
+          double_signing_result
+    | ( Preattestation {level; _},
+        Preattestation_result
+          {balance_updates; delegate; consensus_key; consensus_power} ) ->
+        Format.fprintf
+          ppf
+          "@[<v 2>Preattestation:@,\
+           Level: %a@,\
+           Balance updates:%a@,\
+           Delegate: %a@,\
+           Consensus Power: %a@]"
+          Raw_level.pp
+          level
+          pp_balance_updates
+          balance_updates
+          Consensus_key.pp
+          {delegate; consensus_pkh = consensus_key}
+          Attesting_power.pp_result
+          consensus_power
+    | ( Attestation {consensus_content = {level; _}; dal_content = _},
+        Attestation_result
+          {balance_updates; delegate; consensus_key; consensus_power} ) ->
+        Format.fprintf
+          ppf
+          "@[<v 2>Attestation:@,\
+           Level: %a@,\
+           Balance updates:%a@,\
+           Delegate: %a@,\
+           Consensus Power: %a@]"
+          Raw_level.pp
+          level
+          pp_balance_updates
+          balance_updates
+          Consensus_key.pp
+          {delegate; consensus_pkh = consensus_key}
+          Attesting_power.pp_result
+          consensus_power
+    | ( Preattestations_aggregate {consensus_content = {level; _}; _},
+        Preattestations_aggregate_result
+          {balance_updates; committee; total_consensus_power} ) ->
+        Format.fprintf
+          ppf
+          "@[<v 2>Preattestations aggregate:@,\
+           Level: %a@,\
+           Balance updates:%a@,\
+           Delegates: %a@,\
+           Consensus Power: %a@]"
+          Raw_level.pp
+          level
+          pp_balance_updates
+          balance_updates
+          (Format.pp_print_list pp_committee)
+          committee
+          Attesting_power.pp_result
+          total_consensus_power
+    | ( Attestations_aggregate {consensus_content = {level; _}; _},
+        Attestations_aggregate_result
+          {balance_updates; committee; total_consensus_power} ) ->
+        Format.fprintf
+          ppf
+          "@[<v 2>Attestations aggregate:@,\
+           Level: %a@,\
+           Balance updates:%a@,\
+           Delegates: %a@,\
+           Consensus Power: %a@]"
+          Raw_level.pp
+          level
+          pp_balance_updates
+          balance_updates
+          (Format.pp_print_list pp_committee)
+          committee
+          Attesting_power.pp_result
+          total_consensus_power
+    | ( Double_consensus_operation_evidence {slot; op1; op2},
+        Double_consensus_operation_evidence_result double_signing_result ) ->
+        Format.fprintf
+          ppf
+          "@[<v 2>Double consensus operation evidence:@,\
+           Slot: %a@,\
+           Exhibit A: %a@,\
+           Exhibit B: %a@,\
+           %a@]"
+          Slot.pp
+          slot
+          Operation_hash.pp
+          (Operation.hash op1)
+          Operation_hash.pp
+          (Operation.hash op2)
+          pp_double_signing_result
+          double_signing_result
+    | ( Dal_entrapment_evidence
+          {
+            attestation;
+            consensus_slot = _;
+            slot_index = _;
+            lag_index_opt = _;
+            shard_with_proof = _;
+          },
+        Dal_entrapment_evidence_result {balance_updates} ) ->
+        Format.fprintf
+          ppf
+          "@[<v 2>Dal entrapment evidence:@,\
+           attestation: %a@,\
+           Balance updates:@,\
+          \  %a@]"
+          Operation_hash.pp
+          (Operation.hash attestation)
+          pp_balance_updates
+          balance_updates
+    | Activate_account {id; _}, Activate_account_result bus ->
+        Format.fprintf
+          ppf
+          "@[<v 2>Genesis account activation:@,\
+           Account: %a@,\
+           Balance updates:@,\
+          \  %a@]"
+          Signature.Ed25519.Public_key_hash.pp
+          id
+          pp_balance_updates
+          bus
+    | Proposals {source; period; proposals}, Proposals_result ->
+        Format.fprintf
+          ppf
+          "@[<v 2>Proposals:@,\
+           From: %a@,\
+           Period: %ld@,\
+           Protocols:@,\
+          \  @[<v 0>%a@]@]"
+          Implicit_account_repr.pp
+          source
+          period
+          (Format.pp_print_list Protocol_hash.pp)
+          proposals
+    | Ballot {source; period; proposal; ballot}, Ballot_result ->
+        Format.fprintf
+          ppf
+          "@[<v 2>Ballot:@,From: %a@,Period: %ld@,Protocol: %a@,Vote: %a@]"
+          Implicit_account_repr.pp
+          source
+          period
+          Protocol_hash.pp
+          proposal
+          Data_encoding.Json.pp
+          (Data_encoding.Json.construct Vote.ballot_encoding ballot)
+    | ( Drain_delegate {consensus_key; delegate; destination},
+        Drain_delegate_result {balance_updates; allocated_destination_contract}
+      ) ->
+        Format.fprintf
+          ppf
+          "@[<v 2>Drain delegate:@,\
+           Consensus key hash: %a@,\
+           Delegate: %a@,\
+           Destination: %a%s%a@]"
+          Signature.Public_key_hash.pp
+          consensus_key
+          Implicit_account_repr.pp
+          delegate
+          Implicit_account_repr.pp
+          destination
+          (if allocated_destination_contract then " (allocated)" else "")
+          pp_balance_updates
+          balance_updates
+    | Failing_noop _arbitrary, _ ->
+        (* the Failing_noop operation always fails and can't have result *)
+        .
+    | (Manager_operation _ as op), (Manager_operation_result _ as res) ->
+        pp_manager_operation_result ppf (op, res)
 
-let rec pp_contents_and_result_list :
-    type kind. Format.formatter -> kind contents_and_result_list -> unit =
+let rec pp_contents_and_result_list : type kind.
+    Format.formatter -> kind contents_and_result_list -> unit =
  fun ppf -> function
   | Single_and_result (op, res) -> pp_contents_and_result ppf (op, res)
   | Cons_and_result

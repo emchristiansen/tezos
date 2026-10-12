@@ -26,8 +26,7 @@
 (** Testing
     -------
     Component:    Lib_scoru_wasm input
-    Invocation:   dune exec  src/lib_scoru_wasm/test/test_scoru_wasm.exe \
-                    -- test "^Input$"
+    Invocation:   dune exec src/lib_scoru_wasm/test/main.exe -- --file test_input.ml
     Subject:      Input tests for the tezos-scoru-wasm library
 *)
 
@@ -70,7 +69,7 @@ let write_input () =
           })
       (fun _ -> assert false)
       (function
-        | Input_buffer.Cannot_store_an_earlier_message -> Lwt.return ()
+        | Input_buffer.Cannot_store_an_earlier_message -> Lwt.return_unit
         | _ -> assert false)
   in
   Lwt.return Result.return_unit
@@ -126,7 +125,7 @@ let read_input_no_messages () =
   assert (result = 0l) ;
   Lwt.return @@ Result.return_unit
 
-let test_host_fun () =
+let test_host_fun ~version () =
   let open Lwt.Syntax in
   let input = Input_buffer.alloc () in
   let* () =
@@ -155,7 +154,10 @@ let test_host_fun () =
     Eval.invoke
       ~module_reg
       ~caller:module_key
-      Host_funcs.all
+      (Host_funcs.registry
+         ~write_debug:Noop
+         ~version
+         ~nds_host_functions_enabled:false)
       ~input
       Host_funcs.Internal_for_tests.read_input
       values
@@ -296,33 +298,38 @@ let test_read_input_max_size_above_limit () =
   return_ok_unit
 
 let tests =
-  [
-    tztest "Write input" `Quick write_input;
-    tztest "Read input" `Quick read_input;
-    tztest "Read input no messages" `Quick read_input_no_messages;
-    tztest "Host read input" `Quick test_host_fun;
-    tztest
-      "Write input info at invalid address doesn't dequeue the input"
-      `Quick
-      test_write_input_info_invalid_address;
-    tztest
-      "Write input info beyond memory bounds doesn't dequeue the input"
-      `Quick
-      test_write_input_info_beyond_memory_bounds;
-    tztest
-      "Write input at invalid address doesn't dequeue the input"
-      `Quick
-      test_write_input_invalid_address;
-    tztest
-      "Write input beyond memory bounds doesn't dequeue the input"
-      `Quick
-      test_write_input_beyond_memory_bounds;
-    tztest
-      "Payload bigger than max size constant are truncated"
-      `Quick
-      test_read_input_too_big_payload;
-    tztest
-      "Payload bigger and expected max size constant are truncated"
-      `Quick
-      test_read_input_max_size_above_limit;
-  ]
+  Tztest_helper.tztests_with_all_pvms
+    [("Host read input", `Quick, test_host_fun)]
+  @ [
+      tztest "Write input" `Quick write_input;
+      tztest "Read input" `Quick read_input;
+      tztest "Read input no messages" `Quick read_input_no_messages;
+      tztest
+        "Write input info at invalid address doesn't dequeue the input"
+        `Quick
+        test_write_input_info_invalid_address;
+      tztest
+        "Write input info beyond memory bounds doesn't dequeue the input"
+        `Quick
+        test_write_input_info_beyond_memory_bounds;
+      tztest
+        "Write input at invalid address doesn't dequeue the input"
+        `Quick
+        test_write_input_invalid_address;
+      tztest
+        "Write input beyond memory bounds doesn't dequeue the input"
+        `Quick
+        test_write_input_beyond_memory_bounds;
+      tztest
+        "Payload bigger than max size constant are truncated"
+        `Quick
+        test_read_input_too_big_payload;
+      tztest
+        "Payload bigger and expected max size constant are truncated"
+        `Quick
+        test_read_input_max_size_above_limit;
+    ]
+
+let () =
+  Alcotest_lwt.run ~__FILE__ "test lib scoru wasm" [("Input", tests)]
+  |> Lwt_main.run

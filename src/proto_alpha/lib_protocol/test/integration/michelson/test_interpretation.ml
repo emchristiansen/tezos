@@ -26,19 +26,19 @@
 (** Testing
     -------
     Component:    Protocol (interpretation)
-    Dependencies: src/proto_alpha/lib_protocol/script_interpreter.ml
-    Invocation:   cd src/proto_alpha/lib_protocol/test/integration/michelson && \
-                  dune exec ./main.exe -- test "^interpretation$"
+    Invocation:   dune exec src/proto_alpha/lib_protocol/test/integration/michelson/main.exe \
+                  -- --file test_interpretation.ml
     Subject:      Interpretation of Michelson scripts
 *)
 
 open Protocol
 open Alpha_context
-open Script_interpreter
+open Script_interpreter_errors
 
 let test_context () =
-  Context.init3 () >>=? fun (b, _cs) ->
-  Incremental.begin_construction b >>=? fun v ->
+  let open Lwt_result_syntax in
+  let* b, _cs = Context.init3 () in
+  let* v = Incremental.begin_construction b in
   return (Incremental.alpha_ctxt v)
 
 let logger =
@@ -52,16 +52,25 @@ let logger =
 
       let log_control _ = ()
 
-      let get_log () = Lwt.return (Ok None)
+      let get_log () = Lwt_result_syntax.return_none
     end)
 
 let run_step ctxt code accu stack =
+  let open Lwt_result_syntax in
   let open Script_interpreter in
   let open Contract_helpers in
-  Internals.step_descr None ctxt default_step_constants code accu stack
-  >>=? fun ((_, _, ctxt') as r) ->
-  Internals.step_descr (Some logger) ctxt default_step_constants code accu stack
-  >>=? fun (_, _, ctxt'') ->
+  let* ((_, _, ctxt') as r) =
+    Internals.step_descr None ctxt default_step_constants code accu stack
+  in
+  let* _, _, ctxt'' =
+    Internals.step_descr
+      (Some logger)
+      ctxt
+      default_step_constants
+      code
+      accu
+      stack
+  in
   if Gas.(remaining_operation_gas ctxt' <> remaining_operation_gas ctxt'') then
     Alcotest.failf "Logging should not have an impact on gas consumption." ;
   return r
@@ -69,15 +78,18 @@ let run_step ctxt code accu stack =
 (** Runs a script with an ill-typed parameter and verifies that a
     Bad_contract_parameter error is returned. *)
 let test_bad_contract_parameter () =
-  test_context () >>=? fun ctx ->
+  let open Lwt_result_syntax in
+  let* ctx = test_context () in
   (* Run script with a parameter of wrong type *)
-  Contract_helpers.run_script
-    ctx
-    "{parameter unit; storage unit; code { CAR; NIL operation; PAIR }}"
-    ~storage:"Unit"
-    ~parameter:"0"
-    ()
-  >>= function
+  let*! result =
+    Contract_helpers.run_script
+      ctx
+      "{parameter unit; storage unit; code { CAR; NIL operation; PAIR }}"
+      ~storage:"Unit"
+      ~parameter:"0"
+      ()
+  in
+  match result with
   | Ok _ -> Alcotest.fail "expected an error"
   | Error (Environment.Ecoproto_error (Bad_contract_parameter source') :: _) ->
       Alcotest.(check Testable.contract)
@@ -89,17 +101,20 @@ let test_bad_contract_parameter () =
       Alcotest.failf "Unexpected error: %a" Error_monad.pp_print_trace errs
 
 let test_multiplication_close_to_overflow_passes () =
-  test_context () >>=? fun ctx ->
+  let open Lwt_result_syntax in
+  let* ctx = test_context () in
   (* Get sure that multiplication deals with numbers between 2^62 and
      2^63 without overflowing *)
-  Contract_helpers.run_script
-    ctx
-    "{parameter unit;storage unit;code {DROP; PUSH mutez 2944023901536524477; \
-     PUSH nat 2; MUL; DROP; UNIT; NIL operation; PAIR}}"
-    ~storage:"Unit"
-    ~parameter:"Unit"
-    ()
-  >>= function
+  let*! result =
+    Contract_helpers.run_script
+      ctx
+      "{parameter unit;storage unit;code {DROP; PUSH mutez \
+       2944023901536524477; PUSH nat 2; MUL; DROP; UNIT; NIL operation; PAIR}}"
+      ~storage:"Unit"
+      ~parameter:"Unit"
+      ()
+  in
+  match result with
   | Ok _ -> return_unit
   | Error errs ->
       Alcotest.failf "Unexpected error: %a" Error_monad.pp_print_trace errs
@@ -118,8 +133,9 @@ let dummy_loc = -1
     calls which is larger than the stack size. *)
 
 let test_stack_overflow () =
+  let open Lwt_result_syntax in
   let open Script_typed_ir in
-  test_context () >>=? fun ctxt ->
+  let* ctxt = test_context () in
   (* Set the gas counter to the maximum value *)
   let ctxt =
     Gas.update_remaining_operation_gas ctxt
@@ -130,13 +146,14 @@ let test_stack_overflow () =
   let enorme_et_seq n =
     let rec aux n acc =
       if n = 0 then acc
-      else
-        aux (n - 1) (IConst (dummy_loc, Bool_t, true, IDrop (dummy_loc, acc)))
+      else aux (n - 1) (IPush (dummy_loc, Bool_t, true, IDrop (dummy_loc, acc)))
     in
     aux n (IHalt dummy_loc)
   in
-  run_step ctxt (descr (enorme_et_seq 1_000_000)) EmptyCell EmptyCell
-  >>= function
+  let*! result =
+    run_step ctxt (descr (enorme_et_seq 1_000_000)) EmptyCell EmptyCell
+  in
+  match result with
   | Ok _ -> return_unit
   | Error trace ->
       let trace_string =
@@ -149,8 +166,9 @@ let test_stack_overflow () =
     instruction (IBig_map_mem) for which the interpreter calls Lwt.bind. *)
 
 let test_stack_overflow_in_lwt () =
+  let open Lwt_result_syntax in
   let open Script_typed_ir in
-  test_context () >>=? fun ctxt ->
+  let* ctxt = test_context () in
   let ctxt =
     Gas.update_remaining_operation_gas ctxt
     @@ Gas.fp_of_milligas_int (Saturation_repr.saturated :> int)
@@ -166,7 +184,7 @@ let test_stack_overflow_in_lwt () =
           (n - 1)
           (IDup
              ( dummy_loc,
-               IConst
+               IPush
                  ( dummy_loc,
                    Unit_t,
                    (),
@@ -175,7 +193,8 @@ let test_stack_overflow_in_lwt () =
     aux n (IDrop (dummy_loc, IHalt dummy_loc))
   in
   let script = push_empty_big_map (large_mem_seq 1_000_000) in
-  run_step ctxt (descr script) EmptyCell EmptyCell >>= function
+  let*! result = run_step ctxt (descr script) EmptyCell EmptyCell in
+  match result with
   | Ok _ -> return_unit
   | Error trace ->
       let trace_string =
@@ -185,6 +204,7 @@ let test_stack_overflow_in_lwt () =
 
 (** Test the encoding/decoding of script_interpreter.ml specific errors *)
 let test_json_roundtrip name testable enc v =
+  let open Lwt_result_syntax in
   let v' =
     Data_encoding.Json.destruct enc (Data_encoding.Json.construct enc v)
   in
@@ -204,7 +224,7 @@ let test_json_roundtrip_err name e () =
     e
 
 let error_encoding_tests =
-  let contract_zero = Contract.Implicit Signature.Public_key_hash.zero in
+  let contract_zero = Contract.Implicit Implicit_account_repr.zero in
   let script_expr_int = Micheline.strip_locations (Micheline.Int (0, Z.zero)) in
   List.map
     (fun (name, e) ->
@@ -243,6 +263,7 @@ module Test_map_instr_on_options = struct
       } |}
 
   let run_test_map_opt_script param {prev; total} =
+    let open Lwt_result_syntax in
     let storage =
       Option.fold
         ~none:(Format.sprintf "Pair None %d" total)
@@ -252,7 +273,7 @@ module Test_map_instr_on_options = struct
     let parameter =
       Option.fold ~none:"None" ~some:(Format.sprintf "Some %d") param
     in
-    test_context () >>=? fun ctxt ->
+    let* ctxt = test_context () in
     Contract_helpers.run_script
       ctxt
       test_map_option_script
@@ -271,33 +292,40 @@ module Test_map_instr_on_options = struct
         {prev = Some (Z.to_int prev); total = Z.to_int total}
     | _ -> QCheck2.assume_fail ()
 
-  let assertions storage_before storage_after = function
+  let assertions storage_before storage_after =
+    let open Lwt_result_syntax in
+    function
     | None ->
-        Assert.is_none ~loc:__LOC__ ~pp:Format.pp_print_int storage_after.prev
-        >>=? fun () ->
+        let* () =
+          Assert.is_none ~loc:__LOC__ ~pp:Format.pp_print_int storage_after.prev
+        in
         Assert.equal_int ~loc:__LOC__ storage_before.total storage_after.total
     | Some input ->
-        Assert.get_some ~loc:__LOC__ storage_after.prev >>=? fun prev_aft ->
-        Assert.equal_int ~loc:__LOC__ input prev_aft >>=? fun () ->
+        let* prev_aft = Assert.get_some ~loc:__LOC__ storage_after.prev in
+        let* () = Assert.equal_int ~loc:__LOC__ input prev_aft in
         Assert.equal_int
           ~loc:__LOC__
           (storage_before.total + input)
           storage_after.total
 
   let test_mapping (input, prev, total) =
+    let open Lwt_result_syntax in
     let storage_before = {prev; total} in
-    run_test_map_opt_script input storage_before >>=? fun ({storage; _}, _) ->
+    let* {storage; _}, _ = run_test_map_opt_script input storage_before in
     let new_storage = assume_storage_shape (Micheline.root storage) in
     assertions storage_before new_storage input
 end
 
-let test_contract path storage param ~entrypoint_str ~ok ~ko =
+let test_contract ?initial_ctx path storage param ~entrypoint_str ~ok ~ko =
+  let open Lwt_result_syntax in
   let entrypoint =
     match entrypoint_str with
     | None -> Entrypoint.default
     | Some str -> Entrypoint.of_string_strict_exn str
   in
-  test_context () >>=? fun ctx ->
+  let* ctx =
+    match initial_ctx with None -> test_context () | Some ctx -> return ctx
+  in
   let read_file filename =
     let ch = open_in filename in
     let s = really_input_string ch (in_channel_length ch) in
@@ -305,24 +333,26 @@ let test_contract path storage param ~entrypoint_str ~ok ~ko =
     s
   in
   let script = read_file path in
-  Contract_helpers.run_script
-    ctx
-    script
-    ~storage
-    ~parameter:param
-    ~entrypoint
-    ()
-  >>= function
-  | Ok (res, _) -> ok res
-  | Error t -> ko t
+  let*! result =
+    Contract_helpers.run_script
+      ctx
+      script
+      ~storage
+      ~parameter:param
+      ~entrypoint
+      ()
+  in
+  match result with Ok (res, _) -> ok res | Error t -> ko t
 
 let fail_with_trace trace =
   Alcotest.failf "Unexpected error: %a" Error_monad.pp_print_trace trace
 
-let test_contract_success path storage param expected_storage_str
+let test_contract_success ?initial_ctx path storage param expected_storage_str
     ?entrypoint_str () =
+  let open Lwt_result_syntax in
   let expected_storage = Expr.from_string expected_storage_str in
   test_contract
+    ?initial_ctx
     path
     storage
     param
@@ -332,8 +362,10 @@ let test_contract_success path storage param expected_storage_str
     ~ko:fail_with_trace
     ~entrypoint_str
 
-let test_contract_fail path storage param ?entrypoint_str () =
+let test_contract_fail ?initial_ctx path storage param ?entrypoint_str () =
+  let open Lwt_result_syntax in
   test_contract
+    ?initial_ctx
     path
     storage
     param
@@ -369,41 +401,47 @@ let test_store_and_reload path ~init_storage ~entrypoint_str_1 ~param_1
           (Expr.to_string real.storage))
     ~ko:fail_with_trace
 
+let path = project_root // Filename.dirname __FILE__
+
 let tests =
   [
-    Tztest.tztest "test bad contract error" `Quick test_bad_contract_parameter;
+    Tztest.tztest "bad contract error" `Quick test_bad_contract_parameter;
     Tztest.tztest "check robustness overflow error" `Slow test_stack_overflow;
     Tztest.tztest
       "check robustness overflow error in lwt"
       `Slow
       test_stack_overflow_in_lwt;
     Tztest.tztest
-      "test multiplication no illegitimate overflow"
+      "multiplication no illegitimate overflow"
       `Quick
       test_multiplication_close_to_overflow_passes;
-    Tztest.tztest "test stack overflow error" `Slow test_stack_overflow;
+    Tztest.tztest "stack overflow error" `Slow test_stack_overflow;
     Tztest.tztest_qcheck2
-      ~name:"test map instr against options"
+      ~name:"map instr against options"
       QCheck2.Gen.(
         triple (opt small_signed_int) (opt small_signed_int) small_signed_int)
       Test_map_instr_on_options.test_mapping;
     Tztest.tztest
-      "test lambda_rec instruction"
+      "lambda_rec instruction"
       `Quick
-      (test_contract_success "./contracts/rec_fact.tz" "0" "5" "120");
+      (test_contract_success (path // "contracts/rec_fact.tz") "0" "5" "120");
     Tztest.tztest
-      "test lambda_rec instruction with apply"
+      "lambda_rec instruction with apply"
       `Quick
-      (test_contract_success "./contracts/rec_fact_apply.tz" "0" "5" "120");
+      (test_contract_success
+         (path // "contracts/rec_fact_apply.tz")
+         "0"
+         "5"
+         "120");
     Tztest.tztest
-      "test lambda_rec instruction with an infinite recursion"
+      "lambda_rec instruction with an infinite recursion"
       `Quick
-      (test_contract_fail "./contracts/omega.tz" "Unit" "Unit");
+      (test_contract_fail (path // "contracts/omega.tz") "Unit" "Unit");
     Tztest.tztest
-      "test lambda_rec instruction storage"
+      "lambda_rec instruction storage"
       `Quick
       (test_store_and_reload
-         "./contracts/rec_fact_store.tz"
+         (path // "contracts/rec_fact_store.tz")
          ~init_storage:"Left 0"
          ~entrypoint_str_1:"gen"
          ~param_1:"Unit"
@@ -419,10 +457,10 @@ let tests =
          ~param_2:"5"
          ~expected_storage_str_2:"Left 120");
     Tztest.tztest
-      "test lambda_rec instruction storage"
+      "lambda_rec instruction storage apply store"
       `Quick
       (test_store_and_reload
-         "./contracts/rec_fact_apply_store.tz"
+         (path // "contracts/rec_fact_apply_store.tz")
          ~init_storage:"Left 0"
          ~entrypoint_str_1:"gen"
          ~param_1:"Unit"
@@ -445,5 +483,41 @@ let tests =
          ~entrypoint_str_2:"exec"
          ~param_2:"5"
          ~expected_storage_str_2:"Left 120");
+    Tztest.tztest
+      "index_address instruction from empty context"
+      `Quick
+      (test_contract_success
+         (path // "contracts/index_address.tz")
+         "None"
+         "\"tz1KqTpEZ7Yob7QbPE4Hy4Wo8fHG8LhKxZSx\""
+         "Some 1");
+    Tztest.tztest
+      "index_address instruction with already registered address"
+      `Quick
+      (test_contract_success
+         (path // "contracts/index_address.tz")
+         "None"
+         ("\"" ^ Signature.Public_key_hash.(to_b58check zero) ^ "\"")
+         "Some 0");
+    Tztest.tztest
+      "index_address instruction with contract address"
+      `Quick
+      (test_contract_success
+         (path // "contracts/index_address.tz")
+         "None"
+         "\"KT1FAKEFAKEFAKEFAKEFAKEFAKEFAKGGSE2x\""
+         "Some 1");
+    Tztest.tztest
+      "index_address instruction with smart rollup address"
+      `Quick
+      (test_contract_success
+         (path // "contracts/index_address.tz")
+         "None"
+         "\"sr18wx6ezkeRjt1SZSeZ2UQzQN3Uc3YLMLqg\""
+         "Some 1");
   ]
   @ error_encoding_tests
+
+let () =
+  Alcotest_lwt.run ~__FILE__ Protocol.name [("interpretation", tests)]
+  |> Lwt_main.run

@@ -8,33 +8,34 @@ bug-reports: "https://gitlab.com/tezos/tezos/issues"
 dev-repo: "git+https://gitlab.com/tezos/tezos.git"
 license: "MIT"
 depends: [
-  "dune" { >= "3.0" }
+  "dune" { >= "3.11.1" }
   "ocaml" { >= "4.14" }
-  "tezos-base"
-  "tezos-clic"
-  "tezos-client-base"
-  "tezos-client-base-unix"
-  "tezos-client-commands"
-  "tezos-rpc-http"
-  "tezos-rpc-http-server"
-  "tezos-protocol-updater"
-  "tezos-rpc-http-client-unix"
-  "tezos-stdlib-unix"
-  "tezos-stdlib"
-  "tezos-dal-node-lib"
-  "tezos-dal-node-services"
-  "tezos-layer2-store"
-  "tezos-crypto-dal"
-  "irmin-pack" { >= "3.6.0" & < "3.7.0" }
-  "irmin" { >= "3.6.0" & < "3.7.0" }
-  "tezos-dal-016-PtMumbai"
+  "octez-rust-deps" { = version }
+  "bls12-381" { = version }
+  "octez-libs" { = version }
+  "tezos-dal-node-lib" { = version }
+  "memtrace"
+  "octez-protocol-025-PsUshuai-libs" { = version }
 ]
 depopts: [
-  "tezos-dal-alpha"
+  "octez-protocol-021-PsQuebec-libs"
+  "octez-protocol-022-PsRiotum-libs"
+  "octez-protocol-023-PtSeouLo-libs"
+  "octez-protocol-024-PtTALLiN-libs"
+  "octez-protocol-alpha-libs"
+]
+conflicts: [
+  "checkseum" { = "0.5.0" }
+  "octez-protocol-021-PsQuebec-libs" { != version }
+  "octez-protocol-022-PsRiotum-libs" { != version }
+  "octez-protocol-023-PtSeouLo-libs" { != version }
+  "octez-protocol-024-PtTALLiN-libs" { != version }
+  "octez-protocol-alpha-libs" { != version }
 ]
 build: [
-  ["rm" "-r" "vendors"]
+  ["rm" "-rf" "vendors" "contrib"]
   ["dune" "build" "-p" name "-j" jobs]
   ["dune" "runtest" "-p" name "-j" jobs] {with-test}
 ]
+available: os-family != "windows"
 synopsis: "Tezos: `octez-dal-node` binary"

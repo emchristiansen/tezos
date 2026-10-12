@@ -70,7 +70,9 @@ val connect_all :
     function waits until the connections are effectively closed. *)
 val close_active_conns : ('a, 'b, 'c) Tezos_p2p.P2p_pool.t -> unit Lwt.t
 
-val addr : Ipaddr.V6.t ref
+val version : Network_version.t
+
+val conn_meta_config : unit P2p_params.conn_meta_config
 
 val canceler : Lwt_canceler.t
 
@@ -81,6 +83,7 @@ val id1 : P2p_identity.t Lwt.t
 val id2 : P2p_identity.t Lwt.t
 
 val run_nodes :
+  addr:P2p_addr.t ->
   ?port:int ->
   ((unit, unit) Process.Channel.t ->
   P2p_io_scheduler.t ->
@@ -93,13 +96,22 @@ val run_nodes :
   (unit, error trace) result Lwt.t) ->
   (unit, error trace) result Lwt.t
 
+val run_nodes_fd :
+  addr:P2p_addr.t ->
+  ?port:int ->
+  ((unit, unit) Process.Channel.t ->
+  Ipaddr.V6.t ->
+  int ->
+  (unit, error trace) result Lwt.t) ->
+  ((unit, unit) Process.Channel.t ->
+  Lwt_unix.file_descr ->
+  (unit, error trace) result Lwt.t) ->
+  (unit, error trace) result Lwt.t
+
 val raw_accept :
   P2p_io_scheduler.t ->
   Lwt_unix.file_descr ->
-  ( P2p_io_scheduler.connection * (P2p_addr.t * int),
-    [`Socket_error of exn | `System_error of exn | `Unexpected_error of exn] )
-  result
-  Lwt.t
+  (P2p_io_scheduler.connection * (P2p_addr.t * int)) tzresult Lwt.t
 
 val accept :
   ?id:P2p_identity.t Lwt.t ->
@@ -115,9 +127,7 @@ val raw_connect :
   P2p_io_scheduler.t ->
   P2p_addr.t ->
   int ->
-  ( P2p_io_scheduler.connection,
-    [`Connection_refused | `Unexpected_error of exn] )
-  result
+  (P2p_io_scheduler.connection, (P2p_fd.connect_error, tztrace) Either.t) result
   Lwt.t
 
 val connect :

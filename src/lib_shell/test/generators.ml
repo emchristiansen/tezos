@@ -40,11 +40,13 @@ let operation_mock_proto_gen =
   let* len_gen = frequencya [|(9, return 0); (1, 0 -- 31)|] in
   string_size ?gen:None len_gen
 
+let key_gen = QCheck2.Gen.(opt (string_size (0 -- 64)))
+
+let path_gen = QCheck2.Gen.(list_size (0 -- 10) (small_string ?gen:None))
+
 let block_hash_gen : Block_hash.t QCheck2.Gen.t =
   let open QCheck2.Gen in
-  let string_gen = QCheck2.Gen.small_string ?gen:None in
-  let+ key = opt (string_size (0 -- 64))
-  and+ path = list_size (0 -- 10) string_gen in
+  let+ key = key_gen and+ path = path_gen in
   Block_hash.hash_string ?key path
 
 (** A generator of operations.
@@ -82,13 +84,18 @@ let q_in_0_1 () =
 
 let priority_gen () : Prevalidator_pending_operations.priority QCheck2.Gen.t =
   let open QCheck2.Gen in
+  let open Prevalidator_pending_operations in
   let* top_prio_value = oneofl [`High; `Medium; `Low] in
   match top_prio_value with
-  | `High -> pure `High
-  | `Medium -> pure `Medium
+  | `High -> pure High
+  | `Medium -> pure Medium
   | `Low ->
       let+ weights = small_list (q_in_0_1 ()) in
-      `Low weights
+      Low weights
+
+let status_gen () : Prevalidator_pending_operations.status QCheck2.Gen.t =
+  let open QCheck2.Gen in
+  oneofl [Prevalidator_pending_operations.Fresh; Reclassified]
 
 (** [operation_with_hash_gen ?proto_gen ?block_hash_t ()] is a generator
     for parsable operations, i.e. values of type {!operation}.
@@ -111,15 +118,19 @@ let priority_gen () : Prevalidator_pending_operations.priority QCheck2.Gen.t =
 let operation_with_hash_gen ?proto_gen ?block_hash_t () :
     unit operation QCheck2.Gen.t =
   let open QCheck2.Gen in
+  let* signature_checked = bool in
   let+ oph, op = raw_operation_with_hash_gen ?proto_gen ?block_hash_t () in
-  Internal_for_tests.make_operation op oph ()
+  Internal_for_tests.make_operation ~signature_checked oph op ()
 
-let operation_with_hash_and_priority_gen ?proto_gen ?block_hash_t () :
-    (unit operation * Prevalidator_pending_operations.priority) QCheck2.Gen.t =
+let operation_with_hash_and_status_and_priority_gen ?proto_gen ?block_hash_t ()
+    :
+    (unit operation * Prevalidator_pending_operations.status_and_priority)
+    QCheck2.Gen.t =
   let open QCheck2.Gen in
   let* op = operation_with_hash_gen ?proto_gen ?block_hash_t () in
   let* priority = priority_gen () in
-  return (op, priority)
+  let* status = status_gen () in
+  return (op, Prevalidator_pending_operations.{status; priority})
 
 let raw_op_map_gen ?proto_gen ?block_hash_t () :
     Operation.t Operation_hash.Map.t QCheck2.Gen.t =
@@ -196,8 +207,7 @@ let op_map_gen_n ?proto_gen ?block_hash_t (n : int) :
 let classification_gen : classification QCheck2.Gen.t =
   QCheck2.Gen.oneofa
     [|
-      `Applied;
-      `Prechecked;
+      `Validated;
       `Branch_delayed [];
       `Branch_refused [];
       `Refused [];
@@ -205,8 +215,7 @@ let classification_gen : classification QCheck2.Gen.t =
     |]
 
 let unrefused_classification_gen : classification QCheck2.Gen.t =
-  QCheck2.Gen.oneofa
-    [|`Applied; `Prechecked; `Branch_delayed []; `Branch_refused []|]
+  QCheck2.Gen.oneofa [|`Validated; `Branch_delayed []; `Branch_refused []|]
 
 let parameters_gen : parameters QCheck2.Gen.t =
   let open QCheck2.Gen in
@@ -258,15 +267,13 @@ let with_t_operation_gen : unit t -> unit operation QCheck2.Gen.t =
     let freq_fresh t =
       max
         1
-        (freq_of_list t.applied_rev
-        + freq_of_map (Sized_map.to_map t.prechecked)
+        (freq_of_map (Sized_map.to_map t.validated)
         + freq_of_map (Classification.map t.branch_refused)
         + freq_of_map (Classification.map t.branch_delayed)
         + freq_of_map (Classification.map t.refused)
         + freq_of_map (Classification.map t.outdated))
     in
-    freq_and_gen_of_list t.applied_rev
-    @ freq_and_gen_of_list (List.map snd (Sized_map.bindings t.prechecked))
+    freq_and_gen_of_list (List.map snd (Sized_map.bindings t.validated))
     @ freq_and_gen_of_map (Classification.map t.branch_refused)
     @ freq_and_gen_of_map (Classification.map t.branch_delayed)
     @ freq_and_gen_of_map (Classification.map t.refused)
@@ -284,3 +291,14 @@ let t_with_operation_gen = t_with_operation_gen_ ~can_be_full:true
 
 let t_with_operation_gen__cant_be_full =
   t_with_operation_gen_ ~can_be_full:false
+
+let operation_hash_gen =
+  let open QCheck2.Gen in
+  let+ key = key_gen and+ path = path_gen in
+  Operation_hash.hash_string ?key path
+
+(** Generate an operation hash that is not present as a key in the given map. *)
+let rec fresh_oph_gen ophmap =
+  let open QCheck2.Gen in
+  let* oph = operation_hash_gen in
+  if Operation_hash.Map.mem oph ophmap then fresh_oph_gen ophmap else return oph

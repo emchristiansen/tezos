@@ -1,0 +1,523 @@
+(*****************************************************************************)
+(*                                                                           *)
+(* SPDX-License-Identifier: MIT                                              *)
+(* Copyright (c) 2023 Nomadic Labs. <contact@nomadic-labs.com>               *)
+(*                                                                           *)
+(*****************************************************************************)
+
+(** A GitLab CI job annotated with Octez-specific meta-data. *)
+type tezos_job
+
+module Rules = Rules
+module Runner = Runner
+
+(** Checks that should be performed after {!Pipeline.write}.
+
+    Checks that the file [.gitlab-ci.yml] and all the [.yml] files in [.gitlab]
+    are either generated or excluded. It is an error if a generated file is excluded.
+    You can use [exclude] to specify which files should be excluded.
+    [exclude] is given a path relative to the [root] directory
+    and shall return [true] for excluded paths.
+
+    In case of errors, errors are printed and the process exits with exit code 1. *)
+val check_files :
+  remove_extra_files:bool -> ?exclude:(string -> bool) -> unit -> unit
+
+(** Run-time configuration and command-line processing. *)
+module Cli : sig
+  (** Action the binary should perform. *)
+  type action =
+    | Write  (** Write the CI configuration *)
+    | Overview_pipelines  (** Print pipelines as table. *)
+    | List_pipelines  (** List registered pipelines. *)
+    | Describe_pipeline of {name : string}
+        (** Describe a registered pipeline. *)
+
+  (** Type of the command-line configuration for the generator binary. *)
+  type config = {
+    mutable verbose : bool;
+        (** Enable [verbose] output, including the source of generated jobs. *)
+    mutable inline_source_info : bool;
+        (** Enable the emission of source information in generated configuration. *)
+    mutable remove_extra_files : bool;
+        (** Remove files that are neither generated nor excluded. *)
+    mutable action : action;  (** Action to perform *)
+  }
+
+  (** Populate  {!config} from command-line arguments.
+
+      Terminates the program with usage help if invalid arguments, or
+      [--help] is passed. *)
+  val init : unit -> unit
+
+  (** The current command-line configuration, as populated by {!init}. *)
+  val config : config
+end
+
+(** A facility for registering pipeline stages. *)
+module Stage : sig
+  (* Represents a pipeline stage *)
+  type t
+end
+
+(** A facility for registering pipelines. *)
+module Pipeline : sig
+  (** Default pipeline configuration.
+
+      It is included in [.gitlab-ci.yml] and thus all pipelines inherit it,
+      with the exception of child pipelines. You can specify different defaults
+      for child pipelines, with the default defaults being [default_config]. *)
+  val default_config : Gitlab_ci.Types.default
+
+  (** Register a pipeline.
+
+      [register ~description ?variables ?default name rule] will register a pipeline [name]
+      that runs when [rule] is true.
+
+      If [variables] is set, then these variables will be added to the
+      [workflow:] clause for this pipeline in the top-level [.gitlab-ci.yml].
+      Similarly, an [auto_cancel] clause can be specified.
+
+      If [default] is specified, it will be written to the pipeline's YAML
+      as a [default:] section, providing default job configurations for all
+      jobs in the pipeline (such as retry policies, interruptible settings, etc).
+
+      The [description] is printed in {!list_pipelines}.
+
+      The [jobs] of the pipeline are generated to the file
+      [.gitlab/ci/pipelines/NAME.yml] when {!write} is called. *)
+  val register :
+    ?variables:Gitlab_ci.Types.variables ->
+    ?auto_cancel:Gitlab_ci.Types.auto_cancel ->
+    description:string ->
+    jobs:tezos_job list ->
+    string ->
+    Gitlab_ci.If.t ->
+    unit
+
+  (** A child pipeline.
+
+      See {!register_child} and {!trigger_job} for more information. *)
+  type child_pipeline
+
+  (** Register a child pipeline.
+
+      [register_child name] will register a child pipeline called [name].
+
+      The [jobs] of the pipeline are generated to the file
+      [.gitlab/ci/pipelines/NAME.yml] when {!write} is called. See
+      {!register} for info on [auto_cancel] and [default].
+
+      The [description] is printed in {!list_pipelines}.
+
+      Child pipelines cannot be launched without a trigger job that is
+      included in a regular pipeline (see {!trigger_job}). *)
+  val register_child :
+    ?auto_cancel:Gitlab_ci.Types.auto_cancel ->
+    ?inherit_:Gitlab_ci.Types.inherit_ ->
+    ?default:Gitlab_ci.Types.default ->
+    description:string ->
+    jobs:tezos_job list ->
+    string ->
+    child_pipeline
+
+  (** Writes the set of registered pipelines.
+
+      A top-level configuration is generated to [filename]. It
+      contains a [workflow:] section that enables pipeline execution
+      for each registered, non-child pipeline and an [include:]
+      section that includes the set of jobs for the given pipeline. If
+      specified, [default:] and [variables:] sections are also written
+      to the top-level configuration. The [stages:] section
+      automatically contains all the stages registered with
+      {!Stage.register} that are used in the given pipeline.
+
+      A [dummy_job] is written to the top-level configuration. This
+      job is never enabled, but it works around a GitLab CI issue that
+      occurs when the top-level configuration contains no visible
+      jobs.
+
+      Then, each registered pipeline is written to
+      [.gitlab/ci/pipelines/NAME.yml].
+
+      The string {!header} will be prepended to each written file. *)
+  val write :
+    ?default:Gitlab_ci.Types.default ->
+    ?variables:Gitlab_ci.Types.variables ->
+    filename:string ->
+    unit ->
+    unit
+
+  (** Outputs the set of registered pipelines with their description. *)
+  val list_pipelines : unit -> unit
+
+  (** Pretty prints the set of registered pipelines as a table. *)
+  val overview_pipelines : unit -> unit
+
+  (** Describe the registered pipeline of a given name.
+
+      If no such pipeline is registered, [exit 1] is called and an
+      error message is printed. *)
+  val describe_pipeline : string -> unit
+end
+
+module Cargo : sig
+  (** Value of [CARGO_HOME] *)
+  val home : string
+end
+
+(** A facility for registering images for [image:] keywords.
+
+    Images can be registered in two manners:
+     - {i External} images are built outside the [tezos/tezos] CI and are
+       registered with their path (e.g. [alpine:3.18]).
+
+     - {i Internal} images are built in the pipeline they are
+       used. They are registered an [image_path] and an
+       [image_builder]. The [script:] of an [image_builder]
+       must build the image and push it to [image_path].
+
+    Pipelines with jobs using internal images automatically include
+    corresponding image builder jobs with appropriate dependencies. *)
+module Image : sig
+  (** A registered Docker image in which a job can execute. *)
+  type t
+
+  (* FIXME do not expose this builder.
+     Requires non-trivial refactoring as used in some jobs.
+     Check via [git grep -B3 "mk_external" ci/lib_tezos_ci_jobs] *)
+
+  (** Register an external image of the given [image_path]. *)
+  val mk_external : image_path:string -> t
+
+  (** Pretty-print the image path. *)
+  val pp : Format.formatter -> t -> unit
+end
+
+(** Changesets are used to specify [changes:] clauses in rules.
+
+    Note: Operations over changesets do not preserve order nor
+    duplicates. Ordering and duplicates in [changes:] clauses have no
+    semantic impact. *)
+module Changeset : sig
+  (** A changeset. *)
+  type t
+
+  (** Create a changeset from a list of strings. *)
+  val make : string list -> t
+
+  (** Encode a changeset as a alphabetically sorted list of strings. *)
+  val encode : t -> string list
+
+  (** Combine two changesets. *)
+  val union : t -> t -> t
+
+  (** Operator for {!union}. *)
+  val ( @ ) : t -> t -> t
+end
+
+(** A job dependency.
+
+    - A job that depends on [Job j] will not start until [j] finishes.
+
+    - A job that depends on [Optional j] will not start until [j]
+    finishes, if it is present in the pipeline. For more information,
+    see
+    {{:https://docs.gitlab.com/ee/ci/yaml/#needsoptional}needs:optional}.
+
+    - A job that depends on [Artefacts j] will not start until [j] finishes
+      and will also have the artefacts of [j] available. *)
+type dependency =
+  | Job of tezos_job
+  | Optional of tezos_job
+  | Artifacts of tezos_job
+
+(** Job dependency sets.
+
+    - A [Staged artifact_deps] job implements the default GitLab CI behavior of
+      running once all jobs in the previous stage have terminated. Artifacts are
+      downloaded from the list of jobs in [artifact_deps] (by default, no
+      artifacts are downloaded).
+    - An [Dependent deps] job runs once all the jobs in [deps] have terminated.
+      To have a job run immediately, set [Dependent []]
+
+    In practice, prefer using [Dependent]. Only use [Staged
+    artifact_deps] when the number of dependencies exceed the GitLab
+    imposed limit of 50 [needs:] per job. *)
+type dependencies = Staged of tezos_job list | Dependent of dependency list
+
+(** Values for the [GIT_STRATEGY] variable.
+
+    This can be used to specify whether a job should [Fetch] or [Clone]
+    the git repository, or not get it at all with [No_strategy].
+
+    For more information, see
+   {{:https://docs.gitlab.com/ee/ci/runners/configure_runners.html#git-strategy}GIT_STRATEGY} *)
+type git_strategy =
+  | Fetch  (** Translates to [fetch]. *)
+  | Clone  (** Translates to [clone]. *)
+  | No_strategy
+      (** Translates to [none].
+
+          Renamed to avoid clashes with {!Option.None}. *)
+
+(** Define a job.
+
+    This is a smart constructor for {!Gitlab_ci.Types.job}.
+
+    This function handles dependencies as follows.
+
+    - Translates each {!dependency} to [needs:] and [dependencies:]
+      keywords as detailed in the documentation of {!dependency}.
+
+    - [image_dependencies] is a list of internal !{Image.t}s that this
+      job uses indirectly, i.e. not in it's [image:] field. For
+      instance, this can be used by a job that builds a Docker image
+      with an internal image as input.  A run-time error will be thrown
+      if this list includes an external image.
+
+    - If both a [template] and an [image] are provided, then a
+      run-time error is raised to prevent overriding the image defined
+      in the GitLab template.
+
+    - If the [image] used is {!Internal} and [tag] is set to
+      {!Dynamic} then a run-time error is generated as the required
+      architecture for the internal image cannot be statically
+      deduced.
+
+    This function accepts the following arguments to specify requirements
+    on the runners that are to run the job.
+
+    - [dev_infra] specifies the cloud provider account to use.
+      [false] is [GCP] or [AWS], [true] is [GCP_dev].
+      If omitted, any account may be used.
+
+    - [arch] specifies a required CPU architecture.
+      If omitted, any architecture may be used.
+
+    - [cpu] specifies the required CPU power.
+      If omitted, any CPU may be used.
+
+    - [storage] specifies the required storage method.
+      If omitted, any storage method may be used.
+
+    - [interruptible_runner] specifies whether it is acceptable that the runner
+      may be interrupted, for instance because of the spot instance mechanism.
+      If omitted, either interruptible and non-interruptible runners may be used.
+
+    From these requirements, the function selects a runner tag, using {!Runner.Tag.choose}.
+    This takes the first tag that is compatible with your requirements,
+    from a list of tags ordered in a priority list located in [runner.ml].
+    You may also specify the runner [tag] explicitly instead,
+    in which case the function simply checks that your requirements are compatible.
+
+    - [environment] binds the job to a GitLab environment, granting it
+      access to variables scoped to that environment. Use [action:Access]
+      to avoid registering a deployment.
+      If omitted, only variables with the wildcard scope are available.
+      See {{:https://docs.gitlab.com/ci/environments/} GitLab environments}. *)
+val job :
+  ?arch:Runner.Arch.t ->
+  ?after_script:string list ->
+  ?allow_failure:Gitlab_ci.Types.allow_failure_job ->
+  ?artifacts:Gitlab_ci.Types.artifacts ->
+  ?before_script:string list ->
+  ?cache:Gitlab_ci.Types.cache list ->
+  ?id_tokens:Gitlab_ci.Types.id_tokens ->
+  ?interruptible:bool ->
+  ?dependencies:dependencies ->
+  ?image_dependencies:Image.t list ->
+  ?services:Gitlab_ci.Types.service list ->
+  ?variables:Gitlab_ci.Types.variables ->
+  ?rules:Gitlab_ci.Types.job_rule list ->
+  ?timeout:Gitlab_ci.Types.time_interval ->
+  ?tag:Runner.Tag.t ->
+  ?cpu:Runner.CPU.t ->
+  ?storage:Runner.Storage.t ->
+  ?interruptible_runner:bool ->
+  ?git_strategy:git_strategy ->
+  ?retry:Gitlab_ci.Types.retry ->
+  ?parallel:Gitlab_ci.Types.parallel ->
+  ?environment:Gitlab_ci.Types.environment ->
+  ?description:string ->
+  ?dev_infra:bool ->
+  __POS__:string * int * int * int ->
+  ?image:Image.t ->
+  ?template:Gitlab_ci.Types.template ->
+  ?datadog:bool ->
+  stage:Stage.t ->
+  name:string ->
+  string list ->
+  tezos_job
+
+(** Retry policy that disables automatic retry ([max = 0]).
+
+    Used e.g. by release jobs, which publish artifacts: retrying could
+    republish the same artifact twice. *)
+val no_retry : Gitlab_ci.Types.retry
+
+(** Retry policy that retries up to twice on any failure ([max = 2]). *)
+val retry_twice : Gitlab_ci.Types.retry
+
+(** Retry policy for jobs that run a Docker-in-Docker service.
+
+    Retries (up to twice) on both [Script_failure] and [Runner_system_failure],
+    so that GCP runner preemptions are recovered. *)
+val dind_retry : Gitlab_ci.Types.retry
+
+module Stages : sig
+  val start : Stage.t
+
+  val images : Stage.t
+
+  val sanity : Stage.t
+
+  val build : Stage.t
+
+  val test : Stage.t
+
+  val packaging : Stage.t
+
+  val publish : Stage.t
+
+  val publishing_tests : Stage.t
+
+  val manual : Stage.t
+end
+
+module Images_external : sig
+  val nix : Image.t
+
+  val datadog_ci : Image.t
+
+  val hadolint : Image.t
+
+  val semgrep_agent : Image.t
+
+  (** Upstream Docker image from Docker Hub, used as the builder image
+      for the [alpine-docker-ci] base image (e.g. ["docker:28.5.1"]).
+      Pinned by SHA digest. *)
+  val upstream_docker : Image.t
+
+  val node_alpine : Image.t
+end
+
+module Images : sig
+  val nix : Image.t
+
+  val upstream_docker : Image.t
+
+  val datadog_ci : Image.t
+
+  val hadolint : Image.t
+
+  val semgrep_agent : Image.t
+
+  val macosx_15 : Image.t
+
+  val trivy : Image.t
+
+  val node_alpine : Image.t
+
+  module CI : sig
+    val job_docker_ci :
+      Runner.Arch.t -> ?storage:Runner.Storage.t -> unit -> tezos_job
+
+    val runtime : Image.t
+
+    val monitoring : Image.t
+
+    val prebuild : Image.t
+
+    val prebuild_master : Image.t
+
+    val build : Image.t
+
+    val build_master : Image.t
+
+    val test : Image.t
+
+    val test_master : Image.t
+
+    val e2etest : Image.t
+
+    val release_page : Image.t
+  end
+
+  module Base_images : sig
+    (** The prefix of the path of the base images. *)
+    val path_prefix : string
+
+    (** The version tag shared by all CI base images. *)
+    val base_images_tag : string
+
+    val debian_trixie : Image.t
+
+    val debian_jsonnet_trixie : Image.t
+
+    val ubuntu_22_04 : Image.t
+
+    val ubuntu_24_04 : Image.t
+
+    val ubuntu_26_04 : Image.t
+
+    val debian_build_trixie : Image.t
+
+    val ubuntu_build_24_04 : Image.t
+
+    val debian_homebrew_trixie : Image.t
+
+    val debian_rust_trixie : Image.t
+
+    (** Image containing all dependencies required to build the Rust SDK
+        bindings, built in the [base_images.daily] pipeline. *)
+    val debian_rust_sdk_bindings : Image.t
+
+    (** The Docker version used in Docker-in-Docker CI jobs
+        (e.g. ["28.5.1"]). *)
+    val docker_version : string
+
+    (** Index digest of the upstream [docker:<docker_version>] image, shared by
+        the [docker:<v>] and [docker:<v>-dind] tags. Used to pin the docker base
+        image (e.g. the [FROM docker:<v>] of alpine-docker-ci). *)
+    val docker_digest : string
+
+    (** The fully pinned [docker:<version>-dind@sha256:...] service
+        image reference for Docker-in-Docker CI jobs. *)
+    val dind_service : string
+
+    (** Base image providing Docker-in-Docker for CI jobs that need
+        to build or push Docker images. Based on Alpine Linux,
+        includes the Docker daemon, gcloud, hadolint and regctl. *)
+    val alpine_docker_ci : Image.t
+
+    val ci_release : Image.t
+
+    val alpine_runtime : Image.t
+
+    val alpine_monitoring : Image.t
+
+    val alpine_prebuild : Image.t
+
+    val alpine_build : Image.t
+
+    val alpine_release_page : Image.t
+
+    val alpine_test : Image.t
+
+    val alpine_e2etest : Image.t
+  end
+end
+
+(** [docker_release.sh] invocation stating the CI images the Docker
+    distribution jobs build FROM, passed explicitly as full references: the
+    static [Images.Base_images.alpine_runtime] / [Images.Base_images.alpine_build]
+    images. *)
+val docker_release_script : string
+
+(* OIDC tokens to be generated by GitLab *)
+val id_tokens : Gitlab_ci.Types.id_tokens
+
+(** Get the names and locations of the jobs that were registered with the [job] function. *)
+val get_declared_jobs :
+  unit -> (string * int * int * int) Gitlab_ci.Base.String_map.t

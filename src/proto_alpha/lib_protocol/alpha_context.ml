@@ -3,7 +3,7 @@
 (* Open Source License                                                       *)
 (* Copyright (c) 2018 Dynamic Ledger Solutions, Inc. <contact@tezos.com>     *)
 (* Copyright (c) 2019-2022 Nomadic Labs <contact@nomadic-labs.com>           *)
-(* Copyright (c) 2021-2022 Trili Tech, <contact@trili.tech>                  *)
+(* Copyright (c) 2021-2024 Trili Tech <contact@trili.tech>                   *)
 (*                                                                           *)
 (* Permission is hereby granted, free of charge, to any person obtaining a   *)
 (* copy of this software and associated documentation files (the "Software"),*)
@@ -56,17 +56,34 @@ module Sc_rollup_repr = Sc_rollup_repr
 module Sc_rollup = struct
   module Tick = Sc_rollup_tick_repr
   include Sc_rollup_repr
+
+  module Internal_for_tests = struct
+    include Internal_for_tests
+
+    let is_signal_enable = Sc_rollup_storage.is_signal_enable
+  end
+
+  module Whitelist = struct
+    include Sc_rollup_whitelist_storage
+    include Sc_rollup_whitelist_repr
+  end
+
   module Metadata = Sc_rollup_metadata_repr
+  module Dal_parameters = Sc_rollup_dal_parameters_repr
   module Dissection_chunk = Sc_rollup_dissection_chunk_repr
   include Sc_rollup_PVM_sig
   module ArithPVM = Sc_rollup_arith
   module Wasm_2_0_0PVM = Sc_rollup_wasm.V2_0_0
+  module Riscv_PVM = Sc_rollup_riscv
 
   module Inbox_message = struct
     include Sc_rollup_inbox_message_repr
 
     let protocol_migration_internal_message =
       Raw_context.protocol_migration_internal_message
+
+    let protocol_migration_serialized_message =
+      Raw_context.protocol_migration_serialized_message
   end
 
   module Inbox_merkelized_payload_hashes =
@@ -84,14 +101,15 @@ module Sc_rollup = struct
     let genesis =
       genesis
         ~protocol_migration_message:
-          Inbox_message.protocol_migration_internal_message
+          Inbox_message.protocol_migration_serialized_message
 
-    let add_all_messages ~first_block =
+    let add_all_messages ~first_block ~dal_attested_slots_messages =
       add_all_messages
         ~protocol_migration_message:
           (if first_block then
-           Some Inbox_message.protocol_migration_internal_message
-          else None)
+             Some Inbox_message.protocol_migration_internal_message
+           else None)
+        ~dal_attested_slots_messages
 
     module Internal_for_tests = struct
       include Sc_rollup_inbox_repr.Internal_for_tests
@@ -130,10 +148,13 @@ module Dal = struct
     include Dal_slot_index_repr
   end
 
-  module Attestation = struct
-    include Dal_attestation_repr
-    include Raw_context.Dal
+  module Attestations = struct
+    include Dal_attestations_repr.Accountability
+    include Dal_attestations_repr
+    include Dal_attestations_storage
   end
+
+  module Slot_availability = Dal_attestations_repr.Slot_availability
 
   type slot_id = Dal_slot_repr.Header.id = {
     published_level : Raw_level_repr.t;
@@ -147,7 +168,6 @@ module Dal = struct
   module Slot = struct
     include Dal_slot_repr
     include Dal_slot_storage
-    include Raw_context.Dal
   end
 
   module Operations = struct
@@ -156,6 +176,8 @@ module Dal = struct
 
   module Slots_history = Dal_slot_repr.History
   module Slots_storage = Dal_slot_storage
+  module Delegate = Dal_already_denounced_storage
+  module Past_parameters = Dal_storage
 end
 
 module Dal_errors = Dal_errors_repr
@@ -176,6 +198,21 @@ module Entrypoint = Entrypoint_repr
 module Manager_counter = Manager_counter_repr
 include Operation_repr
 
+module Constants = struct
+  include Constants_repr
+  include Constants_storage
+
+  module Parametric = struct
+    include Constants_parametric_repr
+
+    module Internal_for_tests = struct
+      include Internal_for_tests
+
+      let update_sc_rollup_parameter = update_sc_rollup_parameter
+    end
+  end
+end
+
 module Operation = struct
   type 'kind t = 'kind operation = {
     shell : Operation.shell_header;
@@ -186,7 +223,20 @@ module Operation = struct
 
   let unsigned_encoding = unsigned_operation_encoding
 
+  let bls_mode_unsigned_encoding = bls_mode_unsigned_operation_encoding
+
   include Operation_repr
+
+  let check_signature (type kind) _ctxt (key : Signature.Public_key.t) chain_id
+      (op : kind operation) =
+    let encoding =
+      (* Operations signed by BLS keys use a dedicated serialization encoding,
+         which differs only for attestations and preattestations. *)
+      match key with
+      | Bls _ -> bls_mode_unsigned_encoding
+      | _ -> unsigned_encoding
+    in
+    check_signature encoding key chain_id op
 end
 
 module Block_header = Block_header_repr
@@ -200,8 +250,22 @@ module Block_payload = struct
   include Block_payload_repr
 end
 
-module First_level_of_protocol = struct
-  let get = Storage.Tenderbake.First_level_of_protocol.get
+module Protocol_activation_level = struct
+  let get = Storage.Protocol_activation_level.get
+end
+
+module Consecutive_round_zero = struct
+  let get = Storage.Consecutive_round_zero.get
+
+  let incr ctxt =
+    let open Lwt_result_syntax in
+    let* acc = get ctxt in
+    let acc =
+      if Int32.(equal max_int acc) then Int32.max_int else Int32.succ acc
+    in
+    Storage.Consecutive_round_zero.update ctxt acc
+
+  let reset ctxt = Storage.Consecutive_round_zero.update ctxt 0l
 end
 
 module Ratio = Ratio_repr
@@ -210,30 +274,26 @@ module Raw_level = struct
   include Raw_level_repr
 
   module Internal_for_tests = struct
-    let add = add
+    let from_repr (level : raw_level) = level
 
-    let sub = sub
+    let to_repr (level : raw_level) = level
   end
 end
 
-module Cycle = Cycle_repr
+module Cycle = struct
+  include Cycle_repr
+  include Cycle_storage
+
+  module For_RPC = struct
+    let of_repr c = c
+  end
+end
+
 module Fees = Fees_storage
 
 type public_key = Signature.Public_key.t
 
-type public_key_hash = Signature.Public_key_hash.t
-
 type signature = Signature.t
-
-module Constants = struct
-  include Constants_repr
-  include Constants_storage
-  module Parametric = Constants_parametric_repr
-
-  let round_durations ctxt = Raw_context.round_durations ctxt
-
-  let all ctxt = all_of_parametric (parametric ctxt)
-end
 
 module Voting_period = struct
   include Voting_period_repr
@@ -255,6 +315,14 @@ module Round = struct
   let update ctxt round = Storage.Block_round.update ctxt round
 
   let get ctxt = Storage.Block_round.get ctxt
+
+  module Internal_for_tests = struct
+    include Internal_for_tests
+
+    let from_repr (round : round) = round
+
+    let to_repr (round : round) = round
+  end
 end
 
 module Gas = struct
@@ -273,9 +341,10 @@ module Gas = struct
   let consume = Raw_context.consume_gas
 
   let consume_from available_gas cost =
+    let open Result_syntax in
     match raw_consume available_gas cost with
-    | Some remaining_gas -> ok remaining_gas
-    | None -> error Operation_quota_exceeded
+    | Some remaining_gas -> return remaining_gas
+    | None -> tzfail Operation_quota_exceeded
 
   let remaining_operation_gas = Raw_context.remaining_operation_gas
 
@@ -300,21 +369,48 @@ module Script = struct
   include Michelson_v1_primitives
   include Script_repr
 
+  type michelson_with_storage = t = {code : lazy_expr; storage : lazy_expr}
+
+  type native_kind = Script_native_repr.t = CLST
+
+  type native_with_storage = Script_native_repr.with_storage = {
+    kind : native_kind;
+    storage : lazy_expr;
+  }
+
+  type implementation = Contract_kind_repr.implementation_kind =
+    | Script_code of lazy_expr
+    | Native_kind of native_kind
+
+  type t = Contract_kind_repr.originated_kind =
+    | Script of michelson_with_storage
+    | Native of native_with_storage
+
+  let michelson_with_storage_encoding =
+    Contract_kind_repr.michelson_with_storage_encoding
+
+  let encoding = Contract_kind_repr.encoding
+
   type consume_deserialization_gas = Always | When_needed
 
   let force_decode_in_context ~consume_deserialization_gas ctxt lexpr =
+    let open Result_syntax in
     let gas_cost =
       match consume_deserialization_gas with
       | Always -> Script_repr.stable_force_decode_cost lexpr
       | When_needed -> Script_repr.force_decode_cost lexpr
     in
-    Raw_context.consume_gas ctxt gas_cost >>? fun ctxt ->
-    Script_repr.force_decode lexpr >|? fun v -> (v, ctxt)
+    let* ctxt = Raw_context.consume_gas ctxt gas_cost in
+    let+ v = Script_repr.force_decode lexpr in
+    (v, ctxt)
 
   let force_bytes_in_context ctxt lexpr =
-    Raw_context.consume_gas ctxt (Script_repr.force_bytes_cost lexpr)
-    >>? fun ctxt ->
-    Script_repr.force_bytes lexpr >|? fun v -> (v, ctxt)
+    let open Result_syntax in
+    let* ctxt =
+      Raw_context.consume_gas ctxt (Script_repr.force_bytes_cost lexpr)
+    in
+    let+ v = Script_repr.force_bytes lexpr in
+    (v, ctxt)
 
   let consume_decoding_gas available_gas lexpr =
     let gas_cost = Script_repr.stable_force_decode_cost lexpr in
@@ -357,6 +453,23 @@ module Contract = struct
 
   let get_manager_key = Contract_manager_storage.get_manager_key
 
+  let is_delegate = Contract_delegate_storage.is_delegate
+
+  type delegate_status = Contract_delegate_storage.delegate_status =
+    | Delegate
+    | Delegated of Implicit_account_repr.t
+    | Undelegated
+
+  let get_delegate_status = Contract_delegate_storage.get_delegate_status
+
+  let get_clst_contract_hash ctxt =
+    Storage.Contract.Native_contracts.CLST.get ctxt
+
+  module For_RPC = struct
+    include Contract_storage.For_RPC
+    include Delegate_slashed_deposits_storage.For_RPC
+  end
+
   module Delegate = struct
     let find = Contract_delegate_storage.find
 
@@ -369,61 +482,45 @@ module Contract = struct
   end
 end
 
-module Tx_rollup_level = Tx_rollup_level_repr
-module Tx_rollup_commitment_hash = Tx_rollup_commitment_repr.Hash
-module Tx_rollup_message_result_hash = Tx_rollup_message_result_hash_repr
+module Global_constants_storage = Global_constants_storage
 
-module Tx_rollup = struct
-  include Tx_rollup_repr
-  include Tx_rollup_storage
-  module Internal_for_tests = Tx_rollup_repr
+module Address_registry = struct
+  type diff = Raw_context.Address_registry.diff = {
+    address : Destination.t;
+    index : Z.t;
+  }
+
+  let encoding =
+    let open Data_encoding in
+    conv
+      (fun {address; index} -> (address, index))
+      (fun (address, index) -> {address; index})
+      (obj2 (req "address" Destination.encoding) (req "index" z))
+
+  let register_diff ctxt (diff : diff) =
+    Raw_context.Address_registry.register_diff ctxt diff
+
+  let get_diffs = Raw_context.Address_registry.get_diffs
+
+  include Address_registry_storage
 end
 
-module Tx_rollup_state = struct
-  include Tx_rollup_state_repr
-  include Tx_rollup_state_storage
+module Clst = struct
+  let add_redemption_request =
+    Clst_redemption_requests_storage.add_redemption_request
 
-  module Internal_for_tests = struct
-    include Tx_rollup_state_repr
-    include Tx_rollup_state_repr.Internal_for_tests
+  let total_amount_of_tez ctxt = Clst_storage.get_deposits_balance ctxt
+
+  let finalize = Clst_redemption_requests_storage.finalize
+
+  module Delegates = Clst_delegates_storage
+
+  module For_RPC = struct
+    include Clst_redemption_requests_storage.For_RPC
+    include Clst_delegates_storage.For_RPC
+    include Clst_stake_allocation.For_RPC
   end
 end
-
-module Tx_rollup_withdraw = Tx_rollup_withdraw_repr
-module Tx_rollup_withdraw_list_hash = Tx_rollup_withdraw_list_hash_repr
-module Tx_rollup_message_result = Tx_rollup_message_result_repr
-
-module Tx_rollup_reveal = struct
-  include Tx_rollup_reveal_repr
-  include Tx_rollup_reveal_storage
-end
-
-module Tx_rollup_message = struct
-  include Tx_rollup_message_repr
-
-  let make_message msg = (msg, size msg)
-
-  let make_batch string = make_message @@ Batch string
-
-  let make_deposit sender destination ticket_hash amount =
-    make_message @@ Deposit {sender; destination; ticket_hash; amount}
-end
-
-module Tx_rollup_message_hash = Tx_rollup_message_hash_repr
-
-module Tx_rollup_inbox = struct
-  include Tx_rollup_inbox_repr
-  include Tx_rollup_inbox_storage
-end
-
-module Tx_rollup_commitment = struct
-  include Tx_rollup_commitment_repr
-  include Tx_rollup_commitment_storage
-end
-
-module Tx_rollup_hash = Tx_rollup_hash_builder
-module Tx_rollup_errors = Tx_rollup_errors_repr
-module Global_constants_storage = Global_constants_storage
 
 module Big_map = struct
   module Big_map = Lazy_storage_kind.Big_map
@@ -450,12 +547,14 @@ module Big_map = struct
     Storage.Big_map.Contents.list_key_values ?offset ?length (c, m)
 
   let exists c id =
-    Raw_context.consume_gas c (Gas_limit_repr.read_bytes_cost 0) >>?= fun c ->
-    Storage.Big_map.Key_type.find c id >>=? fun kt ->
+    let open Lwt_result_syntax in
+    let*? c = Raw_context.consume_gas c (Gas_limit_repr.read_bytes_cost 0) in
+    let* kt = Storage.Big_map.Key_type.find c id in
     match kt with
     | None -> return (c, None)
     | Some kt ->
-        Storage.Big_map.Value_type.get c id >|=? fun kv -> (c, Some (kt, kv))
+        let+ kv = Storage.Big_map.Value_type.get c id in
+        (c, Some (kt, kv))
 
   type update = Big_map.update = {
     key : Script_repr.expr;
@@ -519,44 +618,128 @@ module Bond_id = struct
   module Internal_for_tests = Contract_storage
 end
 
-module Receipt = Receipt_repr
+module Receipt = struct
+  type unstaked_frozen_staker = Unstaked_frozen_staker_repr.t =
+    | Single of Contract_repr.t * Implicit_account_repr.t
+    | Shared of Implicit_account_repr.t
+
+  type frozen_staker = Frozen_staker_repr.t = private
+    | Baker of Implicit_account_repr.t
+    | Single_staker of {
+        staker : Contract_repr.t;
+        delegate : Implicit_account_repr.t;
+      }
+    | Shared_between_stakers of {delegate : Implicit_account_repr.t}
+    | Baker_edge of Implicit_account_repr.t
+
+  let frozen_baker = Frozen_staker_repr.baker
+
+  let frozen_baker_edge = Frozen_staker_repr.baker_edge
+
+  let frozen_single_staker = Frozen_staker_repr.single_staker
+
+  let frozen_shared_between_stakers = Frozen_staker_repr.shared_between_stakers
+
+  include Receipt_repr
+end
+
 module Consensus_key = Delegate_consensus_key
+module Misbehaviour = Misbehaviour_repr
 
 module Delegate = struct
   include Delegate_storage
-  include Delegate_missed_endorsements_storage
+  include Delegate_missed_attestations_storage
   include Delegate_slashed_deposits_storage
   include Delegate_cycles
-
-  type deposits = Storage.deposits = {
-    initial_amount : Tez.t;
-    current_amount : Tez.t;
-  }
 
   let last_cycle_before_deactivation =
     Delegate_activation_storage.last_cycle_before_deactivation
 
   let prepare_stake_distribution = Stake_storage.prepare_stake_distribution
 
-  let check_not_tz4 = Contract_delegate_storage.check_not_tz4
+  let check_not_tz5 = Delegate_storage.Contract.check_not_tz5
 
   let delegated_contracts = Contract_delegate_storage.delegated_contracts
 
   let deactivated = Delegate_activation_storage.is_inactive
 
+  let is_forbidden_delegate = Forbidden_delegates_storage.is_forbidden
+
+  let already_denounced = Already_denounced_storage.already_denounced
+
   module Consensus_key = Delegate_consensus_key
+
+  module Rewards = struct
+    include Delegate_rewards
+
+    module For_RPC = struct
+      include Delegate_rewards.For_RPC
+      include Adaptive_issuance_storage.For_RPC
+    end
+
+    module Internal_for_tests = Adaptive_issuance_storage.Internal_for_tests
+  end
+
+  module Staking_parameters = Delegate_staking_parameters
+  module Shared_stake = Shared_stake
+
+  module For_RPC = struct
+    include Delegate_storage.For_RPC
+    include Delegate_slashed_deposits_storage.For_RPC
+    include Delegate_missed_attestations_storage.For_RPC
+    include Pending_denunciations_storage.For_RPC
+
+    let pending_denunciations = Pending_denunciations_storage.find
+
+    let has_pending_denunciations =
+      Pending_denunciations_storage.has_pending_denunciations
+  end
 end
 
 module Stake_distribution = struct
-  let snapshot = Stake_storage.snapshot
+  type delegate_stake_info = Raw_context.delegate_stake_info = {
+    consensus_pk : Consensus_key.pk;
+    stake_weight : Int64.t;
+  }
 
-  let compute_snapshot_index = Delegate_sampler.compute_snapshot_index
+  type stake_info = Raw_context.stake_info = {
+    total_stake_weight : Int64.t;
+    delegates : delegate_stake_info list;
+  }
 
   let baking_rights_owner = Delegate_sampler.baking_rights_owner
 
-  let slot_owner = Delegate_sampler.slot_owner
+  let attestation_slot_owner ctxt ~attested_level slot =
+    let all_bakers_attest_enabled =
+      Consensus_parameters_storage.check_all_bakers_attest_at_level
+        ctxt
+        ~attested_level
+    in
+    Delegate_sampler.attestation_slot_owner
+      ~all_bakers_attest_enabled
+      ctxt
+      attested_level
+      slot
+
+  let stake_info_for_cycle = Delegate_sampler.stake_info_for_cycle
+
+  let stake_info = Delegate_sampler.stake_info
+
+  let load_sampler_for_cycle = Delegate_sampler.load_sampler_for_cycle
+
+  let get_total_frozen_stake ctxt cycle =
+    let open Lwt_result_syntax in
+    let* total_stake = Stake_storage.get_total_active_stake ctxt cycle in
+    return (Stake_repr.get_frozen total_stake)
+
+  module For_RPC = Delegate_sampler.For_RPC
+
+  module Internal_for_tests = struct
+    let get_selected_distribution = Stake_storage.get_selected_distribution
+  end
 end
 
+module Staking = Staking
 module Nonce = Nonce_storage
 
 module Seed = struct
@@ -579,39 +762,54 @@ end
 
 module Migration = Migration_repr
 
+module Attesting_power = struct
+  include Attesting_power_repr
+  include Consensus_parameters_storage
+
+  let get ctxt ~attested_level {slots; baking_power} =
+    let all_bakers_attest_enabled =
+      check_all_bakers_attest_at_level ctxt ~attested_level
+    in
+    if all_bakers_attest_enabled then baking_power else Int64.of_int slots
+
+  let get_slots {slots; _} = slots
+
+  let to_result ctxt ~attested_level =
+    let attested_level = Level_storage.from_raw ctxt attested_level in
+    to_result
+      ~abaab_activated:(check_all_bakers_attest_at_level ctxt ~attested_level)
+
+  let all_bakers_attest_activation_level ctxt =
+    Constants_storage.all_bakers_attest_first_level ctxt
+end
+
 module Consensus = struct
   include Raw_context.Consensus
 
-  let load_endorsement_branch ctxt =
-    Storage.Tenderbake.Endorsement_branch.find ctxt >>=? function
-    | Some endorsement_branch ->
-        Raw_context.Consensus.set_endorsement_branch ctxt endorsement_branch
+  let load_attestation_branch ctxt =
+    let open Lwt_result_syntax in
+    let* result = Storage.Tenderbake.Attestation_branch.find ctxt in
+    match result with
+    | Some attestation_branch ->
+        Raw_context.Consensus.set_attestation_branch ctxt attestation_branch
         |> return
     | None -> return ctxt
 
-  let store_endorsement_branch ctxt branch =
-    let ctxt = set_endorsement_branch ctxt branch in
-    Storage.Tenderbake.Endorsement_branch.add ctxt branch
-
-  let load_grand_parent_branch ctxt =
-    Storage.Tenderbake.Grand_parent_branch.find ctxt >>=? function
-    | Some grand_parent_branch ->
-        Raw_context.Consensus.set_grand_parent_branch ctxt grand_parent_branch
-        |> return
-    | None -> return ctxt
-
-  let store_grand_parent_branch ctxt branch =
-    let ctxt = set_grand_parent_branch ctxt branch in
-    Storage.Tenderbake.Grand_parent_branch.add ctxt branch
+  let store_attestation_branch ctxt branch =
+    let ctxt = set_attestation_branch ctxt branch in
+    Storage.Tenderbake.Attestation_branch.add ctxt branch
 end
 
 let prepare_first_block = Init_storage.prepare_first_block
 
 let prepare ctxt ~level ~predecessor_timestamp ~timestamp =
-  Init_storage.prepare ctxt ~level ~predecessor_timestamp ~timestamp
-  >>=? fun (ctxt, balance_updates, origination_results) ->
-  Consensus.load_endorsement_branch ctxt >>=? fun ctxt ->
-  Consensus.load_grand_parent_branch ctxt >>=? fun ctxt ->
+  let open Lwt_result_syntax in
+  let* ctxt, balance_updates, origination_results =
+    Init_storage.prepare ctxt ~level ~predecessor_timestamp ~timestamp
+  in
+  let* ctxt = Consensus.load_attestation_branch ctxt in
+  let* ctxt = Forbidden_delegates_storage.load ctxt in
+  let* ctxt = Adaptive_issuance_storage.load_reward_coeff ctxt in
   return (ctxt, balance_updates, origination_results)
 
 let finalize ?commit_message:message c fitness =
@@ -621,8 +819,10 @@ let finalize ?commit_message:message c fitness =
     fitness;
     message;
     max_operations_ttl = (Raw_context.constants c).max_operations_time_to_live;
-    last_allowed_fork_level =
-      Raw_level.to_int32 @@ Level.last_allowed_fork_level c;
+    last_finalized_block_level =
+      Raw_level.to_int32 (Level.last_finalized_block_level c);
+    last_preserved_block_level =
+      Raw_level.to_int32 (Level.last_preserved_block_level c);
   }
 
 let current_context c = Raw_context.recover c
@@ -650,10 +850,15 @@ let internal_nonce_already_recorded =
 let description = Raw_context.description
 
 module Parameters = Parameters_repr
+module Votes_EMA = Votes_EMA_repr
+module Per_block_votes = Per_block_votes_repr
 
 module Liquidity_baking = struct
-  include Liquidity_baking_repr
   include Liquidity_baking_storage
+end
+
+module Adaptive_issuance = struct
+  include Adaptive_issuance_storage
 end
 
 module Ticket_hash = struct
@@ -668,6 +873,44 @@ end
 module Token = Token
 module Cache = Cache_repr
 
+module Unstake_requests = struct
+  include Unstake_requests_storage
+
+  module For_RPC = struct
+    include Unstake_requests_storage.For_RPC
+
+    let apply_slash_to_unstaked_unfinalizable ctxt ~delegate ~requests =
+      Unstake_requests_storage.For_RPC.apply_slash_to_unstaked_unfinalizable
+        ctxt
+        {delegate; requests}
+
+    let apply_slash_to_unstaked_unfinalizable_stored_requests ctxt
+        {delegate; requests} =
+      let open Lwt_result_syntax in
+      let* requests =
+        Unstake_requests_storage.For_RPC.apply_slash_to_unstaked_unfinalizable
+          ctxt
+          {delegate; requests}
+      in
+      return {delegate; requests}
+  end
+end
+
+module Unstaked_frozen_deposits = Unstaked_frozen_deposits_storage
+
+module Staking_pseudotoken = struct
+  include Staking_pseudotoken_repr
+  module For_RPC = Staking_pseudotoken_repr
+  module Internal_for_tests = Staking_pseudotoken_repr
+end
+
+module Staking_pseudotokens = struct
+  include Staking_pseudotokens_storage
+  module For_RPC = Staking_pseudotokens_storage.For_RPC
+end
+
 module Internal_for_tests = struct
   let to_raw x = x
+
+  let patch_constants = Raw_context.patch_constants
 end

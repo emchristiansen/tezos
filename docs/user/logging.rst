@@ -1,12 +1,22 @@
-Logging
-=======
+Logging features
+================
 
-Logging features in Octez allow to monitor its execution and be informed in real
-time about *events* of interest, such as errors, completion of certain steps,
+Logging features in Octez allow to monitor the execution of Octez binaries, informing in real
+time about events of interest, such as errors, completion of certain steps,
 etc. This is why various software components emit *events* throughout the
 codebase (see :doc:`../developer/event_logging_framework`), the logging
 framework dispatches them to an arbitrary number of (active) *sinks* which can
 filter print, store, or otherwise handle events.
+
+.. note::
+
+  Log events should not be confused with :doc:`contract events <../active/event>`, which are emitted by smart contracts using specific support in the Michelson language.
+
+The logging framework can be configured with environment variables, which specify how events are mapped to sinks.
+Some Octez binaries provide additional configurations means.
+
+Events
+------
 
 Events have:
 
@@ -37,32 +47,19 @@ Sink Configuration
 The logging framework refers to sinks with URIs (a.k.a.  structured strings of
 the form ``schema://path?query``): the schema of the URI is used to find the
 appropriate sink-implementation, the rest of the URI is used to configure the
-particular instance. There can be as many instances of a given implementation as
-needed, except for the (legacy) *Lwt-Log Sink* which should be activated at most
-once.
-
-(Legacy) Lwt-Log Sink
-~~~~~~~~~~~~~~~~~~~~~
-
-This sink is the one currently activated by default:
-
--  Schema: ``lwt-log``
--  URI-Configuration: **none**; (for now) can only use the legacy
-   ``TEZOS_LOG`` environment variable or the specific section in the
-   node’s configuration file (see below).
-
-This sink can only output pretty-printed versions of the events.
+particular instance.
 
 File-Descriptor Sinks
 ~~~~~~~~~~~~~~~~~~~~~
 
-This is configurable and duplicatable replacement for the lwt-log-sink;
-it allows to output events to regular Unix file-descriptors. It is
-actually a *family* of three URI-schemes:
+File-descriptor sinks allow to configure loggers that output events to
+regular Unix file-descriptors. They are duplicatable. They actually
+consist in a *family* of four URI-schemes:
 
--  ``file-descriptor-path://`` to output to a file,
--  ``file-descriptor-stdout://`` to output to ``stdout`` / ``1``, or
--  ``file-descriptor-stderr://`` to output to ``stderr`` / ``2``.
+-  ``file-descriptor-path://`` outputs to a file
+-  ``file-descriptor-stdout://`` outputs to ``stdout`` / ``1``
+-  ``file-descriptor-stderr://`` outputs to ``stderr`` / ``2``
+-  ``file-descriptor-syslog://`` outputs to a ``syslog`` facility
 
 *Note:* ``-stdout`` and ``-stderr`` schemes are there for convenience
 and for making the API consistent; most Unix-ish systems nowadays have
@@ -70,7 +67,7 @@ and for making the API consistent; most Unix-ish systems nowadays have
 used with ``file-descriptor-path`` (with some precautions).
 
 The path of the URI is used by ``file-descriptor-path`` to choose the
-path to write to and ignored for the other two.
+path to write to and ignored for the other three.
 
 The query of the URI is used to further configure the sink instance.
 
@@ -85,16 +82,24 @@ Common options:
    sections. To exclude a specific section use the ``none`` filter, for
    example ``section-prefix=p2p:none``. To define a filter only for
    one specific section ``section-prefix=p2p:debug&section-prefix=:none``
--  ``format=<value>`` the output format used; acceptable values are:
+-  ``format=<value>`` the output format used. Note that syslog output will ignore
+   this option and use the syslog formatting. Possible values are:
 
    -  ``one-per-line`` (the default): output JSON objects, one per line,
    -  ``netstring``: use the Netstring format
       (cf. `Wikipedia <https://en.wikipedia.org/wiki/Netstring>`__) to
       separate JSON records,
-   -  ``pp`` to output the events pretty-printed, one per line, using a
-      format compatible with
-      `RFC-5424 <https://www.rfc-editor.org/rfc/rfc5424#section-6>`__ (or
-      Syslog).
+   -  ``pp`` or ``pp-rfc5424`` to output the events pretty-printed, one per line,
+      using a format compatible with `RFC-5424
+      <https://www.rfc-editor.org/rfc/rfc5424#section-6>`__ (or Syslog).
+   -  ``pp-short`` to output the events pretty-printed in a shorter and more
+      user-friendly fashion.
+
+-  ``color=true`` enables logs coloring. It only works on ttys, in conjunction with
+   ``format=pp-short``.
+
+- ``advertise-levels=true`` enables the advertisement of the log-level of each
+  events outputted in the sink.
 
 Options available only for the ``file-descriptor-path://`` case:
 
@@ -106,17 +111,26 @@ Options available only for the ``file-descriptor-path://`` case:
 -  ``chmod=<int>`` sets the access-rights of the file at creation time
    (default is ``0o600``, provided
    `Umask <https://en.wikipedia.org/wiki/Umask>`__ allows it).
-- ``daily-logs=<int>`` sets up a rotation for log files, creating a file for
-  each day. The parameter is the number of days these logs should be kept, and
-  hence the number of files. The day of the year with format ["yyyymmdd"] is
-  added as a suffix to the filename, prefixed by a dash. We recomend not to put
-  your tezos logs in ``/var/log`` if you use this option, as you system would
-  use ``logrotate`` automatically.
-- ``create-dirs=<bool>`` when ``true`` allows to create the directory where
-  the log files are stored and all its parents recursively if they don't
-  exist.
+-  ``daily-logs=<int>`` sets up a rotation for log files, creating a file for
+   each day. The parameter is the number of days these logs should be kept, and
+   hence the number of files. The day of the year with format ["yyyymmdd"] is
+   added as a suffix to the filename, prefixed by a dash. We recomend not to put
+   your tezos logs in ``/var/log`` if you use this option, as you system would
+   use ``logrotate`` automatically.
+-  ``create-dirs=<bool>`` when ``true`` allows to create the directory where
+   the log files are stored and all its parents recursively if they don't
+   exist.
 
-Examples:
+Option available only for ``file-descriptor-syslog://`` case:
+
+- ``facility=<facility>`` is the targeted syslog output.
+  The possible values are: ``auth, authpriv, cron, daemon,
+  ftp, kernel, local0, local1, local2, local3,
+  local4, local5, local6, local7, lpr, mail, news,
+  syslog, user, uucp, ntp, security, console``.
+  ``user`` is the default facility if no value is provided. See `RFC-3164 <https://www.rfc-editor.org/rfc/rfc3164#section-6>`__ for more information.
+
+  Examples:
 
 -  ``file-descriptor-path:///the/path/to/write.log?format=one-per-line&level-at-least=notice&with-pid=true&chmod=0o640``
    → Executables will write all log events of level at least ``Notice``
@@ -131,7 +145,7 @@ Examples:
 -  ``file-descriptor-path:///the/path/to/write.log?section-prefix=rpc:debug&section-prefix=validator:debug&section-prefix=:none"``
    → Write only sections validator and rpc at debug level but exclude all
    other sections from the stream.
-- ``"file-descriptor-path:///tmp/node-logs/node.log?daily-logs=5&create-dirs=true&section-prefix=:info"``
+-  ``"file-descriptor-path:///tmp/node-logs/node.log?daily-logs=5&create-dirs=true&section-prefix=:info"``
    sets up daily log files with a history of up to 5 days and verbosity level
    ``info`` for all logs. Files will be named ``node-19700101.log`` in an
    example of a file produced in 1970, January, the 1st. The log directory
@@ -202,17 +216,25 @@ where ``<section-dirname>`` is either ``no-section`` or
 Global Defaults
 ---------------
 
-- ``lwt-log://`` sinks are activated by default and configured to
-  output events of level at least ``Notice``. Their goal is the stdout logging.
+By default, the Octez binaries generate **user logs** as follows:
 
-- A file-descriptor-sink is activated to store logs from last seven days with
-  an ``Info`` level. The path is ``<node-data-dir>/daily-logs/``.
+- ``file-descriptor-stdout://`` sink is activated by default and configured to
+  output events of level at least ``Notice`` to stdout.
 
+The node and the baker additionally generate by default more detailed
+**internal logs** as follows:
 
-JSON Configuration Format
--------------------------
+- A file-descriptor-path sink is activated to store logs from last seven days with an
+  ``Info`` level. For the node, the path is ``<node-data-dir>/daily-logs/``. For
+  other tools, see the corresponding sections in this page.
 
-A configuration JSON blob, is an object with one field ``"active_sinks"``
+Configuration blob
+------------------
+
+Configuration blobs are used in various places: node configuration file,
+logging-configuration RPC, etc.
+
+A configuration blob is a JSON object with one field ``"active_sinks"``
 which contains a list of URIs:
 
 .. code:: javascript
@@ -221,17 +243,46 @@ which contains a list of URIs:
      "active_sinks": [ <list-of-sink-URIs> ]
    }
 
-The URIs are discriminated among the sink implementations above using
-their schemes and activated.
+The URIs, which are sink implementations taking any of the forms above, are
+configured according to their schemes and queries, and activated.
 
-It is used in various places: node configuration file,
-logging-configuration RPC, etc.
+In the following example two sinks are defined.
+
+.. code:: javascript
+
+   "active_sinks": [
+     "file-descriptor-stdout://?format=pp&level-at-least=notice&advertise-levels=true",
+     "file-descriptor-path://<path_to_log>/daily.log?daily-logs=7&format=one-per-line&level-at-least=info&create-dirs=true&chmod=0o640"
+   ]
+
+
+- The first one defines a sink on stdout that will print the logs at level at
+  least ``notice`` using the ``pp`` format and with advertise levels:
+
+.. code::
+
+   <005> 2025-10-10T12:33:27.197-00:00 [agnostic-agent.period_status] new block (BLfoQ7p5cV5nyyiSPFenQxmQfvqi8oqZbqvmG1rL3qwcnYD1F5U) on proposal period (remaining period duration 199)
+   <005> 2025-10-10T12:33:27.198-00:00 [023-PtSeouLo.delegate.denunciation.accuser_processed_block] block BLfoQ7p5cV5nyyiSPFenQxmQfvqi8oqZbqvmG1rL3qwcnYD1F5U registered
+
+- The second one defines rotated logs. Daily logs will be written in the
+  ``<path_to_log>/`` directory with a rotation every 7 days. Here, the format
+  will be ``one-per-line`` and level at least ``info`` giving more informative
+  logs.
+
+.. code::
+
+   {"fd-sink-item.v0":{"hostname":"host","time_stamp":1759939740.311383,"section":["agnostic-agent"],"event":{"period_status.v0":{"block":"BLkzCnfm6XYth9rZ4axJBAjpc5dnt23b9aZsrHchxAeDVbVMzj6","period":"proposal","remaining":100859}}}}
+   {"fd-sink-item.v0":{"hostname":"host","time_stamp":1759939748.555863,"section":["agnostic-agent"],"event":{"period_status.v0":{"block":"BMDApJyvZiZKkpgeTfupLGPwxrsYoU2hwaLcdn5H4g4fxRb3zmh","period":"proposal","remaining":100858}}}}
+
+This configuration blob should be included in ``"internal-events"`` of node config file and in
+``"internal_events"`` for client, accuser, baker config file.
+
 
 Environment Variables
 ---------------------
 
 The logging framework can be configured with environment variables
-before starting the node. Those variables work on all the code using the
+before starting an Octez executable (e.g., the node). Those variables work on all the code using the
 ``tezos-stdlib-unix`` library as long as ``Internal_event_unix.init`` is
 called; this should include *all* the regular ``octez-*`` binaries.
 
@@ -242,10 +293,9 @@ called; this should include *all* the regular ``octez-*`` binaries.
       to configuration JSON files (format above) to load (which
       themselves activate sinks).
 
--  ``TEZOS_LOG`` and ``LWT_LOG`` (with lower priority) contain “rules”
-   to configure the ``lwt-log://`` sink. The rules are expressed with a
-   DSL documented at
-   `Lwt_log_core <https://ocsigen.org/lwt/3.2.1/api/Lwt_log_core>`__:
+-  ``TEZOS_LOG`` and ``LWT_LOG`` (deprecated and has a lower priority) contain
+   “rules” to configure the default ``file-descriptor-stdout`` sink. The rules
+   are expressed with a DSL:
 
    -  rules are separated by semi-colons ``;``,
    -  each rule has the form ``pattern -> level``,
@@ -268,6 +318,8 @@ environment variable, see :ref:`context_component`.
 Node-Specific Configuration
 ---------------------------
 
+The node supports some additional means to configure logging, besides environment variables.
+
 Configuration File
 ~~~~~~~~~~~~~~~~~~
 
@@ -278,19 +330,25 @@ In particular the fields:
 
 -  ``"internal-events"`` contains a configuration of the sinks (format
    above).
--  ``"log"`` is an object which defines the configuration of the
-   ``lwt-log://`` sink; one can redirect the output to a file, set the
-   rules, and change the formatting template.
+-  ``"log"`` is an object which defines the configuration of the default
+   ``file-descriptor-stdout`` sink; one can redirect the output to a file, set
+   the rules, and change the formatting template. The goal of this configuration
+   field is to be simpler to express that ``internal-events`` for simpler
+   changes.
+
+Note that ``log`` is ignored if ``internal-events`` is present.
 
 Command Line Options
 ~~~~~~~~~~~~~~~~~~~~
 
-See ``octez-node run --help``, the ``lwt-log://`` sink configuration can
-be also changed with 2 options:
+See ``octez-node run --help``, the default ``file-descriptor-stdout://`` sink
+configuration can be also be changed with the following options:
 
 -  ``-v`` / ``-vv``: set the global log level to ``Info`` or ``Debug``
    respectively.
 -  ``--log-output``: set the output file.
+-  ``--log-coloring=<bool>``: enable or disable colors in the default stdout
+   logs. The default value is ``true``.
 
 RPC ``/config/logging``
 ~~~~~~~~~~~~~~~~~~~~~~~
@@ -300,9 +358,9 @@ The node exposes an administrative ``PUT`` endpoint:
 
 The input schema is the JSON configuration of the sinks. It
 deactivates all current sinks and activates the ones provided **except**
-the ``lwt-log://`` sink that is left untouched.
+the ``file-descriptor-stdout://`` sink that is left untouched.
 
-Example: (assuming the ``lwt-log://`` is active not to miss other
+Example: (assuming the ``file-descriptor-stdout://`` is active not to miss other
 events) this call adds a sink to suddenly start pretty-printing all
 ``rpc`` events to a ``/tmp/rpclogs`` file:
 
@@ -311,15 +369,21 @@ events) this call adds a sink to suddenly start pretty-printing all
    octez-client rpc put /config/logging with \
      '{ "active_sinks": [ "file-descriptor-path:///tmp/rpclogs?section-prefix=rpc:debug&format=pp&fresh=true" ] }'
 
-Client and Baking Daemons
--------------------------
+Client and baker configuration
+------------------------------
 
-For now, ``octez-client``, ``octez-{baker,accuser}-*``, etc.
-can only be configured using the environment variables.
+Both ``octez-client`` and ``octez-{baker,accuser}`` can be configured either
+using environment variables or using ``internal-events`` in the client configuration
+file, with the file-descriptor sinks described above.
 
-There is one common option ``--log-requests`` which can be used to trace
+There is also one common option ``--log-requests`` which can be used to trace
 all the interactions with the node (but it does *not* use the logging
 framework).
+
+By default, the baker also generates internal logs, which are stored at
+``<client-base-dir>/logs/octez-baker/*``. Hence, running two bakers
+(for two different accounts) with the same base
+directory is not recommended.
 
 Processing Structured Events
 ----------------------------

@@ -1,31 +1,18 @@
 (*****************************************************************************)
 (*                                                                           *)
-(* Open Source License                                                       *)
+(* SPDX-License-Identifier: MIT                                              *)
 (* Copyright (c) 2021 Nomadic Development. <contact@tezcore.com>             *)
-(*                                                                           *)
-(* Permission is hereby granted, free of charge, to any person obtaining a   *)
-(* copy of this software and associated documentation files (the "Software"),*)
-(* to deal in the Software without restriction, including without limitation *)
-(* the rights to use, copy, modify, merge, publish, distribute, sublicense,  *)
-(* and/or sell copies of the Software, and to permit persons to whom the     *)
-(* Software is furnished to do so, subject to the following conditions:      *)
-(*                                                                           *)
-(* The above copyright notice and this permission notice shall be included   *)
-(* in all copies or substantial portions of the Software.                    *)
-(*                                                                           *)
-(* THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR*)
-(* IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,  *)
-(* FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL   *)
-(* THE AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER*)
-(* LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING   *)
-(* FROM, OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER       *)
-(* DEALINGS IN THE SOFTWARE.                                                 *)
+(* Copyright (c) 2024 TriliTech <contact@trili.tech>                         *)
 (*                                                                           *)
 (*****************************************************************************)
 
-module Filter = struct
-  module Proto = Registerer.Registered
-  module Mempool = Plugin.Mempool
+module Validation = struct
+  include Registerer.Registered
+
+  module Plugin = struct
+    include Plugin.Mempool
+    include Plugin.Block_validation
+  end
 end
 
 module RPC = struct
@@ -39,8 +26,87 @@ module Metrics = struct
   let hash = Registerer.Registered.hash
 end
 
-let () = Shell_plugin.register_filter (module Filter)
+module Http_cache_headers = struct
+  include Plugin.Http_cache_headers
 
-let () = Shell_plugin.register_rpc (module RPC)
+  let hash = Registerer.Registered.hash
+end
 
-let () = Shell_plugin.register_metrics (module Metrics)
+module Shell_helpers = struct
+  include Plugin.Shell_helpers
+
+  let hash = Registerer.Registered.hash
+end
+
+let () = Protocol_plugin.register_validation_plugin (module Validation)
+
+let () = Protocol_plugin.register_rpc (module RPC)
+
+let () = Protocol_plugin.register_metrics (module Metrics)
+
+let () =
+  Protocol_plugin.register_http_cache_headers_plugin (module Http_cache_headers)
+
+let () = Protocol_plugin.register_shell_helpers (module Shell_helpers)
+
+module Delegators_contribution_plugin = struct
+  let hash = Registerer.Registered.hash
+
+  let delegated_breakdown_at_sampling context ~cycle ~delegate_pkh =
+    let open Lwt_result_syntax in
+    let*? delegate_pkh =
+      Signature.Of_V_latest.get_public_key_hash delegate_pkh
+    in
+    let* output =
+      Delegators_contribution.delegated_breakdown_at_sampling
+        context
+        ~cycle
+        ~delegate_pkh
+    in
+    match output with
+    | `Ok
+        {
+          min_delegated_amount;
+          min_delegated_level;
+          overstaked;
+          total_delegated_including_overdelegated;
+          total_delegated_after_limits;
+          overdelegated;
+        } ->
+        return
+          (`Ok
+             {
+               Protocol_plugin.min_delegated_amount;
+               min_delegated_level;
+               overstaked;
+               total_delegated_including_overdelegated;
+               total_delegated_after_limits;
+               overdelegated;
+             })
+    | (`Retry_at_level _ | `Cycle_too_far_in_future) as x -> return x
+
+  let min_delegated_breakdown context ~delegate_pkh =
+    let open Lwt_result_syntax in
+    let*? delegate_pkh =
+      Signature.Of_V_latest.get_public_key_hash delegate_pkh
+    in
+    let* {
+           total_delegated;
+           own_delegated;
+           delegators_contributions;
+           former_delegators_unstake_requests;
+         } =
+      Delegators_contribution.min_delegated_breakdown context ~delegate_pkh
+    in
+    return
+      {
+        Protocol_plugin.total_delegated;
+        own_delegated;
+        delegators_contributions;
+        former_delegators_unstake_requests;
+      }
+end
+
+let () =
+  Protocol_plugin.register_delegators_contribution
+    (module Delegators_contribution_plugin)

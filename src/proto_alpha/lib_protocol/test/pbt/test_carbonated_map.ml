@@ -26,8 +26,8 @@
 (** Testing
     -------
     Component:    Protocol Library
-    Invocation:   dune exec \
-                  src/proto_alpha/lib_protocol/test/pbt/test_carbonated_map.exe
+    Invocation:   dune exec src/proto_alpha/lib_protocol/test/pbt/main.exe \
+                  -- --file test_carbonated_map.ml
     Subject:      Operations in Carbonated_map
 *)
 
@@ -79,9 +79,9 @@ let pp_int_map fmt map =
   in
   Lwt_main.run
     (let open Lwt_result_syntax in
-    let* ctxt = new_ctxt () in
-    let*?@ kvs, _ = CM.to_list ctxt map in
-    return kvs)
+     let* ctxt = new_ctxt () in
+     let*?@ kvs, _ = CM.to_list ctxt map in
+     return kvs)
   |> Result.value_f ~default:(fun () -> assert false)
   |> Format.fprintf fmt "%a" pp
 
@@ -108,8 +108,7 @@ let unit_test name f =
 
 type Environment.Error_monad.error += Dummy_error
 
-let dummy_fail =
-  Result.error (Environment.Error_monad.trace_of_error Dummy_error)
+let dummy_fail = Error (Environment.Error_monad.trace_of_error Dummy_error)
 
 let assert_map_contains ctxt map expected =
   let open Result_syntax in
@@ -162,7 +161,7 @@ let test_update_replace =
 (** Test merging when ignoring new overlapping keys. *)
 let test_merge_overlaps_left =
   let open Result_syntax in
-  unit_test "Merge overlap keep existing" @@ fun () ->
+  unit_test "Merge overlaps left" @@ fun () ->
   let ctxt = unsafe_new_context () in
   let* map, ctxt =
     CM.of_list
@@ -315,7 +314,7 @@ let test_size =
   int_map_test "Size returns the number of elements" @@ fun map ->
   let ctxt = unsafe_new_context () in
   let* kvs, _ = CM.to_list ctxt map in
-  Result.ok Compare.List_length_with.(kvs = CM.size map)
+  return Compare.List_length_with.(kvs = CM.size map)
 
 (** Test that all keys of a map are found. *)
 let test_find_existing =
@@ -331,7 +330,7 @@ let test_find_existing =
       ctxt
       kvs
   in
-  Ok true
+  return_true
 
 (** Test that find returns [None] for non-existing keys. *)
 let test_find_non_existing =
@@ -389,7 +388,7 @@ let test_size_merge_self =
 let test_merge_fail =
   int_map_test "Merging with failing merge-overlap" @@ fun map ->
   let ctxt = unsafe_new_context () in
-  Result.ok
+  Result.return
     (match CM.merge ctxt ~merge_overlap:(fun _ _ _ -> dummy_fail) map map with
     | Ok _ when CM.size map = 0 -> true
     | Ok _ -> false
@@ -485,7 +484,7 @@ let test_fold_to_list =
 let test_map_fail =
   int_map_test "Test map with failing function" @@ fun map ->
   let ctxt = unsafe_new_context () in
-  Result.ok
+  Result.return
     (match CM.map_e ctxt (fun _ctxt _key _val -> dummy_fail) map with
     | Ok _ when CM.size map = 0 -> true
     | Error _ -> true
@@ -545,6 +544,4 @@ let tests ~rand = qcheck_wrap ~rand qcheck_tests @ unit_tests
 let () =
   (* Ensure deterministic results. *)
   let rand = Random.State.make [|0x1337533D; 71287309; 397060904|] in
-  Alcotest.run
-    "protocol > pbt > carbonated map"
-    [(Protocol.name ^ ": Carbonated map", tests ~rand)]
+  Alcotest.run ~__FILE__ Protocol.name [("Carbonated map", tests ~rand)]

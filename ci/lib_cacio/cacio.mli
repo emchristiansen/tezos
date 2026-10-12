@@ -1,0 +1,549 @@
+(*****************************************************************************)
+(*                                                                           *)
+(* SPDX-License-Identifier: MIT                                              *)
+(* Copyright (c) 2025 Nomadic Labs. <contact@nomadic-labs.com>               *)
+(*                                                                           *)
+(*****************************************************************************)
+
+(** Pipeline stages.
+
+    [Start] jobs are for internal use only.
+    The [Start] stage is meant to contain either the manual [trigger] job
+    or [datadog_pipeline_trace], i.e. what needs to be done before anything else.
+    Jobs defined with Cacio outside of Cacio itself should thus not use this stage.
+
+    The purpose of [Build] jobs is to produce artifacts for other jobs.
+    They can depend on other build jobs.
+    If there is no job that uses the artifacts of a build job,
+    the build job should not be included.
+    If you intend to include a build job as a test,
+    consider having it in the [Test] stage instead,
+    or add some actual tests that use the artifacts from the build job.
+
+    The purpose of [Test] jobs is to make sure that pipelines fail if something looks wrong.
+    They typically use artifacts from build jobs.
+    Test jobs should only depend on build jobs that build the artifacts that they are testing.
+    Test jobs usually do not depend on other test jobs,
+    with the exception of jobs that aggregate debug artifacts.
+    Test jobs typically produce debug artifacts such as reports and logs,
+    but not artifacts that are used by other jobs,
+    except jobs that aggregate debug artifacts.
+
+    The purpose of [Publish] jobs is to publish artifacts from build jobs
+    somewhere more convenient than GitLab artifacts.
+    Publish jobs should only depend on build jobs that build the artifacts
+    that they are publishing. They can also depend on test jobs to prevent
+    publishing broken artifacts, and on other publish jobs if order matters.
+
+    The purpose of [Test_publication] jobs is to check the result of [Publish] jobs,
+    usually the fact that the artefacts have been published correctly.
+    In theory this should rather be done in [Publish] jobs themselves,
+    so that they can un-publish the artifacts, but some legacy jobs separate the
+    publication from the test. New jobs should avoid using [Test_publication].
+
+    There is no need to include [Build] jobs explicitly in pipelines.
+    One should only list [Test] and [Publish] jobs and let Cacio automatically
+    include the relevant build jobs that they depend on.
+    This reflects the fact that the purpose of build jobs is only to
+    make artifacts for other jobs. *)
+type stage = Start | Build | Test | Publish | Test_publication
+
+(** Dependency relationships.
+
+    - [Job]: do not download artifacts of the dependency.
+      A typical use case is to prevent [Publish] jobs from running
+      before some [Test] jobs succeed, without losing time downloading test reports.
+
+    - [Artifacts]: download artifacts of the dependency. *)
+type need = Job | Artifacts
+
+(** Configuration of sccache. *)
+type sccache_config
+
+(** Make an sccache configuration.
+
+    [error_log]: value of the [SCCACHE_ERROR_LOG] environment variable.
+    [log]: value of the [SCCACHE_LOG] environment variable.
+    [policy]: influences the value of the [SCCACHE_GCS_RW_MODE] environment variable
+    ([READ_WRITE] for push and pull-push policies, [READ_ONLY] otherwise). *)
+val sccache :
+  ?error_log:string ->
+  ?log:string ->
+  ?policy:Gitlab_ci.Types.cache_policy ->
+  unit ->
+  sccache_config
+
+(** Pipeline jobs.
+
+    Jobs are basically code to run in a given pipeline stage. *)
+type job
+
+(** How a job is triggered.
+
+    - [Auto]: the job is triggered automatically once all of its dependencies succeed.
+      This includes the [trigger] job for pipelines that have one.
+    - [Immediate]: same as [Auto], but do not wait for the [trigger] job.
+    - [Manual]: the job can be triggered manually once all of its dependencies succeed.
+
+    Dependencies of [Immediate] jobs must themselves be [Immediate].
+
+    If a job [job] is added automatically, its trigger depends on its reverse dependencies.
+    - If there is an [Immediate] reverse dependency, [job] is added as [Immediate].
+    - Else, if there is an [Auto] reverse dependency, [job] is added as [Auto].
+    - Else, all reverse dependencies are [Manual], so [job] is added as [Manual]. *)
+type trigger = Auto | Immediate | Manual
+
+(** Memoize a function.
+
+    The intended use case is to parameterize jobs without duplicating them by mistake.
+    For instance:
+    {[
+      let my_job =
+        parameterize @@ fun stage ->
+        parameterize @@ fun image ->
+        job ~stage ~image ...
+    ]}
+
+    [my_job] always returns the same job when given the same parameters.
+    This means that you can apply [my_job] in multiple places with the same parameters
+    without duplicating the job in the CI.
+
+    If you instead defined [my_job] as a function directly, like this:
+    {[
+      let my_job stage image =
+        job ~stage ~image ...
+    ]}
+    then the risk of duplicating jobs by mistake would be really high.
+    For instance, if you wrote [~needs: [my_job Build debian_trixie]]
+    in two places to include this job as a dependency of two jobs in the same pipeline,
+    this dependency would be included twice, since each application of [my_job]
+    would return a different job (even if those different jobs had the same name).
+
+    Note that [parameterize] does not automatically parameterize a job's name.
+    If you intend to include multiple instances of [my_job] in the same pipeline,
+    you should compute a name that differs according to the parameters.
+    [parameterize] knows nothing about jobs.
+
+    The parameter type ['a] must be hashable by [Hashtbl]. *)
+val parameterize : ('a -> 'b) -> 'a -> 'b
+
+module type COMPONENT = sig
+  (** Description of a component (argument of the {!Make} functor). *)
+
+  (** Component name.
+
+      This is added as a prefix to jobs and pipelines of this component.
+      It should thus be short.
+
+      Release tags are prefixed by the lowercase version of [name].
+      So names must be valid identifiers. *)
+  val name : string
+
+  (** Files that belong to the component.
+
+      This is added as [changes] clauses for jobs of this component
+      in the [before_merging] pipeline. *)
+  val paths : string list
+end
+
+module type COMPONENT_API = sig
+  (** Functions that components can use to define their CI (result of the {!Make} functor). *)
+
+  (** Define a job.
+
+      This function must only be called once per job. See {!parameterize}.
+
+      Usage:
+      {[
+        job name
+          ~__POS__
+          ~stage: ...
+          ~description: ...
+          ~image: ...
+          [
+            (* script *)
+          ]
+      ]}
+
+      This defines a job named [name] prefixed by the name of the component.
+      The job can then be added to multiple pipelines using other functions
+      from this module.
+
+      Jobs themselves do not carry their [!trigger].
+      Instead, each pipeline can decide to add jobs with a different trigger.
+
+      When added to the [before_merging] or [merge_train] pipeline,
+      jobs are only included to the pipeline if
+      any file listed in [only_if_changed] has been modified,
+      or if the merge request has any label listed in [force_if_label],
+      or if [force] is set to [true].
+      [only_if_changed] can include glob patterns such as [dir/**/*.ml].
+      Its default value is the [paths] of the current component.
+
+      The job will not start before all [needs] jobs succeed.
+      Additionally, [needs] are automatically added to pipelines in which the job
+      is present if they are not already present.
+
+      If [cargo_cache] is [true], the resulting job caches some subdirectories
+      of [.cargo] using GitLab's cache. It also allows cargo to access the network.
+      Default is [false].
+
+      If [sccache] is specified, the resulting job use sccache.
+      This does not use GitLab's cache.
+      Using sccache also forces incremental build in cargo.
+
+      If [dune_cache] is [true], the resulting job uses dune's cache,
+      stored in GitLab's cache. The cache is per job name. Default is [false].
+
+      [?image_dependencies] is temporary,
+      it will be removed once the image feature is implemented in Cacio.
+      See the Future work section for more details.
+
+      [?script] is used to specify the job's script.
+
+      See {!Tezos_ci.job} for information about other arguments.
+
+      The default number of retries is 0 for [Publish] jobs.
+      Other jobs use the value defined in [.gitlab-ci.yml].
+      You can force a specific value with [~retry]. *)
+  val job :
+    __POS__:string * int * int * int ->
+    stage:stage ->
+    description:string ->
+    ?provider:Tezos_ci.Runner.Provider.t ->
+    ?arch:Tezos_ci.Runner.Arch.t ->
+    ?cpu:Tezos_ci.Runner.CPU.t ->
+    ?storage:Tezos_ci.Runner.Storage.t ->
+    ?tag:Tezos_ci.Runner.Tag.t ->
+    ?image:Tezos_ci.Image.t ->
+    ?only_if_changed:string list ->
+    ?force:bool ->
+    ?force_if_label:string list ->
+    ?needs:(need * job) list ->
+    ?parallel:Gitlab_ci.Types.parallel ->
+    ?environment:Gitlab_ci.Types.environment ->
+    ?variables:Gitlab_ci.Types.variables ->
+    ?artifacts:Gitlab_ci.Types.artifacts ->
+    ?cache:Gitlab_ci.Types.cache list ->
+    ?cargo_cache:bool ->
+    ?sccache:sccache_config ->
+    ?dune_cache:bool ->
+    ?disable_datadog:bool ->
+    ?allow_failure:Gitlab_ci.Types.allow_failure_job ->
+    ?retry:Gitlab_ci.Types.retry ->
+    ?timeout:Gitlab_ci.Types.time_interval ->
+    ?image_dependencies:Tezos_ci.Image.t list ->
+    ?services:Gitlab_ci.Types.service list ->
+    ?id_tokens:Gitlab_ci.Types.id_tokens ->
+    ?script:string list ->
+    string ->
+    job
+
+  (** Time interval for timeouts passed to {!tezt_job}. *)
+  type tezt_timeout = No_timeout | Minutes of int
+
+  (** Define a job that runs Tezt tests.
+
+      Just like {!job}, this function must only be called once per job. See {!parameterize}.
+
+      The main [string] argument is the name of the job.
+      It will be prefixed by the name of the component.
+
+      General parameters:
+      - [tezt_exe] is the path to the Tezt executable, relative to [_build/default/].
+        It defaults to [tezt/tests/main.exe]. This executable is assumed to have been
+        built by another job, which you must specify as a dependency with an [Artifacts]
+        [~needs].
+      - [before_script] is prepended to the job's script.
+
+      Timeouts:
+      - [global_timeout] is Tezt's [--global-timeout].
+        It defaults to 30 minutes.
+        Do not set it to [No_timeout] unless you have a VERY good reason.
+      - If [global_timeout] is specified,
+        the main Tezt call is wrapped under the [timeout] command,
+        causing [SIGTERM] to be sent to Tezt after [global_timeout] plus 1 minute,
+        and [SIGKILL] to be sent 1 more minute after that.
+      - If [global_timeout] is specified,
+        the CI job itself also gets a timeout of [global_timeout] plus 10 minutes.
+      - [test_timeout] is Tezt's [--test-timeout].
+        It defaults to 9 minutes.
+
+      Parallel execution:
+      - [parallel_jobs] is GitLab's [parallel:] field.
+        It is the number of CI jobs that are spawned to run in parallel.
+        It defaults to 1.
+      - [parallel_tests] is Tezt's [--job-count].
+        It is the maximum number of tests that Tezt shall run in parallel in a given CI job.
+        It defaults to 6.
+
+      Error handling:
+      - [retry_jobs] is GitLab's [retry:] field.
+        It allows GitLab to re-launch jobs that failed.
+        By default, there is no retry.
+      - [retry_tests] is Tezt's [--retry].
+        It allows Tezt to re-run tests that failed.
+        By default, there is no retry.
+      - Tezt's [--keep-going] is set if, and only if [pipeline] is [`scheduled].
+
+      Test selection:
+      - Manifezt is active if, and only if [pipeline] is [`merge_request]
+        and [select_tezts] is [true] (which is the default).
+        When active, it causes the job to depend on the [select_tezts] job,
+        which is automatically added to the pipeline if necessary.
+      - [test_selection] is a TSL expression.
+        TSL is the Test Selection Language fo Tezt.
+        It allows to select a subset of tests to run.
+        It defaults to [True], i.e. "run all tests".
+
+      For other arguments, see the documentation of the [job] function above. *)
+  val tezt_job :
+    __POS__:string * int * int * int ->
+    pipeline:[`merge_request | `scheduled] ->
+    description:string ->
+    ?provider:Tezos_ci.Runner.Provider.t ->
+    ?arch:Tezos_ci.Runner.Arch.t ->
+    ?cpu:Tezos_ci.Runner.CPU.t ->
+    ?storage:Tezos_ci.Runner.Storage.t ->
+    ?tag:Tezos_ci.Runner.Tag.t ->
+    ?only_if_changed:string list ->
+    ?needs:(need * job) list ->
+    ?disable_datadog:bool ->
+    ?allow_failure:Gitlab_ci.Types.allow_failure_job ->
+    ?tezt_exe:string ->
+    ?global_timeout:tezt_timeout ->
+    ?test_timeout:tezt_timeout ->
+    ?parallel_jobs:int ->
+    ?parallel_tests:int ->
+    ?retry_jobs:int ->
+    ?retry_tests:int ->
+    ?test_selection:Tezt_core.TSL_AST.t ->
+    ?before_script:string list ->
+    ?select_tezts:bool ->
+    string ->
+    job
+
+  (** Register a scheduled pipeline for this component.
+
+      Usage: [register_scheduled_pipeline ~description name jobs]
+
+      [name] can typically be ["daily"] or ["weekly"].
+      The actual name of the pipeline will automatically be prefixed
+      by the name of the component.
+
+      This does not actually register the pipeline in GitLab.
+      The pipeline must manually be set up in GitLab
+      to run with variable [TZ_SCHEDULE_KIND] equal to the name of the pipeline
+      (including the prefix, which is the component's name). *)
+  val register_scheduled_pipeline :
+    description:string -> string -> (trigger * job) list -> unit
+
+  (** {2 Releases} *)
+
+  (** This section contains functions to define jobs for release pipelines.
+      In the future, these functions may be replaced by something more abstract.
+      (See the future work section at the end of the file.) *)
+
+  (** Register jobs to be included in the release pipeline of the current component.
+
+      This pipeline is for releasing this component separately.
+      It runs in [tezos/tezos].
+
+      This function must be called only once per component.
+
+      [tag_rex] allows to specify a custom tag regular expression.
+      It is registered to be returned by {!get_release_tag_rexes}.
+
+      Not implemented for the [Shared] component. *)
+  val register_dedicated_release_pipeline :
+    ?tag_rex:string -> (trigger * job) list -> unit
+
+  (** Register jobs to be included in the test release pipeline of the current component.
+
+      This pipeline is for testing the release of this component separately.
+      It runs in namespaces other than [tezos].
+
+      This function must be called only once per component.
+
+      [tag_rex] allows to specify a custom tag regular expression.
+      It is registered to be returned by {!get_release_tag_rexes}.
+
+      Not implemented for the [Shared] component. *)
+  val register_dedicated_test_release_pipeline :
+    ?tag_rex:string -> (trigger * job) list -> unit
+
+  (** Register jobs to be included in the prerelease pipeline of the current component.
+
+      This pipeline is for releasing release candidates of this component separately.
+      It runs in [tezos/tezos].
+
+      This function must be called only once per component.
+
+      [tag_rex] allows to specify a custom tag regular expression.
+      It is registered to be returned by {!get_release_tag_rexes}.
+
+      Not implemented for the [Shared] component. *)
+  val register_dedicated_prerelease_pipeline :
+    ?tag_rex:string -> (trigger * job) list -> unit
+
+  (** Register jobs to be included in the test prerelease pipeline of the current component.
+
+      This pipeline is for testing the prerelease of this component separately.
+      It runs in namespaces other than [tezos].
+
+      This function must be called only once per component.
+
+      [tag_rex] allows to specify a custom tag regular expression.
+      It is registered to be returned by {!get_release_tag_rexes}.
+
+      Not implemented for the [Shared] component. *)
+  val register_dedicated_test_prerelease_pipeline :
+    ?tag_rex:string -> (trigger * job) list -> unit
+end
+
+(** The main functor of Cacio. *)
+module Make (_ : COMPONENT) : COMPONENT_API
+
+(** An instance of [Make] for jobs with no component.
+
+    Only use this if you have a good reason, as jobs should usually belong to components.
+    Add a comment next to your job definitions to justify this reason. *)
+module Shared : COMPONENT_API
+
+(** {2 Global pipelines} *)
+
+(** Global pipelines.
+
+    Global pipelines are pipelines that are shared between components:
+    several components can add jobs to them with {!register_jobs}, and no
+    single component owns them.
+
+    Cacio does not define any global pipeline itself: use
+    {!new_global_pipeline} to define one. *)
+type global_pipeline
+
+(** Define a global pipeline outside of Cacio.
+
+    [new_global_pipeline ~description name rule] defines a global pipeline
+    named [name], that GitLab creates when [rule] holds. Components can then
+    add jobs to it with {!register_jobs}, and {!close} registers it with CIAO
+    once all jobs have been added.
+
+    [rule] is lazy because it is only forced by {!close}, i.e. once all
+    components have been initialized. Some rules need this: the rule of the
+    [non_release_tag] pipelines is defined from the release tags of all
+    components (see {!get_release_tag_rexes}), which are only all known once
+    every component has declared its release pipelines.
+
+    [description] is printed by [ci/bin/main.exe --list-pipelines].
+    Its first sentence should be short (<= 80 characters) and be followed by
+    two new-lines. The remainder should detail what the pipeline does, why we
+    do it, when it happens, how, and by whom it is triggered.
+
+    If [variables] is set, these variables are added to the [workflow:] clause
+    of this pipeline. Similarly for [auto_cancel].
+
+    The other arguments control how the jobs of this pipeline are converted:
+    - if [interruptible_pipeline] is [false], jobs are not interruptible
+      (for instance, scheduled pipelines usually are not supposed to be interruptible);
+    - if [interruptible_publish] is [true], jobs of the [Publish] stage are
+      interruptible;
+    - if [with_condition] is [true], the conditions of jobs (see [only_if])
+      are taken into account; use this for merge request pipelines only,
+      as other pipelines run all of their jobs unconditionally;
+    - if [with_job_trigger] is [true], the manual [trigger] job is added to the
+      pipeline and all jobs that are not [Immediate] or [Manual] are made to
+      depend on it;
+    - if [with_datadog_pipeline_trace] is [false], the
+      [datadog_pipeline_trace] job is not added to the pipeline
+      (it is added by default);
+    - if [allow_manual_jobs] is [false], {!register_jobs} refuses [Manual]
+      jobs for this pipeline. *)
+val new_global_pipeline :
+  ?variables:Gitlab_ci.Types.variables ->
+  ?auto_cancel:Gitlab_ci.Types.auto_cancel ->
+  ?interruptible_pipeline:bool ->
+  ?interruptible_publish:bool ->
+  ?with_condition:bool ->
+  ?with_job_trigger:bool ->
+  ?with_datadog_pipeline_trace:bool ->
+  ?allow_manual_jobs:bool ->
+  description:string ->
+  string ->
+  Gitlab_ci.If.t Lazy.t ->
+  global_pipeline
+
+(** Add jobs to a given global pipeline. *)
+val register_jobs : global_pipeline -> (trigger * job) list -> unit
+
+(** {2 Listing registered jobs and more} *)
+
+(** Only call these functions after all jobs are registered. *)
+
+(** Register all pipelines that were defined with {!new_global_pipeline}
+    with CIAO.
+
+    After that, it is no longer possible to register new jobs and pipelines:
+    the set of pipelines is closed. *)
+val close : unit -> unit
+
+(** Regular expressions that match release tags.
+
+    Those are the tags of the release pipelines that components declared with
+    the [register_dedicated_*_pipeline] functions of {!COMPONENT_API}.
+    Used to define the pipelines that run on tags which are {e not} release
+    tags. Only call this once all components have been initialized:
+    {!close} is what guarantees it, since it forces the rules of pipelines. *)
+val get_release_tag_rexes : unit -> string list
+
+(** Get the names and locations of the jobs that were registered with the [job] function. *)
+val get_declared_jobs :
+  unit -> (string * int * int * int) Gitlab_ci.Base.String_map.t
+
+(** {2 Other} *)
+
+(** Output the list of Tezt jobs, as well as some of their parameters, to a file.
+
+    The file can be read by [tezt/stats]. *)
+val output_tezt_job_list : string -> unit
+
+(** {2 Future work} *)
+
+(** Ideally, all components would only have a single path (their toplevel directory).
+    For now, we choose to allow multiple paths, so that:
+    - one can migrate old components more easily;
+    - one can continue to run tests of a component if one of its dependencies is modified
+      (by including the paths of these dependencies in the list of paths for
+      this component). *)
+
+(** Instead of having one [register_*_release_jobs] function per release pipeline,
+    it would be better if components only declared WHAT they want to release, not HOW.
+    Components could give a list of build jobs, and for each of them they could specify
+    which artifacts are meant to be published, as well as which Docker images.
+    It should be possible to generate everything else just from this information.
+    This abstraction could guarantee important invariants like:
+    - a test release must not create a GitLab release on [tezos/tezos];
+    - there is only one job that creates a GitLab release in each pipeline
+      (unless we actually want one per component as well, in which case
+      the invariant becomes: there is exactly one job per component, plus a global one);
+    - our release page is only updated by actual release pipelines
+      (other pipelines can update the test release page instead);
+    - Docker images are only pushed to Docker Hub in actual release pipelines,
+      not test release pipelines (those can use the GitLab registry instead for instance);
+    - ... *)
+
+(** Another idea would be to have the default ~force_if_label be ["ci--" ^ component_name].
+    Or to automatically add this label to the list. *)
+
+(** Pipelines that are declared by components, with the
+    [register_*_pipeline] functions of {!COMPONENT_API}, are registered with
+    CIAO as soon as they are declared, since all of their jobs are given at
+    that point. They could instead be defined with {!new_global_pipeline}
+    (renamed into [new_pipeline]) and registered by {!close} like global
+    pipelines, which would unify the two code paths. The value of doing so is
+    low though: it would not make Cacio more modular. *)
+
+(** The function [job] currently takes [?image_dependencies] as an optional argument.
+    This is temporary and should be replaced by ~needs:[job_to_build_image]
+    once all the images have been migrated to Cacio.
+    In that case, Cacio would add the [job_to_build_image] in the pipeline, as a dependency. *)

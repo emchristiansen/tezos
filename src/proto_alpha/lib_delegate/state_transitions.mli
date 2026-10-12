@@ -29,6 +29,7 @@
 open Protocol
 open Alpha_context
 open Baking_state
+open Baking_state_types
 open Baking_actions
 
 val do_nothing : state -> (state * action) Lwt.t
@@ -38,60 +39,48 @@ type proposal_acceptance = Invalid | Outdated_proposal | Valid_proposal
 val is_acceptable_proposal_for_current_level :
   state -> proposal -> proposal_acceptance Lwt.t
 
-val make_consensus_list :
-  state -> proposal -> (consensus_key_and_delegate * consensus_content) list
+val make_consensus_vote_batch :
+  state -> proposal -> consensus_vote_kind -> unsigned_consensus_vote_batch
 
 val may_update_proposal :
   is_proposal_applied:bool -> state -> proposal -> state Lwt.t
 
-val preendorse : state -> proposal -> (state * action) Lwt.t
+val preattest : state -> proposal -> (state * action) Lwt.t
 
-val extract_pqc :
-  state -> proposal -> (Kind.preendorsement operation list * Round.t) option
+val extract_pqc : state -> proposal -> (packed_operation list * Round.t) option
 
 val handle_proposal :
   is_proposal_applied:bool -> state -> proposal -> (state * action) Lwt.t
 
-val round_proposer :
-  state ->
-  (consensus_key_and_delegate * endorsing_slot) SlotMap.t ->
-  Round.t ->
-  (consensus_key_and_delegate * endorsing_slot) option
-
-val propose_fresh_block_action :
-  endorsements:Kind.endorsement Operation.t list ->
-  dal_attestations:Kind.dal_attestation Operation.t list ->
-  ?last_proposal:block_info ->
-  predecessor:block_info ->
-  state ->
-  consensus_key_and_delegate ->
-  Round.t ->
-  action Lwt.t
-
+(** Propose a block at the start of the given round for the given delegate,
+    given that there was already a proposal at the current level, the last one
+    being [last_proposal]. *)
 val propose_block_action :
-  state -> consensus_key_and_delegate -> Round.t -> proposal -> action Lwt.t
+  state -> Delegate.t -> Round.t -> last_proposal:proposal -> action Lwt.t
 
 (** Increase the current round and propose at the new round (same
-   level), if the baker has a proposer slot. *)
+    level), if the baker has a proposer slot. *)
 val end_of_round : state -> Round.t -> (state * action) Lwt.t
 
-(** Propose (if possible) for the first time at a new level. *)
-val time_to_bake_at_next_level : state -> Round.t -> (state * action) Lwt.t
+(** Propose for the first time at a level at the given round. There was no
+    previous proposal at the current level. *)
+val time_to_prepare_next_level_block :
+  state -> Round.t -> (state * action) Lwt.t
 
 val update_locked_round : state -> Round.t -> Block_payload_hash.t -> state
 
-val make_endorse_action : state -> proposal -> action
+val prepare_attest_action : state -> proposal -> action
 
-val prequorum_reached_when_awaiting_preendorsements :
+val prequorum_reached_when_awaiting_preattestations :
   state ->
   Operation_worker.candidate ->
-  Kind.preendorsement operation list ->
+  Kind.preattestation operation list ->
   (state * action) Lwt.t
 
-val quorum_reached_when_waiting_endorsements :
+val quorum_reached_when_waiting_attestations :
   state ->
   Operation_worker.candidate ->
-  Kind.endorsement operation list ->
+  Kind.attestation operation list ->
   (state * action) Lwt.t
 
 val step : state -> event -> (state * action) Lwt.t

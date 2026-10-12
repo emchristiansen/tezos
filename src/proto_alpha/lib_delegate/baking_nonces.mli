@@ -2,6 +2,7 @@
 (*                                                                           *)
 (* Open Source License                                                       *)
 (* Copyright (c) 2021 Nomadic Labs <contact@nomadic-labs.com>                *)
+(* Copyright (c) 2024 TriliTech <contact@trili.tech>                         *)
 (*                                                                           *)
 (* Permission is hereby granted, free of charge, to any person obtaining a   *)
 (* copy of this software and associated documentation files (the "Software"),*)
@@ -26,89 +27,61 @@
 open Protocol
 open Alpha_context
 
-type state = {
-  cctxt : Protocol_client_context.full;
-  chain : Chain_services.chain;
-  constants : Constants.t;
-  config : Baking_configuration.nonce_config;
-  nonces_location : [`Nonce] Baking_files.location;
-  mutable last_predecessor : Block_hash.t;
-}
+type state
 
 type t = state
 
-type nonces = Nonce.t Block_hash.Map.t
+(** [nonces] is a hash map corresponding to the data which can be found in the
+    file from [nonces_location] *)
+type nonces
 
-val empty : Nonce.t Block_hash.Map.t
-
-val encoding : Nonce.t Block_hash.Map.t Data_encoding.t
-
+(** [load wallet location] loads the file corresponding to [location] and
+    returns a data structure containing the stored information. *)
 val load :
   #Client_context.wallet ->
-  [< `Highwatermarks | `Nonce | `State] Baking_files.location ->
-  Nonce.t Block_hash.Map.t tzresult Lwt.t
+  stateful_location:[`Stateful_nonce] Baking_files.location ->
+  nonces tzresult Lwt.t
 
-val save :
-  #Client_context.wallet ->
-  [< `Highwatermarks | `Nonce | `State] Baking_files.location ->
-  Nonce.t Block_hash.Map.t ->
-  unit tzresult Lwt.t
-
-val mem : Nonce.t Block_hash.Map.t -> Block_hash.t -> bool
-
-val find_opt : Nonce.t Block_hash.Map.t -> Block_hash.t -> Nonce.t option
-
-val get_block_level_opt :
-  #Tezos_rpc.Context.simple ->
-  chain:Block_services.chain ->
-  block:Block_services.block ->
-  int32 option Lwt.t
-
-val get_outdated_nonces :
-  t ->
-  Nonce.t Block_hash.Map.t ->
-  (Nonce.t Block_hash.Map.t * Nonce.t Block_hash.Map.t) tzresult Lwt.t
-
-val filter_outdated_nonces :
-  t -> Nonce.t Block_hash.Map.t -> Nonce.t Block_hash.Map.t tzresult Lwt.t
-
-val blocks_from_current_cycle :
-  t ->
-  Block_services.block ->
-  ?offset:int32 ->
-  unit ->
-  Block_hash.t list tzresult Lwt.t
-
-val get_unrevealed_nonces :
-  t -> Nonce.t Block_hash.Map.t -> (Raw_level.t * Nonce.t) list tzresult Lwt.t
-
+(** [generate_seed_nonce nonce_config delegate level] computes a nonce via a
+    [Deterministic] or [Random] approach, depending on the [nonce_config]
+    argument; the deterministic case uses as parameters [delegate] and [level]. *)
 val generate_seed_nonce :
+  ?timeout:float ->
   Baking_configuration.nonce_config ->
-  Baking_state.consensus_key ->
+  Baking_state_types.Key.t ->
   Raw_level.t ->
   (Nonce_hash.t * Nonce.t) tzresult Lwt.t
 
+(** [register_nonce cctxt ~chain_id block_hash nonce ~cycle ~level ~round] updates
+    the contents from the nonces file located using [cctxt] and [~chain_id] by
+    adding a new entry or replacing an existing one of the form
+    [block_hash] : [nonce] * [~cycle] * [~level] * [~round]. *)
 val register_nonce :
   #Protocol_client_context.full ->
   chain_id:Chain_id.t ->
   Block_hash.t ->
   Nonce.t ->
+  cycle:Cycle.t ->
+  level:Raw_level.t ->
+  round:Round.t ->
   unit tzresult Lwt.t
 
-val inject_seed_nonce_revelation :
-  #Protocol_client_context.full ->
-  chain:Chain_services.chain ->
-  block:Block_services.block ->
-  branch:Block_hash.t ->
-  (Raw_level.t * Nonce.t) list ->
-  unit tzresult Lwt.t
+(** [start_revelation_worker cctxt config chain_id constants] starts the
+    continuous process of monitoring block proposals to determine when nonces
+    should be revealed. The internal state is created from [cctxt],
+    [~extra_nodes], [config], [chain_id] and [constants].
 
-val reveal_potential_nonces : t -> Baking_state.proposal -> unit tzresult Lwt.t
+    The function returns a canceller to stop the worker and a callback function
+    to push new block proposals for processing. The callback takes a [cctxt] to
+    identify which node the proposal came from, and the [proposal] itself.
 
+    Nonce revelations will be injected to all nodes ([cctxt] and [~extra_nodes])
+    in parallel. *)
 val start_revelation_worker :
   Protocol_client_context.full ->
   Baking_configuration.nonce_config ->
   Chain_id.t ->
   Constants.t ->
-  Baking_state.proposal Lwt_stream.t ->
-  Lwt_canceler.t Lwt.t
+  (Lwt_canceler.t
+  * (Protocol_client_context.full -> Baking_state_types.proposal -> unit))
+  Lwt.t

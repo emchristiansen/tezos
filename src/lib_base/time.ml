@@ -112,8 +112,7 @@ module Protocol = struct
       ( Json.wrap_error
       (* NOTE: this encoding is only used as a building block for a json
           encoding so we can raise the json exception directly. *)
-      @@
-      fun s ->
+      @@ fun s ->
         match of_notation s with
         | Some i -> i
         | None -> (
@@ -340,6 +339,20 @@ module System = struct
 
     let hash = hash
   end)
+end
+
+module Monotonic = struct
+  module Span = struct
+    type t = Mtime.Span.t
+
+    let to_ms x =
+      Int64.to_int
+        Mtime.Span.(Int64.unsigned_div (to_uint64_ns x) (to_uint64_ns ms))
+
+    let to_float_us x = Mtime.Span.(to_float_ns x /. to_float_ns us)
+
+    let to_float_s x = Mtime.Span.(to_float_ns x /. to_float_ns s)
+  end
 end
 
 let () =

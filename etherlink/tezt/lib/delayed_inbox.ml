@@ -1,0 +1,218 @@
+(*****************************************************************************)
+(*                                                                           *)
+(* SPDX-License-Identifier: MIT                                              *)
+(* SPDX-FileCopyrightText: 2025 Nomadic Labs <contact@nomadic-labs.com>      *)
+(* SPDX-FileCopyrightText: 2025 Trilitech <contact@trili.tech>               *)
+(* SPDX-FileCopyrightText: 2025 Functori <contact@functori.com>              *)
+(*                                                                           *)
+(*****************************************************************************)
+
+open Rpc.Syntax
+open Test_helpers
+open Evm_node_lib_dev_encoding.Rlp
+
+type receiver = TezosAddr of string | EthereumAddr of string
+
+let raw_addr = function TezosAddr addr | EthereumAddr addr -> addr
+
+type deposit_info = {receiver : receiver; chain_id : int option}
+
+let encode_option encode_some = function
+  | None -> List []
+  | Some v ->
+      let value = encode_some v in
+      List [Value value]
+
+let encode_deposit_info deposit_info =
+  let receiver =
+    match deposit_info.receiver with
+    | TezosAddr addr ->
+        let tag = Bytes.make 1 '\001' in
+        let receiver = Hex.to_bytes (`Hex (remove_0x addr)) in
+        List [Value tag; Value receiver]
+    | EthereumAddr addr ->
+        let receiver = Hex.to_bytes (`Hex (remove_0x addr)) in
+        Value receiver
+  in
+  let bytes =
+    encode (List [receiver; encode_option encode_int deposit_info.chain_id])
+  in
+  let (`Hex str) = Hex.of_bytes bytes in
+  add_0x ("01" ^ str)
+
+type endpoint = Sc_rollup_node of Sc_rollup_node.t | Evm_node of Evm_node.t
+
+let subkeys path = function
+  | Sc_rollup_node sc_rollup_node ->
+      Sc_rollup_node.RPC.call sc_rollup_node
+      @@ Sc_rollup_rpc.get_global_block_durable_state_value
+           ~pvm_kind:"wasm_2_0_0"
+           ~operation:Sc_rollup_rpc.Subkeys
+           ~key:path
+           ()
+  | Evm_node evm_node ->
+      let*@! list = Rpc.state_subkeys evm_node path in
+      return list
+
+let content ?(kernel = Kernel.Latest) endpoint =
+  subkeys (Durable_storage_path.delayed_inbox kernel) endpoint
+
+let data ?(kernel = Kernel.Latest) endpoint hash =
+  let path = sf "%s/%s/data" (Durable_storage_path.delayed_inbox kernel) hash in
+  match endpoint with
+  | Sc_rollup_node sc_rollup_node ->
+      Sc_rollup_node.RPC.call sc_rollup_node
+      @@ Sc_rollup_rpc.get_global_block_durable_state_value
+           ~pvm_kind:"wasm_2_0_0"
+           ~operation:Sc_rollup_rpc.Value
+           ~key:path
+           ()
+  | Evm_node evm_node ->
+      let*@ res = Rpc.state_value evm_node path in
+      return res
+
+let assert_mem ?kernel endpoint hash =
+  let* delayed_transactions_hashes = content ?kernel endpoint in
+  Check.(list_mem string hash delayed_transactions_hashes)
+    ~error_msg:"hash %L should be present in the delayed inbox %R" ;
+  unit
+
+let assert_empty ?kernel endpoint =
+  let* delayed_transactions_hashes = content ?kernel endpoint in
+  Check.is_true
+    (List.length delayed_transactions_hashes <= 1)
+    ~error_msg:"Expected empty delayed inbox" ;
+  unit
+
+let size ?kernel endpoint =
+  let* delayed_transactions_hashes = content ?kernel endpoint in
+  let size = List.length delayed_transactions_hashes - 1 in
+  if size < 0 then
+    (* /meta is removed, if the delayed inbox was empty it would be (-1) here. *)
+    return 0
+  else return size
+
+let wait_for_delayed_inbox_add_tx_and_injected ~sequencer ~sc_rollup_node
+    ~client =
+  let event_watcher =
+    let added = Evm_node.wait_for_evm_event New_delayed_transaction sequencer in
+    let injected = Evm_node.wait_for_block_producer_tx_injected sequencer in
+    let* (_transaction_kind, added_hash), injected_hash =
+      Lwt.both added injected
+    in
+    Check.((added_hash = injected_hash) string)
+      ~error_msg:"Injected hash %R is not the expected one %L" ;
+    Lwt.return_unit
+  in
+  wait_for_event
+    event_watcher
+    ~sequencer
+    ~sc_rollup_node
+    ~client
+    ~error_msg:
+      "Timed out while waiting for transaction to be added to the delayed \
+       inbox and injected"
+
+let send_deposit_to_delayed_inbox ?(rlp = false) ~amount ~bridge ~depositor
+    ~deposit_info ~sc_rollup_node ~sc_rollup_address client =
+  (* Implements optional types decoding as in the RLP library from the
+   kernel's library. *)
+  let infos =
+    if rlp then encode_deposit_info deposit_info
+    else raw_addr deposit_info.receiver
+  in
+  let* () =
+    Client.transfer
+      ~entrypoint:"deposit"
+      ~arg:(sf "Pair %S %s" sc_rollup_address infos)
+      ~amount
+      ~giver:depositor.Account.public_key_hash
+      ~receiver:bridge
+      ~burn_cap:Tez.one
+      client
+  in
+  let* l1_level = Client.bake_for_and_wait_level ~keys:[] client in
+  let* _ =
+    Sc_rollup_node.wait_for_level ~timeout:120. sc_rollup_node l1_level
+  in
+  unit
+
+let send_tezos_operation_to_delayed_inbox ?(amount = Tez.one) ?expect_failure
+    ~sc_rollup_node ~client ~l1_contracts ~sc_rollup_address
+    ?(sender = Constant.bootstrap2) ?(tezosx_format = false) operation =
+  let* signature = Operation_core.sign operation client in
+  let* (`Hex hex) = Operation_core.hex ~signature operation client in
+  let hex = if tezosx_format then "00" ^ hex else hex in
+  let bytes = Hex.to_bytes (`Hex hex) in
+  let op =
+    Data_encoding.Binary.of_bytes_exn Tezos_base.Operation.encoding bytes
+  in
+  let hash = Tezos_base.Operation.hash op in
+  let* () =
+    Client.transfer
+      ~arg:(sf "Pair %S 0x%s" sc_rollup_address hex)
+      ~amount
+      ~giver:sender.public_key_hash
+      ~receiver:l1_contracts.Setup.delayed_transaction_bridge
+      ~burn_cap:Tez.one
+      ?expect_failure
+      client
+  in
+  let* _ = Rollup.next_rollup_node_level ~sc_rollup_node ~client in
+  Lwt.return hash
+
+let send_raw_transaction_to_delayed_inbox ?(wait_for_next_level = true)
+    ?(amount = Tez.one) ?expect_failure ~sc_rollup_node ~client ~l1_contracts
+    ~sc_rollup_address ?(sender = Constant.bootstrap2) raw_tx =
+  let expected_hash =
+    `Hex raw_tx |> Hex.to_bytes |> Tezos_crypto.Hacl.Hash.Keccak_256.digest
+    |> Hex.of_bytes |> Hex.show
+  in
+  let* () =
+    Client.transfer
+      ~arg:(sf "Pair %S 0x%s" sc_rollup_address raw_tx)
+      ~amount
+      ~giver:sender.public_key_hash
+      ~receiver:l1_contracts.Setup.delayed_transaction_bridge
+      ~burn_cap:Tez.one
+      ?expect_failure
+      client
+  in
+  let* () =
+    if wait_for_next_level then
+      let* _ = Rollup.next_rollup_node_level ~sc_rollup_node ~client in
+      unit
+    else unit
+  in
+  Lwt.return expected_hash
+
+let send_fa_deposit_to_delayed_inbox ?(proxy = "") ~amount ~l1_contracts
+    ~depositor ~receiver ~sc_rollup_node ~sc_rollup_address client =
+  let* () =
+    Client.transfer
+      ~entrypoint:"set"
+      ~arg:
+        (sf
+           "Pair %S (Pair (Right (Right %s%s)) 0)"
+           sc_rollup_address
+           receiver
+           (remove_0x proxy))
+      ~amount:Tez.zero
+      ~giver:depositor.Account.public_key_hash
+      ~receiver:l1_contracts.Setup.ticket_router_tester
+      ~burn_cap:Tez.one
+      client
+  in
+  let* () = Client.bake_for_and_wait ~keys:[] client in
+  let* () =
+    Client.transfer
+      ~entrypoint:"mint"
+      ~arg:(sf "Pair (Pair 0 None) %d" amount)
+      ~amount:Tez.zero
+      ~giver:depositor.Account.public_key_hash
+      ~receiver:l1_contracts.Setup.ticket_router_tester
+      ~burn_cap:Tez.one
+      client
+  in
+  let* _ = Rollup.next_rollup_node_level ~sc_rollup_node ~client in
+  unit

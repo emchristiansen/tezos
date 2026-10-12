@@ -7,7 +7,7 @@ In particular, Tezt can be used to orchestrate tests involving Tezos nodes and c
 
 To facilitate the use with Tezos, Tezt has been complemented by a specific library called Tezt-Tezos.
 
-Tezt is pronounced `/tɛzti/ <http://ipa-reader.xyz/?text=t%C9%9Bzti>`_
+Tezt is pronounced `/tɛzti/ <https://ipa-reader.com/?text=t%C9%9Bzti>`_
 (think "tezty", as in *Tez* are tas*ty*).
 
 
@@ -238,7 +238,7 @@ Here is a minimal example::
       (* your test here *)
       unit
 
-Then, declare those files in ``manifest/main.ml``::
+Then, declare those files in ``manifest/``, for instance in :src:`manifest/product_octez.ml`::
 
     let _octez_base_tezts =
       tezt
@@ -248,10 +248,10 @@ Then, declare those files in ``manifest/main.ml``::
         ~deps:[octez_base]
 
 This causes the manifest to generate executable ``src/lib_base/tezt/main.exe`` for you.
-This executable calls ``Test.run``. It also declares a Dune alias ``runtezt``
+This executable calls ``Test.run``. It also declares a Dune alias ``runtest``
 so that you can run your tests with either of the following commands::
 
-    dune build @src/lib_base/runtezt
+    dune build @src/lib_base/runtest
     dune exec src/lib_base/tezt/main.exe
 
 Note that your tests will actually also be available in ``tezt/tests/main.exe``.
@@ -309,18 +309,3 @@ Regression tests are registered with ``Regression.register`` instead of
 ``Test.register``. Use ``Regression.capture`` or ``Regression.hooks`` to
 capture output that you want to be stable. Regression tests can be used
 both in unit tests and integration tests.
-
-Pre-commit hook
----------------
-
-The `pre-commit <https://git-scm.com/book/en/v2/Customizing-Git-Git-Hooks>`_
-hook located in :src:`scripts/pre_commit/pre_commit.py`
-executes modified Tezt tests automatically. It looks for staged files
-(the default) or modified files (if ``--unstaged`` is passed) in
-:src:`tezt/tests` and executes them. This avoids
-pushing commits that will break the CI. It is also handy to execute
-the relevant subset of tests by calling
-``./scripts/pre_commit/pre_commit.py [--unstaged]`` manually.
-
-We refer to the header of ``pre_commit.py`` and its ``--help`` flag
-for additional instructions.

@@ -35,6 +35,9 @@ val from_raw : Raw_context.t -> Raw_level_repr.t -> Level_repr.t
 val from_raw_with_offset :
   Raw_context.t -> offset:int32 -> Raw_level_repr.t -> Level_repr.t tzresult
 
+(** When the given level is two or above, return its predecessor. When
+    the given level is one or less, return [None] (because we cannot
+    build the [Level_repr.t] for level zero). *)
 val pred : Raw_context.t -> Level_repr.t -> Level_repr.t option
 
 val succ : Raw_context.t -> Level_repr.t -> Level_repr.t
@@ -59,16 +62,14 @@ val levels_in_current_cycle :
 val levels_with_commitments_in_cycle :
   Raw_context.t -> Cycle_repr.t -> Level_repr.t list
 
-val last_allowed_fork_level : Raw_context.t -> Raw_level_repr.t
+val last_preserved_block_level : Raw_context.t -> Raw_level_repr.t
+
+val last_finalized_block_level : Raw_context.t -> Raw_level_repr.t
 
 (** Returns [Some cycle] if the current level represents the last
    level of [cycle] and [None] if the level is not the last level of a
    cycle. *)
 val dawn_of_a_new_cycle : Raw_context.t -> Cycle_repr.t option
-
-(** Returns [true] if the stake distribution should be snapshot at the current
-   level. *)
-val may_snapshot_stake_distribution : Raw_context.t -> bool
 
 (** Returns [true] if RANDAO should be computed at the current level, that is
     if the current level, relative to the cycle's start, equals the nonce

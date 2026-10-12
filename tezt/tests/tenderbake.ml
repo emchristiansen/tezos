@@ -30,6 +30,8 @@
    Subject:      Basic test for Tenderbake and related newly added API components
 *)
 
+let team = Tag.layer1
+
 (* ------------------------------------------------------------------------- *)
 (* Typedefs *)
 
@@ -38,10 +40,16 @@ let transfer_data =
 
 let baker = Constant.bootstrap5.alias
 
-let default_overrides =
-  [(* ensure that blocks must be endorsed *) (["consensus_threshold"], `Int 6)]
+let default_overrides protocol =
+  (* ensure that blocks must be attested *)
+  if Protocol.(number protocol >= 022) then
+    [(["consensus_threshold_size"], `Int 6)]
+  else [(["consensus_threshold"], `Int 6)]
 
-let init ?(overrides = default_overrides) protocol =
+let init ?overrides protocol =
+  let overrides =
+    Option.value ~default:(default_overrides protocol) overrides
+  in
   let* sandbox_node = Node.init [Synchronisation_threshold 0; Private_mode] in
   let sandbox_endpoint = Client.Node sandbox_node in
   let* sandbox_client = Client.init ~endpoint:sandbox_endpoint () in
@@ -62,7 +70,7 @@ let init ?(overrides = default_overrides) protocol =
 
 let bootstrap_accounts = List.tl Constant.all_secret_keys
 
-let endorsers =
+let attesters =
   [
     Constant.bootstrap1.alias;
     Constant.bootstrap2.alias;
@@ -71,17 +79,17 @@ let endorsers =
     Constant.bootstrap5.alias;
   ]
 
-let endorse endpoint protocol client endorsers =
-  Client.endorse_for ~endpoint ~protocol ~key:endorsers ~force:true client
+let attest endpoint protocol client attesters =
+  Client.attest_for ~endpoint ~protocol ~key:attesters ~force:true client
 
-let preendorse endpoint protocol client preendorsers =
-  Client.preendorse_for ~endpoint ~protocol ~key:preendorsers ~force:true client
+let preattest endpoint protocol client preattesters =
+  Client.preattest_for ~endpoint ~protocol ~key:preattesters ~force:true client
 
 let test_bake_two =
   Protocol.register_test
     ~__FILE__
     ~title:"Tenderbake transfer - baking 2"
-    ~tags:["baking"; "tenderbake"]
+    ~tags:[team; "baking"; "tenderbake"]
   @@ fun protocol ->
   let* _proto_hash, endpoint, client, _node = init protocol in
   let end_idx = List.length bootstrap_accounts in
@@ -112,12 +120,12 @@ let test_low_level_commands =
   Protocol.register_test
     ~__FILE__
     ~title:"Tenderbake low level commands"
-    ~tags:["propose"; "endorse"; "preendorse"; "tenderbake"; "low_level"]
+    ~tags:[team; "propose"; "attest"; "preattest"; "tenderbake"; "low_level"]
   @@ fun protocol ->
   let* _proto_hash, endpoint, client, _node = init protocol in
-  Log.info "Doing a propose -> preendorse -> endorse cycle" ;
-  let proposer = endorsers in
-  let preendorsers = endorsers in
+  Log.info "Doing a propose -> preattest -> attest cycle" ;
+  let proposer = attesters in
+  let preattesters = attesters in
   let* () =
     Client.transfer
       ~amount:(Tez.of_int 3)
@@ -126,8 +134,8 @@ let test_low_level_commands =
       client
   in
   let* () = Client.propose_for client ~protocol ~endpoint ~key:proposer in
-  let* () = preendorse endpoint protocol client preendorsers in
-  let* () = endorse endpoint protocol client endorsers in
+  let* () = preattest endpoint protocol client preattesters in
+  let* () = attest endpoint protocol client attesters in
   let* () =
     Client.transfer
       ~amount:(Tez.of_int 2)
@@ -136,8 +144,8 @@ let test_low_level_commands =
       client
   in
   let* () = Client.propose_for client ~protocol ~endpoint ~key:proposer in
-  let* () = preendorse endpoint protocol client preendorsers in
-  let* () = endorse endpoint protocol client endorsers in
+  let* () = preattest endpoint protocol client preattesters in
+  let* () = attest endpoint protocol client attesters in
   let* () = Client.propose_for client ~protocol ~endpoint ~key:proposer in
   Lwt.return_unit
 
@@ -156,7 +164,7 @@ let find_account public_key_hash' =
 
 let baker_at_round0 ?level client =
   let* json =
-    RPC.Client.call client @@ RPC.get_chain_block_helper_baking_rights ?level ()
+    Client.RPC.call client @@ RPC.get_chain_block_helper_baking_rights ?level ()
   in
   match JSON.(json |=> 0 |-> "delegate" |> as_string_opt) with
   | Some delegate_id -> return (find_account delegate_id)
@@ -180,7 +188,7 @@ let find_bootstrap_account_not_in unwanted =
         (String.concat ", "
         @@ List.map (fun Account.{alias; _} -> alias) unwanted)
 
-(* Run one node, and bake, preendorse, and endorse using the
+(* Run one node, and bake, preattest, and attest using the
    client commands. *)
 let test_manual_bake =
   let minimal_block_delay = 1 in
@@ -188,16 +196,30 @@ let test_manual_bake =
     ~__FILE__
     ~title:"Tenderbake manual bake"
     ~tags:
-      ["propose"; "endorse"; "preendorse"; "tenderbake"; "low_level"; "manual"]
+      [
+        team;
+        "propose";
+        "attest";
+        "preattest";
+        "tenderbake";
+        "low_level";
+        "manual";
+      ]
   @@ fun protocol ->
   let* _proto_hash, _endpoint, client, node =
+    let consensus_threshold_name =
+      if Protocol.(number protocol >= 022) then "consensus_threshold_size"
+      else "consensus_threshold"
+    in
     init
       ~overrides:
         [
           (["minimal_block_delay"], `String_of_int minimal_block_delay);
           (["delay_increment_per_round"], `String_of_int 1);
-          (["consensus_threshold"], `Int 45);
+          ([consensus_threshold_name], `Int 45);
           (["consensus_committee_size"], `Int 67);
+          (* because [number_of_shards] has to be at most [consensus_committee_size] *)
+          (["dal_parametric"; "number_of_shards"], `Int 32);
         ]
       protocol
   in
@@ -228,7 +250,7 @@ let test_manual_bake =
   Log.info "Deposit" ;
   let* balance = Client.get_balance_for client ~account:recipient.alias in
   let* deposit =
-    RPC.Client.call client
+    Client.RPC.call client
     @@ RPC.get_chain_block_context_delegate_frozen_deposits
          recipient.public_key_hash
   in
@@ -240,8 +262,8 @@ let test_manual_bake =
   Log.info "Wait for level 2" ;
   let* (_ : int) = Node.wait_for_level node 2 in
 
-  Log.info "Preendorse" ;
-  let endorsers =
+  Log.info "Preattest" ;
+  let attesters =
     [
       Constant.bootstrap1.alias;
       Constant.bootstrap2.alias;
@@ -249,7 +271,7 @@ let test_manual_bake =
       Constant.bootstrap4.alias;
     ]
   in
-  let* () = Client.preendorse_for ~key:endorsers ~force:true client in
+  let* () = Client.preattest_for ~protocol ~key:attesters ~force:true client in
 
   let giver = "bootstrap1" in
   Log.info "Transfer from giver %s to recipient %s" giver recipient.alias ;
@@ -274,16 +296,16 @@ let test_manual_bake =
   in
   Log.info "Transfer injected with operation hash %s" operation_hash ;
 
-  Log.info "Endorse" ;
-  let* () = Client.endorse_for ~key:endorsers ~force:true client in
+  Log.info "Attest" ;
+  let* () = Client.attest_for ~protocol ~key:attesters ~force:true client in
 
   Log.info "Test that %s is pending" operation_hash ;
   let* pending_ops =
-    RPC.Client.call client @@ RPC.get_chain_mempool_pending_operations ()
+    Client.RPC.call client @@ RPC.get_chain_mempool_pending_operations ()
   in
   let op_hashes =
     JSON.(
-      pending_ops |-> "applied" |> as_list
+      pending_ops |-> "validated" |> as_list
       |> List.map (fun op -> op |-> "hash" |> as_string))
   in
   Check.(list_mem string)
@@ -305,7 +327,7 @@ let test_manual_bake =
   Log.info "Test balance" ;
   let* balance = Client.get_balance_for client ~account:recipient.alias in
   let* deposit =
-    RPC.Client.call client
+    Client.RPC.call client
     @@ RPC.get_chain_block_context_delegate_frozen_deposits
          recipient.public_key_hash
   in
@@ -330,16 +352,31 @@ let test_manual_bake_null_threshold =
     ~__FILE__
     ~title:"Tenderbake manual bake null threshold"
     ~tags:
-      ["propose"; "endorse"; "preendorse"; "tenderbake"; "low_level"; "manual"]
+      [
+        team;
+        "propose";
+        "attest";
+        "preattest";
+        "tenderbake";
+        "low_level";
+        "manual";
+      ]
   @@ fun protocol ->
   let* _proto_hash, _endpoint, client, node =
+    let consensus_threshold_name =
+      if Protocol.(number protocol >= 022) then "consensus_threshold_size"
+      else "consensus_threshold"
+    in
+
     init
       ~overrides:
         [
           (["minimal_block_delay"], `String_of_int minimal_block_delay);
           (["delay_increment_per_round"], `String_of_int 1);
-          (["consensus_threshold"], `Int 0);
+          ([consensus_threshold_name], `Int 0);
           (["consensus_committee_size"], `Int 67);
+          (* because [number_of_shards] has to be at most [consensus_committee_size] *)
+          (["dal_parametric"; "number_of_shards"], `Int 32);
         ]
       protocol
   in
@@ -391,7 +428,7 @@ let test_manual_bake_null_threshold =
   Log.info "Test balance" ;
   let* balance = Client.get_balance_for client ~account:recipient.alias in
   let* deposit =
-    RPC.Client.call client
+    Client.RPC.call client
     @@ RPC.get_chain_block_context_delegate_frozen_deposits
          recipient.public_key_hash
   in
@@ -408,18 +445,19 @@ let test_repropose =
     ~title:"Tenderbake low level repropose"
     ~tags:
       [
+        team;
         "propose";
-        "endorse";
-        "preendorse";
+        "attest";
+        "preattest";
         "tenderbake";
         "low_level";
         "repropose";
       ]
   @@ fun protocol ->
   let* _proto_hash, endpoint, client, _node = init protocol in
-  Log.info "Doing a propose -> preendorse -> endorse cycle" ;
-  let proposer = endorsers in
-  let preendorsers = endorsers in
+  Log.info "Doing a propose -> preattest -> attest cycle" ;
+  let proposer = attesters in
+  let preattesters = attesters in
   let* () =
     Client.transfer
       ~amount:(Tez.of_int 3)
@@ -428,8 +466,8 @@ let test_repropose =
       client
   in
   let* () = Client.propose_for client ~protocol ~endpoint ~key:proposer in
-  let* () = preendorse endpoint protocol client preendorsers in
-  let* () = endorse endpoint protocol client endorsers in
+  let* () = preattest endpoint protocol client preattesters in
+  let* () = attest endpoint protocol client attesters in
   let* () =
     Client.transfer
       ~amount:(Tez.of_int 2)

@@ -31,6 +31,14 @@ val print_expr : Format.formatter -> Script_repr.expr -> unit
 
 val print_expr_unwrapped : Format.formatter -> Script_repr.expr -> unit
 
+val unparse_stack :
+  'location ->
+  (Script_repr.expr * Script_repr.expr) list ->
+  ('location, string) Micheline.node
+
+val print_typed_stack :
+  Format.formatter -> (Script_repr.expr * Script_repr.expr) list -> unit
+
 val print_execution_trace :
   Format.formatter -> Script_typed_ir.execution_trace -> unit
 
@@ -56,7 +64,8 @@ val unparse_expression : Script.expr -> Michelson_v1_parser.parsed
 (** Unexpand the macros and produce the result of parsing an
     intermediate pretty printed source. Works on generic trees,for
     programs that fail to be converted to a specific script version. *)
-val unparse_invalid : string Micheline.canonical -> Michelson_v1_parser.parsed
+val unparse_invalid :
+  string Micheline.canonical -> string Michelson_v1_parser.parser_result
 
 val ocaml_constructor_of_prim : Michelson_v1_primitives.prim -> string
 

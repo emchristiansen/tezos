@@ -25,7 +25,7 @@
 
 open Protocol
 open Alpha_context
-open Test_tez
+open Tez_helpers
 
 let transfer_and_check_balances ?(with_burn = false) ~loc b ?(fee = Tez.zero)
     ?expect_apply_failure src dst amount =
@@ -59,11 +59,13 @@ let transfer_and_check_balances ?(with_burn = false) ~loc b ?(fee = Tez.zero)
   (b, op)
 
 let n_transactions n b ?fee source dest amount =
+  let open Lwt_result_syntax in
   List.fold_left_es
     (fun b _ ->
-      transfer_and_check_balances ~loc:__LOC__ b ?fee source dest amount
-      >>=? fun (i, _) ->
-      Incremental.finalize_block i >>=? fun b ->
+      let* i, _ =
+        transfer_and_check_balances ~loc:__LOC__ b ?fee source dest amount
+      in
+      let* b = Incremental.finalize_block i in
       Incremental.begin_construction b)
     b
     (1 -- n)

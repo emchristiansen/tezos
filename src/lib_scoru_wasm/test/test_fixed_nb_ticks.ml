@@ -26,8 +26,7 @@
 (** Testing
     -------
     Component:    Wasm_pvm
-    Invocation:   dune exec  src/lib_scoru_wasm/test/test_scoru_wasm.exe \
-                    -- test "^Max nb of ticks$"
+    Invocation:   dune exec src/lib_scoru_wasm/test/main.exe -- --file test_fixed_nb_ticks.ml
     Subject:      WASM PVM evaluation tests for fixed nb of ticks per top level call
 *)
 
@@ -67,7 +66,7 @@ let test_looping_kernel ~version () =
 
   (* This module loops indefinitely. *)
   let*! loop_module_tree =
-    initial_tree ~version ~ticks_per_snapshot:max_nb_ticks loop_module
+    initial_state ~version ~ticks_per_snapshot:max_nb_ticks loop_module
   in
   let*! loop_module_tree = eval_until_input_requested loop_module_tree in
   let*! tree_with_dummy_input = set_empty_inbox_step 0l loop_module_tree in
@@ -82,7 +81,7 @@ let test_noop_kernel ~version () =
 
   (* This module does a noop. *)
   let*! noop_module_tree =
-    initial_tree ~version ~ticks_per_snapshot:max_nb_ticks noop_module
+    initial_state ~version ~ticks_per_snapshot:max_nb_ticks noop_module
   in
   (* Eval until snapshot, which shouldn't take any tick since the default state
      is Snapshot. *)
@@ -106,7 +105,7 @@ let test_stuck_in_decode_kernel ~version () =
 
   (* This module does a noop. *)
   let*! noop_module_tree =
-    initial_tree ~version ~ticks_per_snapshot:max_nb_ticks noop_module
+    initial_state ~version ~ticks_per_snapshot:max_nb_ticks noop_module
   in
   let*! noop_module_tree = eval_until_input_requested noop_module_tree in
   (* Collect an inbox. *)
@@ -124,7 +123,7 @@ let test_stuck_in_init_kernel ~version () =
 
   (* This module does a noop. *)
   let*! noop_module_tree =
-    initial_tree ~version ~ticks_per_snapshot:max_nb_ticks noop_module
+    initial_state ~version ~ticks_per_snapshot:max_nb_ticks noop_module
   in
   let*! noop_module_tree = eval_until_input_requested noop_module_tree in
   (* Adds one input tick, part of the maximum number of ticks per toplevel
@@ -143,7 +142,11 @@ let test_stuck_in_init_kernel ~version () =
     Z.(succ (sub info.current_tick previous_max_nb_ticks))
   in
   let*! tree = Wasm.Internal_for_tests.set_max_nb_ticks new_max_nb_ticks tree in
-  let*! tree = Wasm.compute_step tree in
+  let*! tree =
+    Wasm.compute_step
+      ~wasm_entrypoint:Tezos_scoru_wasm.Constants.wasm_entrypoint
+      tree
+  in
 
   (* Check is_stuck and current tick *)
   let*! info = Wasm.get_info tree in
@@ -153,11 +156,14 @@ let test_stuck_in_init_kernel ~version () =
     (assert (info.current_tick = Z.add previous_max_nb_ticks new_max_nb_ticks))
 
 let tests =
-  tztests_with_pvm
-    ~versions:[V0; V1]
+  tztests_with_all_pvms
     [
       ("nb of ticks limited", `Quick, test_looping_kernel);
       ("evaluation takes fixed nb of ticks", `Quick, test_noop_kernel);
       ("stuck in decode", `Quick, test_stuck_in_decode_kernel);
       ("stuck in init", `Quick, test_stuck_in_init_kernel);
     ]
+
+let () =
+  Alcotest_lwt.run ~__FILE__ "test lib scoru wasm" [("Max nb of ticks", tests)]
+  |> Lwt_main.run

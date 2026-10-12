@@ -1,32 +1,52 @@
 ; This file was automatically generated, do not edit.
 ; Edit file manifest/main.ml instead.
 
-(executable
- (name test_lib_dal_node)
+(library
+ (name src_lib_dal_node_test__tezt_lib)
+ (instrumentation (backend bisect_ppx))
  (libraries
-  tezos-stdlib
-  tezos-stdlib-unix
-  tezos-base
-  tezos-test-helpers
-  tezos-base-test-helpers
-  tezos-crypto-dal
-  tezos_dal_node_lib
-  alcotest-lwt)
+  tezt.core
+  bls12-381.archive
+  octez-libs.stdlib
+  octez-libs.stdlib-unix
+  octez-libs.base
+  octez-libs.error-monad
+  tezos-dal-node-lib
+  octez-libs.test-helpers
+  tezt-bam)
+ (preprocess (pps ppx_hash))
+ (library_flags (:standard -linkall))
+ (flags
+  (:standard)
+  -open Tezt_core
+  -open Tezt_core.Base
+  -open Tezos_stdlib
+  -open Tezos_stdlib_unix
+  -open Tezos_base.TzPervasives
+  -open Tezos_error_monad
+  -open Tezos_error_monad.TzLwtreslib
+  -open Tezos_dal_node_lib
+  -open Tezos_test_helpers)
+ (modules test_storage test_skip_shards test_committee_fetch))
+
+(executable
+ (name main)
+ (instrumentation (backend bisect_ppx --bisect-sigterm))
+ (libraries
+  octez-rust-deps
+  src_lib_dal_node_test__tezt_lib
+  tezt)
  (link_flags
   (:standard)
   (:include %{workspace_root}/macos-link-flags.sexp))
- (flags
-  (:standard)
-  -open Tezos_stdlib
-  -open Tezos_stdlib_unix
-  -open Tezos_base
-  -open Tezos_base.TzPervasives
-  -open Tezos_test_helpers
-  -open Tezos_base_test_helpers
-  -open Tezos_crypto_dal
-  -open Tezos_dal_node_lib))
+ (modules main))
 
 (rule
  (alias runtest)
  (package tezos-dal-node-lib)
- (action (run %{dep:./test_lib_dal_node.exe})))
+ (enabled_if (<> false %{env:RUNTEZTALIAS=true}))
+ (action (run %{dep:./main.exe} /flaky /ci_disabled)))
+
+(rule
+ (targets main.ml)
+ (action (with-stdout-to %{targets} (echo "let () = Tezt.Test.run ()"))))

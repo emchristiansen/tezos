@@ -26,8 +26,7 @@
 (** Testing
     -------
     Component:    Lib_scoru_wasm input
-    Invocation:   dune exec  src/lib_scoru_wasm/test/test_scoru_wasm.exe \
-                    -- test "Set/get"
+    Invocation:   dune exec src/lib_scoru_wasm/test/main.exe -- --file test_get_set.ml
     Subject:      Input tests for the tezos-scoru-wasm library
 *)
 
@@ -46,7 +45,7 @@ let empty_tree () =
   let empty_store = Context.empty index in
   return @@ Context.Tree.empty empty_store
 
-type Tezos_lazy_containers.Lazy_map.tree += Tree of Context.tree
+type Tezos_tree_encoding.tree_instance += Tree of Context.tree
 
 module Tree : Tezos_tree_encoding.TREE with type tree = Context.tree = struct
   type tree = Context.tree
@@ -75,7 +74,7 @@ let zero =
     (Bounded.Non_negative_int32.of_value 0l)
 
 let initialise_tree () =
-  Wasm_utils.initial_tree ~from_binary:true "arbitrary boot sector"
+  Wasm_utils.initial_state ~from_binary:true "arbitrary boot sector"
 
 let make_inbox_info ~inbox_level ~message_counter =
   Wasm_pvm_state.
@@ -164,11 +163,7 @@ let test_set_input ~version () =
       "\000\000hello"
       tree
   in
-  let* buffers =
-    Tree_encoding_runner.decode
-      (Tezos_tree_encoding.option Wasm_pvm.durable_buffers_encoding)
-      tree
-  in
+  let* buffers = State.Encoding_runner.decode_buffers tree in
   let buffers =
     match buffers with Some buffers -> buffers | None -> assert false
   in
@@ -212,10 +207,13 @@ let test_get_output ~version () =
   Lwt_result_syntax.return_unit
 
 let tests =
-  tztests_with_pvm
-    ~versions:[V0; V1]
+  tztests_with_all_pvms
     [
       ("Get info", `Quick, test_get_info);
       ("Set input", `Quick, test_set_input);
       ("Get output", `Quick, test_get_output);
     ]
+
+let () =
+  Alcotest_lwt.run ~__FILE__ "test lib scoru wasm" [("Set/get", tests)]
+  |> Lwt_main.run

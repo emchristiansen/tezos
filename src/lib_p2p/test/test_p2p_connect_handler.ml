@@ -26,7 +26,7 @@
 (** Testing
     -------
     Component:    P2P
-    Invocation:   dune build @src/lib_p2p/test/runtest_p2p_connect_handler
+    Invocation:   dune exec src/lib_p2p/test/test_p2p_connect_handler.exe
     Subject:      Test that P2p_connect_handler is well-behaved
 *)
 
@@ -41,7 +41,7 @@ let point_id : P2p_point.Id.t = (P2p_addr.of_string_exn "0.0.0.0", 0)
 let test_connect_destroy =
   let open Lwt_result_syntax in
   tztest "Connect then destroy" `Quick @@ fun () ->
-  let t =
+  let* t =
     P2p_connect_handler.Internal_for_tests.create
       (`Make_default_pool ())
       (`Dependencies dependencies)
@@ -77,14 +77,14 @@ let test_correct_incoming_connection_number =
     {dependencies with socket_accept = socket_accept_hanging_forever}
   in
   let incoming = P2p_point.Table.create 0 in
-  let t =
+  let* t =
     P2p_connect_handler.Internal_for_tests.create
       ~config
       ~incoming
       (`Make_default_pool ())
       (`Dependencies dependencies)
   in
-  let*! fd = P2p_fd.socket PF_INET6 SOCK_STREAM 0 in
+  let* fd = P2p_fd.socket () in
   Alcotest.(
     check'
       int
@@ -102,36 +102,57 @@ let test_correct_incoming_connection_number =
 
 let test_on_new_connection =
   let open Lwt_result_syntax in
+  let check ~msg ~expected ~actual =
+    Alcotest.(check' int ~msg ~expected ~actual)
+  in
   tztest "on_new_connection hook is triggered on new connection" `Quick
   @@ fun () ->
-  let t =
+  let* t =
     P2p_connect_handler.Internal_for_tests.create
       (`Make_default_pool ())
       (`Dependencies dependencies)
   in
-  let callbacks_nb = ref 0 in
-  P2p_connect_handler.on_new_connection t (fun _id _conn ->
-      callbacks_nb := !callbacks_nb + 1) ;
-  Alcotest.(
-    check'
-      int
-      ~msg:"Before any connection, on_new_connection is never called"
-      ~expected:0
-      ~actual:!callbacks_nb) ;
-  let*! _conn = P2p_connect_handler.connect t point_id in
-  Alcotest.(
-    check'
-      int
-      ~msg:"After connect, on_new_connection called"
-      ~expected:1
-      ~actual:!callbacks_nb) ;
+  let num_connect = ref 0 in
+  let num_disconnect = ref 0 in
+  P2p_connect_handler.on_new_connection t (fun _id _conn -> incr num_connect) ;
+  P2p_connect_handler.on_disconnection t (fun _id -> incr num_disconnect) ;
+  check
+    ~msg:"Before any connection, on_new_connection is never called"
+    ~expected:0
+    ~actual:!num_connect ;
+  check
+    ~msg:"Before any connection, on_disconnection is never called"
+    ~expected:0
+    ~actual:!num_disconnect ;
+  let* conn = P2p_connect_handler.connect t point_id in
+  check
+    ~msg:"After connect, on_new_connection called"
+    ~expected:1
+    ~actual:!num_connect ;
+  check
+    ~msg:"After connect, on_disconnection is not called"
+    ~expected:0
+    ~actual:!num_disconnect ;
+  let*! () =
+    P2p_conn.disconnect ~wait:true ~reason:(User "explicit disconnect") conn
+  in
+  check
+    ~msg:"After disconnect, on_new_connection is not called"
+    ~expected:1
+    ~actual:!num_connect ;
+  check
+    ~msg:"After disconnect, on_disconnection is called"
+    ~expected:1
+    ~actual:!num_disconnect ;
   let*! () = P2p_connect_handler.destroy t in
-  Alcotest.(
-    check'
-      int
-      ~msg:"After destruction, no new call to on_new_connection"
-      ~expected:1
-      ~actual:!callbacks_nb) ;
+  check
+    ~msg:"After destruction, no new call to on_new_connection"
+    ~expected:1
+    ~actual:!num_connect ;
+  check
+    ~msg:"After destruction, no new call to on_disconnection"
+    ~expected:1
+    ~actual:!num_disconnect ;
   return_unit
 
 let tests =
@@ -142,5 +163,7 @@ let tests =
   ]
 
 let () =
-  Alcotest_lwt.run "P2p_connect_handler" [("P2p_connect_handler", tests)]
+  Alcotest_lwt.run ~__FILE__ "tezos-p2p" [("p2p.connect_handler", tests)]
   |> Lwt_main.run
+
+let () = Tezt.Test.run ()

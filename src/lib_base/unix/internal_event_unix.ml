@@ -42,7 +42,22 @@ end
    run with [Singleprocess]. *)
 let env_var_name = "TEZOS_EVENTS_CONFIG"
 
-let init ?lwt_log_sink ?(configuration = Configuration.lwt_log) () =
+module Event = struct
+  include Internal_event.Simple
+
+  let section = ["internal_event_unix"]
+
+  let loaded_from_env =
+    declare_2
+      ~section
+      ~name:"uri_loaded_from_env"
+      ~msg:"Loaded URIs from environment"
+      ~level:Notice
+      ("variable", Data_encoding.string)
+      ("value", Data_encoding.string)
+end
+
+let init_raw ~internal_events () =
   let _ =
     (* This is just here to force the linking (and hence
        initialization) of all these modules: *)
@@ -53,9 +68,6 @@ let init ?lwt_log_sink ?(configuration = Configuration.lwt_log) () =
   in
   let open Lwt_result_syntax in
   let*! r =
-    let* () =
-      Lwt_result.ok @@ Lwt_log_sink_unix.initialize ?cfg:lwt_log_sink ()
-    in
     let* () =
       match Sys.(getenv_opt env_var_name) with
       | None -> return_unit
@@ -73,19 +85,14 @@ let init ?lwt_log_sink ?(configuration = Configuration.lwt_log) () =
                 match Uri.scheme uri with
                 | None ->
                     let* cfg = Configuration.of_file (Uri.path uri) in
-                    Configuration.apply cfg
+                    Internal_event_config.apply cfg
                 | Some _ -> Internal_event.All_sinks.activate uri)
               uris
           in
-          Internal_event.Debug_event.(
-            emit
-              (make
-                 "Loaded URIs from environment"
-                 ~attach:
-                   (`O
-                     [("variable", `String env_var_name); ("value", `String s)])))
+          let*! () = Event.(emit loaded_from_env (env_var_name, s)) in
+          return_unit
     in
-    Configuration.apply configuration
+    Configuration.apply internal_events
   in
   match r with
   | Ok () -> Lwt.return_unit
@@ -107,3 +114,93 @@ let close () =
         "ERROR@ closing Internal_event_unix:@ %a\n%!"
         Error_monad.pp_print_trace
         el
+
+open Filename.Infix
+
+let default_daily_logs_at ~daily_logs_path ~section_prefixes ~advertise_levels =
+  Internal_event_config.make_config_uri
+    ~create_dirs:true
+    ~daily_logs:7
+    ~level:Info
+    ~format:"pp-rfc5424"
+    ~section_prefixes
+    ~advertise_levels
+    (`Path (daily_logs_path // "daily.log"))
+
+let make_default_internal_events ~rules ~verbosity ~colors
+    ~(log_output : Logs_simple_config.Output.t) ~daily_logs_path
+    ~daily_logs_section_prefixes ~advertise_levels =
+  (* By default the node has two logs output:
+     - on the configured [log_output] using the configured [verbosity] and
+       a short pretty printing
+     - on disk, with a 7 days rotation with an info verbosity level and a
+       standard pretty printing *)
+  let origin, rules = Level_config_rules.find_log_rules rules in
+  let section_prefixes =
+    match rules with
+    | Some rules -> (
+        try Level_config_rules.parse_rules rules
+        with _ ->
+          Printf.ksprintf
+            Stdlib.failwith
+            "Incorrect log rules defined in %s"
+            origin)
+    | None -> []
+  in
+  let user_events =
+    let kind =
+      match log_output with
+      | Stdout -> `Stdout
+      | Stderr -> `Stderr
+      | File fp -> `Path fp
+      | Null -> `Null
+      | Syslog _ -> `Syslog (Logs_simple_config.Output.to_string log_output)
+    in
+    Internal_event_config.make_config_uri
+      ~level:verbosity
+      ~section_prefixes
+      ~colors
+      ~format:"pp-short"
+      ~advertise_levels
+      kind
+  in
+  let sinks = [user_events] in
+  let sinks =
+    match daily_logs_path with
+    | Some daily_logs_path ->
+        let internal_logs_events =
+          default_daily_logs_at
+            ~section_prefixes:daily_logs_section_prefixes
+            ~daily_logs_path
+            ~advertise_levels
+        in
+        internal_logs_events :: sinks
+    | None -> sinks
+  in
+  Internal_event_config.make_custom sinks
+
+let make_with_defaults ?verbosity ?enable_default_daily_logs_at
+    ?(daily_logs_section_prefixes = [])
+    ?(log_cfg = Logs_simple_config.default_cfg) () =
+  make_default_internal_events
+    ~rules:log_cfg.rules
+    ~verbosity:(Option.value verbosity ~default:log_cfg.default_level)
+    ~colors:log_cfg.colors
+    ~log_output:log_cfg.output
+    ~daily_logs_path:enable_default_daily_logs_at
+    ~daily_logs_section_prefixes
+    ~advertise_levels:log_cfg.advertise_levels
+
+let init ?config:(internal_events = make_with_defaults ()) () =
+  let open Lwt_syntax in
+  let* () = init_raw ~internal_events () in
+  return_unit
+
+let enable_default_daily_logs_at ~daily_logs_path =
+  let uri =
+    default_daily_logs_at
+      ~section_prefixes:[]
+      ~daily_logs_path
+      ~advertise_levels:false
+  in
+  Internal_event.All_sinks.activate uri

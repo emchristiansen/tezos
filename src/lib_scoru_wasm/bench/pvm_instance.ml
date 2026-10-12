@@ -25,18 +25,14 @@
 
 open Tezos_scoru_wasm
 open Tezos_scoru_wasm_helpers
-open Encodings_util
 module Wasm = Wasm_utils.Wasm
-module Wasm_fast_vm = Tezos_scoru_wasm_fast.Vm
+module Wasm_fast_vm =
+  Tezos_scoru_wasm_fast.Vm.Make_vm (Tezos_scoru_wasm_fast.Pvm.Default_params)
+module State = Wasm_utils.State
 
-let encode_pvm_state state tree =
-  Tree_encoding_runner.encode
-    Tezos_scoru_wasm.Wasm_pvm.pvm_state_encoding
-    state
-    tree
+let encode_pvm_state state tree = State.Encoding_runner.encode state tree
 
-let decode_pvm_state tree =
-  Tree_encoding_runner.decode Tezos_scoru_wasm.Wasm_pvm.pvm_state_encoding tree
+let decode_pvm_state tree = State.Encoding_runner.decode tree
 
 let get_tick_from_tree tree =
   let open Lwt_syntax in
@@ -53,17 +49,4 @@ module PP = struct
   let tick_label = Format.asprintf "%a" Wasm_utils.pp_state
 end
 
-module Placeholder_builtins = struct
-  let reveal_preimage _hash =
-    Stdlib.failwith "reveal_preimage is not available out of the box in tests"
-
-  let reveal_metadata () =
-    Stdlib.failwith "reveal_metadata is not available out of the box in tests"
-end
-
-let builtins =
-  Tezos_scoru_wasm.Builtins.
-    {
-      reveal_preimage = Placeholder_builtins.reveal_preimage;
-      reveal_metadata = Placeholder_builtins.reveal_metadata;
-    }
+let builtins = Wasm_utils.reveal_builtins

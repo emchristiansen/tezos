@@ -27,8 +27,7 @@ module Assert = Assert
 open Tezos_protocol_alpha
 open Protocol
 open Alpha_context
-open Tezos_context
-open Tezos_shell_context
+module Plugin = Tezos_protocol_plugin_alpha
 
 module Proto_nonce = struct
   module Table = Hashtbl.Make (struct
@@ -112,7 +111,8 @@ module Account = struct
   let account_to_bootstrap ({pkh; pk; _}, amount, delegate_to) =
     let open Parameters in
     ({
-       public_key_hash = pkh;
+       (* FIXME-PA *)
+       public_key_hash = Implicit_account_repr.Forbidden.of_pkh pkh;
        public_key = Some pk;
        amount;
        delegate_to;
@@ -198,8 +198,8 @@ let make_rpc_context ~chain_id ctxt block =
 (* This type is used only to provide a simpler interface to the exterior. *)
 type baker_policy =
   | By_round of int
-  | By_account of public_key_hash
-  | Excluding of public_key_hash list
+  | By_account of Implicit_account_repr.t
+  | Excluding of Implicit_account_repr.t list
 
 let get_next_baker_by_round rpc_ctxt round block =
   let open Lwt_result_syntax in
@@ -232,7 +232,7 @@ let get_next_baker_excluding rpc_ctxt excludes block =
   let {Plugin.RPC.Baking_rights.delegate = pkh; timestamp; round; _} =
     List.find
       (fun {Plugin.RPC.Baking_rights.delegate; _} ->
-        not (List.mem ~equal:Signature.Public_key_hash.equal delegate excludes))
+        not (List.mem ~equal:Implicit_account_repr.equal delegate excludes))
       bakers
     |> WithExceptions.Option.get ~loc:__LOC__
   in
@@ -247,11 +247,9 @@ let dispatch_policy rpc_ctxt = function
 let get_next_baker chain_store ?(policy = By_round 0) =
   dispatch_policy chain_store policy
 
-let get_endorsing_power _chain_store _b = 0
-
 module Forge = struct
   type header = {
-    baker : public_key_hash;
+    baker : Implicit_account_repr.t;
     (* the signer of the block *)
     shell : Block_header.shell_header;
     contents : Block_header.contents;
@@ -262,7 +260,7 @@ module Forge = struct
 
   let make_contents ~payload_hash ~payload_round
       ?(proof_of_work_nonce = default_proof_of_work_nonce)
-      ?(liquidity_baking_toggle_vote = Liquidity_baking.LB_pass)
+      ?(liquidity_baking_toggle_vote = Per_block_votes.Per_block_vote_pass)
       ~seed_nonce_hash () =
     Block_header.
       {
@@ -270,7 +268,7 @@ module Forge = struct
         payload_round;
         proof_of_work_nonce;
         seed_nonce_hash;
-        liquidity_baking_toggle_vote;
+        per_block_votes = {liquidity_baking_vote = liquidity_baking_toggle_vote};
       }
 
   let make_shell ~level ~predecessor ~timestamp ~fitness ~operations_hash
@@ -294,7 +292,10 @@ module Forge = struct
 
   let sign_header ~chain_id {baker; shell; contents} =
     let open Lwt_result_syntax in
-    let* delegate = Account.find baker in
+    (* FIXME-PA *)
+    let* delegate =
+      Account.find (Implicit_account_repr.Forbidden.to_pkh baker)
+    in
     let unsigned_bytes =
       Data_encoding.Binary.to_bytes_exn
         Block_header.unsigned_encoding
@@ -370,22 +371,12 @@ let protocol_param_key = ["protocol_parameters"]
 let check_constants_consistency constants =
   let open Lwt_result_syntax in
   let open Constants_parametric_repr in
-  let {blocks_per_cycle; blocks_per_commitment; blocks_per_stake_snapshot; _} =
-    constants
-  in
+  let {blocks_per_cycle; blocks_per_commitment; _} = constants in
   let* () =
     Error_monad.unless (blocks_per_commitment <= blocks_per_cycle) (fun () ->
         failwith
           "Inconsistent constants : blocks per commitment must be less than \
            blocks per cycle")
-  in
-  let* () =
-    Error_monad.unless
-      (blocks_per_cycle >= blocks_per_stake_snapshot)
-      (fun () ->
-        failwith
-          "Inconsistent constants : blocks per cycle must be superior than \
-           blocks per stake snapshot")
   in
   return_unit
 
@@ -428,7 +419,12 @@ let default_genesis_parameters =
   let open Tezos_protocol_alpha_parameters in
   {
     Default_parameters.(
-      parameters_of_constants {constants_sandbox with consensus_threshold = 0})
+      parameters_of_constants
+        {
+          constants_sandbox with
+          consensus_threshold_size = 0;
+          proof_of_work_threshold = -1L;
+        })
     with
     bootstrap_accounts = default_accounts;
   }
@@ -553,9 +549,8 @@ let apply pred_resulting_ctxt chain_id ~policy ?(operations = empty_operations)
       `Lazy
       element_of_key
   in
-  let* validation, block_header_metadata =
+  let* (validation, block_header_metadata), operations_results =
     let*! r =
-      let open Environment.Error_monad in
       let* vstate =
         begin_validation_and_application
           pred_ctxt
@@ -568,15 +563,23 @@ let apply pred_resulting_ctxt chain_id ~policy ?(operations = empty_operations)
              })
           ~predecessor:(Store.Block.shell_header pred)
       in
-      let* vstate =
+      let* vstate, resultll =
         List.fold_left_es
-          (List.fold_left_es (fun vstate op ->
-               let* state, _result = validate_and_apply_operation vstate op in
-               return state))
-          vstate
+          (fun (vstate, resultll) l ->
+            let* vstate, resultl =
+              List.fold_left_es
+                (fun (vstate, resultl) op ->
+                  let* state, result = validate_and_apply_operation vstate op in
+                  return (state, result :: resultl))
+                (vstate, [])
+                l
+            in
+            return (vstate, List.rev resultl :: resultll))
+          (vstate, [])
           operations
       in
-      finalize_validation_and_application vstate (Some shell)
+      let* x = finalize_validation_and_application vstate (Some shell) in
+      return (x, List.rev resultll)
     in
     let*? r = Environment.wrap_tzresult r in
     return r
@@ -589,9 +592,11 @@ let apply pred_resulting_ctxt chain_id ~policy ?(operations = empty_operations)
          validation.max_operations_ttl)
   in
   let validation = {validation with max_operations_ttl} in
-  let context = Shell_context.unwrap_disk_context validation.context in
   let*! resulting_context_hash =
-    Context.commit ~time:shell.timestamp ?message:validation.message context
+    Context_ops.commit
+      ~time:shell.timestamp
+      ?message:validation.message
+      validation.context
   in
   let block_header_metadata =
     Data_encoding.Binary.to_bytes_exn
@@ -619,16 +624,24 @@ let apply pred_resulting_ctxt chain_id ~policy ?(operations = empty_operations)
   let block_header =
     {Tezos_base.Block_header.shell = header.shell; protocol_data}
   in
+  let operations_results =
+    List.map
+      (List.map
+         (Data_encoding.Binary.to_bytes_exn
+            Protocol.Main.operation_receipt_encoding))
+      operations_results
+  in
   let operations_metadata_hashes =
     Some
       (List.map
          (List.map (fun r -> Operation_metadata_hash.hash_bytes [r]))
-         (WithExceptions.List.init ~loc:__LOC__ 4 (fun _ -> [])))
+         operations_results)
   in
   return
     ( block_header,
       block_header_metadata,
       block_hash_metadata,
+      operations_results,
       operations_metadata_hashes,
       resulting_context_hash,
       validation )
@@ -644,6 +657,7 @@ let apply_and_store chain_store ?(synchronous_merge = true) ?policy
   let* ( block_header,
          block_header_metadata,
          block_metadata_hash,
+         ops_metadata,
          ops_metadata_hashes,
          resulting_context_hash,
          validation ) =
@@ -656,20 +670,22 @@ let apply_and_store chain_store ?(synchronous_merge = true) ?policy
       pred_resulting_context_hash
   in
   let ops_metadata =
-    let operations_metadata =
-      WithExceptions.List.init ~loc:__LOC__ 4 (fun _ -> [])
-    in
     match ops_metadata_hashes with
     | Some metadata_hashes ->
         let res =
           WithExceptions.List.map2
             ~loc:__LOC__
-            (WithExceptions.List.map2 ~loc:__LOC__ (fun x y -> (x, y)))
-            operations_metadata
+            (WithExceptions.List.map2 ~loc:__LOC__ (fun x y ->
+                 (Block_validation.Metadata x, y)))
+            ops_metadata
             metadata_hashes
         in
         Block_validation.Metadata_hash res
-    | None -> Block_validation.(No_metadata_hash operations_metadata)
+    | None ->
+        let operations_metadata =
+          WithExceptions.List.init ~loc:__LOC__ 4 (fun _ -> [])
+        in
+        Block_validation.(No_metadata_hash operations_metadata)
   in
   let validation_result =
     {
@@ -679,11 +695,13 @@ let apply_and_store chain_store ?(synchronous_merge = true) ?policy
           timestamp = block_header.shell.timestamp;
           message = validation.Tezos_protocol_environment.message;
           max_operations_ttl = validation.max_operations_ttl;
-          last_allowed_fork_level = validation.last_allowed_fork_level;
+          last_finalized_block_level = validation.last_finalized_block_level;
+          last_preserved_block_level = validation.last_preserved_block_level;
         };
       block_metadata = (block_header_metadata, block_metadata_hash);
       ops_metadata;
       shell_header_hash = Block_validation.Shell_header_hash.zero;
+      protocol_data = Bytes.empty;
     }
   in
   let operations =
@@ -707,6 +725,10 @@ let apply_and_store chain_store ?(synchronous_merge = true) ?policy
         let*! () = Block_store.await_merging block_store in
         let* _ = Store.Chain.set_head chain_store b in
         let*! () = Block_store.await_merging block_store in
+        let context_index =
+          Store.context_index (Store.Chain.global_store chain_store)
+        in
+        let*! () = Context_ops.wait_gc_completion context_index in
         (match Block_store.get_merge_status block_store with
         | Merge_failed err -> Assert.fail_msg "%a" pp_print_trace err
         | Running | Not_running -> ()) ;
@@ -732,7 +754,7 @@ let bake chain_store ?synchronous_merge ?policy ?operation ?operations pred =
 (********** Cycles ****************)
 
 (* This function is duplicated from Context to avoid a cyclic dependency *)
-let get_constants rpc_ctxt b = Alpha_services.Constants.all rpc_ctxt b
+let get_constants rpc_ctxt b = Plugin.Alpha_services.Constants.all rpc_ctxt b
 
 let bake_n chain_store ?synchronous_merge ?policy n b =
   let open Lwt_result_syntax in

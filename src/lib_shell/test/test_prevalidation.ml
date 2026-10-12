@@ -26,9 +26,16 @@
 (** Testing
     -------
     Component:    Prevalidation
-    Invocation:   dune exec src/lib_shell/test/test_prevalidation.exe
+    Invocation:   dune exec src/lib_shell/test/main.exe \
+                  -- --file test_prevalidation.ml
     Subject:      Unit tests for {!Prevalidation.T}
 *)
+
+let register_test ~title ~additional_tags =
+  Test.register
+    ~__FILE__
+    ~title:("Shell: Mempool prevalidation: " ^ title)
+    ~tags:(["mempool"; "prevalidation"] @ additional_tags)
 
 module Init = struct
   let chain_id = Shell_test_helpers.chain_id
@@ -41,19 +48,17 @@ module Init = struct
   let wrap_tzresult_lwt_disk
       (f : Tezos_protocol_environment.Context.t -> unit tzresult Lwt.t) () :
       unit tzresult Lwt.t =
-    Lwt_utils_unix.with_tempdir "tezos_test_" (fun base_dir ->
+    Lwt_utils_unix.with_tempdir "tezos_test_" (fun data_dir ->
         let open Lwt_result_syntax in
-        let root = Filename.concat base_dir "context" in
-        let*! idx = Context.init root in
+        let* idx = Context_ops.init ~kind:`Disk ~data_dir () in
         let* genesis =
-          Context.commit_genesis
+          Context_ops.commit_genesis
             idx
             ~chain_id
             ~time:Shell_test_helpers.genesis_time
             ~protocol:Shell_test_helpers.genesis_protocol_hash
         in
-        let*! v = Context.checkout_exn idx genesis in
-        let v = Tezos_shell_context.Shell_context.wrap_disk_context v in
+        let*! v = Context_ops.checkout_exn idx genesis in
         f v)
 
   let genesis_block ~timestamp ctxt =
@@ -64,6 +69,17 @@ module Init = struct
         context_hash
     in
     Store.Unsafe.block_of_repr repr
+
+  (** Register a Tezt test from a function that takes a context as
+      argument and returns a tzresult promise. *)
+  let register_test_that_needs_ctxt f =
+    register_test (fun () ->
+        let open Lwt_syntax in
+        let* res = wrap_tzresult_lwt_disk f () in
+        match res with
+        | Ok () -> unit
+        | Error err ->
+            Test.fail "Test failed with tztrace:@.%a" pp_print_trace err)
 end
 
 let make_chain_store ctxt =
@@ -101,19 +117,31 @@ module Mock_protocol :
   end
 end
 
-module MakeFilter (Proto : Tezos_protocol_environment.PROTOCOL) :
-  Shell_plugin.FILTER
-    with type Proto.operation_data = Proto.operation_data
-     and type Proto.operation = Proto.operation
-     and type Mempool.state = unit
-     and type Proto.Mempool.validation_info = Proto.Mempool.validation_info =
-Shell_plugin.No_filter (struct
+module Wrap_protocol (Proto : Tezos_protocol_environment.PROTOCOL) :
+  Protocol_plugin.T
+    with type operation_data = Proto.operation_data
+     and type operation = Proto.operation
+     and type Mempool.t = Proto.Mempool.t = Protocol_plugin.No_plugin (struct
   let hash = Protocol_hash.zero
 
   include Proto
 
   let complete_b58prefix _ = assert false
 end)
+
+module Mock_bounding :
+  Prevalidator_bounding.T with type protocol_operation = Mock_protocol.operation =
+struct
+  type state = unit
+
+  let empty = ()
+
+  type protocol_operation = Mock_protocol.operation
+
+  let add_operation _ _ _ = assert false
+
+  let remove_operation _ _ = assert false
+end
 
 module MakePrevalidation = Prevalidation.Internal_for_tests.Make
 
@@ -123,11 +151,13 @@ let now () = Time.System.to_protocol (Tezos_base.Time.System.now ())
 let chain_store = ()
 
 (** Test that [create] returns [Ok] in a pristine context. *)
-let test_create ctxt =
+let () =
+  Init.register_test_that_needs_ctxt ~title:"create" ~additional_tags:["create"]
+  @@ fun ctxt ->
   let open Lwt_result_syntax in
   let (module Chain_store) = make_chain_store ctxt in
-  let module Filter = MakeFilter (Mock_protocol) in
-  let module P = MakePrevalidation (Chain_store) (Filter) in
+  let module Proto = Wrap_protocol (Mock_protocol) in
+  let module P = MakePrevalidation (Chain_store) (Proto) (Mock_bounding) in
   let timestamp : Time.Protocol.t = now () in
   let head = Init.genesis_block ~timestamp ctxt in
   let* _ = P.create chain_store ~head ~timestamp in
@@ -166,46 +196,56 @@ let pp_classification fmt classification =
     Format.fprintf fmt "%s: %a" name pp_print_trace trace
   in
   match classification with
-  | `Applied -> Format.fprintf fmt "Applied"
-  | `Prechecked -> Format.fprintf fmt "Prechecked"
+  | `Validated -> Format.fprintf fmt "Validated"
   | `Branch_delayed trace -> print_error_classification "Branch_delayed" trace
   | `Branch_refused trace -> print_error_classification "Branch_refused" trace
   | `Refused trace -> print_error_classification "Refused" trace
   | `Outdated trace -> print_error_classification "Outdated" trace
 
-let check_classification_is_exn loc
-    (classification : Prevalidator_classification.classification) =
-  match classification with
+let unexpected_classification ~__LOC__ expected classification =
+  Test.fail
+    "%s:@.Expected classification %s, but got %a"
+    __LOC__
+    expected
+    pp_classification
+    classification
+
+let assert_success ~__LOC__ = function
+  | `Validated -> ()
+  | classification ->
+      unexpected_classification ~__LOC__ "Validated" classification
+
+let assert_operation_conflict ~__LOC__ = function
+  | `Branch_delayed [Validation_errors.Operation_conflict _] -> ()
+  | cl ->
+      unexpected_classification
+        ~__LOC__
+        "Branch_delayed: [Operation_conflict]"
+        cl
+
+let assert_rejected_by_full_mempool ~__LOC__ = function
+  | `Branch_delayed [Validation_errors.Rejected_by_full_mempool _] -> ()
+  | cl ->
+      unexpected_classification
+        ~__LOC__
+        "Branch_delayed: [Rejected_by_full_mempool]"
+        cl
+
+let assert_replacement ~__LOC__ = function
+  (* Replaced by the protocol *)
+  | `Branch_delayed [Validation_errors.Operation_replacement _] -> ()
+  (* Replaced by the filter *)
+  | `Branch_delayed [Validation_errors.Removed_from_full_mempool _] -> ()
+  | classification ->
+      unexpected_classification
+        ~__LOC__
+        "Outdated: [Operation_replacement] or Branch_delayed: \
+         [Removed_from_full_mempool]"
+        classification
+
+let assert_exn ~__LOC__ = function
   | `Branch_delayed [Exn _] -> ()
-  | _ ->
-      QCheck2.Test.fail_reportf
-        "%s:@.Expected classification (Branch_delayed: [Exn]), but got %a"
-        loc
-        pp_classification
-        classification
-
-let pp_expected fmt = function
-  | `Prechecked -> Format.fprintf fmt "Prechecked"
-  | `Branch_delayed -> Format.fprintf fmt "Branch_delayed"
-  | `Branch_refused -> Format.fprintf fmt "Branch_refused"
-  | `Refused -> Format.fprintf fmt "Refused"
-
-let check_classification loc ~expected
-    (classification : Prevalidator_classification.classification) =
-  match (expected, classification) with
-  | `Prechecked, `Prechecked
-  | `Branch_delayed, `Branch_delayed _
-  | `Branch_refused, `Branch_refused _
-  | `Refused, `Refused _ ->
-      ()
-  | _ ->
-      QCheck2.Test.fail_reportf
-        "%s:@.Expected classification %a, but got %a"
-        loc
-        pp_expected
-        expected
-        pp_classification
-        classification
+  | cl -> unexpected_classification ~__LOC__ "Branch_delayed: [Exn]" cl
 
 type error += Branch_delayed_error | Branch_refused_error | Refused_error
 
@@ -236,25 +276,49 @@ let () =
     (function Refused_error -> Some () | _ -> None)
     (fun () -> Refused_error)
 
+let assert_branch_delayed_error ~__LOC__ = function
+  | `Branch_delayed [Branch_delayed_error] -> ()
+  | cl ->
+      unexpected_classification
+        ~__LOC__
+        "Branch_delayed: [Branch_delayed_error]"
+        cl
+
+let assert_branch_refused_error ~__LOC__ = function
+  | `Branch_refused [Branch_refused_error] -> ()
+  | cl ->
+      unexpected_classification
+        ~__LOC__
+        "Branch_refused: [Branch_refused_error]"
+        cl
+
+let assert_refused_error ~__LOC__ = function
+  | `Refused [Refused_error] -> ()
+  | cl -> unexpected_classification ~__LOC__ "Refused: [Refused_error]" cl
+
+type proto_replacement = Replacement | No_replacement
+
 (** Possible outcomes of protocol's [Mempool.add_operation] that we
     want to test. *)
-type proto_add_outcome =
-  | Proto_added  (** Return [Proto.Mempool.Added]. *)
-  | Proto_replaced  (** Return [Proto.Mempool.Replaced]. *)
+type proto_outcome =
+  | Proto_success of proto_replacement
+      (** Return either [Proto.Mempool.Added] (when [proto_replacement] is
+          [No_replacement]) or [Proto.Mempool.Replaced] (when it is
+          [Replacement]. *)
   | Proto_unchanged  (** Return [Proto.Mempool.Unchanged]. *)
   | Proto_branch_delayed  (** Fail with a [`Temporary] error. *)
   | Proto_branch_refused  (** Fail with a [`Branch] error. *)
   | Proto_refused  (** Fail with a [`Permanent] error. *)
   | Proto_crash  (** Raise an exception. *)
 
-let proto_add_outcome_gen =
+let proto_outcome_gen =
   (* We try to give higher weights to more usual outcomes, and in
-     particular to [Proto_added] so that the number of operations in
-     the mempool can grow. *)
+     particular to [Proto_success No_replacement] so that the number
+     of operations in the mempool can grow. *)
   QCheck2.Gen.frequencyl
     [
-      (4, Proto_added);
-      (2, Proto_replaced);
+      (8, Proto_success No_replacement);
+      (2, Proto_success Replacement);
       (2, Proto_unchanged);
       (1, Proto_branch_delayed);
       (1, Proto_branch_refused);
@@ -262,203 +326,198 @@ let proto_add_outcome_gen =
       (1, Proto_crash);
     ]
 
-(** Mock protocol with a toy mempool that has an adjustable
-    [add_operation] function: it behaves as instructed by the provided
-    [proto_add_outcome].
+(** Get a random operation hash from an [Operation_hash.Map.t].
+    Fail with [Invalid_argument] when the map is empty. *)
+let random_oph_from_map ophmap =
+  fst QCheck2.Gen.(generate1 (oneofl (Operation_hash.Map.bindings ophmap)))
 
-    Unlike in [Mock_protocol], here [Mempool.t] is an actual state
-    that keeps track of validated operations and can be retrieved with
-    [Mempool.operations]. This allows the test below to check that
-    operations were correctly added or removed. *)
+(** Mock protocol with a toy mempool that has an adjustable
+    [add_operation] function.
+
+    At the center of the toy mempool is the [Mempool.t] type, which is
+    no longer [unit] as in [Mock_protocol]. Instead, this type has two
+    components:
+
+    - A map that keeps track of validated operations and can be
+      retrieved with [Mempool.operations]. This allows the tests to check
+      that operations were correctly added or removed.
+
+    - A [proto_outcome] that allows the caller of
+      [Mempool.add_operation] to specify the desired outcome of this
+      function. It is then returned unchanged by the function. It is
+      first initialized to [Proto_success No_replacement], so that the
+      mempool can easily be filled with valid operations by simply
+      leaving it unmodified. *)
 module Toy_proto :
   Tezos_protocol_environment.PROTOCOL
     with type operation_data = unit
      and type operation = Mock_protocol.operation
-     and type Mempool.validation_info = proto_add_outcome = struct
+     and type Mempool.t =
+      Mock_protocol.operation Operation_hash.Map.t * proto_outcome = struct
   include Mock_protocol
 
   module Mempool = struct
     include Mempool
 
-    type t = operation Operation_hash.Map.t
+    type t = operation Operation_hash.Map.t * proto_outcome
 
-    (* We use this type as a hack to tell [add_operation] which
-       outcome we want. *)
-    type validation_info = proto_add_outcome
+    type validation_info = unit
 
     let init _ctxt _chain_id ~head_hash:_ ~head:_ ~cache:_ =
-      Lwt_result.return (Proto_crash, Operation_hash.Map.empty)
+      (* The default outcome is [Proto_success No_replacement]: this
+         is useful when we just want to set up a mempool that contains
+         operations, as in [test_remove_operation]. *)
+      Lwt_result.return
+        ((), (Operation_hash.Map.empty, Proto_success No_replacement))
 
-    let operation_encoding =
+    (* Fake encoding that will not be used anyway. *)
+    let encoding =
       Data_encoding.conv
-        (fun {shell; protocol_data = ()} -> shell)
-        (fun shell -> {shell; protocol_data = ()})
-        Operation.shell_header_encoding
+        (fun _ -> ())
+        (fun () -> (Operation_hash.Map.empty, Proto_success No_replacement))
+        Data_encoding.unit
 
-    let encoding = Operation_hash.Map.encoding operation_encoding
+    let partial_op_validation ?check_signature:_ _ _ = Lwt.return_ok []
 
-    let add_operation ?check_signature:_ ?conflict_handler info state (oph, op)
+    let add_valid_operation ?conflict_handler (state, desired_outcome) (oph, op)
         =
       if Option.is_none conflict_handler then
-        QCheck2.Test.fail_reportf
+        Test.fail
           "Prevalidation should always call [Proto.Mempool.add_operation] with \
            an explicit [conflict_handler]." ;
-      match (info : proto_add_outcome) with
-      | Proto_added ->
-          let state = Operation_hash.Map.add oph op state in
-          Lwt_result.return (state, Added)
-      | Proto_replaced ->
-          let removed =
-            match Operation_hash.Map.choose state with
-            | Some (hash, _) -> hash
-            | None ->
-                (* This outcome should not be used when the mempool is
-                   empty. See [consistent_outcomes]. *)
-                assert false
-          in
+      match desired_outcome with
+      (* To be able to replace an operation, we need the mempool to be
+         non-empty. If it is empty, then [Proto_success Replacement] falls back
+         to the behavior of [Proto_success No_replacement]. *)
+      | Proto_success Replacement when not (Operation_hash.Map.is_empty state)
+        ->
+          let removed = random_oph_from_map state in
           let state = Operation_hash.Map.remove removed state in
           let state = Operation_hash.Map.add oph op state in
-          Lwt_result.return (state, Replaced {removed})
-      | Proto_unchanged -> Lwt_result.return (state, Unchanged)
-      | Proto_branch_delayed ->
-          Lwt_result.fail (Validation_error [Branch_delayed_error])
-      | Proto_branch_refused ->
-          Lwt_result.fail (Validation_error [Branch_refused_error])
-      | Proto_refused -> Lwt_result.fail (Validation_error [Refused_error])
+          Ok ((state, desired_outcome), Replaced {removed})
+      | Proto_success (No_replacement | Replacement) ->
+          let state = Operation_hash.Map.add oph op state in
+          Ok ((state, desired_outcome), Added)
+      | Proto_unchanged -> Ok ((state, desired_outcome), Unchanged)
+      | Proto_branch_delayed -> Error (Validation_error [Branch_delayed_error])
+      | Proto_branch_refused -> Error (Validation_error [Branch_refused_error])
+      | Proto_refused -> Error (Validation_error [Refused_error])
       | Proto_crash -> assert false
 
-    let remove_operation state oph = Operation_hash.Map.remove oph state
+    let add_operation ?check_signature ?conflict_handler info state (oph, op) :
+        (t * add_result, add_error) result Lwt.t =
+      let open Lwt_result_syntax in
+      let*! partial_op_validation =
+        partial_op_validation ?check_signature info op
+      in
+      match partial_op_validation with
+      | Ok checks ->
+          let*? () = List.iter_e (fun check -> check ()) checks in
+          Lwt.return (add_valid_operation ?conflict_handler state (oph, op))
+      | Error e -> fail e
+
+    let remove_operation (state, desired_outcome) oph =
+      (Operation_hash.Map.remove oph state, desired_outcome)
 
     let merge ?conflict_handler:_ _ _ = assert false
 
-    let operations = Fun.id
+    let operations = fst
   end
 end
 
-(** Possible outcomes of filter's
-    [Mempool.add_operation_and_enforce_mempool_bound] that we want to test. *)
-type filter_add_outcome =
-  | F_no_replace  (** Return [`No_replace]. *)
-  | F_replace  (** Return [`Replace _]. *)
-  | F_branch_delayed  (** Fail with a [`Temporary] error. *)
-  | F_branch_refused  (** Fail with a [`Branch] error. *)
-  | F_refused  (** Fail with a [`Permanent] error. *)
-  | F_crash  (** Raise an exception. *)
+module Toy_filter = Wrap_protocol (Toy_proto)
 
-let filter_add_outcome_encoding =
-  Data_encoding.string_enum
+type bounding_outcome =
+  | B_success of int
+      (** Add the operation successfully, and replace [n] operations in the
+          process (or replace all operations in the state if there are less
+          than [n]).
+          In practice we generate [0 <= n <= 3], and very often [n = 0]
+          meaning that there is no replacement. *)
+  | B_error
+      (** Return [Error op_to_overtake_opt] where [op_to_overtake_opt] is
+          randomly [None] or an operation present in the state. *)
+  | B_crash  (** Raise an exception. *)
+
+(** This generator returns:
+    - with odds 3/5: [B_success 0]
+    - with odds 1/15 each: [B_success n], for [1 <= n <= 3]
+    - with odds 2/15: [B_error]
+    - with odds 1/15: [B_crash]
+
+    We strongly favor [B_success 0] (aka add the operation without any
+    replacements) so that the mempool may grow on average. *)
+let bounding_outcome_gen =
+  let open QCheck2.Gen in
+  frequency
     [
-      ("No_replace", F_no_replace);
-      ("Replace", F_replace);
-      ("Branch_delayed", F_branch_delayed);
-      ("Branch_refused", F_branch_refused);
-      ("Refused", F_refused);
-      ("Crash", F_crash);
+      ( 12,
+        let* n = frequencyl [(9, 0); (1, 1); (1, 2); (1, 3)] in
+        return (B_success n) );
+      (2, pure B_error);
+      (1, pure B_crash);
     ]
 
-let filter_add_outcome_gen =
-  (* We try to give higher weights to more usual outcomes, and in
-     particular to [Proto_added] so that the number of operations in
-     the mempool can grow. *)
-  QCheck2.Gen.frequencyl
-    [
-      (8, F_no_replace);
-      (4, F_replace);
-      (1, F_branch_delayed);
-      (1, F_branch_refused);
-      (1, F_refused);
-      (1, F_crash);
-    ]
+(** Toy bounding with an adjustable [add] function.
 
-(** Toy mempool filter with an adjustable
-    [add_operation_and_enforce_mempool_bound] and an actual [state] that
-    keeps track of added operations. *)
-module Toy_filter = struct
-  include MakeFilter (Toy_proto)
+    As in [Toy_proto], the [state] has a dual role of tracking the
+    valid operations and providing [add] with the desired
+    [bounding_outcome].
 
-  module Mempool = struct
-    (* Once again, we hack this type to specify the desired outcome. *)
-    type config = filter_add_outcome
+    Note that despite its name, the [Toy_bounding] does not bound the
+    mempool, but instead may return any output at any time, because
+    the purpose of the current file is to test the [Prevalidation]
+    component. The actual Bounding built by [Prevalidator_bounding.Make]
+    is tested by itself in [test_prevalidator_bounding.ml]. *)
+module Toy_bounding :
+  Prevalidator_bounding.T
+    with type protocol_operation = Toy_proto.operation
+     and type state =
+      Toy_proto.operation Shell_operation.operation Operation_hash.Map.t
+      * bounding_outcome = struct
+  type protocol_operation = Toy_proto.operation
 
-    let config_encoding = filter_add_outcome_encoding
+  type state =
+    Toy_proto.operation Shell_operation.operation Operation_hash.Map.t
+    * bounding_outcome
 
-    let default_config = F_no_replace
+  (* Similarly to [Toy_proto.Mempool.t], we initialize the [state]
+     with the outcome [B_success 0] so that it is easy to add
+     operations to the mempool and make it grow. *)
+  let empty = (Operation_hash.Map.empty, B_success 0)
 
-    type state = Operation_hash.Set.t
+  (** Remove and return [n] random hashes from [ophmap].
+      If [n > cardinal ophmap], return all the keys of [ophmap] instead.
+      Not tail-rec because in practice it is used with n <= 3. *)
+  let rec pop_n ophmap n =
+    if n <= 0 || Operation_hash.Map.is_empty ophmap then (ophmap, [])
+    else
+      let oph = random_oph_from_map ophmap in
+      let ophmap = Operation_hash.Map.remove oph ophmap in
+      let ophmap, popped = pop_n ophmap (n - 1) in
+      (ophmap, oph :: popped)
 
-    let init _ ~head:_ = Lwt_result.return Operation_hash.Set.empty
+  let add_operation (ophmap, desired_outcome) _config op =
+    match desired_outcome with
+    | B_success n ->
+        let ophmap, replaced = pop_n ophmap n in
+        let ophmap = Operation_hash.Map.add op.Shell_operation.hash op ophmap in
+        Ok ((ophmap, desired_outcome), replaced)
+    | B_error ->
+        let op_to_overtake =
+          let open QCheck2.Gen in
+          if Operation_hash.Map.is_empty ophmap || generate1 bool then None
+          else
+            Some (snd (generate1 (oneofl (Operation_hash.Map.bindings ophmap))))
+        in
+        Error op_to_overtake
+    | B_crash -> assert false
 
-    let flush _ ~head:_ = assert false
-
-    let remove ~filter_state oph = Operation_hash.Set.remove oph filter_state
-
-    let pre_filter _ ~filter_state:_ _ = assert false
-
-    let add_operation_and_enforce_mempool_bound ?replace config filter_state
-        (oph, _op) =
-      let filter_state =
-        match replace with
-        | None -> filter_state
-        | Some replace_oph -> Operation_hash.Set.remove replace_oph filter_state
-      in
-      let filter_state = Operation_hash.Set.add oph filter_state in
-      match config with
-      | F_no_replace -> Lwt_result.return (filter_state, `No_replace)
-      | F_replace ->
-          let replace_oph =
-            match Operation_hash.Set.choose filter_state with
-            | Some hash -> hash
-            | None ->
-                (* This outcome should not be used when the mempool is
-                   empty. See [consistent_outcomes]. *)
-                assert false
-          in
-          let filter_state =
-            Operation_hash.Set.remove replace_oph filter_state
-          in
-          let replacement =
-            (replace_oph, `Branch_delayed [Branch_delayed_error])
-          in
-          Lwt_result.return (filter_state, `Replace replacement)
-      | F_branch_delayed ->
-          Lwt_result.fail (`Branch_delayed [Branch_delayed_error])
-      | F_branch_refused ->
-          Lwt_result.fail (`Branch_refused [Branch_refused_error])
-      | F_refused -> Lwt_result.fail (`Refused [Refused_error])
-      | F_crash -> assert false
-
-    let conflict_handler _ ~existing_operation:_ ~new_operation:_ = assert false
-  end
+  let remove_operation ((ophmap, outcome) as state) oph =
+    if Operation_hash.Map.mem oph ophmap then
+      (Operation_hash.Map.remove oph ophmap, outcome)
+    else state
 end
-
-(** Adjust the outcomes of [Proto.Mempool.add_operation] and
-    [Filter.Mempool.add_operation_and_enforce_mempool_bound] we wish to
-    test, to avoid asking these functions to return a result that
-    wouldn't make sense. *)
-let consistent_outcomes ~mempool_is_empty proto_outcome filter_outcome =
-  if mempool_is_empty then
-    (* If the mempool contains no valid operations, then there is no
-       operation to replace, so outcomes can be neither
-       [Proto_replaced] nor [F_replace]. *)
-    let proto_outcome =
-      match proto_outcome with
-      | Proto_replaced -> Proto_added
-      | _ -> proto_outcome
-    in
-    let filter_outcome =
-      match filter_outcome with
-      | F_replace -> F_no_replace
-      | _ -> filter_outcome
-    in
-    (proto_outcome, filter_outcome)
-  else
-    (* If the protocol already causes the removal of an old operation,
-       then the mempool is not full and the filter won't also remove
-       an operation. In other words, the outcomes [Proto_replaced] and
-       [F_replace] are incompatible. *)
-    match (proto_outcome, filter_outcome) with
-    | Proto_replaced, F_replace -> (Proto_replaced, F_no_replace)
-    | _ -> (proto_outcome, filter_outcome)
 
 (** Test [Prevalidation.add_operation].
 
@@ -466,68 +525,76 @@ let consistent_outcomes ~mempool_is_empty proto_outcome filter_outcome =
     the filter's [Mempool.add_operation_and_enforce_mempool_bound],
     check the returned classification and the updates of the protocol
     and filter internal states. *)
-let test_add_operation ctxt =
+let () =
+  Init.register_test_that_needs_ctxt
+    ~title:"add_operation"
+    ~additional_tags:["add"]
+  @@ fun ctxt ->
   (* Number of operations that will be added. *)
   let nb_ops = 100 in
   let open Lwt_result_syntax in
+  let open Shell_operation in
   let (module Chain_store) = make_chain_store ctxt in
-  let module P = MakePrevalidation (Chain_store) (Toy_filter) in
-  let add_op state (op, (proto_outcome, filter_outcome)) =
-    let valid_ops_before = P.Internal_for_tests.get_valid_operations state in
-    let filter_state_before = P.Internal_for_tests.get_filter_state state in
-    assert (
-      not (Operation_hash.Map.mem op.Shell_operation.hash valid_ops_before)) ;
-    assert (not (Operation_hash.Set.mem op.hash filter_state_before)) ;
-    let proto_outcome, filter_outcome =
-      let mempool_is_empty = Operation_hash.Map.is_empty valid_ops_before in
-      consistent_outcomes ~mempool_is_empty proto_outcome filter_outcome
+  let module P = MakePrevalidation (Chain_store) (Toy_filter) (Toy_bounding) in
+  let open P.Internal_for_tests in
+  let add_op state (op, (proto_outcome, bounding_outcome)) =
+    let proto_ophmap_before = get_mempool_operations state in
+    let bounding_ophmap_before = fst (get_bounding_state state) in
+    assert (not (Operation_hash.Map.mem op.hash proto_ophmap_before)) ;
+    assert (not (Operation_hash.Map.mem op.hash bounding_ophmap_before)) ;
+    let state = set_mempool state (proto_ophmap_before, proto_outcome) in
+    let state =
+      set_bounding_state state (bounding_ophmap_before, bounding_outcome)
     in
-    let state = P.Internal_for_tests.set_validation_info state proto_outcome in
-    let*! ( state,
-            (_op : Mock_protocol.operation Shell_operation.operation),
-            classification,
-            replacements ) =
-      P.add_operation state filter_outcome op
+    let*! state, returned_op, classification, replacements =
+      P.legacy_add_operation state P.default_config op
     in
     (* Check the classification. *)
-    (match (proto_outcome, filter_outcome) with
-    | (Proto_added | Proto_replaced), (F_no_replace | F_replace) ->
-        check_classification __LOC__ ~expected:`Prechecked classification
-    | (Proto_unchanged | Proto_branch_delayed), _
-    | (Proto_added | Proto_replaced), F_branch_delayed ->
-        check_classification __LOC__ ~expected:`Branch_delayed classification
-    | Proto_branch_refused, _ | (Proto_added | Proto_replaced), F_branch_refused
-      ->
-        check_classification __LOC__ ~expected:`Branch_refused classification
-    | Proto_refused, _ | (Proto_added | Proto_replaced), F_refused ->
-        check_classification __LOC__ ~expected:`Refused classification
-    | Proto_crash, _ | (Proto_added | Proto_replaced), F_crash ->
-        check_classification_is_exn __LOC__ classification) ;
-    (* Check whether the new operation has been added, whether there
-       is a replacement, and when there is one, whether it has been removed. *)
-    let valid_ops = P.Internal_for_tests.get_valid_operations state in
-    let filter_state = P.Internal_for_tests.get_filter_state state in
-    (match (proto_outcome, filter_outcome) with
-    | Proto_added, F_no_replace ->
-        assert (Operation_hash.Map.mem op.hash valid_ops) ;
-        assert (Operation_hash.Set.mem op.hash filter_state) ;
-        assert (List.is_empty replacements)
-    | Proto_added, F_replace | Proto_replaced, F_no_replace -> (
-        assert (Operation_hash.Map.mem op.hash valid_ops) ;
-        assert (Operation_hash.Set.mem op.hash filter_state) ;
-        match replacements with
-        | [] | _ :: _ :: _ -> assert false
-        | [(removed, _)] ->
-            assert (Operation_hash.Map.mem removed valid_ops_before) ;
-            assert (Operation_hash.Set.mem removed filter_state_before) ;
-            assert (not (Operation_hash.Map.mem removed valid_ops)) ;
-            assert (not (Operation_hash.Set.mem removed filter_state)))
-    | Proto_replaced, F_replace ->
-        (* [consistent_outcomes] makes this case impossible. *) assert false
+    (match (proto_outcome, bounding_outcome) with
+    | Proto_success _, B_success _ -> assert_success ~__LOC__ classification
+    | Proto_success _, B_error ->
+        assert_rejected_by_full_mempool ~__LOC__ classification
+    | Proto_unchanged, _ -> assert_operation_conflict ~__LOC__ classification
+    | Proto_branch_delayed, _ ->
+        assert_branch_delayed_error ~__LOC__ classification
+    | Proto_branch_refused, _ ->
+        assert_branch_refused_error ~__LOC__ classification
+    | Proto_refused, _ -> assert_refused_error ~__LOC__ classification
+    | Proto_crash, _ | Proto_success _, B_crash ->
+        assert_exn ~__LOC__ classification) ;
+    (* Check that the states have been correctly updated. *)
+    let proto_ophmap = get_mempool_operations state in
+    let bounding_ophmap = fst (get_bounding_state state) in
+    let count_before = Operation_hash.Map.cardinal proto_ophmap_before in
+    let count = Operation_hash.Map.cardinal proto_ophmap in
+    (match (proto_outcome, bounding_outcome) with
+    | Proto_success proto_replacement, B_success nb_replaced_bounding ->
+        assert (Operation_hash.Map.mem op.hash proto_ophmap) ;
+        assert (Operation_hash.Map.mem op.hash bounding_ophmap) ;
+        List.iter
+          (fun (replaced, replacement_classification) ->
+            assert (Operation_hash.Map.mem replaced proto_ophmap_before) ;
+            assert (Operation_hash.Map.mem replaced bounding_ophmap_before) ;
+            assert (not (Operation_hash.Map.mem replaced proto_ophmap)) ;
+            assert (not (Operation_hash.Map.mem replaced bounding_ophmap)) ;
+            assert_replacement ~__LOC__ replacement_classification)
+          replacements ;
+        let nb_replaced_proto =
+          match proto_replacement with Replacement -> 1 | No_replacement -> 0
+        in
+        let nb_replaced = nb_replaced_proto + nb_replaced_bounding in
+        let nb_replaced = min nb_replaced count_before in
+        assert (List.compare_length_with replacements nb_replaced = 0) ;
+        assert (count = count_before + 1 - nb_replaced)
     | _ ->
-        assert (not (Operation_hash.Map.mem op.hash valid_ops)) ;
-        assert (not (Operation_hash.Set.mem op.hash filter_state)) ;
-        assert (List.is_empty replacements)) ;
+        assert (not (Operation_hash.Map.mem op.hash proto_ophmap)) ;
+        assert (not (Operation_hash.Map.mem op.hash bounding_ophmap)) ;
+        assert (List.is_empty replacements) ;
+        assert (count = count_before)) ;
+    (* Check that the operation has been correctly updated (or left alone). *)
+    (match proto_outcome with
+    | Proto_success _ | Proto_unchanged -> assert returned_op.signature_checked
+    | _ -> assert (returned_op == op)) ;
     Lwt.return state
   in
   let timestamp : Time.Protocol.t = now () in
@@ -536,142 +603,103 @@ let test_add_operation ctxt =
   let ops = mk_ops nb_ops in
   let outcomes =
     QCheck2.Gen.(
-      generate ~n:nb_ops (pair proto_add_outcome_gen filter_add_outcome_gen))
+      generate ~n:nb_ops (pair proto_outcome_gen bounding_outcome_gen))
   in
   let ops_and_outcomes, leftovers = List.combine_with_leftovers ops outcomes in
   assert (Option.is_none leftovers) ;
   let*! final_prevalidation_state =
     List.fold_left_s add_op prevalidation_state ops_and_outcomes
   in
-  let final_valid_ops =
-    P.Internal_for_tests.get_valid_operations final_prevalidation_state
-  in
-  let final_filter_state =
-    P.Internal_for_tests.get_filter_state final_prevalidation_state
+  let final_proto_ophmap = get_mempool_operations final_prevalidation_state in
+  let final_bounding_ophmap =
+    fst (get_bounding_state final_prevalidation_state)
   in
   assert (
-    Operation_hash.Map.cardinal final_valid_ops
-    = Operation_hash.Set.cardinal final_filter_state) ;
+    Operation_hash.Map.cardinal final_proto_ophmap
+    = Operation_hash.Map.cardinal final_bounding_ophmap) ;
   Operation_hash.Map.iter
-    (fun oph _ -> assert (Operation_hash.Set.mem oph final_filter_state))
-    final_valid_ops ;
+    (fun oph _ -> assert (Operation_hash.Map.mem oph final_bounding_ophmap))
+    final_proto_ophmap ;
   return_unit
 
 (** Test [Prevalidation.remove_operation]. *)
-let test_remove_operation ctxt =
+let () =
+  Init.register_test_that_needs_ctxt
+    ~title:"remove_operation"
+    ~additional_tags:["remove"]
+  @@ fun ctxt ->
   (* Number of operations initially added to the validation state. *)
-  let nb_initial_ops = 20 in
+  let nb_initial_ops = 50 in
   (* Number of operations on which we will call [remove_operation]
      after we have added [nb_initial_ops] operations to the state. We
      must have [nb_ops_to_remove <= nb_initial_ops]; removal from an
      empty state will be tested separately. *)
-  let nb_ops_to_remove = 10 in
+  let nb_ops_to_remove = 30 in
   let open Lwt_result_syntax in
   let (module Chain_store) = make_chain_store ctxt in
-  let module P = MakePrevalidation (Chain_store) (Toy_filter) in
+  let module P = MakePrevalidation (Chain_store) (Toy_filter) (Toy_bounding) in
+  let open P.Internal_for_tests in
   let timestamp : Time.Protocol.t = now () in
   let head = Init.genesis_block ~timestamp ctxt in
-  let* state = P.create chain_store ~head ~timestamp in
   (* Test removal from empty state. *)
-  let state = P.remove_operation state Operation_hash.zero in
-  assert (
-    Operation_hash.Map.is_empty
-      (P.Internal_for_tests.get_valid_operations state)) ;
-  assert (
-    Operation_hash.Set.is_empty (P.Internal_for_tests.get_filter_state state)) ;
-  (* For each operation that will be removed, we generate a boolean
-     that indicates whether the operation should be present in the
-     prevalidation state. *)
-  let removed_op_was_present =
-    QCheck2.Gen.(generate ~n:nb_ops_to_remove bool)
-  in
-  (* We will need as many original operations to remove as there are
-     occurrences of [false] in [removed_op_was_present]. *)
-  let nb_original_ops_to_remove =
-    List.fold_left (fun n b -> if b then n else n + 1) 0 removed_op_was_present
-  in
-  (* We generate all needed operations at the same time to have
-     [operations_gen]'s guarantee that their hashes are distinct. *)
-  let ops = mk_ops (nb_initial_ops + nb_original_ops_to_remove) in
-  (* Add [nb_initial_ops] operations to the prevalidation state. *)
-  let state = P.Internal_for_tests.set_validation_info state Proto_added in
-  let rec add_ops n state ops =
-    if n <= 0 then return (state, ops)
-    else
-      match ops with
-      | [] ->
-          (* We generated more than [nb_initial_ops] operations. *) assert false
-      | op :: remaining_ops ->
-          let*! state, _op, _classification, _replacement =
-            P.add_operation state F_no_replace op
-          in
-          add_ops (n - 1) state remaining_ops
-  in
-  let* state, ops = add_ops nb_initial_ops state ops in
-  assert (
-    Operation_hash.Map.cardinal
-      (P.Internal_for_tests.get_valid_operations state)
-    = nb_initial_ops) ;
-  (* Call [Prevalidation.remove_operation] on [nb_ops_to_remove]
-     operations, which are already present in the state or not as
-     specified by [removed_op_was_present]. *)
-  let rec remove_ops state old_cardinal removed_op_was_present ops =
-    match removed_op_was_present with
-    | [] -> ()
-    | was_present :: rest_was_present ->
-        let oph, remaining_ops =
-          if was_present then
-            match
-              Operation_hash.Map.choose
-                (P.Internal_for_tests.get_valid_operations state)
-            with
-            | Some (oph, _) -> (oph, ops)
-            | None ->
-                (* More operations have been added to the state than removed. *)
-                assert false
-          else
-            match ops with
-            | op :: remaining_ops -> (op.Shell_operation.hash, remaining_ops)
-            | [] ->
-                (* We generated enough operations for each occurrence of
-                   [false] in [removed_op_was_present]. *)
-                assert false
+  let* state = P.create chain_store ~head ~timestamp in
+  let oph = QCheck2.Gen.generate1 Generators.operation_hash_gen in
+  let state = P.remove_operation state oph in
+  assert (Operation_hash.Map.is_empty (get_mempool_operations state)) ;
+  assert (Operation_hash.Map.is_empty (fst (get_bounding_state state))) ;
+  (* Prepare the initial state. *)
+  let*! initial_state =
+    List.fold_left_s
+      (fun state op ->
+        let*! state, _op, _classification, _replacement =
+          P.legacy_add_operation state P.default_config op
         in
-        let state = P.remove_operation state oph in
-        let valid_ops = P.Internal_for_tests.get_valid_operations state in
-        let filter_state = P.Internal_for_tests.get_filter_state state in
-        assert (not (Operation_hash.Map.mem oph valid_ops)) ;
-        assert (not (Operation_hash.Set.mem oph filter_state)) ;
-        let new_cardinal = Operation_hash.Map.cardinal valid_ops in
-        assert (
-          if was_present then new_cardinal = old_cardinal - 1
-          else new_cardinal = old_cardinal) ;
-        remove_ops state new_cardinal rest_was_present remaining_ops
+        Lwt.return state)
+      state
+      (mk_ops nb_initial_ops)
   in
-  remove_ops state nb_initial_ops removed_op_was_present ops ;
+  let initial_proto_ophmap = get_mempool_operations initial_state in
+  let initial_cardinal = Operation_hash.Map.cardinal initial_proto_ophmap in
+  assert (initial_cardinal = nb_initial_ops) ;
+  (* Test the removal of present or fresh operations. *)
+  let test_remove (state, proto_ophmap_before, cardinal_before) =
+    if QCheck2.Gen.(generate1 bool) then (
+      (* Remove a present operation. *)
+      let oph = random_oph_from_map proto_ophmap_before in
+      let state = P.remove_operation state oph in
+      let proto_ophmap = get_mempool_operations state in
+      let bounding_ophmap = fst (get_bounding_state state) in
+      assert (not (Operation_hash.Map.mem oph proto_ophmap)) ;
+      assert (not (Operation_hash.Map.mem oph bounding_ophmap)) ;
+      let cardinal = Operation_hash.Map.cardinal proto_ophmap in
+      assert (cardinal = cardinal_before - 1) ;
+      assert (Operation_hash.Map.cardinal bounding_ophmap = cardinal) ;
+      (state, proto_ophmap, cardinal))
+    else
+      (* Remove a fresh operation. *)
+      let bounding_ophmap_before = get_bounding_state state in
+      let oph =
+        QCheck2.Gen.generate1 (Generators.fresh_oph_gen proto_ophmap_before)
+      in
+      let state = P.remove_operation state oph in
+      let proto_ophmap = get_mempool_operations state in
+      let bounding_ophmap = get_bounding_state state in
+      (* Internal states are physically unchanged. *)
+      assert (proto_ophmap == proto_ophmap_before) ;
+      assert (bounding_ophmap == bounding_ophmap_before) ;
+      (state, proto_ophmap, cardinal_before)
+  in
+  let rec fun_power f x n = if n <= 0 then x else fun_power f (f x) (n - 1) in
+  let final_state, final_proto_ophmap, final_cardinal =
+    fun_power
+      test_remove
+      (initial_state, initial_proto_ophmap, initial_cardinal)
+      nb_ops_to_remove
+  in
+  let final_bounding_ophmap = fst (get_bounding_state final_state) in
+  assert (Operation_hash.Map.cardinal final_bounding_ophmap = final_cardinal) ;
+  assert (
+    Operation_hash.Map.for_all
+      (fun oph _op -> Operation_hash.Map.mem oph final_bounding_ophmap)
+      final_proto_ophmap) ;
   return_unit
-
-let () =
-  let register_test name f =
-    Tztest.tztest name `Quick (Init.wrap_tzresult_lwt_disk f)
-  in
-  Alcotest_lwt.run
-    "mempool-prevalidation"
-    [
-      (* Run only those tests with:
-         dune exec src/lib_shell/test/test_prevalidation.exe -- test create '0' *)
-      ("create", [register_test "[create] succeeds" test_create]);
-      (* Run only those tests with:
-         dune exec src/lib_shell/test/test_prevalidation.exe -- test add_operation '0' *)
-      ( "add_operation",
-        [
-          register_test
-            "Check classification and state updates"
-            test_add_operation;
-        ] );
-      (* Run only those tests with:
-         dune exec src/lib_shell/test/test_prevalidation.exe -- test remove_operation '0' *)
-      ( "remove_operation",
-        [register_test "Test remove_operation" test_remove_operation] );
-    ]
-  |> Lwt_main.run

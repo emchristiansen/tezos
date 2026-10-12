@@ -47,16 +47,16 @@ let pp_manager_operation_content (type kind) source internal pp_result ppf
       | "default" -> ()
       | _ -> Format.fprintf ppf "@,Entrypoint: %s" entrypoint) ;
       (if not (Script_repr.is_unit_parameter parameters) then
-       let expr =
-         WithExceptions.Option.to_exn
-           ~none:(Failure "ill-serialized argument")
-           (Data_encoding.force_decode parameters)
-       in
-       Format.fprintf
-         ppf
-         "@,Parameter: @[<v 0>%a@]"
-         Michelson_v1_printer.print_expr
-         expr) ;
+         let expr =
+           WithExceptions.Option.to_exn
+             ~none:(Failure "ill-serialized argument")
+             (Data_encoding.force_decode parameters)
+         in
+         Format.fprintf
+           ppf
+           "@,Parameter: @[<v 0>%a@]"
+           Michelson_v1_printer.print_expr
+           expr) ;
       pp_result ppf result ;
       Format.fprintf ppf "@]"
   | Origination {delegate; credit; script = {code; storage}; preorigination = _}
@@ -148,7 +148,7 @@ let pp_manager_operation_content (type kind) source internal pp_result ppf
         ppf
         "@[<v 2>%s:@,Delegate: %a@,Unlimited deposits%a@]"
         (if internal then "Internal set deposits limit"
-        else "Set deposits limit")
+         else "Set deposits limit")
         Contract.pp
         source
         pp_result
@@ -158,7 +158,7 @@ let pp_manager_operation_content (type kind) source internal pp_result ppf
         ppf
         "@[<v 2>%s:@,Delegate: %a@,Limit: %a%a@]"
         (if internal then "Internal set deposits limit"
-        else "Set deposits limit")
+         else "Set deposits limit")
         Contract.pp
         source
         Tez.pp
@@ -295,16 +295,16 @@ let pp_manager_operation_contents_and_result ppf
   in
   let pp_transaction_result
       (Transaction_result
-        {
-          balance_updates;
-          consumed_gas;
-          storage;
-          originated_contracts;
-          storage_size;
-          paid_storage_size_diff;
-          lazy_storage_diff;
-          allocated_destination_contract = _;
-        }) =
+         {
+           balance_updates;
+           consumed_gas;
+           storage;
+           originated_contracts;
+           storage_size;
+           paid_storage_size_diff;
+           lazy_storage_diff;
+           allocated_destination_contract = _;
+         }) =
     (match originated_contracts with
     | [] -> ()
     | contracts ->
@@ -341,14 +341,14 @@ let pp_manager_operation_contents_and_result ppf
   in
   let pp_origination_result
       (Origination_result
-        {
-          lazy_storage_diff;
-          balance_updates;
-          consumed_gas;
-          originated_contracts;
-          storage_size;
-          paid_storage_size_diff;
-        }) =
+         {
+           lazy_storage_diff;
+           balance_updates;
+           consumed_gas;
+           originated_contracts;
+           storage_size;
+           paid_storage_size_diff;
+         }) =
     (match originated_contracts with
     | [] -> ()
     | contracts ->
@@ -377,7 +377,7 @@ let pp_manager_operation_contents_and_result ppf
   in
   let pp_register_global_constant_result
       (Register_global_constant_result
-        {balance_updates; consumed_gas; size_of_constant; global_address}) =
+         {balance_updates; consumed_gas; size_of_constant; global_address}) =
     (match balance_updates with
     | [] ->
         (* Not possible - register global constant operation always returns
@@ -501,8 +501,8 @@ let pp_manager_operation_contents_and_result ppf
         internal_operation_results) ;
   Format.fprintf ppf "@]"
 
-let rec pp_contents_and_result_list :
-    type kind. Format.formatter -> kind contents_and_result_list -> unit =
+let rec pp_contents_and_result_list : type kind.
+    Format.formatter -> kind contents_and_result_list -> unit =
  fun ppf -> function
   | Single_and_result
       (Seed_nonce_revelation {level; nonce}, Seed_nonce_revelation_result bus)

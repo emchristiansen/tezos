@@ -38,7 +38,12 @@ module Proto = struct
       let open Lwt_result_syntax in
       let+ ctxt =
         Lwt.map wrap_tzresult
-        @@ Raw_context.prepare ~level ~predecessor_timestamp ~timestamp ctxt
+        @@ Raw_context.prepare
+             ~level
+             ~predecessor_timestamp
+             ~timestamp
+             ~all_bakers_attest_first_level:None
+             ctxt
       in
       Raw_context.set_gas_limit
         ctxt
@@ -96,8 +101,9 @@ module Proto = struct
         =
       (code_size :> int)
 
-    let actual_code_size Script_ir_translator.(Ex_code (Code {code; _})) =
-      8 * Obj.(reachable_words @@ repr code)
+    let actual_code_size
+        Script_ir_translator.(Ex_code (Code {implementation; _})) =
+      8 * Obj.(reachable_words @@ repr implementation)
 
     let parse_ty (raw_ctxt : Raw_context.t) ~allow_lazy_storage ~allow_operation
         ~allow_contract ~allow_ticket script =
@@ -128,7 +134,8 @@ module Proto = struct
         @@ Script_ir_translator.parse_data
              ~elab_conf:(Script_ir_translator_config.make ~legacy:true ())
              ctxt
-             ~allow_forged
+             ~allow_forged_tickets:allow_forged
+             ~allow_forged_lazy_storage_id:allow_forged
              ty
              expr
       in
@@ -167,8 +174,7 @@ module Proto = struct
       let open Lwt_result_syntax in
       let ctxt : Alpha_context.context = Obj.magic raw_ctxt in
       let+ toplevel, updated_ctxt =
-        Lwt.map wrap_tzresult
-        @@ Script_ir_translator.parse_toplevel ctxt ~legacy:true expr
+        Lwt.map wrap_tzresult @@ Script_ir_translator.parse_toplevel ctxt expr
       in
       let consumed =
         (Alpha_context.Gas.consumed ~since:ctxt ~until:updated_ctxt :> int)
@@ -226,8 +232,8 @@ module Proto = struct
       match node with
       | Ex_lambda (_, Lam (_, node)) | Ex_lambda (_, LamRec (_, node)) -> node
 
-    let rec find_lambda_tys :
-        type a c. (a, c) Script_typed_ir.ty -> (a -> ex_lambda list) list =
+    let rec find_lambda_tys : type a c.
+        (a, c) Script_typed_ir.ty -> (a -> ex_lambda list) list =
      fun ty ->
       let open Script_typed_ir in
       match ty with
@@ -236,7 +242,7 @@ module Proto = struct
       | Big_map_t _ | Contract_t _ | Operation_t | Sapling_transaction_t _
       | Sapling_transaction_deprecated_t _ | Sapling_state_t _ | Never_t
       | Bls12_381_g1_t | Bls12_381_g2_t | Bls12_381_fr_t | Ticket_t _
-      | Chain_id_t | Chest_key_t | Chest_t | Tx_rollup_l2_address_t ->
+      | Chain_id_t | Chest_key_t | Chest_t ->
           []
       | Pair_t (t1, t2, _, _) ->
           let g1 = List.map (fun g (v, _) -> g v) @@ find_lambda_tys t1 in
@@ -262,8 +268,7 @@ module Proto = struct
           @@ find_lambda_tys t
       | Map_t (_, tv, _) -> find_lambda_tys_map tv
 
-    and find_lambda_tys_map :
-        type tk tv c.
+    and find_lambda_tys_map : type tk tv c.
         (tv, c) Script_typed_ir.ty ->
         ((tk, tv) Script_typed_ir.map -> ex_lambda list) list =
      fun tv ->
@@ -298,6 +303,13 @@ module Proto = struct
     | _ -> false
 
   let code_storage_type ({storage_type; _} : Translator.toplevel) = storage_type
+
+  module Global_constants = struct
+    let expand ctxt (expr : Script.expr) =
+      let open Lwt_syntax in
+      let+ res = Global_constants_storage.expand ctxt expr in
+      match res with Error _ -> (ctxt, expr) | Ok x -> x
+  end
 end
 
 let () = Known_protocols.register (module Proto)

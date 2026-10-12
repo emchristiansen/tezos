@@ -56,21 +56,21 @@ type failure_kind =
   | Cannot_read_block_hash of Block_hash.t
   | Cannot_read_block_level of Int32.t
   | Cannot_read_resulting_context_hash of Block_hash.t
+  | Cannot_read_block_metadata of Block_hash.t
 
 type error += Reconstruction_failure of failure_kind
 
 type error += Cannot_reconstruct of History_mode.t
 
-(** [reconstruct ?patch_context ~store_dir ~context_dir genesis uau
-    uapo omsl] reconstructs the storage located in [store_dir] and
-    [context_dir]. The resulting storage will see its history mode
-    changed to archive. *)
+(** [reconstruct ?patch_context ~store_dir ~data_dir genesis uau uapo
+    omsl] reconstructs the storage located in [store_dir] and [data_dir]. The
+    resulting storage will see its history mode changed to archive. *)
 val reconstruct :
   ?patch_context:
     (Tezos_protocol_environment.Context.t ->
     Tezos_protocol_environment.Context.t tzresult Lwt.t) ->
   store_dir:string ->
-  context_dir:string ->
+  data_dir:string ->
   Genesis.t ->
   user_activated_upgrades:User_activated.upgrades ->
   user_activated_protocol_overrides:User_activated.protocol_overrides ->

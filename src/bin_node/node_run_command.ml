@@ -1,26 +1,9 @@
 (*****************************************************************************)
 (*                                                                           *)
-(* Open Source License                                                       *)
+(* SPDX-License-Identifier: MIT                                              *)
 (* Copyright (c) 2018 Dynamic Ledger Solutions, Inc. <contact@tezos.com>     *)
 (* Copyright (c) 2019-2021 Nomadic Labs, <contact@nomadic-labs.com>          *)
-(*                                                                           *)
-(* Permission is hereby granted, free of charge, to any person obtaining a   *)
-(* copy of this software and associated documentation files (the "Software"),*)
-(* to deal in the Software without restriction, including without limitation *)
-(* the rights to use, copy, modify, merge, publish, distribute, sublicense,  *)
-(* and/or sell copies of the Software, and to permit persons to whom the     *)
-(* Software is furnished to do so, subject to the following conditions:      *)
-(*                                                                           *)
-(* The above copyright notice and this permission notice shall be included   *)
-(* in all copies or substantial portions of the Software.                    *)
-(*                                                                           *)
-(* THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR*)
-(* IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,  *)
-(* FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL   *)
-(* THE AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER*)
-(* LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING   *)
-(* FROM, OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER       *)
-(* DEALINGS IN THE SOFTWARE.                                                 *)
+(* Copyright (c) 2024 TriliTech <contact@trili.tech>                         *)
 (*                                                                           *)
 (*****************************************************************************)
 
@@ -29,6 +12,9 @@ type error += Non_private_sandbox of P2p_addr.t
 type error += RPC_Port_already_in_use of P2p_point.Id.t list
 
 type error += Invalid_sandbox_file of string
+
+(** Profiler for RPC server. *)
+module Profiler = (val Profiler.wrap Shell_profiling.rpc_server_profiler)
 
 let () =
   register_error_kind
@@ -95,30 +81,6 @@ module Event = struct
       ~level:Notice
       ()
 
-  let read_identity =
-    declare_1
-      ~section
-      ~name:"read_identity"
-      ~msg:"read identity file"
-      ~level:Notice
-      ("peer_id", P2p_peer.Id.encoding)
-
-  let generating_identity =
-    declare_0
-      ~section
-      ~name:"generating_identity"
-      ~msg:"generating an identity file"
-      ~level:Notice
-      ()
-
-  let identity_generated =
-    declare_1
-      ~section
-      ~name:"identity_generated"
-      ~msg:"identity file generated"
-      ~level:Notice
-      ("peer_id", P2p_peer.Id.encoding)
-
   let disabled_config_validation =
     declare_0
       ~section
@@ -127,16 +89,23 @@ module Event = struct
       ~level:Warning
       ()
 
-  let starting_rpc_server =
-    declare_4
+  let starting_local_rpc_server =
+    declare_3
       ~section
-      ~name:"starting_rpc_server"
-      ~msg:"starting RPC server on {host}:{port} (acl = {acl_policy})"
+      ~name:"starting_local_rpc_server"
+      ~msg:"starting local RPC server on {host}:{port} (acl = {acl_policy})"
       ~level:Notice
       ("host", Data_encoding.string)
       ("port", Data_encoding.uint16)
-      ("tls", Data_encoding.bool)
       ("acl_policy", Data_encoding.string)
+
+  let starting_internal_rpc_server =
+    declare_0
+      ~section
+      ~name:"starting_internal_rpc_server"
+      ~msg:"starting internal RPC server"
+      ~level:Info
+      ()
 
   let starting_metrics_server =
     declare_2
@@ -151,16 +120,17 @@ module Event = struct
     declare_3
       ~section
       ~name:"starting_node"
-      ~msg:"starting the Tezos node v{version} ({git_info})"
+      ~msg:"starting the Octez node {version} ({git_info})"
       ~level:Notice
       ("chain", Distributed_db_version.Name.encoding)
-      ~pp2:Tezos_version.Version.pp
-      ("version", Tezos_version.Node_version.version_encoding)
+      ~pp2:Tezos_version.Version.pp_simple
+      ("version", Tezos_version.Octez_node_version.version_encoding)
       ("git_info", Data_encoding.string)
 
   let node_is_ready =
     declare_0
       ~section
+      ~alternative_color:Internal_event.Green
       ~name:"node_is_ready"
       ~msg:"the Tezos node is now running"
       ~level:Notice
@@ -174,12 +144,12 @@ module Event = struct
       ~level:Notice
       ()
 
-  let shutting_down_rpc_server =
+  let shutting_down_local_rpc_server =
     declare_0
       ~section
-      ~name:"shutting_down_rpc_server"
-      ~msg:"shutting down the RPC server"
-      ~level:Notice
+      ~name:"shutting_down_local_rpc_server"
+      ~msg:"shutting down the local RPC server"
+      ~level:Info
       ()
 
   let bye =
@@ -201,40 +171,63 @@ module Event = struct
       ("stacktrace", Data_encoding.string)
 
   let incorrect_history_mode =
-    declare_2
+    declare_1
       ~section
       ~name:"incorrect_history_mode"
-      ~msg:
-        "The given history mode {given_history_mode} does not correspond to \
-         the stored history mode {stored_history_mode}. If you wish to force \
-         the switch, use the flag '--force-history-mode-switch'."
+      ~msg:"{switch_error}"
       ~level:Error
-      ~pp1:History_mode.pp
-      ("given_history_mode", History_mode.encoding)
-      ~pp2:History_mode.pp
-      ("stored_history_mode", History_mode.encoding)
+      ~pp1:Error_monad.pp
+      ("switch_error", Error_monad.error_encoding)
+
+  let enable_http_cache_headers_for_local =
+    declare_0
+      ~section
+      ~name:"enable_http_cache_headers_for_local"
+      ~msg:"HTTP cache headers enabled for local rpc server"
+      ~level:Notice
+      ()
+
+  let accepted_conn_rpc_server =
+    declare_2
+      ~section
+      ~name:"accepted_conn_rpc_server"
+      ~msg:"[pid:{pid}] ({con}) accepted connection"
+      ~level:Debug
+      ("pid", Data_encoding.int32)
+      ("con", Data_encoding.string)
+
+  let conn_closed_rpc_server =
+    declare_2
+      ~section
+      ~name:"conn_closed_rpc_server"
+      ~msg:"[pid:{pid}] ({con}) got connection closed"
+      ~level:Debug
+      ("pid", Data_encoding.int32)
+      ("con", Data_encoding.string)
 end
 
 open Filename.Infix
 
 let init_identity_file (config : Config_file.t) =
-  let open Lwt_result_syntax in
+  let check_data_dir ~data_dir =
+    let dummy_genesis =
+      {
+        Genesis.time = Time.Protocol.epoch;
+        block = Block_hash.zero;
+        protocol = Protocol_hash.zero;
+      }
+    in
+    Data_version.ensure_data_dir ~mode:Exists dummy_genesis data_dir
+  in
   let identity_file =
     config.data_dir // Data_version.default_identity_file_name
   in
-  if Sys.file_exists identity_file then
-    let* identity = Node_identity_file.read identity_file in
-    let*! () = Event.(emit read_identity) identity.peer_id in
-    return identity
-  else
-    let*! () = Event.(emit generating_identity) () in
-    let* identity =
-      Node_identity_file.generate identity_file config.p2p.expected_pow
-    in
-    let*! () = Event.(emit identity_generated) identity.peer_id in
-    return identity
+  Identity_file.init
+    ~check_data_dir
+    ~identity_file
+    ~expected_pow:config.p2p.expected_pow
 
-let init_node ?sandbox ?target ~identity ~singleprocess
+let init_node ?sandbox ?target ~identity ~singleprocess ~internal_events
     ~force_history_mode_switch (config : Config_file.t) =
   let open Lwt_result_syntax in
   (* TODO "WARN" when pow is below our expectation. *)
@@ -295,6 +288,7 @@ let init_node ?sandbox ?target ~identity ~singleprocess
             proof_of_work_target =
               Tezos_crypto.Crypto_box.make_pow_target config.p2p.expected_pow;
             trust_discovered_peers = sandbox <> None;
+            disable_peer_discovery = config.p2p.disable_peer_discovery;
           }
         in
         return_some (p2p_config, config.p2p.limits)
@@ -328,14 +322,14 @@ let init_node ?sandbox ?target ~identity ~singleprocess
         config.shell.block_validator_limits.operation_metadata_size_limit;
       patch_context;
       data_dir = config.data_dir;
+      internal_events;
       store_root = Data_version.store_dir config.data_dir;
-      context_root = Data_version.context_dir config.data_dir;
       protocol_root = Data_version.protocol_dir config.data_dir;
       p2p = p2p_config;
       target;
       enable_testchain = config.p2p.enable_testchain;
       disable_mempool = config.p2p.disable_mempool;
-      dal = config.dal;
+      dal_config = config.blockchain_network.dal_config;
     }
   in
   let* () =
@@ -343,21 +337,58 @@ let init_node ?sandbox ?target ~identity ~singleprocess
     | Some history_mode when force_history_mode_switch ->
         Store.may_switch_history_mode
           ~store_dir:node_config.store_root
-          ~context_dir:node_config.context_root
+          ~data_dir:config.data_dir
           genesis
           ~new_history_mode:history_mode
     | _ -> return_unit
   in
+  let version =
+    Tezos_version.Version.to_string
+      Tezos_version_value.Current_git_info.octez_version
+  in
+  let commit_info =
+    ({
+       commit_hash = Tezos_version_value.Current_git_info.commit_hash;
+       commit_date = Tezos_version_value.Current_git_info.committer_date;
+     }
+      : Tezos_version.Octez_node_version.commit_info)
+  in
   Node.create
     ~sandboxed:(sandbox <> None)
     ?sandbox_parameters:(Option.map snd sandbox_param)
+    ?disable_context_pruning:config.shell.disable_context_pruning
     ~singleprocess
+    ~version
+    ~commit_info
     node_config
     config.shell.peer_validator_limits
     config.shell.block_validator_limits
     config.shell.prevalidator_limits
     config.shell.chain_validator_limits
-    config.shell.history_mode
+    ?history_mode:config.shell.history_mode
+    ?maintenance_delay:config.shell.storage_maintenance_delay
+
+let rpc_metrics =
+  Prometheus.Summary.v_labels
+    ~label_names:["endpoint"; "method"]
+    ~help:"RPC endpoint call counts and sum of execution times."
+    ~namespace:Tezos_version.Octez_node_version.namespace
+    ~subsystem:"rpc"
+    "calls"
+
+module Metrics_server = Prometheus_app.Cohttp (Cohttp_lwt_unix.Server)
+
+type port = int
+
+type socket_file = string
+
+type single_server_kind =
+  | Process of socket_file
+  | Local of Conduit_lwt_unix.server * port
+
+let extract_mode = function
+  | Process socket_file -> `Unix_domain_socket (`File socket_file)
+  | Local (mode, _) -> mode
 
 (* Add default accepted CORS headers *)
 let sanitize_cors_headers ~default headers =
@@ -366,48 +397,41 @@ let sanitize_cors_headers ~default headers =
   |> String.Set.(union (of_list default))
   |> String.Set.elements
 
-let rpc_metrics =
-  Prometheus.Summary.v_labels
-    ~label_names:["endpoint"; "method"]
-    ~help:"RPC endpoint call counts and sum of execution times."
-    ~namespace:Tezos_version.Node_version.namespace
-    ~subsystem:"rpc"
-    "calls"
-
-module Metrics_server = Prometheus_app.Cohttp (Cohttp_lwt_unix.Server)
-
-let launch_rpc_server ~acl_policy ~media_types (config : Config_file.t) node
-    (addr, port) =
+(* Launches an RPC server depending on the given server kind. [middleware] can
+   be provided to transform the callback. *)
+let launch_rpc_server ?middleware (config : Config_file.t) dir rpc_server_kind
+    addr =
   let open Lwt_result_syntax in
   let rpc_config = config.rpc in
+  let media_types = rpc_config.media_type in
   let host = Ipaddr.V6.to_string addr in
-  let dir = Node.build_rpc_directory node in
-  let dir = Node_directory.build_node_directory config dir in
-  let dir =
-    Tezos_rpc.Directory.register_describe_directory_service
-      dir
-      Tezos_rpc.Service.description_service
-  in
-  let mode =
-    match rpc_config.tls with
-    | None -> `TCP (`Port port)
-    | Some {cert; key} ->
-        `TLS (`Crt_file_path cert, `Key_file_path key, `No_password, `Port port)
-  in
-  let acl =
-    let open RPC_server.Acl in
-    find_policy acl_policy (Ipaddr.V6.to_string addr, Some port)
-    |> Option.value_f ~default:(fun () -> default addr)
-  in
-  let*! () =
-    Event.(emit starting_rpc_server)
-      (host, port, rpc_config.tls <> None, RPC_server.Acl.policy_type acl)
-  in
-  let cors_headers =
-    sanitize_cors_headers ~default:["Content-Type"] rpc_config.cors_headers
+  let* acl =
+    (* Also emits events depending on server kind *)
+    match rpc_server_kind with
+    | Process _ ->
+        let*! () = Event.(emit starting_internal_rpc_server) () in
+        return_none
+    | Local (mode, port) ->
+        let*! acl_policy = RPC_server.Acl.resolve_domain_names rpc_config.acl in
+        let acl =
+          let open RPC_server.Acl in
+          find_policy acl_policy (Ipaddr.V6.to_string addr, Some port)
+          |> Option.value_f ~default:(fun () -> default addr)
+        in
+        let*! () =
+          match (mode : Conduit_lwt_unix.server) with
+          | `TCP _ | `TLS _ | `Unix_domain_socket _ ->
+              Event.(emit starting_local_rpc_server)
+                (host, port, RPC_server.Acl.policy_type acl)
+          | _ -> Lwt.return_unit
+        in
+        return_some acl
   in
   let cors =
-    RPC_server.
+    let cors_headers =
+      sanitize_cors_headers ~default:["Content-Type"] rpc_config.cors_headers
+    in
+    Resto_cohttp.Cors.
       {
         allowed_origins = rpc_config.cors_origins;
         allowed_headers = cors_headers;
@@ -416,52 +440,202 @@ let launch_rpc_server ~acl_policy ~media_types (config : Config_file.t) node
   let server =
     RPC_server.init_server
       ~cors
-      ~acl
+      ?acl
       ~media_types:(Media_type.Command_line.of_command_line media_types)
       dir
   in
   let callback (conn : Cohttp_lwt_unix.Server.conn) req body =
-    let path = Cohttp_lwt.Request.uri req |> Uri.path in
-    if path = "/metrics" then
-      let*! response = Metrics_server.callback conn req body in
-      Lwt.return (`Response response)
-    else Tezos_rpc_http_server.RPC_server.resto_callback server conn req body
+    (* Every call is routed through the ACL-governed RPC dispatcher.
+       /metrics is intentionally excluded: it is only served by the dedicated
+       metrics server when --metrics-addr is explicitly configured. *)
+    (Tezos_rpc_http_server.RPC_server.resto_callback
+       server
+       conn
+       req
+       body
+     [@profiler.span_s
+       {verbosity = Notice} [Cohttp.Request.uri req |> Uri.path]])
   in
   let update_metrics uri meth =
     Prometheus.Summary.(time (labels rpc_metrics [uri; meth]) Sys.time)
   in
-  let callback =
-    RPC_middleware.rpc_metrics_transform_callback ~update_metrics dir callback
+  let callback conn req body =
+    let*! () =
+      Event.(emit accepted_conn_rpc_server)
+        (Int32.of_int (Unix.getpid ()), Cohttp.Connection.to_string (snd conn))
+    in
+    RPC_middleware.rpc_metrics_transform_callback
+      ~update_metrics
+      dir
+      callback
+      conn
+      req
+      body
   in
+  let callback =
+    match middleware with
+    | Some middleware -> middleware callback
+    | None -> callback
+  in
+  let mode = extract_mode rpc_server_kind in
   Lwt.catch
     (fun () ->
-      let*! () = RPC_server.launch ~host server ~callback mode in
+      let*! () =
+        RPC_server.launch
+          ~host
+          server
+          ~callback
+          ~conn_closed:(fun (_, con) ->
+            Event.(emit__dont_wait__use_with_care conn_closed_rpc_server)
+              (Int32.of_int (Unix.getpid ()), Cohttp.Connection.to_string con))
+          ~max_active_connections:config.rpc.max_active_rpc_connections
+          mode
+      in
       return server)
     (function
       (* FIXME: https://gitlab.com/tezos/tezos/-/issues/1312
          This exception seems to be unreachable.
       *)
-      | Unix.Unix_error (Unix.EADDRINUSE, "bind", "") ->
-          tzfail (RPC_Port_already_in_use [(addr, port)])
+      | Unix.Unix_error (Unix.EADDRINUSE, "bind", "") as exn -> (
+          match rpc_server_kind with
+          | Process _ -> fail_with_exn exn
+          | Local (_, port) -> tzfail (RPC_Port_already_in_use [(addr, port)]))
       | exn -> fail_with_exn exn)
 
-let init_rpc (config : Config_file.t) node =
+(* Describes the kind of servers that can be handled by the node.
+   - Local_rpc_server: RPC server is run by the node itself
+     (this may block the node in case of heavy RPC load),
+   - External_rpc_server: RPC server is spawned as an external
+     process,
+   - No_server: the node is not responding to any RPC. *)
+type rpc_server_kind =
+  | Local_rpc_server of RPC_server.server list
+  | External_rpc_server of {
+      watchdog_process : External_watchdog.Process.t;
+      rpc_servers :
+        (RPC_server.server
+        * string (* comm_socket_path used to communicate with the rpc_process *))
+        list;
+    }
+  | No_server
+
+(* Initializes an RPC server handled by the node main process. *)
+let init_local_rpc_server ?middleware (config : Config_file.t) dir =
   let open Lwt_result_syntax in
-  let media_types = config.rpc.media_type in
-  List.concat_map_es
-    (fun addr ->
-      let* addrs = Config_file.resolve_rpc_listening_addrs addr in
-      match addrs with
-      | [] -> failwith "Cannot resolve listening address: %S" addr
-      | addrs ->
-          let*! acl_policy =
-            RPC_server.Acl.resolve_domain_names config.rpc.acl
-          in
-          List.map_es
-            (fun addr ->
-              launch_rpc_server ~acl_policy ~media_types config node addr)
-            addrs)
-    config.rpc.listen_addrs
+  let* servers =
+    List.concat_map_es
+      (fun addr ->
+        let* addrs = Config_file.resolve_rpc_listening_addrs addr in
+        match addrs with
+        | [] -> failwith "Cannot resolve listening address: %S" addr
+        | addrs ->
+            List.map_es
+              (fun (addr, port) ->
+                let mode =
+                  match config.rpc.tls with
+                  | None -> `TCP (`Port port)
+                  | Some {cert; key} ->
+                      `TLS
+                        ( `Crt_file_path cert,
+                          `Key_file_path key,
+                          `No_password,
+                          `Port port )
+                in
+                launch_rpc_server
+                  ?middleware
+                  config
+                  dir
+                  (Local (mode, port))
+                  addr)
+              addrs)
+      config.rpc.listen_addrs
+  in
+  return (Local_rpc_server servers)
+
+let rpc_socket_path ~socket_dir ~id ~pid =
+  let filename = Format.sprintf "octez-external-rpc-socket-%d-%d" pid id in
+  Filename.concat socket_dir filename
+
+(* Initializes an RPC server handled by the node process. It will be
+   used by an external RPC process, identified by [id], to forward
+   RPCs to the node through a Unix socket. *)
+let init_local_rpc_server_for_external_process ?middleware id
+    (config : Config_file.t) dir addr =
+  let open Lwt_result_syntax in
+  let socket_dir = Tezos_base_unix.Socket.get_temporary_socket_dir () in
+  let pid = Unix.getpid () in
+  let comm_socket_path = rpc_socket_path ~id ~socket_dir ~pid in
+  (* Register a clean up callback to clean the comm_socket_path when
+     shutting down. Indeed, the socket file is created by the
+     Conduit-lwt-unix.Conduit_lwt_server.listen function, but the
+     resource is not cleaned. *)
+  let _ =
+    Lwt_exit.register_clean_up_callback ~loc:__LOC__ (fun _ ->
+        Lwt_unix.unlink comm_socket_path)
+  in
+  let* rpc_server =
+    launch_rpc_server ?middleware config dir (Process comm_socket_path) addr
+  in
+  return (rpc_server, comm_socket_path)
+
+let init_external_rpc_server ?middleware config node_version dir internal_events
+    =
+  let open Lwt_result_syntax in
+  (* Start the watchdog process that will monitor the RPC processes. *)
+  let* watchdog_process =
+    Octez_rpc_process.External_watchdog.Process.init
+      {internal_events}
+      ~process_path:Sys.executable_name
+  in
+  (* Start one rpc_process for each rpc endpoint. *)
+  let id = ref 0 in
+  let* rpc_servers =
+    List.concat_map_ep
+      (fun addr ->
+        let* addrs = Config_file.resolve_rpc_listening_addrs addr in
+        match addrs with
+        | [] -> failwith "Cannot resolve listening address: %S" addr
+        | addrs ->
+            List.map_ep
+              (fun (p2p_point : P2p_point.Id.t) ->
+                let id =
+                  let curid = !id in
+                  incr id ;
+                  curid
+                in
+                let* local_rpc_server, comm_socket_path =
+                  init_local_rpc_server_for_external_process
+                    ?middleware
+                    id
+                    config
+                    dir
+                    (fst p2p_point)
+                in
+                let addr = P2p_point.Id.to_string p2p_point in
+                (* Update the config sent to the rpc_process to
+                   start so that it contains a single listen
+                   address. *)
+                let config =
+                  {
+                    config with
+                    rpc = {config.rpc with external_listen_addrs = [addr]};
+                  }
+                in
+                let* _ =
+                  Octez_rpc_process.External_watchdog.Process.start_server
+                    watchdog_process
+                    {
+                      config;
+                      internal_events;
+                      rpc_comm_socket_path = comm_socket_path;
+                      node_version;
+                    }
+                in
+                return (local_rpc_server, comm_socket_path))
+              addrs)
+      config.rpc.external_listen_addrs
+  in
+  return (External_rpc_server {watchdog_process; rpc_servers})
 
 let metrics_serve metrics_addrs =
   let open Lwt_result_syntax in
@@ -500,18 +674,88 @@ let init_zcash () =
          "Failed to initialize Zcash parameters: %s"
          (Printexc.to_string exn))
 
+let init_rpc (config : Config_file.t) (node : Node.t) internal_events =
+  let open Lwt_result_syntax in
+  (* Start local RPC server (handled by the node main process) only
+     when at least one local listen addr is given. *)
+  let node_version = Node.get_version node in
+  let dir =
+    Node.build_rpc_directory
+      ~node_version
+      ~profiling_config:config.profiling
+      node
+  in
+  let dir = Node_directory.build_node_directory config dir in
+  let dir =
+    Tezos_rpc.Directory.register_describe_directory_service
+      dir
+      Tezos_rpc.Service.description_service
+  in
+  let* local_rpc_server =
+    if config.rpc.listen_addrs = [] then return No_server
+    else
+      let* middleware =
+        if config.rpc.enable_http_cache_headers then
+          let*! () = Event.(emit enable_http_cache_headers_for_local ()) in
+
+          let http_cache_headers_middleware =
+            let Http_cache_headers.
+                  {get_estimated_time_to_next_level; get_block_hash} =
+              Node.http_cache_header_tools node
+            in
+            RPC_middleware.Http_cache_headers.make
+              ~get_estimated_time_to_next_level
+              ~get_block_hash
+          in
+          return_some http_cache_headers_middleware
+        else return_none
+      in
+      init_local_rpc_server ?middleware config dir
+  in
+  (* Start RPC process only when at least one listen addr is given. *)
+  let* rpc_server =
+    if config.rpc.external_listen_addrs = [] then return No_server
+    else
+      (* Starts the node's local RPC server that aims to handle the
+         RPCs forwarded by the rpc_process, if they cannot be
+         processed by the rpc_process itself. *)
+      init_external_rpc_server config node_version dir internal_events
+  in
+  return (local_rpc_server :: [rpc_server])
+
+let[@warning "-32"] may_start_profiler data_dir
+    (profiling_config : Tezos_profiler.Profiler.profiling_config) =
+  match
+    Tezos_profiler_unix.Profiler_instance.selected_backends ~profiling_config
+  with
+  | Some backends ->
+      List.iter
+        (fun Tezos_profiler_unix.Profiler_instance.{instance_maker; _} ->
+          let profiler_maker = instance_maker ~directory:data_dir in
+          Shell_profiling.activate_all ~profiling_config ~profiler_maker)
+        backends
+  | None -> ()
+
 let run ?verbosity ?sandbox ?target ?(cli_warnings = [])
     ?ignore_testchain_warning ~singleprocess ~force_history_mode_switch
     (config : Config_file.t) =
   let open Lwt_result_syntax in
   (* Main loop *)
-  let*! () =
-    Log_config.init_internal_events_with_defaults
-      ~internal_events:(config.internal_events, config.data_dir)
-      ?verbosity
-      ~log_cfg:config.log
-      ()
+  let internal_events =
+    match config.internal_events with
+    | Some ie -> ie
+    | None ->
+        Tezos_base_unix.Internal_event_unix.make_with_defaults
+          ~enable_default_daily_logs_at:
+            Filename.Infix.(config.data_dir // "daily_logs")
+          ?verbosity
+          ~log_cfg:config.log
+          ()
   in
+  let*! () =
+    Tezos_base_unix.Internal_event_unix.init ~config:internal_events ()
+  in
+  () [@profiler.overwrite may_start_profiler config.data_dir config.profiling] ;
   let*! () =
     Lwt_list.iter_s (fun evt -> Internal_event.Simple.emit evt ()) cli_warnings
   in
@@ -523,22 +767,25 @@ let run ?verbosity ?sandbox ?target ?(cli_warnings = [])
   in
   let* () = Config_validation.check ?ignore_testchain_warning config in
   let* identity = init_identity_file config in
+  ()
+  [@profiler.overwrite
+    {driver_ids = [Opentelemetry]}
+      (Opentelemetry_profiler.initialize
+         ~unique_identifier:(P2p_peer.Id.to_b58check identity.peer_id)
+         "octez-node")] ;
   Updater.init (Data_version.protocol_dir config.data_dir) ;
   let*! () =
     Event.(emit starting_node)
       ( config.blockchain_network.chain_name,
-        Tezos_version.Current_git_info.version,
-        Tezos_version.Current_git_info.abbreviated_commit_hash )
+        Tezos_version_value.Current_git_info.octez_version,
+        Tezos_version_value.Current_git_info.abbreviated_commit_hash )
   in
   let*! () = init_zcash () in
-  let* () =
-    let find_srs_files () = Tezos_base.Dal_srs.find_trusted_setup_files () in
-    Tezos_crypto_dal.Cryptobox.Config.init_dal ~find_srs_files config.dal
-  in
   let*! node =
     init_node
       ?sandbox
       ?target
+      ~internal_events
       ~identity
       ~singleprocess
       ~force_history_mode_switch
@@ -547,35 +794,15 @@ let run ?verbosity ?sandbox ?target ?(cli_warnings = [])
   let*! () =
     Result.iter_error_s
       (function
-        | Store_errors.Cannot_switch_history_mode {previous_mode; next_mode}
-          :: _ ->
-            Event.(emit incorrect_history_mode) (previous_mode, next_mode)
+        | (Store_errors.Cannot_switch_history_mode _ as err) :: _ ->
+            Event.(emit incorrect_history_mode) err
         | _ -> Lwt.return_unit)
       node
   in
   let*? node in
-  let node_downer =
+  let log_node_downer =
     Lwt_exit.register_clean_up_callback ~loc:__LOC__ (fun _ ->
-        let*! () = Event.(emit shutting_down_node) () in
-        Node.shutdown node)
-  in
-  let* rpc = init_rpc config node in
-  let rpc_downer =
-    Lwt_exit.register_clean_up_callback
-      ~loc:__LOC__
-      ~after:[node_downer]
-      (fun _ ->
-        let*! () = Event.(emit shutting_down_rpc_server) () in
-        List.iter_p RPC_server.shutdown rpc)
-  in
-  let*! () = Event.(emit node_is_ready) () in
-  let _ =
-    Lwt_exit.register_clean_up_callback
-      ~loc:__LOC__
-      ~after:[rpc_downer]
-      (fun exit_status ->
-        let*! () = Event.(emit bye) exit_status in
-        Tezos_base_unix.Internal_event_unix.close ())
+        Event.(emit shutting_down_node) ())
   in
   Lwt.dont_wait
     (fun () ->
@@ -587,10 +814,85 @@ let run ?verbosity ?sandbox ?target ?(cli_warnings = [])
     (fun exn ->
       Event.(
         emit__dont_wait__use_with_care metrics_ended (Printexc.to_string exn))) ;
+  (* The initialization of the RPC server concludes the node's
+     initialization. This is necessary to start answering to RPC only
+     when the node is fully initialized. *)
+  let* rpc_servers = init_rpc config node internal_events in
+  (* Shutdown node BEFORE RPC servers to avoid EPIPE errors.
+     When RPC servers (especially external ones using Eio) shut down first,
+     they tear down sockets while validators are still running, causing
+     broken pipe errors and slow shutdown due to cascading failures. *)
+  let node_downer =
+    Lwt_exit.register_clean_up_callback
+      ~loc:__LOC__
+      ~after:[log_node_downer]
+      (fun _ -> Node.shutdown node)
+  in
+  let rpc_downer =
+    Lwt_exit.register_clean_up_callback
+      ~loc:__LOC__
+      ~after:[node_downer]
+      (fun _ ->
+        let*! () = Event.(emit shutting_down_local_rpc_server) () in
+        List.iter_s
+          (function
+            | No_server -> Lwt.return_unit
+            | External_rpc_server {watchdog_process; rpc_servers} ->
+                List.iter_s
+                  (fun (local_server, rpc_process) ->
+                    (* Stop the RPC_process first to avoid requests to
+                       be forwarded to the node with a RPC_server that
+                       is down. *)
+                    let*! res =
+                      Octez_rpc_process.External_watchdog.Process.stop_server
+                        watchdog_process
+                        rpc_process
+                    in
+                    let*! () =
+                      match res with
+                      | Ok () -> Lwt.return_unit
+                      | Error errs ->
+                          (* Filter out expected errors *)
+                          let unexpected_errors =
+                            List.filter
+                              (function
+                                | Exn (Unix.Unix_error (Unix.EPIPE, _, _))
+                                | Exn
+                                    (Unix.Unix_error (Unix.ECONNREFUSED, _, _))
+                                | Exn (Unix.Unix_error (Unix.ECONNRESET, _, _))
+                                | Canceled
+                                | Exn Lwt.Canceled ->
+                                    false
+                                | _ -> true)
+                              errs
+                          in
+                          if unexpected_errors <> [] then
+                            Format.eprintf
+                              "Closing rpc_process, unexpected error: %a@."
+                              (Format.pp_print_list Error_monad.pp)
+                              unexpected_errors ;
+                          Lwt.return_unit
+                    in
+                    let*! () = RPC_server.shutdown local_server in
+                    Lwt.return_unit)
+                  rpc_servers
+            | Local_rpc_server rpc_server ->
+                List.iter_p RPC_server.shutdown rpc_server)
+          rpc_servers)
+  in
+  let _ =
+    Lwt_exit.register_clean_up_callback
+      ~loc:__LOC__
+      ~after:[rpc_downer]
+      (fun exit_status ->
+        let*! () = Event.(emit bye) exit_status in
+        Tezos_base_unix.Internal_event_unix.close ())
+  in
+  let*! () = Event.(emit node_is_ready) () in
   Lwt_utils.never_ending ()
 
 let process sandbox verbosity target singleprocess force_history_mode_switch
-    args =
+    allow_yes_crypto args =
   let open Lwt_result_syntax in
   let verbosity =
     let open Internal_event in
@@ -606,6 +908,13 @@ let process sandbox verbosity target singleprocess force_history_mode_switch
           cli_warnings := event :: !cli_warnings ;
           Lwt.return_unit)
         args
+    in
+    let* () =
+      if Tezos_crypto.Helpers.is_yes_crypto_enabled && not allow_yes_crypto then
+        failwith
+          "Yes crypto is enabled but the option '--allow-yes-crypto' was not \
+           provided."
+      else return_unit
     in
     let* () =
       match sandbox with
@@ -634,9 +943,9 @@ let process sandbox verbosity target singleprocess force_history_mode_switch
                 "Failed to parse the provided target. A '<block_hash>,<level>' \
                  value was expected.")
     in
-    Lwt_lock_file.try_with_lock
-      ~when_locked:(fun () ->
-        failwith "Data directory is locked by another process")
+    Lwt_lock_file.with_lock
+      ~when_locked:
+        (`Fail (Exn (Failure "Data directory is locked by another process")))
       ~filename:(Data_version.lock_file config.data_dir)
     @@ fun () ->
     Lwt.catch
@@ -652,15 +961,19 @@ let process sandbox verbosity target singleprocess force_history_mode_switch
           config)
       (function exn -> fail_with_exn exn)
   in
-  Lwt_main.run
-    (let*! r = Lwt_exit.wrap_and_exit main_promise in
-     match r with
-     | Ok () ->
-         let*! _ = Lwt_exit.exit_and_wait 0 in
-         Lwt.return (`Ok ())
-     | Error err ->
-         let*! _ = Lwt_exit.exit_and_wait 1 in
-         Lwt.return @@ `Error (false, Format.asprintf "%a" pp_print_trace err))
+  Lwt.Exception_filter.(set handle_all_except_runtime) ;
+  Tezos_base_unix.Event_loop.main_run
+    ~process_name:"node run"
+    ~eio:true
+    (fun () ->
+      let*! r = Lwt_exit.wrap_and_exit main_promise in
+      match r with
+      | Ok () ->
+          let*! _ = Lwt_exit.exit_and_wait 0 in
+          Lwt.return (`Ok ())
+      | Error err ->
+          let*! _ = Lwt_exit.exit_and_wait 1 in
+          Lwt.return @@ `Error (false, Format.asprintf "%a" pp_print_trace err))
 
 module Term = struct
   let verbosity =
@@ -736,11 +1049,25 @@ module Term = struct
           ~doc
           ["force-history-mode-switch"])
 
+  let allow_yes_crypto =
+    let open Cmdliner in
+    let doc =
+      Format.sprintf
+        "Allow usage of yes cryptography. This is used conjointly with the \
+         `TEZOS_USE_YES_CRYPTO_I_KNOW_WHAT_I_AM_DOING` environment variable. \
+         To actually enable yes crypto this option must be used and the \
+         environment variable must be set to `true`. If only the environment \
+         variable is set, the node will refuse to start."
+    in
+    Arg.(
+      value & flag
+      & info ~docs:Shared_arg.Manpage.misc_section ~doc ["allow-yes-crypto"])
+
   let term =
     Cmdliner.Term.(
       ret
         (const process $ sandbox $ verbosity $ target $ singleprocess
-       $ force_history_mode_switch $ Shared_arg.Term.args))
+       $ force_history_mode_switch $ allow_yes_crypto $ Shared_arg.Term.args))
 end
 
 module Manpage = struct

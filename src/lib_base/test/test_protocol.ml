@@ -26,44 +26,54 @@
 (* Testing
    -------
    Component:    Base, Protocol
-   Invocation:   dune build @src/lib_base/runtest
+   Invocation:   dune exec src/lib_base/test/main.exe \
+                  -- --file test_protocol.ml
    Subject:      Check the ordering of protocol versions
 *)
 
 let all_env_versions = Protocol.[V0; V1; V2; V3]
 
-let env_v_eq_check () =
+let () =
+  Test.register
+    ~__FILE__
+    ~title:"environment version comparison: equal"
+    ~tags:[Tag.layer1; Tag.base]
+  @@ fun () ->
   List.iter
-    (fun v -> assert (Protocol.compare_version v v = 0))
-    all_env_versions
-
-let env_v_lt_check () =
-  let rec check = function
-    | [] -> ()
-    | v :: vs ->
-        assert (List.for_all (fun w -> Protocol.compare_version v w < 0) vs) ;
-        check vs
-  in
-  check all_env_versions
-
-let env_v_gt_check () =
-  let rec check = function
-    | [] -> ()
-    | v :: vs ->
-        assert (List.for_all (fun w -> Protocol.compare_version w v > 0) vs) ;
-        check vs
-  in
-  check all_env_versions
-
-let env_v_comparison_checks =
-  let open Alcotest in
-  [
-    test_case "equal" `Quick env_v_eq_check;
-    test_case "less-than" `Quick env_v_lt_check;
-    test_case "greater-than" `Quick env_v_gt_check;
-  ]
+    (fun v ->
+      if not (Protocol.compare_version v v = 0) then
+        Test.fail "a protocol version should be equal to itself")
+    all_env_versions ;
+  unit
 
 let () =
-  Alcotest.run
-    "Protocol"
-    [("environment-version-comparison", env_v_comparison_checks)]
+  Test.register
+    ~__FILE__
+    ~title:"environment version comparison: less-than"
+    ~tags:[Tag.layer1; Tag.base]
+  @@ fun () ->
+  let rec check = function
+    | [] -> ()
+    | v :: vs ->
+        if not (List.for_all (fun w -> Protocol.compare_version v w < 0) vs)
+        then Test.fail "error on protocol version comparison" ;
+        check vs
+  in
+  check all_env_versions ;
+  unit
+
+let () =
+  Test.register
+    ~__FILE__
+    ~title:"environment version comparison: greater-than"
+    ~tags:[Tag.layer1; Tag.base]
+  @@ fun () ->
+  let rec check = function
+    | [] -> ()
+    | v :: vs ->
+        if not (List.for_all (fun w -> Protocol.compare_version w v > 0) vs)
+        then Test.fail "error on protocol version comparison" ;
+        check vs
+  in
+  check all_env_versions ;
+  unit

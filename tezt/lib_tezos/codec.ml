@@ -23,7 +23,7 @@
 (*                                                                           *)
 (*****************************************************************************)
 
-let spawn_command ?(path = Constant.tezos_codec) ?hooks arguments =
+let spawn_command ?(path = Uses.path Constant.octez_codec) ?hooks arguments =
   Process.spawn path ?hooks arguments
 
 let spawn_encode ?path ?hooks ~name json =
@@ -50,3 +50,30 @@ let spawn_dump_encodings ?path () = spawn_command ?path ["dump"; "encodings"]
 let dump_encodings ?path () =
   let* json = spawn_dump_encodings ?path () |> Process.check_and_read_stdout in
   return (JSON.parse ~origin:"octez-codec dump encodings" json)
+
+let spawn_dump_encoding ?path ~id () =
+  spawn_command ?path ["dump"; "encoding"; id]
+
+let dump_encoding ?path ~id () =
+  let* json =
+    spawn_dump_encoding ?path ~id () |> Process.check_and_read_stdout
+  in
+  return (JSON.parse ~origin:"octez-codec dump encoding" json)
+
+let spawn_describe_binary_schema ?path ~id () =
+  spawn_command ?path ["describe"; id; "binary"; "schema"]
+
+let spawn_describe_json_schema ?path ~id () =
+  spawn_command ?path ["describe"; id; "json"; "schema"]
+
+let describe_binary_schema ?path ~id () =
+  let* output =
+    spawn_describe_binary_schema ?path ~id () |> Process.check_and_read_stdout
+  in
+  return output
+
+let describe_json_schema ?path ~id () =
+  let* output =
+    spawn_describe_json_schema ?path ~id () |> Process.check_and_read_stdout
+  in
+  return output

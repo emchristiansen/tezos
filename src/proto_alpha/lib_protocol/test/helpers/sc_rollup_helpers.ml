@@ -32,6 +32,9 @@ let originated_rollup op =
   in
   Contract.Internal_for_tests.originated_contract nonce
 
+module Arith_pvm = Pvm_in_memory.Arith
+module Wasm_pvm = Pvm_in_memory.Wasm
+
 module Make_in_memory_context (Context : sig
   type tree
 
@@ -74,8 +77,8 @@ struct
     | Some k ->
         let index = Context.index context in
         let* p = Context.produce_tree_proof index k step in
-        return (Some p)
-    | None -> return None
+        return_some p
+    | None -> return_none
 
   let kinded_hash_to_state_hash = function
     | `Value hash | `Node hash ->
@@ -85,24 +88,15 @@ struct
 
   let proof_after proof = kinded_hash_to_state_hash proof.Context.Proof.after
 
+  let cast_read_only proof = Context.Proof.{proof with after = proof.before}
+
   let proof_encoding =
     Tezos_context_merkle_proof_encoding.Merkle_proof_encoding.V2.Tree2
     .tree_proof_encoding
 end
 
-module In_memory_context =
-  Make_in_memory_context (Tezos_context_memory.Context_binary)
 module Wrong_in_memory_context =
   Make_in_memory_context (Tezos_context_memory.Context)
-
-module Arith_pvm :
-  Sc_rollup.PVM.S
-    with type context = In_memory_context.Tree.t
-     and type state = In_memory_context.tree
-     and type proof =
-      Tezos_context_memory.Context.Proof.tree
-      Tezos_context_memory.Context.Proof.t =
-  Sc_rollup.ArithPVM.Make (In_memory_context)
 
 module Wrong_arith_pvm :
   Sc_rollup.PVM.S
@@ -113,103 +107,10 @@ module Wrong_arith_pvm :
       Tezos_context_memory.Context.Proof.t =
   Sc_rollup.ArithPVM.Make (Wrong_in_memory_context)
 
-module Wasm_pvm :
-  Sc_rollup.PVM.S
-    with type context = In_memory_context.Tree.t
-     and type state = In_memory_context.tree
-     and type proof =
-      Tezos_context_memory.Context.Proof.tree
-      Tezos_context_memory.Context.Proof.t =
-  Sc_rollup.Wasm_2_0_0PVM.Make (Environment.Wasm_2_0_0.Make) (In_memory_context)
-
-(* TODO: https://gitlab.com/tezos/tezos/-/issues/4386
-   Extracted and adapted from {!Tezos_context_memory}. *)
-let make_empty_context ?(root = "/tmp") () =
+let genesis_commitment ~boot_sector ~origination_level kind =
   let open Lwt_syntax in
-  let context_promise =
-    let+ index = Tezos_context_memory.Context_binary.init root in
-    Tezos_context_memory.Context_binary.empty index
-  in
-  match Lwt.state context_promise with
-  | Lwt.Return result -> result
-  | Lwt.Fail exn -> raise exn
-  | Lwt.Sleep ->
-      (* The in-memory context should never block *)
-      assert false
-
-(* TODO: https://gitlab.com/tezos/tezos/-/issues/4386
-   Extracted and adapted from {!Tezos_context_memory}. *)
-let make_empty_tree =
-  let dummy_context = make_empty_context ~root:"dummy" () in
-  fun () -> Tezos_context_memory.Context_binary.Tree.empty dummy_context
-
-let compute_origination_proof ~boot_sector = function
-  | Sc_rollup.Kind.Example_arith ->
-      let open Lwt_syntax in
-      let context = make_empty_context () in
-      let+ proof = Arith_pvm.produce_origination_proof context boot_sector in
-      let proof = WithExceptions.Result.get_ok ~loc:__LOC__ proof in
-      WithExceptions.Result.get_ok ~loc:__LOC__
-      @@ Sc_rollup.Proof.serialize_pvm_step ~pvm:(module Arith_pvm) proof
-  | Sc_rollup.Kind.Wasm_2_0_0 ->
-      let open Lwt_syntax in
-      let context = make_empty_context () in
-      let+ proof = Wasm_pvm.produce_origination_proof context boot_sector in
-      let proof = WithExceptions.Result.get_ok ~loc:__LOC__ proof in
-      WithExceptions.Result.get_ok ~loc:__LOC__
-      @@ Sc_rollup.Proof.serialize_pvm_step ~pvm:(module Wasm_pvm) proof
-
-(** [wrong_arith_origination_proof ~alter_binary_bit ~boot_sector]
-    returns a serialized proof computed with a Arith PVM using 32-ary
-    trees.
-
-    If [alter_binary_bit] is set to true, the resulting proof lies
-    about the arity of its trees. *)
-let wrong_arith_origination_proof ~alter_binary_bit ~boot_sector =
-  let open Lwt_syntax in
-  let context = Tezos_context_memory.make_empty_context () in
-  let+ proof = Wrong_arith_pvm.produce_origination_proof context boot_sector in
-  let proof = WithExceptions.Result.get_ok ~loc:__LOC__ proof in
-  let proof =
-    (* TODO: https://gitlab.com/tezos/tezos/-/issues/4386 This should
-       be exposed more cleanly in the Tezos context libraries.
-
-       Basically, the 2nd bit of the `version` field is set to 1 to
-       signal a proof for a [Context_binary] tree.*)
-    if alter_binary_bit then {proof with version = proof.version land 0b10}
-    else proof
-  in
-  WithExceptions.Result.get_ok ~loc:__LOC__
-  @@ Sc_rollup.Proof.serialize_pvm_step ~pvm:(module Arith_pvm) proof
-
-let wrap_origination_proof ~kind ~boot_sector proof_string_opt :
-    Sc_rollup.Proof.serialized tzresult Lwt.t =
-  let open Lwt_result_syntax in
-  match proof_string_opt with
-  | None ->
-      let*! origination_proof = compute_origination_proof ~boot_sector kind in
-      return origination_proof
-  | Some proof_string -> return proof_string
-
-let genesis_commitment ~boot_sector ~origination_level = function
-  | Sc_rollup.Kind.Example_arith ->
-      let open Lwt_syntax in
-      let context = make_empty_context () in
-      let* proof = Arith_pvm.produce_origination_proof context boot_sector in
-      let proof = WithExceptions.Result.get_ok ~loc:__LOC__ proof in
-      let genesis_state_hash = Arith_pvm.proof_stop_state proof in
-      return
-        Sc_rollup.Commitment.(
-          genesis_commitment ~origination_level ~genesis_state_hash)
-  | Sc_rollup.Kind.Wasm_2_0_0 ->
-      let open Lwt_syntax in
-      let context = make_empty_context () in
-      let* proof = Wasm_pvm.produce_origination_proof context boot_sector in
-      let proof = WithExceptions.Result.get_ok ~loc:__LOC__ proof in
-      let genesis_state_hash = Wasm_pvm.proof_stop_state proof in
-      return
-        Sc_rollup.Commitment.(
-          genesis_commitment ~origination_level ~genesis_state_hash)
+  let+ genesis_state_hash = Sc_rollup.genesis_state_hash_of kind ~boot_sector in
+  Sc_rollup.Commitment.genesis_commitment ~origination_level ~genesis_state_hash
 
 let genesis_commitment_raw ~boot_sector ~origination_level kind =
   let open Lwt_syntax in
@@ -221,6 +122,7 @@ let genesis_commitment_raw ~boot_sector ~origination_level kind =
     match kind with
     | Sc_rollups.Kind.Example_arith -> Sc_rollup.Kind.Example_arith
     | Sc_rollups.Kind.Wasm_2_0_0 -> Sc_rollup.Kind.Wasm_2_0_0
+    | Sc_rollups.Kind.Riscv -> Sc_rollup.Kind.Riscv
   in
   let* res = genesis_commitment ~boot_sector ~origination_level kind in
   let res =
@@ -259,23 +161,19 @@ let make_eol ~inbox_level ~message_counter =
   let payload = make_internal_inbox_message End_of_level in
   make_input ~inbox_level ~message_counter payload
 
-let make_info_per_level ~during_migration ~inbox_level ~predecessor_timestamp
-    ~predecessor =
+let make_info_per_level ~inbox_level ~predecessor_timestamp ~predecessor =
   let payload =
     make_internal_inbox_message
       (Info_per_level {predecessor_timestamp; predecessor})
   in
-  make_input
-    ~inbox_level
-    ~message_counter:(if during_migration then Z.of_int 2 else Z.one)
-    payload
+  make_input ~inbox_level ~message_counter:Z.one payload
 
 let make_protocol_migration ~inbox_level =
   let payload =
     make_internal_inbox_message
       Sc_rollup.Inbox_message.protocol_migration_internal_message
   in
-  make_input ~inbox_level ~message_counter:Z.one payload
+  make_input ~inbox_level ~message_counter:Z.(succ one) payload
 
 (** Message is the combination of a [message] and its associated [input].
 
@@ -354,16 +252,16 @@ let strs_to_inputs inbox_level messages =
     messages
 
 (** Transform the list of all inputs the PVM should read. *)
-let make_inputs predecessor_timestamp predecessor messages inbox_level =
+let make_inputs ~first_block predecessor_timestamp predecessor messages
+    inbox_level =
   (* SOL is at index 0. *)
   let sol = make_sol ~inbox_level in
   (* Info_per_level is at index 1. *)
   let info_per_level =
-    make_info_per_level
-      ~during_migration:false
-      ~inbox_level
-      ~predecessor_timestamp
-      ~predecessor
+    make_info_per_level ~inbox_level ~predecessor_timestamp ~predecessor
+  in
+  let mig =
+    if first_block then [make_protocol_migration ~inbox_level] else []
   in
   (* External inputs start at index 2. *)
   let external_inputs =
@@ -371,17 +269,19 @@ let make_inputs predecessor_timestamp predecessor messages inbox_level =
       (fun i message ->
         make_external_input
           ~inbox_level
-          ~message_counter:(Z.of_int (2 + i))
+          ~message_counter:(Z.of_int (2 + List.length mig + i))
           message)
       messages
   in
   (* EOL is after SOL/Info_per_level and all external inputs, therefore,
      at index [2 + List.length messages]. *)
   let eol =
-    let message_counter = Z.of_int (2 + List.length messages) in
+    let message_counter =
+      Z.of_int (2 + List.length mig + List.length messages)
+    in
     make_eol ~inbox_level ~message_counter
   in
-  [sol; info_per_level] @ external_inputs @ [eol]
+  [sol; info_per_level] @ mig @ external_inputs @ [eol]
 
 let predecessor_timestamp_and_hash_from_level level =
   let level_int64 = Int64.of_int32 @@ Raw_level.to_int32 level in
@@ -396,7 +296,14 @@ let wrap_messages level
     payloads_per_level =
   let predecessor_timestamp, predecessor = pred_info in
   let payloads = List.map make_external_inbox_message messages in
-  let inputs = make_inputs predecessor_timestamp predecessor messages level in
+  let inputs =
+    make_inputs
+      ~first_block:(level = Raw_level.root || level = Raw_level.(succ root))
+      predecessor_timestamp
+      predecessor
+      messages
+      level
+  in
   {payloads; predecessor_timestamp; predecessor; messages; level; inputs}
 
 (** An empty inbox level is a SOL,IPL and EOL. *)
@@ -612,42 +519,33 @@ let list_of_inputs_from_list_of_messages
     payloads_per_levels
 
 let dumb_init level =
-  WithExceptions.Result.get_ok ~loc:__LOC__
-  @@ Sc_rollup.Inbox.genesis
-       ~predecessor_timestamp:Time.Protocol.epoch
-       ~predecessor:Block_hash.zero
-       level
+  Sc_rollup.Inbox.genesis
+    ~predecessor_timestamp:Time.Protocol.epoch
+    ~predecessor:Block_hash.zero
+    level
 
 let dumb_init_repr level =
-  WithExceptions.Result.get_ok ~loc:__LOC__
-  @@ Sc_rollup_inbox_repr.genesis
-       ~protocol_migration_message:
-         Raw_context.protocol_migration_internal_message
-       ~predecessor_timestamp:Time.Protocol.epoch
-       ~predecessor:Block_hash.zero
-       level
+  Sc_rollup_inbox_repr.genesis
+    ~protocol_migration_message:
+      Raw_context.protocol_migration_serialized_message
+    ~predecessor_timestamp:Time.Protocol.epoch
+    ~predecessor:Block_hash.zero
+    level
 
 let origination_op ?force_reveal ?counter ?fee ?gas_limit ?storage_limit
-    ?origination_proof ?(boot_sector = "") ?(parameters_ty = "unit") ctxt src
-    kind =
-  let open Lwt_result_syntax in
-  let*! origination_proof =
-    match origination_proof with
-    | Some origination_proof -> Lwt.return origination_proof
-    | None -> compute_origination_proof ~boot_sector kind
-  in
+    ?(boot_sector = "") ?(parameters_ty = "unit") ?whitelist ctxt src kind =
   Op.sc_rollup_origination
     ?force_reveal
     ?counter
     ?fee
     ?gas_limit
     ?storage_limit
+    ?whitelist
     ctxt
     src
     kind
     ~boot_sector
     ~parameters_ty:(Script.lazy_expr @@ Expr.from_string parameters_ty)
-    ~origination_proof
 
 let latest_level_proof inbox =
   Sc_rollup.Inbox.Internal_for_tests.level_proof_of_history_proof
@@ -666,33 +564,23 @@ module Node_inbox = struct
       ?(genesis_predecessor = Block_hash.zero)
       ?(inbox_creation_level = Raw_level.root) () =
     let open Result_syntax in
-    let* inbox =
-      Environment.wrap_tzresult
-      @@ Sc_rollup.Inbox.genesis
-           ~predecessor_timestamp:genesis_predecessor_timestamp
-           ~predecessor:genesis_predecessor
-           inbox_creation_level
+    let inbox =
+      Sc_rollup.Inbox.genesis
+        ~predecessor_timestamp:genesis_predecessor_timestamp
+        ~predecessor:genesis_predecessor
+        inbox_creation_level
     in
     let history = Sc_rollup.Inbox.History.empty ~capacity:10000L in
     let payloads_histories = Payloads_histories.empty in
-    let* payloads_history, history, _inbox, _payloads, _messages =
-      Environment.wrap_tzresult
-      @@ Sc_rollup.Inbox.add_all_messages
-           ~first_block:true
-           ~predecessor_timestamp:genesis_predecessor_timestamp
-           ~predecessor:genesis_predecessor
-           history
-           inbox
-           []
-    in
-    let witness_hash = Sc_rollup.Inbox.current_witness inbox in
-    let payloads_histories =
-      Payloads_histories.add witness_hash payloads_history payloads_histories
-    in
     return {inbox; history; payloads_histories}
 
-  let fill_inbox node_inbox payloads_per_levels =
-    let open Result_syntax in
+  (** [fill_inbox ~inbox_creation_level node_inbox payloads_per_levels]
+      incrementally adds the given [payloads_per_levels] to [node_inbox].
+      Can be called multiple times on an existing inbox to append new
+      levels, e.g. to keep the local inbox in sync with the on-chain
+      inbox after baking additional blocks. *)
+  let fill_inbox ~inbox_creation_level node_inbox payloads_per_levels =
+    let open Result_wrap_syntax in
     let rec aux {inbox; history; payloads_histories} = function
       | [] -> return {inbox; history; payloads_histories}
       | ({
@@ -700,7 +588,7 @@ module Node_inbox = struct
            predecessor_timestamp;
            predecessor;
            messages;
-           level = _;
+           level;
            inputs = _;
          } :
           payloads_per_level)
@@ -710,15 +598,15 @@ module Node_inbox = struct
               (fun message -> Sc_rollup.Inbox_message.External message)
               messages
           in
-          let* payloads_history, history, inbox, witness, _messages =
-            Environment.wrap_tzresult
-            @@ Sc_rollup.Inbox.add_all_messages
-                 ~first_block:false
-                 ~predecessor_timestamp
-                 ~predecessor
-                 history
-                 inbox
-                 messages
+          let*@ payloads_history, history, inbox, witness, _messages =
+            Sc_rollup.Inbox.add_all_messages
+              ~first_block:Raw_level.(equal (succ inbox_creation_level) level)
+              ~dal_attested_slots_messages:[]
+              ~predecessor_timestamp
+              ~predecessor
+              history
+              inbox
+              messages
           in
           (* Store in the history this archived level. *)
           let witness_hash =
@@ -734,24 +622,25 @@ module Node_inbox = struct
     in
     aux node_inbox payloads_per_levels
 
-  let construct_inbox ?inbox_creation_level ?genesis_predecessor_timestamp
-      ?genesis_predecessor payloads_per_levels =
+  let construct_inbox ?(inbox_creation_level = Raw_level.root)
+      ?genesis_predecessor_timestamp ?genesis_predecessor payloads_per_levels =
     let open Result_syntax in
     let* node_inbox =
       new_inbox
         ?genesis_predecessor_timestamp
         ?genesis_predecessor
-        ?inbox_creation_level
+        ~inbox_creation_level
         ()
     in
-    fill_inbox node_inbox payloads_per_levels
+    fill_inbox ~inbox_creation_level node_inbox payloads_per_levels
 
   let get_history history hash =
     Lwt.return @@ Sc_rollup.Inbox.History.find hash history
 
   let produce_proof {payloads_histories; history; _} inbox_snapshot
       (level, message_counter) =
-    Lwt.map Environment.wrap_tzresult
+    let open Lwt_result_wrap_syntax in
+    wrap
     @@ Sc_rollup.Inbox.produce_proof
          ~get_payloads_history:(get_payloads_history payloads_histories)
          ~get_history:(get_history history)
@@ -770,14 +659,16 @@ module Node_inbox = struct
   let produce_payloads_proof {payloads_histories; _}
       (head_cell_hash : Sc_rollup.Inbox_merkelized_payload_hashes.Hash.t)
       message_counter =
-    Lwt.map Environment.wrap_tzresult
+    let open Lwt_result_wrap_syntax in
+    wrap
     @@ Sc_rollup.Inbox.Internal_for_tests.produce_payloads_proof
          (get_payloads_history payloads_histories)
          head_cell_hash
          ~index:message_counter
 
   let produce_inclusion_proof {history; _} inbox_snapshot level =
-    Lwt.map Environment.wrap_tzresult
+    let open Lwt_result_wrap_syntax in
+    wrap
     @@ Sc_rollup.Inbox.Internal_for_tests.produce_inclusion_proof
          (get_history history)
          inbox_snapshot
@@ -788,18 +679,13 @@ module Protocol_inbox = struct
   let new_inbox ?(genesis_predecessor_timestamp = Time.Protocol.epoch)
       ?(genesis_predecessor = Block_hash.zero)
       ?(inbox_creation_level = Raw_level.root) () =
-    let open Result_syntax in
-    let* inbox =
-      Environment.wrap_tzresult
-      @@ Sc_rollup.Inbox.genesis
-           ~predecessor_timestamp:genesis_predecessor_timestamp
-           ~predecessor:genesis_predecessor
-           inbox_creation_level
-    in
-    return inbox
+    Sc_rollup.Inbox.genesis
+      ~predecessor_timestamp:genesis_predecessor_timestamp
+      ~predecessor:genesis_predecessor
+      inbox_creation_level
 
-  let fill_inbox inbox payloads_per_levels =
-    let open Result_syntax in
+  let fill_inbox ~inbox_creation_level inbox payloads_per_levels =
+    let open Result_wrap_syntax in
     let rec aux inbox = function
       | [] -> return inbox
       | ({
@@ -807,35 +693,25 @@ module Protocol_inbox = struct
            predecessor_timestamp;
            predecessor;
            messages;
-           level = _;
+           level;
            inputs = _;
          } :
           payloads_per_level)
         :: rst ->
-          let* payloads =
-            Environment.wrap_tzresult
-            @@ List.map_e
-                 (fun message ->
-                   Sc_rollup.Inbox_message.(serialize @@ External message))
-                 messages
+          let payloads =
+            List.map
+              (fun message -> Sc_rollup.Inbox_message.(External message))
+              messages
           in
-          let witness = Sc_rollup.Inbox.init_witness_no_history in
-          let* witness =
-            Environment.wrap_tzresult
-            @@ Sc_rollup.Inbox.add_info_per_level_no_history
-                 ~predecessor_timestamp
-                 ~predecessor
-                 witness
-          in
-          let* witness =
-            if List.is_empty payloads then ok witness
-            else
-              Environment.wrap_tzresult
-              @@ Sc_rollup.Inbox.add_messages_no_history payloads witness
-          in
-          let* inbox =
-            Environment.wrap_tzresult
-            @@ Sc_rollup.Inbox.finalize_inbox_level_no_history inbox witness
+          let*@ _, _, inbox, _, _ =
+            Sc_rollup.Inbox.add_all_messages
+              ~first_block:Raw_level.(equal (succ inbox_creation_level) level)
+              ~dal_attested_slots_messages:[]
+              ~predecessor_timestamp
+              ~predecessor
+              (Sc_rollup.Inbox.History.empty ~capacity:1000L)
+              inbox
+              payloads
           in
           aux inbox rst
     in
@@ -851,17 +727,16 @@ module Protocol_inbox = struct
     let empty_level = [make_empty_level ?pred_info next_level] in
     fill_inbox inbox empty_level
 
-  let construct_inbox ?inbox_creation_level ?genesis_predecessor_timestamp
-      ?genesis_predecessor payloads_per_levels =
-    let open Result_syntax in
-    let* inbox =
+  let construct_inbox ?(inbox_creation_level = Raw_level.root)
+      ?genesis_predecessor_timestamp ?genesis_predecessor payloads_per_levels =
+    let inbox =
       new_inbox
         ?genesis_predecessor_timestamp
         ?genesis_predecessor
-        ?inbox_creation_level
+        ~inbox_creation_level
         ()
     in
-    fill_inbox inbox payloads_per_levels
+    fill_inbox ~inbox_creation_level inbox payloads_per_levels
 end
 
 let construct_node_and_protocol_inbox ?inbox_creation_level
@@ -914,3 +789,239 @@ module Protocol_inbox_with_ctxt = struct
     in
     return (block, list_of_messages)
 end
+
+let is_reveal_enabled_default =
+  Sc_rollup.is_reveal_enabled_predicate
+    Default_parameters.constants_mainnet.sc_rollup.reveal_activation_level
+
+let tick_of_int_exn ?(__LOC__ = __LOC__) n =
+  WithExceptions.Option.get ~loc:__LOC__ (Sc_rollup.Tick.of_int n)
+
+module type PVM_eval = sig
+  include Sc_rollup.PVM.S
+
+  val make_empty_context : unit -> context
+
+  val initial_hash : hash Lwt.t
+
+  val eval_until_input :
+    fuel:int option ->
+    our_states:(int * hash) trace ->
+    int ->
+    state ->
+    (state * int option * int * (int * hash) trace) Lwt.t
+
+  val eval_inputs_from_initial_state :
+    metadata:Sc_rollup.Metadata.t ->
+    ?fuel:int ->
+    ?bootsector:string ->
+    Sc_rollup.input trace trace ->
+    (state * Sc_rollup.Tick.t * (Sc_rollup.Tick.t * hash) trace, 'a) result
+    Lwt.t
+end
+
+module Make_PVM_eval (PVM : sig
+  include Sc_rollup.PVM.S
+
+  val make_empty_state : unit -> state
+
+  val make_empty_context : unit -> context
+end) : PVM_eval with type context = PVM.context and type state = PVM.state =
+struct
+  include PVM
+
+  let bootsector_state ~bootsector =
+    let open Lwt_syntax in
+    let empty = make_empty_state () in
+    let* state = initial_state ~empty in
+    let* state = install_boot_sector state bootsector in
+    return state
+
+  let initial_hash =
+    let open Lwt_syntax in
+    let empty = make_empty_state () in
+    let* state = initial_state ~empty in
+    state_hash state
+
+  let consume_fuel = Option.map pred
+
+  let continue_with_fuel ~our_states ~(tick : int) fuel state f =
+    let open Lwt_syntax in
+    match fuel with
+    | Some 0 -> return (state, fuel, tick, our_states)
+    | _ -> f tick our_states (consume_fuel fuel) state
+
+  (* TODO: https://gitlab.com/tezos/tezos/-/issues/3498
+
+     the following is almost the same code as in the rollup node, except that it
+     creates the association list (tick, state_hash). *)
+  let eval_until_input ~fuel ~our_states start_tick state =
+    let open Lwt_syntax in
+    let rec go ~our_states fuel (tick : int) state =
+      let* input_request =
+        is_input_state ~is_reveal_enabled:is_reveal_enabled_default state
+      in
+      match fuel with
+      | Some 0 -> return (state, fuel, tick, our_states)
+      | None | Some _ -> (
+          match input_request with
+          | No_input_required ->
+              let* state = eval state in
+              let* state_hash = state_hash state in
+              let our_states = (tick, state_hash) :: our_states in
+              go ~our_states (consume_fuel fuel) (tick + 1) state
+          | Needs_reveal (Request_dal_page _pid) ->
+              (* TODO/DAL: https://gitlab.com/tezos/tezos/-/issues/4160
+                 We assume that there are no confirmed Dal slots.
+                 We'll reuse the infra to provide Dal pages in the future. *)
+              let input = Sc_rollup.(Reveal (Dal_page None)) in
+              let* state = set_input input state in
+              let* state_hash = state_hash state in
+              let our_states = (tick, state_hash) :: our_states in
+              go ~our_states (consume_fuel fuel) (tick + 1) state
+          | Needs_reveal (Reveal_raw_data _)
+          | Needs_reveal Reveal_metadata
+          | Needs_reveal Reveal_dal_parameters
+          | Initial | First_after _ ->
+              return (state, fuel, tick, our_states)
+          | Needs_reveal (Request_adal_page _) ->
+              (* ADAL/FIXME: https://gitlab.com/tezos/tezos/-/milestones/410
+
+                 to be implemented when needed. *)
+              assert false)
+    in
+
+    go ~our_states fuel start_tick state
+
+  let eval_metadata ~fuel ~our_states tick state ~metadata =
+    let open Lwt_syntax in
+    continue_with_fuel ~our_states ~tick fuel state
+    @@ fun tick our_states fuel state ->
+    let input = Sc_rollup.(Reveal (Metadata metadata)) in
+    let* state = set_input input state in
+    let* state_hash = state_hash state in
+    let our_states = (tick, state_hash) :: our_states in
+    let tick = succ tick in
+    return (state, fuel, tick, our_states)
+
+  let feed_input ~fuel ~our_states ~tick state input =
+    let open Lwt_syntax in
+    let* state, fuel, tick, our_states =
+      eval_until_input ~fuel ~our_states tick state
+    in
+    continue_with_fuel ~our_states ~tick fuel state
+    @@ fun tick our_states fuel state ->
+    let* state = set_input input state in
+    let* state_hash = state_hash state in
+    let our_states = (tick, state_hash) :: our_states in
+    let tick = tick + 1 in
+    let* state, fuel, tick, our_states =
+      eval_until_input ~fuel ~our_states tick state
+    in
+    return (state, fuel, tick, our_states)
+
+  let eval_inbox ?fuel ~inputs ~tick state =
+    let open Lwt_result_syntax in
+    List.fold_left_es
+      (fun (state, fuel, tick, our_states) input ->
+        let*! state, fuel, tick, our_states =
+          feed_input ~fuel ~our_states ~tick state input
+        in
+        return (state, fuel, tick, our_states))
+      (state, fuel, tick, [])
+      inputs
+
+  let eval_inputs ~fuel ~tick ?(our_states = []) ~inputs_per_levels state =
+    let open Lwt_result_syntax in
+    List.fold_left_es
+      (fun (state, fuel, tick, our_states) inputs ->
+        let* state, fuel, tick, our_states' =
+          eval_inbox ?fuel ~inputs ~tick state
+        in
+        return (state, fuel, tick, our_states @ our_states'))
+      (state, fuel, tick, our_states)
+      inputs_per_levels
+
+  let eval_inputs_from_initial_state ~metadata ?fuel ?(bootsector = "")
+      inputs_per_levels =
+    let open Lwt_result_syntax in
+    let*! state = bootsector_state ~bootsector in
+    let*! state_hash = state_hash state in
+    let tick = 0 in
+    let our_states = [(tick, state_hash)] in
+    let tick = succ tick in
+    (* 1. We evaluate the boot sector. *)
+    let*! state, fuel, tick, our_states =
+      eval_until_input ~fuel ~our_states tick state
+    in
+    (* 2. We evaluate the metadata. *)
+    let*! state, fuel, tick, our_states =
+      eval_metadata ~fuel ~our_states tick state ~metadata
+    in
+    (* 3. We evaluate the inbox. *)
+    let* state, _fuel, tick, our_states =
+      eval_inputs state ~fuel ~tick ~our_states ~inputs_per_levels
+    in
+    let our_states =
+      List.sort (fun (x, _) (y, _) -> Compare.Int.compare x y) our_states
+    in
+    let our_states =
+      List.map
+        (fun (tick_int, state) -> (tick_of_int_exn tick_int, state))
+        our_states
+    in
+    let tick = tick_of_int_exn tick in
+    return (state, tick, our_states)
+end
+
+module Arith_pvm_eval = Make_PVM_eval (Arith_pvm)
+module Wasm_pvm_eval = Make_PVM_eval (Wasm_pvm)
+
+let make_pvm_with_context_and_state (type context state)
+    (module PVM : Sc_rollup.PVM.S
+      with type context = context
+       and type state = state) ~state ~context ~reveal ~inbox () :
+    (module Sc_rollup.Proof.PVM_with_context_and_state) =
+  let Node_inbox.{payloads_histories; history; inbox} = inbox in
+  (module struct
+    include PVM
+
+    let context : context = context
+
+    let state = state
+
+    let reveal = reveal
+
+    module Inbox_with_history = struct
+      let inbox = Sc_rollup.Inbox.old_levels_messages inbox
+
+      let get_history inbox =
+        Sc_rollup.Inbox.History.find inbox history |> Lwt.return
+
+      let get_payloads_history witness_hash =
+        Payloads_histories.find witness_hash payloads_histories
+        |> WithExceptions.Option.get ~loc:__LOC__
+        |> Lwt.return
+    end
+
+    (* FIXME/DAL-REFUTATION: https://gitlab.com/tezos/tezos/-/issues/3992
+       Extend refutation game to handle Dal refutation case. *)
+    module Dal_with_history = struct
+      let confirmed_slots_history = Dal.Slots_history.genesis
+
+      let get_history _hash = Lwt.return_none
+
+      let page_info = None
+
+      let dal_activation_level =
+        let constants = Default_parameters.constants_test in
+        if constants.dal.feature_enable then
+          Some constants.sc_rollup.reveal_activation_level.dal_parameters
+        else None
+
+      let dal_attested_slots_validity_lag =
+        let constants = Default_parameters.constants_test in
+        constants.sc_rollup.reveal_activation_level
+          .dal_attested_slots_validity_lag
+    end
+  end)

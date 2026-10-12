@@ -1,0 +1,190 @@
+(*****************************************************************************)
+(*                                                                           *)
+(* Open Source License                                                       *)
+(* Copyright (c) 2025 Nomadic Labs, <contact@nomadic-labs.com>               *)
+(* Copyright (c) 2023 Functori,     <contact@functori.com>                   *)
+(*                                                                           *)
+(* Permission is hereby granted, free of charge, to any person obtaining a   *)
+(* copy of this software and associated documentation files (the "Software"),*)
+(* to deal in the Software without restriction, including without limitation *)
+(* the rights to use, copy, modify, merge, publish, distribute, sublicense,  *)
+(* and/or sell copies of the Software, and to permit persons to whom the     *)
+(* Software is furnished to do so, subject to the following conditions:      *)
+(*                                                                           *)
+(* The above copyright notice and this permission notice shall be included   *)
+(* in all copies or substantial portions of the Software.                    *)
+(*                                                                           *)
+(* THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR*)
+(* IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,  *)
+(* FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL   *)
+(* THE AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER*)
+(* LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING   *)
+(* FROM, OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER       *)
+(* DEALINGS IN THE SOFTWARE.                                                 *)
+(*                                                                           *)
+(*****************************************************************************)
+
+module Worker = Gs_interface.Worker_instance
+open Gs_interface.Worker_instance
+module Events = Gs_transport_connection_events
+
+let peer_of_connection p2p_layer conn =
+  let open Types.P2P.Metadata.Connection in
+  let {P2p_connection.Info.peer_id; id_point; remote_metadata; _} =
+    P2p.connection_info p2p_layer conn
+  in
+  let default_port =
+    Transport_layer_default_parameters.P2p_config.listening_port
+  in
+  let addr =
+    Option.value remote_metadata.advertised_net_addr ~default:(fst id_point)
+  in
+  let port =
+    Option.value remote_metadata.advertised_net_port ~default:default_port
+  in
+  let maybe_reachable_point = (addr, port) in
+  Types.Peer.{peer_id; maybe_reachable_point}
+
+(** This handler forwards information about connections established by the P2P
+    layer to the Gossipsub worker.
+
+    Note that, a connection is considered [outbound] only if we initiated it and
+    we trust the point or the peer we are connecting to. Consequently, PX peers
+    are not considered outgoing connections by default, as they are not trusted
+    unless explicitly specified otherwise.
+
+    Indeed, Gossipsub tries to maintain a threshold of outbound connections per
+    topic. So, we don't automatically set connections we initiate to PX peers as
+    outbound to avoid possible love bombing attacks. The Rust version also
+    implements a way to mitigate this risk, but not the Go implementation.
+*)
+let new_connections_handler gs_worker p2p_layer peer_id conn =
+  let P2p_connection.Info.{id_point = addr, port_opt; _} =
+    P2p.connection_info p2p_layer conn
+  in
+  let Types.P2P.Metadata.Connection.{is_bootstrap_peer = bootstrap; _} =
+    P2p.connection_remote_metadata p2p_layer conn
+  in
+  let pool_opt = P2p.pool p2p_layer in
+  let fold_pool_opt f arg =
+    Option.fold
+      pool_opt
+      ~none:true (* It doesn't matter in fake networks where pool is None *)
+      ~some:(fun pool -> f pool arg)
+  in
+  let trusted_peer = fold_pool_opt P2p_pool.Peers.get_trusted peer_id in
+  let trusted_point =
+    Option.fold port_opt ~none:false ~some:(fun port ->
+        fold_pool_opt P2p_pool.Points.get_trusted (addr, port))
+  in
+  let trusted = trusted_peer || trusted_point in
+  (* Currently direct peers are not supported. The "private mode" mechanism
+     present in octez-p2p could maybe be used for that. *)
+  let direct = false in
+  let peer = peer_of_connection p2p_layer conn in
+  Worker.(
+    New_connection {peer; direct; trusted; bootstrap} |> p2p_input gs_worker)
+
+(** This handler forwards information about P2P disconnections to the Gossipsub
+    worker. *)
+let disconnections_handler gs_worker peer_id =
+  let open GS.Introspection in
+  (* When this callback is called, we only have the [peer_id] and not
+     the [maybe_reachable_point].
+
+     It can be reconstructed in many ways:
+
+     - We could do it via the octez-p2p
+
+     - We can find it in the automaton state (choosen option)
+
+     Last option does not have the good complexity but is simple enough.
+  *)
+  let view = Worker.state gs_worker in
+  let {connections; _} = view in
+  (* Complexity is wrong, but the number of connections should not be
+     too large, so it should be ok in practice. *)
+  let bindings = Connections.bindings connections in
+  let value =
+    List.find_opt
+      (fun (peer, _) -> P2p_peer.Id.equal peer.Types.Peer.peer_id peer_id)
+      bindings
+  in
+  match value with
+  | None -> (* Something is off, we should log something probably. *) ()
+  | Some (peer, _) -> Worker.(Disconnection {peer} |> p2p_input gs_worker)
+
+(** This handler forwards p2p messages received via Octez p2p to the Gossipsub
+    worker. The application callback is spawned asynchronously so that a slow
+    callback on one connection does not delay receiving messages from other
+    peers. *)
+let transport_layer_inputs_handler gs_worker p2p_layer ~app_in_callback =
+  let open Lwt_syntax in
+  let rec loop () =
+    let* conn, p2p_message = P2p.recv_any p2p_layer in
+    let from_peer = peer_of_connection p2p_layer conn in
+    (match p2p_message with
+    | Message_with_header {message_id; _} ->
+        Lwt.dont_wait
+          (fun () ->
+            let open Lwt_syntax in
+            let* res = app_in_callback message_id from_peer in
+            match res with
+            | Ok () -> return_unit
+            | Error trace ->
+                Events.(emit app_in_callback_failed (message_id, trace)))
+          (fun exn ->
+            Format.eprintf
+              "Warning: exception in DAL shard reception callback: %s@."
+              (Printexc.to_string exn))
+    | _ -> ()) ;
+    Worker.(In_message {from_peer; p2p_message} |> bounded_p2p_input gs_worker) ;
+    loop ()
+  in
+  loop ()
+
+(** This loop pops messages from application output stream and calls the given
+    [app_messages_callback] on them. *)
+let app_messages_handler gs_worker ~app_out_callback ~verbose =
+  let open Lwt_syntax in
+  let rec loop app_output_stream =
+    let* Worker.{message; message_id; topic = _} =
+      Worker.Stream.pop app_output_stream
+    in
+    let* res = app_out_callback message message_id in
+    let* () =
+      match res with
+      | Ok () ->
+          if not verbose then return_unit
+          else Events.(emit message_notified_to_app message_id)
+      | Error err -> Events.(emit app_message_callback_failed (message_id, err))
+    in
+    loop app_output_stream
+  in
+  Worker.app_output_stream gs_worker |> loop
+
+let activate gs_worker p2p_layer ~app_out_callback ~app_in_callback ~verbose
+    ~canceler =
+  (* Register a handler to notify new P2P connections to GS. *)
+  let open Lwt_result_syntax in
+  let () =
+    new_connections_handler gs_worker p2p_layer
+    |> P2p.on_new_connection p2p_layer
+  in
+  (* Register a handler to notify P2P disconnections to GS. *)
+  let () = disconnections_handler gs_worker |> P2p.on_disconnection p2p_layer in
+  let* p2p_worker = Gs_callback_worker.create gs_worker p2p_layer in
+  let () =
+    Lwt_canceler.on_cancel canceler (fun () ->
+        Gs_callback_worker.shutdown p2p_worker)
+  in
+  (* We are not expecting any of the promises below to fulfill, unless they are rejected. *)
+  let*! _ =
+    Lwt.pick
+      [
+        Worker.main_loop_promise gs_worker;
+        transport_layer_inputs_handler gs_worker p2p_layer ~app_in_callback;
+        app_messages_handler gs_worker ~app_out_callback ~verbose;
+      ]
+  in
+  return_unit

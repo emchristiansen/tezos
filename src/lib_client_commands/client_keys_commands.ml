@@ -34,17 +34,19 @@ let group =
 let algo_param () =
   let open Lwt_result_syntax in
   Tezos_clic.parameter
-    ~autocomplete:(fun _ -> return ["ed25519"; "secp256k1"; "p256"; "bls"])
+    ~autocomplete:(fun _ ->
+      return ["ed25519"; "secp256k1"; "p256"; "bls"; "mldsa44"])
     (fun _ name ->
       match name with
       | "ed25519" -> return Signature.Ed25519
       | "secp256k1" -> return Signature.Secp256k1
       | "p256" -> return Signature.P256
       | "bls" -> return Signature.Bls
+      | "mldsa44" -> return Signature.Mldsa44
       | name ->
           failwith
             "Unknown signature algorithm (%s). Available: 'ed25519', \
-             'secp256k1','p256' or 'bls'"
+             'secp256k1','p256', 'bls' or 'mldsa44'"
             name)
 
 let sig_algo_arg =
@@ -52,12 +54,21 @@ let sig_algo_arg =
     ~doc:"use custom signature algorithm"
     ~long:"sig"
     ~short:'s'
-    ~placeholder:"ed25519|secp256k1|p256|bls"
+    ~placeholder:"ed25519|secp256k1|p256|bls|mldsa44"
     ~default:"ed25519"
     (algo_param ())
 
+let algo_to_prefix algo =
+  let open Signature in
+  match algo with
+  | Ed25519 -> "tz1"
+  | Secp256k1 -> "tz2"
+  | P256 -> "tz3"
+  | Bls -> "tz4"
+  | Mldsa44 -> "tz5"
+
 let gen_keys_containing ?(encrypted = false) ?(prefix = false)
-    ?(ignore_case = false) ?(force = false) ~containing ~name
+    ?(ignore_case = false) ?(force = false) ~algo ~containing ~name
     (cctxt : #Client_context.io_wallet) =
   let open Lwt_result_syntax in
   let unrepresentable =
@@ -131,13 +142,15 @@ let gen_keys_containing ?(encrypted = false) ?(prefix = false)
             in
             let matches =
               if prefix then
-                let containing_tz1 = List.map (( ^ ) "tz1") containing in
+                let tz_prefix =
+                  List.map (( ^ ) (algo_to_prefix algo)) containing
+                in
                 fun key ->
                   List.exists
                     (fun containing ->
                       String.sub (adjust_case key) 0 (String.length containing)
                       = containing)
-                    containing_tz1
+                    tz_prefix
               else
                 let re = Re.Str.regexp (String.concat "\\|" containing) in
                 fun key ->
@@ -148,7 +161,7 @@ let gen_keys_containing ?(encrypted = false) ?(prefix = false)
             in
             let rec loop attempts =
               let public_key_hash, public_key, secret_key =
-                Signature.generate_key ()
+                Signature.generate_key ~algo ()
               in
               let hash =
                 Signature.Public_key_hash.to_b58check
@@ -329,23 +342,21 @@ let generate_test_keys =
   command
     ~group
     ~desc:"Generate an array of accounts for testing purposes."
-    (args1 alias_prefix_param)
+    (args2 alias_prefix_param sig_algo_arg)
     (prefixes ["stresstest"; "gen"; "keys"] @@ keys_count_param @@ stop)
-    (fun alias_prefix n (cctxt : Client_context.full) ->
+    (fun (alias_prefix, algo) n (cctxt : Client_context.full) ->
       let open Lwt_result_syntax in
       (* By default, the alias prefix matches the bootstrap<idx>
          pattern used in sandboxed mode.*)
       let alias_prefix =
         match alias_prefix with
         | None -> fun i -> Format.sprintf "bootstrap%d" (i + 6)
-        | Some alias_prefix -> Format.sprintf "%s%06d" alias_prefix
+        | Some alias_prefix -> Format.sprintf "%s%d" alias_prefix
       in
       let* source_list =
         List.init_es ~when_negative_length:[] n (fun i ->
             let alias = alias_prefix i in
-            let pkh, pk, sk =
-              Signature.generate_key ~algo:Signature.Ed25519 ()
-            in
+            let pkh, pk, sk = Signature.generate_key ~algo () in
             let*? pk_uri = Tezos_signer_backends.Unencrypted.make_pk pk in
             let*? sk_uri = Tezos_signer_backends.Unencrypted.make_sk sk in
             return ({pkh; pk; sk}, pk_uri, sk_uri, alias))
@@ -376,118 +387,6 @@ let generate_test_keys =
       let*! () = cctxt#message "%a@." Data_encoding.Json.pp json in
       return_unit)
 
-let aggregate_fail_if_already_registered cctxt force pk_uri name =
-  let open Lwt_result_syntax in
-  let* pk_opt = Aggregate_alias.Public_key.find_opt cctxt name in
-  match pk_opt with
-  | None -> return_unit
-  | Some (pk_uri_found, _) ->
-      fail_unless
-        (pk_uri = pk_uri_found || force)
-        (error_of_fmt
-           "public and secret keys '%s' don't correspond, please don't use \
-            --force"
-           name)
-
-module Bls_commands = struct
-  open Lwt_result_syntax
-
-  let generate_keys ~force ~encrypted name (cctxt : #Client_context.io_wallet) =
-    let* name = Aggregate_alias.Secret_key.of_fresh cctxt force name in
-    let mnemonic = Mnemonic.new_random in
-    let*! () =
-      cctxt#message
-        "It is important to save this mnemonic in a secure place:@\n\
-         @\n\
-         %a@\n\
-         @\n\
-         The mnemonic can be used to recover your spending key.@."
-        Mnemonic.words_pp
-        (Bip39.to_words mnemonic)
-    in
-    let seed = Mnemonic.to_32_bytes mnemonic in
-    let pkh, pk, sk = Tezos_crypto.Aggregate_signature.generate_key ~seed () in
-    let*? pk_uri = Tezos_signer_backends.Unencrypted.Aggregate.make_pk pk in
-    let* sk_uri =
-      if encrypted then
-        Tezos_signer_backends.Encrypted.prompt_twice_and_encrypt_aggregate
-          cctxt
-          sk
-      else Tezos_signer_backends.Unencrypted.Aggregate.make_sk sk |> Lwt.return
-    in
-    register_aggregate_key
-      cctxt
-      ~force
-      (pkh, pk_uri, sk_uri)
-      ~public_key:pk
-      name
-
-  let list_keys (cctxt : #Client_context.io_wallet) =
-    let* aggregate_keys_list = list_aggregate_keys cctxt in
-    List.iter_es
-      (fun (name, pkh, pk, sk) ->
-        let* pkh_str = Aggregate_alias.Public_key_hash.to_source pkh in
-        let*! () =
-          match (pk, sk) with
-          | None, None -> cctxt#message "%s: %s" name pkh_str
-          | _, Some uri ->
-              let scheme =
-                Option.value ~default:"aggregate_unencrypted"
-                @@ Uri.scheme (uri : aggregate_sk_uri :> Uri.t)
-              in
-              cctxt#message "%s: %s (%s sk known)" name pkh_str scheme
-          | Some _, _ -> cctxt#message "%s: %s (pk known)" name pkh_str
-        in
-        return_unit)
-      aggregate_keys_list
-
-  let show_address ~show_private name (cctxt : #Client_context.io_wallet) =
-    let* keys_opt = alias_aggregate_keys cctxt name in
-    match keys_opt with
-    | None ->
-        let*! () = cctxt#error "No keys found for address" in
-        return_unit
-    | Some (pkh, pk, skloc) -> (
-        let*! () =
-          cctxt#message
-            "Hash: %a"
-            Tezos_crypto.Aggregate_signature.Public_key_hash.pp
-            pkh
-        in
-        match pk with
-        | None -> return_unit
-        | Some pk ->
-            let*! () =
-              cctxt#message
-                "Public Key: %a"
-                Tezos_crypto.Aggregate_signature.Public_key.pp
-                pk
-            in
-            if show_private then
-              Option.iter_es
-                (fun skloc ->
-                  let* skloc = Aggregate_alias.Secret_key.to_source skloc in
-                  let*! () = cctxt#message "Secret Key: %s" skloc in
-                  return_unit)
-                skloc
-            else return_unit)
-
-  let import_secret_key ~force name sk_uri (cctxt : #Client_context.io_wallet) =
-    let* name = Aggregate_alias.Secret_key.of_fresh cctxt false name in
-    let* pk_uri = aggregate_neuterize sk_uri in
-    let* () = aggregate_fail_if_already_registered cctxt force pk_uri name in
-    let* pkh, public_key =
-      import_aggregate_secret_key ~io:(cctxt :> Client_context.io_wallet) pk_uri
-    in
-    let*! () =
-      cctxt#message
-        "Bls address added: %a"
-        Tezos_crypto.Aggregate_signature.Public_key_hash.pp
-        pkh
-    in
-    register_aggregate_key cctxt (pkh, pk_uri, sk_uri) ?public_key name
-end
-
 let commands network : Client_context.full Tezos_clic.command list =
   let open Lwt_result_syntax in
   let open Tezos_clic in
@@ -498,6 +397,18 @@ let commands network : Client_context.full Tezos_clic.command list =
         (Client_keys.registered_signers ())
     then Tezos_clic.switch ~long:"encrypted" ~doc:"Encrypt the key on-disk" ()
     else Tezos_clic.constant true
+  in
+  let unencrypted_switch () =
+    if
+      List.exists
+        (fun (scheme, _) -> scheme = Tezos_signer_backends.Unencrypted.scheme)
+        (Client_keys.registered_signers ())
+    then
+      Tezos_clic.switch
+        ~long:"unencrypted"
+        ~doc:"Store the secret key unencrypted on-disk"
+        ()
+    else Tezos_clic.constant false
   in
   let show_private_switch =
     switch ~long:"show-secret" ~short:'S' ~doc:"show the private key" ()
@@ -527,16 +438,9 @@ let commands network : Client_context.full Tezos_clic.command list =
           List.iter_s
             (fun (n, signer) ->
               match signer with
-              | Simple (module S : SIGNER) ->
+              | (module S : SIGNER) ->
                   cctxt#message
                     "@[<v 2>Scheme `%s`: %s@,@[<hov 0>%a@]@]"
-                    n
-                    S.title
-                    Format.pp_print_text
-                    S.description
-              | Aggregate (module S : AGGREGATE_SIGNER) ->
-                  cctxt#message
-                    "@[<v 2>Aggregate scheme `%s`: %s@,@[<hov 0>%a@]@]"
                     n
                     S.title
                     Format.pp_print_text
@@ -549,14 +453,24 @@ let commands network : Client_context.full Tezos_clic.command list =
         command
           ~group
           ~desc:"Generate a pair of keys."
-          (args2 (Secret_key.force_switch ()) sig_algo_arg)
+          (args3
+             (Secret_key.force_switch ())
+             sig_algo_arg
+             (unencrypted_switch ()))
           (prefixes ["gen"; "keys"] @@ Secret_key.fresh_alias_param @@ stop)
-          (fun (force, algo) name (cctxt : Client_context.full) ->
-            let* name = Secret_key.of_fresh cctxt force name in
+          (fun (force, algo, unencrypted) name (cctxt : Client_context.full) ->
+            let* name =
+              Secret_key.of_fresh ~show_existing_key:false cctxt force name
+            in
             let pkh, pk, sk = Signature.generate_key ~algo () in
             let*? pk_uri = Tezos_signer_backends.Unencrypted.make_pk pk in
             let* sk_uri =
-              Tezos_signer_backends.Encrypted.prompt_twice_and_encrypt cctxt sk
+              if unencrypted then
+                Lwt.return (Tezos_signer_backends.Unencrypted.make_sk sk)
+              else
+                Tezos_signer_backends.Encrypted.prompt_twice_and_encrypt
+                  cctxt
+                  sk
             in
             register_key cctxt ~force (pkh, pk_uri, sk_uri) name)
     | Some `Testnet | None ->
@@ -569,7 +483,9 @@ let commands network : Client_context.full Tezos_clic.command list =
              (encrypted_switch ()))
           (prefixes ["gen"; "keys"] @@ Secret_key.fresh_alias_param @@ stop)
           (fun (force, algo, encrypted) name (cctxt : Client_context.full) ->
-            let* name = Secret_key.of_fresh cctxt force name in
+            let* name =
+              Secret_key.of_fresh ~show_existing_key:false cctxt force name
+            in
             let pkh, pk, sk = Signature.generate_key ~algo () in
             let*? pk_uri = Tezos_signer_backends.Unencrypted.make_pk pk in
             let* sk_uri =
@@ -585,41 +501,6 @@ let commands network : Client_context.full Tezos_clic.command list =
         command
           ~group
           ~desc:"Generate keys including the given string."
-          (args3
-             (switch
-                ~long:"prefix"
-                ~short:'P'
-                ~doc:"the key must begin with tz1[word]"
-                ())
-             (switch
-                ~long:"ignore-case"
-                ~short:'I'
-                ~doc:"make the pattern case-insensitive"
-                ())
-             (force_switch ()))
-          (prefixes ["gen"; "vanity"; "keys"]
-          @@ Public_key_hash.fresh_alias_param @@ prefix "matching"
-          @@ seq_of_param
-          @@ string
-               ~name:"words"
-               ~desc:"string key must contain one of these words")
-          (fun (prefix, ignore_case, force)
-               name
-               containing
-               (cctxt : Client_context.full) ->
-            let* name = Public_key_hash.of_fresh cctxt force name in
-            gen_keys_containing
-              ~encrypted:true
-              ~force
-              ~prefix
-              ~ignore_case
-              ~containing
-              ~name
-              cctxt)
-    | Some `Testnet | None ->
-        command
-          ~group
-          ~desc:"Generate keys including the given string."
           (args4
              (switch
                 ~long:"prefix"
@@ -632,19 +513,60 @@ let commands network : Client_context.full Tezos_clic.command list =
                 ~doc:"make the pattern case-insensitive"
                 ())
              (force_switch ())
-             (encrypted_switch ()))
+             sig_algo_arg)
           (prefixes ["gen"; "vanity"; "keys"]
           @@ Public_key_hash.fresh_alias_param @@ prefix "matching"
           @@ seq_of_param
           @@ string
                ~name:"words"
                ~desc:"string key must contain one of these words")
-          (fun (prefix, ignore_case, force, encrypted)
+          (fun (prefix, ignore_case, force, algo)
                name
                containing
-               (cctxt : Client_context.full) ->
+               (cctxt : Client_context.full)
+             ->
             let* name = Public_key_hash.of_fresh cctxt force name in
             gen_keys_containing
+              ~algo
+              ~encrypted:true
+              ~force
+              ~prefix
+              ~ignore_case
+              ~containing
+              ~name
+              cctxt)
+    | Some `Testnet | None ->
+        command
+          ~group
+          ~desc:"Generate keys including the given string."
+          (args5
+             (switch
+                ~long:"prefix"
+                ~short:'P'
+                ~doc:"the key must begin with tz1[word]"
+                ())
+             (switch
+                ~long:"ignore-case"
+                ~short:'I'
+                ~doc:"make the pattern case-insensitive"
+                ())
+             (force_switch ())
+             (encrypted_switch ())
+             sig_algo_arg)
+          (prefixes ["gen"; "vanity"; "keys"]
+          @@ Public_key_hash.fresh_alias_param @@ prefix "matching"
+          @@ seq_of_param
+          @@ string
+               ~name:"words"
+               ~desc:"string key must contain one of these words")
+          (fun (prefix, ignore_case, force, encrypted, algo)
+               name
+               containing
+               (cctxt : Client_context.full)
+             ->
+            let* name = Public_key_hash.of_fresh cctxt force name in
+            gen_keys_containing
+              ~algo
               ~encrypted
               ~force
               ~prefix
@@ -685,7 +607,9 @@ let commands network : Client_context.full Tezos_clic.command list =
       @@ prefixes ["secret"; "key"]
       @@ Secret_key.fresh_alias_param @@ Client_keys.sk_uri_param @@ stop)
       (fun force name sk_uri (cctxt : Client_context.full) ->
-        let* name = Secret_key.of_fresh cctxt force name in
+        let* name =
+          Secret_key.of_fresh ~show_existing_key:false cctxt force name
+        in
         let* pk_uri = Client_keys.neuterize sk_uri in
         let* () = fail_if_already_registered cctxt force pk_uri name in
         let* pkh, public_key =
@@ -702,26 +626,28 @@ let commands network : Client_context.full Tezos_clic.command list =
         register_key cctxt ~force (pkh, pk_uri, sk_uri) ?public_key name);
   ]
   @ (if network <> Some `Mainnet then []
-    else
-      [
-        command
-          ~group
-          ~desc:"Add a fundraiser secret key to the wallet."
-          (args1 (Secret_key.force_switch ()))
-          (prefix "import"
-          @@ prefixes ["fundraiser"; "secret"; "key"]
-          @@ Secret_key.fresh_alias_param @@ stop)
-          (fun force name (cctxt : Client_context.full) ->
-            let* name = Secret_key.of_fresh cctxt force name in
-            let* sk = input_fundraiser_params cctxt in
-            let* sk_uri =
-              Tezos_signer_backends.Encrypted.prompt_twice_and_encrypt cctxt sk
-            in
-            let* pk_uri = Client_keys.neuterize sk_uri in
-            let* () = fail_if_already_registered cctxt force pk_uri name in
-            let* pkh, _public_key = Client_keys.public_key_hash pk_uri in
-            register_key cctxt ~force (pkh, pk_uri, sk_uri) name);
-      ])
+     else
+       [
+         command
+           ~group
+           ~desc:"Add a fundraiser secret key to the wallet."
+           (args1 (Secret_key.force_switch ()))
+           (prefix "import"
+           @@ prefixes ["fundraiser"; "secret"; "key"]
+           @@ Secret_key.fresh_alias_param @@ stop)
+           (fun force name (cctxt : Client_context.full) ->
+             let* name =
+               Secret_key.of_fresh ~show_existing_key:false cctxt force name
+             in
+             let* sk = input_fundraiser_params cctxt in
+             let* sk_uri =
+               Tezos_signer_backends.Encrypted.prompt_twice_and_encrypt cctxt sk
+             in
+             let* pk_uri = Client_keys.neuterize sk_uri in
+             let* () = fail_if_already_registered cctxt force pk_uri name in
+             let* pkh, _public_key = Client_keys.public_key_hash pk_uri in
+             register_key cctxt ~force (pkh, pk_uri, sk_uri) name);
+       ])
   @ [
       command
         ~group
@@ -774,6 +700,24 @@ let commands network : Client_context.full Tezos_clic.command list =
               in
               return_unit)
             l);
+      command
+        ~group
+        ~desc:"List the keys known by the remote wallet."
+        no_options
+        (prefix "list"
+        @@ prefixes ["known"; "remote"; "keys"]
+        @@ Client_keys.uri_param @@ stop)
+        (fun () uri (cctxt : Client_context.full) ->
+          let* pkhs = Client_keys.list_known_keys uri in
+          let*! () =
+            cctxt#message
+              "@[<v 2>Tezos remote known keys:@,%a@]"
+              (Format.pp_print_list
+                 ~pp_sep:Format.pp_print_cut
+                 Signature.Public_key_hash.pp)
+              pkhs
+          in
+          return_unit);
       command
         ~group
         ~desc:"Show the keys associated with an implicit account."
@@ -906,7 +850,9 @@ let commands network : Client_context.full Tezos_clic.command list =
         @@ prefixes ["keys"; "from"; "mnemonic"]
         @@ Secret_key.fresh_alias_param @@ stop)
         (fun (force, encrypt) name (cctxt : Client_context.full) ->
-          let* name = Secret_key.of_fresh cctxt force name in
+          let* name =
+            Secret_key.of_fresh ~show_existing_key:false cctxt force name
+          in
           let* mnemonic = cctxt#prompt "Enter your mnemonic: " in
           let mnemonic = String.trim mnemonic |> String.split_on_char ' ' in
           match Bip39.of_words mnemonic with
@@ -957,50 +903,4 @@ let commands network : Client_context.full Tezos_clic.command list =
                   pkh
               in
               return_unit);
-      (let desc = "Generate a pair of BLS keys." in
-       let force_switch = Aggregate_alias.Secret_key.force_switch in
-       let cmd =
-         prefixes ["bls"; "gen"; "keys"]
-         @@ Aggregate_alias.Secret_key.fresh_alias_param @@ stop
-       in
-       match network with
-       | Some `Mainnet ->
-           command
-             ~group
-             ~desc
-             (args1 (force_switch ()))
-             cmd
-             (fun force name (cctxt : #Client_context.full) ->
-               Bls_commands.generate_keys ~force ~encrypted:true name cctxt)
-       | Some `Testnet | None ->
-           command
-             ~group
-             ~desc
-             (args2 (force_switch ()) (encrypted_switch ()))
-             cmd
-             (fun (force, encrypted) name (cctxt : #Client_context.full) ->
-               Bls_commands.generate_keys ~force ~encrypted name cctxt));
-      command
-        ~group
-        ~desc:"List BlS keys."
-        no_options
-        (prefixes ["bls"; "list"; "keys"] @@ stop)
-        (fun () cctxt -> Bls_commands.list_keys cctxt);
-      command
-        ~group
-        ~desc:"Show the keys associated with an rollup account."
-        (args1 show_private_switch)
-        (prefixes ["bls"; "show"; "address"]
-        @@ Aggregate_alias.Public_key_hash.alias_param @@ stop)
-        (fun show_private (name, _pkh) (cctxt : #Client_context.full) ->
-          Bls_commands.show_address ~show_private name cctxt);
-      command
-        ~group
-        ~desc:"Add a secret key to the wallet."
-        (args1 (Aggregate_alias.Secret_key.force_switch ()))
-        (prefixes ["bls"; "import"; "secret"; "key"]
-        @@ Aggregate_alias.Secret_key.fresh_alias_param
-        @@ aggregate_sk_uri_param @@ stop)
-        (fun force name sk_uri cctxt ->
-          Bls_commands.import_secret_key ~force name sk_uri cctxt);
     ]

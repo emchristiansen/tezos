@@ -6,7 +6,7 @@ language and a short explanation of how smart contracts are executed
 and interact in the blockchain.
 
 The language is stack-based, with high level data types and primitives,
-and strict static type checking. Its design cherry picks traits from
+and strict static type checking. Its design cherry-picks traits from
 several language families. Vigilant readers will notice direct
 references to Forth, Scheme, ML and Cat.
 
@@ -29,31 +29,34 @@ the specification. The document also starts with a less formal
 explanation of the context: how Michelson code interacts with the
 blockchain.
 
-.. _address_prefixes_alpha:
+.. _transaction_semantics_alpha:
 
 Semantics of smart contracts and transactions
 ---------------------------------------------
 
 The Tezos ledger currently has two types of accounts that can hold
-tokens (and be the destinations of transactions).
+tokens. Accounts can be used in transactions as senders, to send tokens,
+or as destinations, to receive tokens.
 
-  - An implicit account is a non programmable account, whose tokens
-    are spendable and delegatable by a public key. Its address is
-    directly the public key hash, and starts with ``tz1``, ``tz2``,
-    ``tz3`` or ``tz4``.
-  - A smart contract is a programmable account. A transaction to such
-    an address can provide data, and can fail for reasons decided by
-    its Michelson code. Its address is a unique hash that depends on
-    the operation that led to its creation, and starts with ``KT1``.
+- User account: non-programmable account whose address is
+  the public key hash, prefixed by ``tz`` and one digit.
+  User accounts are sometimes called implicit accounts.
+  A transaction to such an address cannot provide data, except :doc:`tickets <./tickets>`.
+- Smart contract: programmable account associated to some Michelson code,
+  whose address is a unique hash, prefixed by ``KT1``.
+  A transaction to such
+  an address can provide data, and can fail for reasons detailed below.
+  Smart contracts are sometimes called originated accounts.
 
-From Michelson, they are indistinguishable. A safe way to think about
-this is to consider that implicit accounts are smart contracts that
-always succeed to receive tokens, and does nothing else.
+Finally, addresses prefixed with ``sr1`` identify :doc:`Smart Rollups
+<./smart_rollups>`, which cannot hold tokens but can be the destination of transactions.
 
-Finally, addresses prefixed with ``sr1`` identify :doc:`smart rollups <./smart_rollups>`.
+See :doc:`./accounts` for more details.
 
-Intra-transaction semantics
-~~~~~~~~~~~~~~~~~~~~~~~~~~~
+Smart contract call semantics
+~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+
+The only way to call a smart contract is to perform a transaction operation whose destination is the address of the smart contract.
 
 Alongside their tokens, smart contracts keep a piece of storage. Both
 are ruled by a specific logic specified by a Michelson program. A
@@ -64,7 +67,7 @@ storage and transfer its tokens.
 The Michelson program receives as input a stack containing a single
 pair whose first element is an input value and second element the
 content of the storage space. It must return a stack containing a
-single pair whose first element is the list of internal operations
+single pair whose first element is the list of operations
 that it wants to emit, and second element is the new contents of the
 storage space. Alternatively, a Michelson program can fail, explicitly
 using a specific opcode, or because something went wrong that could
@@ -77,25 +80,40 @@ and these two components are transformed automatically in a simple and
 deterministic way to an input value. This feature is available both
 for users and from Michelson code. See the dedicated section.
 
-Inter-transaction semantics
-~~~~~~~~~~~~~~~~~~~~~~~~~~~
+Transaction semantics
+~~~~~~~~~~~~~~~~~~~~~
 
-An operation included in the blockchain is a sequence of "external
-operations" signed as a whole by a source address. These operations
-are of three kinds:
+On one hand, a smart call may result from an external operation of kind Transaction.
+External operations are :doc:`blockchain operations <./blocks_ops>` included in a block, signed by a user account.
 
-  - Transactions to transfer tokens to implicit accounts or tokens and
-    parameters to a smart contract (or, optionally, to a specified
-    entrypoint of a smart contract).
-  - Originations to create new smart contracts from its Michelson
-    source code, an initial amount of tokens transferred from the
-    source, and an initial storage contents.
-  - Delegations to assign the tokens of the source to the stake of
-    another implicit account (without transferring any tokens).
+On the other hand, a smart contract call may be emitted as an internal operation of kind Transaction, either when executing another smart contract call or when :ref:`triggering the execution of an outbox message from a smart rollup <triggering_execution_outbox_message>`.
 
-Smart contracts can also emit "internal operations". These are run
-in sequence after the external transaction completes, as in the
-following schema for a sequence of two external operations.
+This section explains the whole semantics of an external transaction, including the execution of the smart contract called directly by it and the others smart contracts called indirectly via emitted internal operations.
+
+The subset of blockchain operations that can be emitted by Michelson programs as internal operations are of the following kinds:
+
+- Transaction transferring:
+
+  * tokens and optionally tickets to a user account, or
+  * tokens and parameters to a smart contract (or, optionally, to a specified
+    entrypoint of a smart contract), or
+  * parameters to a smart rollup.
+
+- Origination creating a new smart contract from its Michelson
+  source code, an initial amount of tokens transferred from the
+  source, and an initial storage content.
+- Delegation assigning the tokens of the sender account to the stake of
+  a user account (without transferring any tokens).
+- :doc:`Contract event <./event>` delivering live information from a smart
+  contract to external applications.
+
+Internal operations are not included in any block, and are not signed.
+
+Internal operations are run in an atomic sequence with the external operation who triggered the contract call, *after* the contract execution, in depth-first order.
+This implies in particular that any contract calls emitted by a contract C are executed after contract C successfully finishes execution returning its result (the list of internal operations and the new storage).
+
+Note that :ref:`manager operations batches <manager_operations_batches_alpha>` contain a sequence of external operations signed as a whole by a source user account, which are executed atomically.
+For example, in case of a batch of two external operations, execution proceeds as follows:
 
 ::
 
@@ -103,10 +121,10 @@ following schema for a sequence of two external operations.
     | op 1 | internal ops 1 |  op 2 | internal ops 2 |
     +------+----------------+-------+----------------+
 
-Smart contracts called by internal transactions can in turn also emit
-internal operation. The interpretation of the internal operations
-of a given external operation uses a stack, as in the following
-example, also with two external operations.
+Smart contracts called by internal operations can in turn also emit
+internal operations. The interpreter
+uses a stack of internal operations to perform them in depth-first order, as in the following more detailed
+example, corresponding to the two external operations above.
 
 ::
 
@@ -135,25 +153,25 @@ Failures
 
 All transactions can fail for a few reasons, mostly:
 
-  - Not enough tokens in the source to spend the specified amount.
-  - The script took too many execution steps.
-  - The script failed programmatically using the ``FAILWITH`` instruction.
+- Not enough tokens in the source to spend the specified amount.
+- The script took too many execution steps.
+- The script failed programmatically using the ``FAILWITH`` instruction.
 
 External transactions can also fail for these additional reasons:
 
-  - The signature of the external operations was wrong.
-  - The code or initial storage in an origination did not typecheck.
-  - The parameter in a transfer did not typecheck.
-  - The destination did not exist.
-  - The specified entrypoint did not exist.
+- The signature of the external operations was wrong.
+- The code or initial storage in an origination did not typecheck.
+- The parameter in a transfer did not typecheck.
+- The destination did not exist.
+- The specified entrypoint did not exist.
 
 All these errors cannot happen in internal transactions, as the type
 system catches them at operation creation time. In particular,
-Michelson has two types to talk about other accounts: ``address`` and
+Michelson has two types to talk about other addresses: ``address`` and
 ``contract t``. The ``address`` type merely gives the guarantee that
 the value has the form of a Tezos address. The ``contract t`` type, on
-the other hand, guarantees that the value is indeed a valid, existing
-account whose parameter type is ``t``. To make a transaction from
+the other hand, guarantees that the address is indeed a valid destination of
+transfers whose parameter type is ``t``. To make a transaction from
 Michelson, a value of type ``contract t`` must be provided, and the
 type system checks that the argument to the transaction is indeed of
 type ``t``. Hence, all transactions made from Michelson are well
@@ -163,7 +181,7 @@ In any case, when a failure happens, either total success or total
 failure is guaranteed. If a transaction (internal or external) fails,
 then the whole sequence fails and all the effects up to the failure
 are reverted. These transactions can still be included in blocks, and
-the transaction fees are given to the implicit account who baked the
+the transaction fees are given to the user account who baked the
 block.
 
 Language semantics
@@ -437,6 +455,22 @@ the program on an abstract stack representing the input type provided by
 the programmer, and checking that the resulting symbolic stack is
 consistent with the expected result, also provided by the programmer.
 
+.. _type_normalization_alpha:
+
+Type normalization
+~~~~~~~~~~~~~~~~~~
+
+For convenience, Michelson developers can use some compact type notations for types that do not exist in the language implementation.
+These are just shorthands that are expanded into existing types during the so-called "type normalization".
+
+Currently, the only such notation concerns N-ary pairs (also called tuples), which are expanded into "right combs", that is, nested binary pairs with right associativity.
+See `type pair <https://tezos.gitlab.io/michelson-reference/#type-pair>`__ for details.
+
+The node RPC ``/helpers/script/normalize_type`` is available to normalize a given Michelson type (see :doc:`../api/openapi`, within the protocol-dependent RPCs).
+This RPC is intended for tool developers wanting to support the type shorthands in their tools without reimplementing their normalization.
+However, one side effect of this RPC is the stripping of :ref:`annotations <annotations_alpha>`.
+As a consequence, a tool needing to preserve annotations on shorthand data types should implement its own type normalization instead of relying on this RPC.
+
 Side note
 ~~~~~~~~~
 
@@ -449,1324 +483,79 @@ as well-typed. This is because the implementation uses a simple single
 pass typechecking algorithm, and does not handle any form of
 polymorphism.
 
-Core data types and notations
------------------------------
-
--  ``string``, ``nat``, ``int`` and ``bytes``: The core primitive
-   constant types.
-
--  ``bool``: The type for booleans whose values are ``True`` and
-   ``False``.
-
--  ``unit``: The type whose only value is ``Unit``, to use as a
-   placeholder when some result or parameter is not necessary. For
-   instance, when the only goal of a contract is to update its storage.
-
--  ``never``: The empty type. Since ``never`` has no inhabitant, no value of
-   this type is allowed to occur in a well-typed program.
-
--  ``list (t)``: A single, immutable, homogeneous linked list, whose
-   elements are of type ``(t)``, and that we write ``{}`` for the empty
-   list or ``{ first ; ... }``. In the semantics, we use chevrons to
-   denote a subsequence of elements. For instance: ``{ head ; <tail> }``.
-
--  ``pair (l) (r)``: A pair of values ``a`` and ``b`` of types ``(l)``
-   and ``(r)``, that we write ``(Pair a b)``.
-
--  ``pair (t{1}) ... (t{n})`` with ``n > 2``: A shorthand for ``pair (t{1}) (pair (t{2}) ... (pair (t{n-1}) (t{n})) ...)``.
-
--  ``option (t)``: Optional value of type ``(t)`` that we write ``None``
-   or ``(Some v)``.
-
--  ``or (l) (r)``: A union of two types: a value holding either a value
-   ``a`` of type ``(l)`` or a value ``b`` of type ``(r)``, that we write
-   ``(Left a)`` or ``(Right b)``.
-
--  ``set (t)``: Immutable sets of values of type ``(t)`` that we write as
-   lists ``{ item ; ... }``, of course with their elements unique, and
-   sorted.
-
--  ``map (k) (t)``: Immutable maps from keys of type ``(k)`` of values
-   of type ``(t)`` that we write ``{ Elt key value ; ... }``, with keys
-   sorted.
-
--  ``big_map (k) (t)``: Lazily deserialized maps from keys of type
-   ``(k)`` of values of type ``(t)``.
-   These maps should be used if you intend to store large amounts of data in a map.
-   Using ``big_map`` can reduce gas costs significantly compared to standard maps, as data is lazily deserialized.
-   Note however that individual operations on ``big_map`` have higher gas costs than those over standard maps.
-   A ``big_map`` also has a lower storage cost than a standard map of the same size, when large keys are used, since only the hash of each key is stored in a ``big_map``.
-
-   A ``big_map`` cannot appear inside another ``big_map``.
-   See the section on :ref:`operations on big maps <OperationsOnBigMaps_alpha>` for a description of the syntax of values of type ``big_map (k) (t)`` and available operations.
-
-Core instructions
------------------
-
-Control structures
-~~~~~~~~~~~~~~~~~~
-
-A detailed description of the following instructions can be found in the `interactive Michelson reference manual <https://tezos.gitlab.io/michelson-reference/>`__.
-
--  ``FAILWITH``: Explicitly abort the current program (`documentation <https://tezos.gitlab.io/michelson-reference/#instr-FAILWITH>`__).
--  ``{}``: Empty sequence (`documentation <https://tezos.gitlab.io/michelson-reference/#instr-NOOP>`__).
--  ``{ I ; C }``: Sequence (`documentation <https://tezos.gitlab.io/michelson-reference/#instr-SEQ>`__).
--  ``IF bt bf``: Conditional branching (`documentation <https://tezos.gitlab.io/michelson-reference/#instr-IF>`__).
--  ``LOOP body``: A generic loop (`documentation <https://tezos.gitlab.io/michelson-reference/#instr-LOOP>`__).
--  ``LOOP_LEFT body``: A loop with an accumulator (`documentation <https://tezos.gitlab.io/michelson-reference/#instr-LOOP_LEFT>`__).
--  ``DIP code``: Runs code protecting the top element of the stack (`documentation <https://tezos.gitlab.io/michelson-reference/#instr-DIP>`__).
--  ``DIP n code``: Runs code protecting the ``n`` topmost elements of the stack (`documentation <https://tezos.gitlab.io/michelson-reference/#instr-DIPN>`__).
--  ``EXEC``: Execute a function from the stack (`documentation <https://tezos.gitlab.io/michelson-reference/#instr-EXEC>`__).
--  ``APPLY``: Partially apply a tuplified function from the stack (`documentation <https://tezos.gitlab.io/michelson-reference/#instr-APPLY>`__).
-
-Stack operations
-~~~~~~~~~~~~~~~~
-
-A detailed description of the following instructions can be found in the `interactive Michelson reference manual <https://tezos.gitlab.io/michelson-reference/>`__.
-
--  ``DROP``: Drop the top element of the stack (`documentation <https://tezos.gitlab.io/michelson-reference/#instr-DROP>`__).
-- ``DROP n``: Drop the ``n`` topmost elements of the stack (`documentation <https://tezos.gitlab.io/michelson-reference/#instr-DROPN>`__).
--  ``DUP``: Duplicate the top element of the stack (`documentation <https://tezos.gitlab.io/michelson-reference/#instr-DUP>`__).
--  ``DUP n``: Duplicate the ``n``-th element of the stack (`documentation <https://tezos.gitlab.io/michelson-reference/#instr-DUPN>`__).
--  ``SWAP``: Exchange the top two elements of the stack (`documentation <https://tezos.gitlab.io/michelson-reference/#instr-SWAP>`__).
-- ``DIG n``: Take the element at depth ``n`` of the stack and move it
-  on top (`documentation <https://tezos.gitlab.io/michelson-reference/#instr-DIG>`__).
-- ``DUG n``: Place the element on top of the stack at depth ``n`` (`documentation <https://tezos.gitlab.io/michelson-reference/#instr-DUG>`__).
--  ``PUSH 'a x``: Push a constant value of a given type onto the stack (`documentation <https://tezos.gitlab.io/michelson-reference/#instr-PUSH>`__).
--  ``LAMBDA 'a 'b code``: Push a lambda with the given parameter type ``'a`` and return type ``'b`` onto the stack (`documentation <https://tezos.gitlab.io/michelson-reference/#instr-LAMBDA>`__).
-- ``LAMBDA_REC 'a 'b code``: Push a recursive lambda onto the stack (`documentation <https://tezos.gitlab.io/michelson-reference/#instr-LAMBDA_REC>`__).
-
-Generic comparison
-~~~~~~~~~~~~~~~~~~
-
-Comparison only works on a class of types that we call comparable. A
-``COMPARE`` operation is defined in an ad hoc way for each comparable
-type, but the result of compare is always an ``int``, which can in turn
-be checked in a generic manner using the following combinators. The
-result of ``COMPARE`` is ``0`` if the top two elements of the stack are
-equal, negative if the first element in the stack is less than the
-second, and positive otherwise.
-
-A detailed description of the following instructions can be found in the `interactive Michelson reference manual <https://tezos.gitlab.io/michelson-reference/>`__.
-
--  ``EQ``: Checks that the top element of the stack is equal to zero (`documentation <https://tezos.gitlab.io/michelson-reference/#instr-EQ>`__).
--  ``NEQ``: Checks that the top element of the stack is not equal to zero (`documentation <https://tezos.gitlab.io/michelson-reference/#instr-NEQ>`__).
--  ``LT``: Checks that the top element of the stack is less than zero (`documentation <https://tezos.gitlab.io/michelson-reference/#instr-LT>`__).
--  ``GT``: Checks that the top element of the stack is greater than zero (`documentation <https://tezos.gitlab.io/michelson-reference/#instr-GT>`__).
--  ``LE``: Checks that the top element of the stack is less than or equal to
-   zero (`documentation <https://tezos.gitlab.io/michelson-reference/#instr-LE>`__).
--  ``GE``: Checks that the top of the stack is greater than or equal to
-   zero (`documentation <https://tezos.gitlab.io/michelson-reference/#instr-GE>`__).
-
-Operations
-----------
-
-Operations on unit
-~~~~~~~~~~~~~~~~~~
-
-A detailed description of the following instructions can be found in the `interactive Michelson reference manual <https://tezos.gitlab.io/michelson-reference/>`__.
-
--  ``UNIT``: Push a unit value onto the stack (`documentation <https://tezos.gitlab.io/michelson-reference/#instr-UNIT>`__).
--  ``COMPARE``: Unit comparison (`documentation <https://tezos.gitlab.io/michelson-reference/#instr-COMPARE>`__).
-
-Operations on type never
-~~~~~~~~~~~~~~~~~~~~~~~~
-
-A detailed description of the following instructions can be found in the `interactive Michelson reference manual <https://tezos.gitlab.io/michelson-reference/>`__.
-
--  ``NEVER``: Close a forbidden branch (`documentation <https://tezos.gitlab.io/michelson-reference/#instr-NEVER>`__).
--  ``COMPARE``: Trivial comparison on type ``never`` (`documentation <https://tezos.gitlab.io/michelson-reference/#instr-COMPARE>`__).
-
-
-Operations on booleans
-~~~~~~~~~~~~~~~~~~~~~~
-
-A detailed description of the following instructions can be found in the `interactive Michelson reference manual <https://tezos.gitlab.io/michelson-reference/>`__.
-
--  ``OR`` (`documentation <https://tezos.gitlab.io/michelson-reference/#instr-OR>`__).
--  ``AND`` (`documentation <https://tezos.gitlab.io/michelson-reference/#instr-AND>`__).
--  ``XOR`` (`documentation <https://tezos.gitlab.io/michelson-reference/#instr-XOR>`__).
--  ``NOT`` (`documentation <https://tezos.gitlab.io/michelson-reference/#instr-NOT>`__).
--  ``COMPARE``: Boolean comparison (`documentation <https://tezos.gitlab.io/michelson-reference/#instr-COMPARE>`__).
-
-Operations on integers and natural numbers
-~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
-
-A detailed description of the following instructions can be found in the `interactive Michelson reference manual <https://tezos.gitlab.io/michelson-reference/>`__.
-
--  ``NEG`` (`documentation <https://tezos.gitlab.io/michelson-reference/#instr-NEG>`__).
--  ``ABS`` (`documentation <https://tezos.gitlab.io/michelson-reference/#instr-ABS>`__).
--  ``ISNAT`` (`documentation <https://tezos.gitlab.io/michelson-reference/#instr-ISNAT>`__).
--  ``INT`` (`documentation <https://tezos.gitlab.io/michelson-reference/#instr-INT>`__).
--  ``ADD`` (`documentation <https://tezos.gitlab.io/michelson-reference/#instr-ADD>`__).
--  ``SUB`` (`documentation <https://tezos.gitlab.io/michelson-reference/#instr-SUB>`__).
--  ``MUL`` (`documentation <https://tezos.gitlab.io/michelson-reference/#instr-MUL>`__).
--  ``EDIV``: Perform Euclidean division (`documentation <https://tezos.gitlab.io/michelson-reference/#instr-EDIV>`__).
--  ``OR`` (`documentation <https://tezos.gitlab.io/michelson-reference/#instr-OR>`__).
--  ``AND`` (`documentation <https://tezos.gitlab.io/michelson-reference/#instr-AND>`__).
--  ``XOR`` (`documentation <https://tezos.gitlab.io/michelson-reference/#instr-XOR>`__).
--  ``NOT``: Two's complement (`documentation <https://tezos.gitlab.io/michelson-reference/#instr-NOT>`__).
--  ``LSL`` (`documentation <https://tezos.gitlab.io/michelson-reference/#instr-LSL>`__).
--  ``LSR`` (`documentation <https://tezos.gitlab.io/michelson-reference/#instr-LSR>`__).
--  ``COMPARE``: Integer/natural comparison (`documentation <https://tezos.gitlab.io/michelson-reference/#instr-COMPARE>`__).
-
-Operations on strings
-~~~~~~~~~~~~~~~~~~~~~
-
-A detailed description of the following instructions can be found in the `interactive Michelson reference manual <https://tezos.gitlab.io/michelson-reference/>`__.
-
--  ``CONCAT``: String concatenation (`documentation <https://tezos.gitlab.io/michelson-reference/#instr-CONCAT>`__).
--  ``SIZE``: number of characters in a string (`documentation <https://tezos.gitlab.io/michelson-reference/#instr-SIZE>`__).
--  ``SLICE``: String access (`documentation <https://tezos.gitlab.io/michelson-reference/#instr-SLICE>`__).
--  ``COMPARE``: Lexicographic comparison (`documentation <https://tezos.gitlab.io/michelson-reference/#instr-COMPARE>`__).
-
-Operations on pairs and right combs
-~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
-
-A detailed description of the following instructions can be found in the `interactive Michelson reference manual <https://tezos.gitlab.io/michelson-reference/>`__.
-
--  ``PAIR``: Build a binary pair from the stack's top two elements (`documentation <https://tezos.gitlab.io/michelson-reference/#instr-PAIR>`__).
--  ``PAIR n``: Fold ``n`` values on the top of the stack in a right comb (`documentation <https://tezos.gitlab.io/michelson-reference/#instr-PAIRN>`__).
--  ``UNPAIR``: Split a pair into its components (`documentation <https://tezos.gitlab.io/michelson-reference/#instr-UNPAIR>`__).
--  ``UNPAIR n``: Unfold ``n`` values from a right comb on the top of the stack (`documentation <https://tezos.gitlab.io/michelson-reference/#instr-UNPAIRN>`__).
--  ``CAR``: Access the left part of a pair (`documentation <https://tezos.gitlab.io/michelson-reference/#instr-CAR>`__).
--  ``CDR``: Access the right part of a pair (`documentation <https://tezos.gitlab.io/michelson-reference/#instr-CDR>`__).
-- ``GET k``: Access an element or a sub comb in a right comb (`documentation <https://tezos.gitlab.io/michelson-reference/#instr-GETN>`__).
-- ``UPDATE k``: Update an element or a sub comb in a right comb (`documentation <https://tezos.gitlab.io/michelson-reference/#instr-UPDATEN>`__).
--  ``COMPARE``: Lexicographic comparison (`documentation <https://tezos.gitlab.io/michelson-reference/#instr-COMPARE>`__).
-
-Operations on sets
-~~~~~~~~~~~~~~~~~~
-
-A detailed description of the following instructions can be found in the `interactive Michelson reference manual <https://tezos.gitlab.io/michelson-reference/>`__.
-
--  ``EMPTY_SET 'elt``: Build a new, empty set for elements of a given
-   type (`documentation <https://tezos.gitlab.io/michelson-reference/#instr-EMPTY_SET>`__).
--  ``MEM``: Check for the presence of an element in a set (`documentation <https://tezos.gitlab.io/michelson-reference/#instr-MEM>`__).
--  ``UPDATE``: Inserts or removes an element in a set, replacing a
-   previous value (`documentation <https://tezos.gitlab.io/michelson-reference/#instr-UPDATE>`__).
--  ``ITER body``: Apply the body expression to each element of a set (`documentation <https://tezos.gitlab.io/michelson-reference/#instr-ITER>`__).
--  ``SIZE``: Get the cardinality of the set (`documentation <https://tezos.gitlab.io/michelson-reference/#instr-SIZE>`__).
-
-Operations on maps
-~~~~~~~~~~~~~~~~~~
-
--  ``EMPTY_MAP 'key 'val``: Build a new, empty map from keys of a
-   given type to values of another given type.
-
-   The ``'key`` type must be comparable (the ``COMPARE`` primitive must
-   be defined over it).
-
-::
-
-    :: 'S -> map 'key 'val : 'S
-
-    > EMPTY_MAP _ _ / S  =>  {} : S
-
-
--  ``GET``: Access an element in a map, returns an optional value to be
-   checked with ``IF_SOME``.
-
-::
-
-    :: 'key : map 'key 'val : 'S   ->   option 'val : 'S
-
-    > GET / x : {} : S  =>  None : S
-    > GET / x : { Elt k v ; <tl> } : S  =>  opt_y : S
-        iff COMPARE / x : k : []  =>  1 : []
-        where GET / x : { <tl> } : S  =>  opt_y : S
-    > GET / x : { Elt k v ; <tl> } : S  =>  Some v : S
-        iff COMPARE / x : k : []  =>  0 : []
-    > GET / x : { Elt k v ; <tl> } : S  =>  None : S
-        iff COMPARE / x : k : []  =>  -1 : []
-
--  ``MEM``: Check for the presence of a binding for a key in a map.
-
-::
-
-    :: 'key : map 'key 'val : 'S   ->  bool : 'S
-
-    > MEM / x : {} : S  =>  false : S
-    > MEM / x : { Elt k v ; <tl> } : S  =>  r : S
-        iff COMPARE / x : k : []  =>  1 : []
-        where MEM / x : { <tl> } : S  =>  r : S
-    > MEM / x : { Elt k v ; <tl> } : S  =>  true : S
-        iff COMPARE / x : k : []  =>  0 : []
-    > MEM / x : { Elt k v ; <tl> } : S  =>  false : S
-        iff COMPARE / x : k : []  =>  -1 : []
-
--  ``UPDATE``: Assign or remove an element in a map.
-
-::
-
-    :: 'key : option 'val : map 'key 'val : 'S   ->   map 'key 'val : 'S
-
-    > UPDATE / x : None : {} : S  =>  {} : S
-    > UPDATE / x : Some y : {} : S  =>  { Elt x y } : S
-    > UPDATE / x : opt_y : { Elt k v ; <tl> } : S  =>  { Elt k v ; <tl'> } : S
-        iff COMPARE / x : k : []  =>  1 : []
-          where UPDATE / x : opt_y : { <tl> } : S  =>  { <tl'> } : S
-    > UPDATE / x : None : { Elt k v ; <tl> } : S  =>  { <tl> } : S
-        iff COMPARE / x : k : []  =>  0 : []
-    > UPDATE / x : Some y : { Elt k v ; <tl> } : S  =>  { Elt k y ; <tl> } : S
-        iff COMPARE / x : k : []  =>  0 : []
-    > UPDATE / x : None : { Elt k v ; <tl> } : S  =>  { Elt k v ; <tl> } : S
-        iff COMPARE / x : k : []  =>  -1 : []
-    > UPDATE / x : Some y : { Elt k v ; <tl> } : S  =>  { Elt x y ; Elt k v ; <tl> } : S
-        iff COMPARE / x : k : []  =>  -1 : []
-
--  ``GET_AND_UPDATE``: A combination of the ``GET`` and ``UPDATE`` instructions.
-
-::
-
-    :: 'key : option 'val : map 'key 'val : 'S   ->   option 'val : map 'key 'val : 'S
-
-This instruction is similar to ``UPDATE`` but it also returns the
-value that was previously stored in the ``map`` at the same key as
-``GET`` would.
-
-::
-
-    > GET_AND_UPDATE / x : None : {} : S  =>  None : {} : S
-    > GET_AND_UPDATE / x : Some y : {} : S  =>  None : { Elt x y } : S
-    > GET_AND_UPDATE / x : opt_y : { Elt k v ; <tl> } : S  =>  opt_y' : { Elt k v ; <tl'> } : S
-        iff COMPARE / x : k : []  =>  1 : []
-          where GET_AND_UPDATE / x : opt_y : { <tl> } : S  =>  opt_y' : { <tl'> } : S
-    > GET_AND_UPDATE / x : None : { Elt k v ; <tl> } : S  =>  Some v : { <tl> } : S
-        iff COMPARE / x : k : []  =>  0 : []
-    > GET_AND_UPDATE / x : Some y : { Elt k v ; <tl> } : S  =>  Some v : { Elt k y ; <tl> } : S
-        iff COMPARE / x : k : []  =>  0 : []
-    > GET_AND_UPDATE / x : None : { Elt k v ; <tl> } : S  =>  None : { Elt k v ; <tl> } : S
-        iff COMPARE / x : k : []  =>  -1 : []
-    > GET_AND_UPDATE / x : Some y : { Elt k v ; <tl> } : S  =>  None : { Elt x y ; Elt k v ; <tl> } : S
-        iff COMPARE / x : k : []  =>  -1 : []
-
--  ``MAP body``: Apply the body expression to each element of a map. The
-   body sequence has access to the stack.
-
-::
-
-    :: (map 'key 'val) : 'A   ->  (map 'key 'b) : 'A
-       iff   body :: [ (pair 'key 'val) : 'A -> 'b : 'A ]
-
-    > MAP body / {} : S  =>  {} : S
-    > MAP body / { Elt k v ; <tl> } : S  =>  { Elt k v' ; <tl'> } : S''
-        where body / Pair k v : S  =>  v' : S'
-        and MAP body / { <tl> } : S'  =>  { <tl'> } : S''
-
--  ``ITER body``: Apply the body expression to each element of a map.
-   The body sequence has access to the stack.
-
-::
-
-    :: (map 'elt 'val) : 'A   ->  'A
-       iff   body :: [ (pair 'elt 'val : 'A) -> 'A ]
-
-    > ITER body / {} : S  =>  S
-    > ITER body / { Elt k v ; <tl> } : S  =>  ITER body / { <tl> } : S'
-       iff body / (Pair k v) : S  =>  S'
-
--  ``SIZE``: Get the cardinality of the map.
-
-::
-
-    :: map 'key 'val : 'S -> nat : 'S
-
-    > SIZE / {} : S  =>  0 : S
-    > SIZE / { _ ; <tl> } : S  =>  1 + s : S
-        where  SIZE / { <tl> } : S  =>  s : S
-
-
-Operations on ``big_maps``
-~~~~~~~~~~~~~~~~~~~~~~~~~~
-.. _OperationsOnBigMaps_alpha:
-
-Big maps have three possible representations. A map literal is always
-a valid representation for a big map. Big maps can also be represented
-by integers called big-map identifiers. Finally, big maps can be
-represented as pairs of a big-map identifier (an integer) and a
-big-map diff (written in the same syntax as a map whose values are
-options).
-
-So for example, ``{ Elt "bar" True ; Elt "foo" False }``, ``42``, and
-``Pair 42 { Elt "foo" (Some False) }`` are all valid representations
-of type ``big_map string bool``.
-
-The behavior of big-map operations is the same as if they were normal
-maps, except that under the hood, the elements are loaded and
-deserialized on demand.
-
--  ``EMPTY_BIG_MAP 'key 'val``: Build a new, empty big map from keys of a
-   given type to values of another given type.
-
-   The ``'key`` type must be comparable (the ``COMPARE`` primitive must
-   be defined over it).
-
-::
-
-    :: 'S -> map 'key 'val : 'S
-
--  ``GET``: Access an element in a ``big_map``, returns an optional value to be
-   checked with ``IF_SOME``.
-
-::
-
-    :: 'key : big_map 'key 'val : 'S   ->   option 'val : 'S
-
--  ``MEM``: Check for the presence of an element in a ``big_map``.
-
-::
-
-    :: 'key : big_map 'key 'val : 'S   ->  bool : 'S
-
--  ``UPDATE``: Assign or remove an element in a ``big_map``.
-
-::
-
-    :: 'key : option 'val : big_map 'key 'val : 'S   ->   big_map 'key 'val : 'S
-
-
--  ``GET_AND_UPDATE``: A combination of the ``GET`` and ``UPDATE`` instructions.
-
-::
-
-    :: 'key : option 'val : big_map 'key 'val : 'S   ->   option 'val : big_map 'key 'val : 'S
-
-This instruction is similar to ``UPDATE`` but it also returns the
-value that was previously stored in the ``big_map`` at the same key as
-``GET`` would.
-
-
-Operations on optional values
-~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
-
-A detailed description of the following instructions can be found in the `interactive Michelson reference manual <https://tezos.gitlab.io/michelson-reference/>`__.
-
--  ``SOME``: Pack a value as an optional value (`documentation <https://tezos.gitlab.io/michelson-reference/#instr-SOME>`__).
--  ``NONE 'a``: The absent optional value (`documentation <https://tezos.gitlab.io/michelson-reference/#instr-NONE>`__).
--  ``IF_NONE bt bf``: Inspect an optional value (`documentation <https://tezos.gitlab.io/michelson-reference/#instr-IF_NONE>`__).
--  ``COMPARE``: Optional values comparison (`documentation <https://tezos.gitlab.io/michelson-reference/#instr-COMPARE>`__).
-- ``MAP body``: Apply the body expression to the value inside the option if there is one (`documentation <https://tezos.gitlab.io/michelson-reference/#instr-MAP>`__).
-
-Operations on unions
-~~~~~~~~~~~~~~~~~~~~
-
-A detailed description of the following instructions can be found in the `interactive Michelson reference manual <https://tezos.gitlab.io/michelson-reference/>`__.
-
--  ``LEFT 'b``: Pack a value in a union (left case) (`documentation <https://tezos.gitlab.io/michelson-reference/#instr-LEFT>`__).
--  ``RIGHT 'a``: Pack a value in a union (right case) (`documentation <https://tezos.gitlab.io/michelson-reference/#instr-RIGHT>`__).
--  ``IF_LEFT bt bf``: Inspect a value of a union (`documentation <https://tezos.gitlab.io/michelson-reference/#instr-IF_LEFT>`__).
--  ``COMPARE``: Unions comparison (`documentation <https://tezos.gitlab.io/michelson-reference/#instr-COMPARE>`__).
-
-Operations on lists
-~~~~~~~~~~~~~~~~~~~
-
--  ``CONS``: Prepend an element to a list.
-
-::
-
-    :: 'a : list 'a : 'S   ->   list 'a : 'S
-
-    > CONS / a : { <l> } : S  =>  { a ; <l> } : S
-
--  ``NIL 'a``: The empty list.
-
-::
-
-    :: 'S   ->   list 'a : 'S
-
-    > NIL / S  =>  {} : S
-
--  ``IF_CONS bt bf``: Inspect a list.
-
-::
-
-    :: list 'a : 'A   ->   'B
-       iff   bt :: [ 'a : list 'a : 'A -> 'B]
-             bf :: [ 'A -> 'B]
-
-    > IF_CONS bt bf / { a ; <rest> } : S  =>  bt / a : { <rest> } : S
-    > IF_CONS bt bf / {} : S  =>  bf / S
-
--  ``MAP body``: Apply the body expression to each element of the list.
-   The body sequence has access to the stack.
-
-::
-
-    :: (list 'elt) : 'A   ->  (list 'b) : 'A
-       iff   body :: [ 'elt : 'A -> 'b : 'A ]
-
-    > MAP body / {} : S  =>  {} : S
-    > MAP body / { a ; <rest> } : S  =>  { b ; <rest'> } : S''
-        where body / a : S  =>  b : S'
-        and MAP body / { <rest> } : S'  =>  { <rest'> } : S''
-
--  ``SIZE``: Get the number of elements in the list.
-
-::
-
-    :: list 'elt : 'S -> nat : 'S
-
-    > SIZE / { _ ; <rest> } : S  =>  1 + s : S
-        where  SIZE / { <rest> } : S  =>  s : S
-    > SIZE / {} : S  =>  0 : S
-
-
--  ``ITER body``: Apply the body expression to each element of a list.
-   The body sequence has access to the stack.
-
-::
-
-    :: (list 'elt) : 'A   ->  'A
-         iff body :: [ 'elt : 'A -> 'A ]
-    > ITER body / {} : S  =>  S
-    > ITER body / { a ; <rest> } : S  =>  ITER body / { <rest> } : S'
-       iff body / a : S  =>  S'
-
-
-Domain specific data types
---------------------------
-
--  ``timestamp``: Dates in the real world.
-
--  ``mutez``: A specific type for manipulating tokens.
-
--  ``address``: An untyped address (implicit account or smart contract).
-
--  ``contract 'param``: A contract, with the type of its code,
-   ``contract unit`` for implicit accounts.
-
--  ``operation``: An internal operation emitted by a contract.
-
--  ``key``: A public cryptographic key.
-
--  ``key_hash``: The hash of a public cryptographic key.
-
--  ``signature``: A cryptographic signature.
-
--  ``chain_id``: An identifier for a chain, used to distinguish the test and the main chains.
-
--  ``bls12_381_g1``, ``bls12_381_g2`` : Points on the BLS12-381 curves G\ :sub:`1`\  and G\ :sub:`2`\ , respectively.
-
--  ``bls12_381_fr`` : An element of the scalar field F\ :sub:`r`\ , used for scalar multiplication on the BLS12-381 curves G\ :sub:`1`\  and G\ :sub:`2`\ .
-
--  ``sapling_transaction ms``: A :doc:`Sapling <sapling>` transaction
-
--  ``sapling_state ms``: A :doc:`Sapling <sapling>` state
-
--  ``ticket (t)``: A ticket used to authenticate information of type ``(t)`` on-chain.
-
--  ``chest``: a timelocked chest containing bytes and information to open it.
-   see :doc:`Timelock <timelock>` .
-
--  ``chest_key``: used to open a chest, also contains a proof
-   to check the correctness of the opening. see :doc:`Timelock <timelock>` .
-
-- ``tx_rollup_l2_address``: An address used to identify an account in a transaction rollup ledger. It is the hash of a BLS public key, used to authenticate layer-2 operations to transfer tickets from this account.
-
-
-Domain specific operations
---------------------------
-
-Operations on timestamps
-~~~~~~~~~~~~~~~~~~~~~~~~
-
-A detailed description of the following instructions can be found in the `interactive Michelson reference manual <https://tezos.gitlab.io/michelson-reference/>`__.
-
--  ``ADD`` Increment / decrement a timestamp of the given number of
-   seconds (`documentation <https://tezos.gitlab.io/michelson-reference/#instr-ADD>`__).
--  ``SUB`` Subtract a number of seconds from a timestamp (`documentation <https://tezos.gitlab.io/michelson-reference/#instr-SUB>`__).
--  ``SUB`` Subtract two timestamps (`documentation <https://tezos.gitlab.io/michelson-reference/#instr-SUB>`__).
--  ``COMPARE``: Timestamp comparison (`documentation <https://tezos.gitlab.io/michelson-reference/#instr-COMPARE>`__).
-
-
-Operations on Mutez
-~~~~~~~~~~~~~~~~~~~
-
-Mutez (micro-Tez) are internally represented by a 64 bit signed
-integers. There are restrictions to prevent creating a negative amount
-of mutez. Operations are limited to prevent overflow and mixing them
-with other numerical types by mistake. They are also mandatory checked
-for under/overflows.
-
--  ``ADD``
-
-::
-
-    :: mutez : mutez : 'S   ->   mutez : 'S
-
-    > ADD / x : y : S  =>  [FAILED]   on overflow
-    > ADD / x : y : S  =>  (x + y) : S
-
--  ``SUB_MUTEZ``
-
-::
-
-    :: mutez : mutez : 'S   ->   option mutez : 'S
-
-    > SUB_MUTEZ / x : y : S  =>  None
-        iff   x < y
-    > SUB_MUTEZ / x : y : S  =>  Some (x - y) : S
-
--  ``MUL``
-
-::
-
-    :: mutez : nat : 'S   ->   mutez : 'S
-    :: nat : mutez : 'S   ->   mutez : 'S
-
-    > MUL / x : y : S  =>  [FAILED]   on overflow
-    > MUL / x : y : S  =>  (x * y) : S
-
--  ``EDIV``
-
-::
-
-    :: mutez : nat : 'S   ->   option (pair mutez mutez) : 'S
-    :: mutez : mutez : 'S   ->   option (pair nat mutez) : 'S
-
-    > EDIV / x : 0 : S  =>  None
-    > EDIV / x : y : S  =>  Some (Pair (x / y) (x % y)) : S
-        iff y <> 0
-
--  ``COMPARE``: Mutez comparison
-
-::
-
-   :: mutez : mutez : 'S -> int : 'S
-
-   > COMPARE / x : y : S  =>  -1 : S
-       iff x < y
-   > COMPARE / x : y : S  =>  0 : S
-       iff x = y
-   > COMPARE / x : y : S  =>  1 : S
-       iff x > y
-
-Operations on contracts
-~~~~~~~~~~~~~~~~~~~~~~~
-
--  ``CREATE_CONTRACT { storage 'g ; parameter 'p ; code ... }``:
-   Forge a new contract from a literal.
-
-::
-
-    :: option key_hash : mutez : 'g : 'S
-       -> operation : address : 'S
-
-Originate a contract based on a literal. The parameters are the
-optional delegate, the initial amount taken from the current
-contract, and the initial storage of the originated contract.
-The contract is returned as a first class value (to be dropped, passed
-as parameter or stored). The ``CONTRACT 'p`` instruction will fail
-until it is actually originated. Note that since ``tz4`` addresses
-cannot be registered as delegates, the origination operation will fail
-if the delegate is a ``tz4``.
-
--  ``TRANSFER_TOKENS``: Forge a transaction.
-
-::
-
-    :: 'p : mutez : contract 'p : 'S   ->   operation : 'S
-
-The parameter must be consistent with the one expected by the
-contract, unit for an account.
-
-.. _MichelsonSetDelegate_alpha:
-
--  ``SET_DELEGATE``: Set or withdraw the contract's delegation.
-
-::
-
-    :: option key_hash : 'S   ->   operation : 'S
-
-Using this instruction is the only way to modify the delegation of a
-smart contract. If the parameter is ``None`` then the delegation of the
-current contract is withdrawn; if it is ``Some kh`` where ``kh`` is the
-key hash of a registered delegate that is not the current delegate of
-the contract, then this operation sets the delegate of the contract to
-this registered delegate. The operation fails if ``kh`` is the current
-delegate of the contract or if ``kh`` is not a registered delegate.
-Note that ``tz4`` addresses cannot be registered as delegates.
-
--  ``BALANCE``: Push the current amount of mutez held by the executing
-   contract, including any mutez added by the calling transaction.
-
-::
-
-    :: 'S   ->   mutez : 'S
-
--  ``ADDRESS``: Cast the contract to its address.
-
-::
-
-    :: contract _ : 'S   ->   address : 'S
-
-    > ADDRESS / addr : S  =>  addr : S
-
--  ``CONTRACT 'p``: Cast the address to the given contract type if possible.
-
-::
-
-    :: address : 'S   ->   option (contract 'p) : 'S
-
-    > CONTRACT / addr : S  =>  Some addr : S
-        iff addr exists and is a contract of parameter type 'p
-    > CONTRACT / addr : S  =>  Some addr : S
-        iff 'p = unit and addr is an implicit contract
-    > CONTRACT / addr : S  =>  None : S
-        otherwise
-
--  ``SOURCE``: Push the contract that initiated the current
-   transaction, i.e. the contract that paid the fees and
-   storage cost, and whose manager signed the operation
-   that was sent on the blockchain. Note that since
-   ``TRANSFER_TOKENS`` instructions can be chained,
-   ``SOURCE`` and ``SENDER`` are not necessarily the same.
-
-::
-
-    :: 'S   ->   address : 'S
-
--  ``SENDER``: Push the contract that initiated the current
-   internal transaction. It may be the ``SOURCE``, but may
-   also be different if the source sent an order to an intermediate
-   smart contract, which then called the current contract.
-
-::
-
-    :: 'S   ->   address : 'S
-
--  ``SELF``: Push the current contract.
-
-::
-
-    :: 'S   ->   contract 'p : 'S
-       where   contract 'p is the type of the current contract
-
-Note that ``SELF`` is forbidden in lambdas because it cannot be
-type-checked; the type of the contract executing the lambda cannot be
-known at the point of type-checking the lambda's body.
-
--  ``SELF_ADDRESS``: Push the address of the current contract. This is
-   equivalent to ``SELF; ADDRESS`` except that it is allowed in
-   lambdas.
-
-::
-
-    :: 'S   ->   address : 'S
-
-Note that ``SELF_ADDRESS`` inside a lambda returns the address of the
-contract executing the lambda, which can be different from the address
-of the contract in which the ``SELF_ADDRESS`` instruction is written.
-
--  ``AMOUNT``: Push the amount of the current transaction.
-
-::
-
-    :: 'S   ->   mutez : 'S
-
--  ``IMPLICIT_ACCOUNT``: Return a default contract with the given
-   public/private key pair. Any funds deposited in this contract can
-   immediately be spent by the holder of the private key. This contract
-   cannot execute Michelson code and will always exist on the
-   blockchain.
-
-::
-
-    :: key_hash : 'S   ->   contract unit : 'S
-
-- ``VOTING_POWER``: Return the voting power of a given contract. This
-   voting power coincides with the weight of the contract in the
-   voting listings, which is calculated at the beginning of every
-   voting period. Currently the voting power is proportional to the
-   full staking balance of the contract, but this might change in
-   future version of the protocol and developers should not rely on
-   this. Hence, the value returned by ``VOTING_POWER`` should only be
-   considered relative to the one returned by ``TOTAL_VOTING_POWER``.
-
-::
-
-    :: key_hash : 'S   ->   nat : 'S
-
-Special operations
-~~~~~~~~~~~~~~~~~~
-
--  ``NOW``: Push the minimal injection time for the current block,
-   namely the block whose validation triggered this execution. The
-   minimal injection time is 60 seconds after the timestamp of the
-   predecessor block. This value does not change during the execution
-   of the contract.
-
-::
-
-    :: 'S   ->   timestamp : 'S
-
--  ``CHAIN_ID``: Push the chain identifier.
-
-::
-
-    :: 'S   ->   chain_id : 'S
-
--  ``COMPARE``: Chain identifier comparison
-
-::
-
-    :: chain_id : chain_id : 'S   ->   int : 'S
-
-    > COMPARE / x : y : S  =>  -1 : S
-        iff x < y
-    > COMPARE / x : y : S  =>  0 : S
-        iff x = y
-    > COMPARE / x : y : S  =>  1 : S
-        iff x > y
-
--  ``LEVEL``: Push the level of the current transaction's block.
-
-::
-
-    :: 'S   ->   nat : 'S
-
--  ``TOTAL_VOTING_POWER``: Return the total voting power of all contracts. The total
-   voting power coincides with the sum of the voting power of every contract in
-   the voting listings (as returned by ``VOTING_POWER``). The voting listings is calculated at the beginning of every
-   voting period.
-
-::
-
-    :: 'S   ->   nat : 'S
-
-- ``MIN_BLOCK_TIME``: Push the current minimal block time in seconds.
-
-::
-
-    :: 'S   ->   nat : 'S
-
-Operations on bytes
-~~~~~~~~~~~~~~~~~~~
-
-Bytes are used for serializing data, in order to check signatures and
-compute hashes on them. They can also be used to incorporate data from
-the wild and untyped outside world.
-
--  ``PACK``: Serializes a piece of data to its optimized
-   binary representation.
-
-::
-
-     :: 'a : 'S   ->   bytes : 'S
-
--  ``UNPACK 'a``: Deserializes a piece of data, if valid.
-
-::
-
-     :: bytes : 'S   ->   option 'a : 'S
-
--  ``CONCAT``: Byte sequence concatenation.
-
-::
-
-    :: bytes : bytes : 'S   -> bytes : 'S
-
-    > CONCAT / s : t : S  =>  (s ^ t) : S
-
-    :: bytes list : 'S   -> bytes : 'S
-
-    > CONCAT / {} : S  =>  0x : S
-    > CONCAT / { s ; <ss> } : S  =>  (s ^ r) : S
-       where CONCAT / { <ss> } : S  =>  r : S
-
--  ``SIZE``: size of a sequence of bytes.
-
-::
-
-     :: bytes : 'S   ->   nat : 'S
-
--  ``SLICE``: Bytes access.
-
-::
-
-    :: nat : nat : bytes : 'S   -> option bytes : 'S
-
-    > SLICE / offset : length : s : S  =>  Some ss : S
-       where ss is the substring of s at the given offset and of the given length
-         iff offset and (offset + length) are in bounds
-    > SLICE / offset : length : s : S  =>  None : S
-         iff offset or (offset + length) are out of bounds
-
--  ``COMPARE``: Lexicographic comparison.
-
-::
-
-    :: bytes : bytes : 'S   ->   int : 'S
-
-    > COMPARE / s : t : S  =>  -1 : S
-        iff s < t
-    > COMPARE / s : t : S  =>  0 : S
-        iff s = t
-    > COMPARE / s : t : S  =>  1 : S
-        iff s > t
-
-Bitwise logical operators are also available on bytes.
-
--  ``OR``
-
-::
-
-    :: bytes : bytes : 'S   ->   bytes : 'S
-
-    > OR / x : y : S  =>  (x | y) : S
-
--  ``AND``
-
-::
-
-    :: bytes : bytes : 'S   ->   bytes : 'S
-
-    > AND / x : y : S  =>  (x & y) : S
-
--  ``XOR``
-
-::
-
-    :: bytes : bytes : 'S   ->   bytes : 'S
-
-    > XOR / x : y : S  =>  (x ^ y) : S
-
--  ``NOT``
-
-::
-
-    :: bytes : 'S   ->   bytes : 'S
-
-    > NOT / x : S  =>  ~x : S
-
-Logical shifts are also available on bytes.
-
--  ``LSL``
-
-::
-
-    :: bytes : nat : 'S   ->   bytes : 'S
-
-    > LSL / x : s : S  =>  (x << s) : S
-        iff   s <= 64000
-    > LSL / x : s : S  =>  [FAILED]
-        iff   s > 64000
-
--  ``LSR``
-
-::
-
-    :: bytes : nat : 'S   ->   bytes : 'S
-
-    > LSR / x : s : S  =>  (x >> s) : S
-        iff   s <= 256
-    > LSR / x : s : S  =>  [FAILED]
-        iff   s > 256
-
-Bytes can be converted to natural numbers and integers.
-
-- ``NAT``: Convert ``bytes`` to type ``nat`` using big-endian encoding.
-  The ``bytes`` are allowed to have leading zeros.
-
-::
-
-    :: bytes : 'S   ->   nat : 'S
-
-    > NAT / s : S  =>  n : S
-        iff s is a big-endian encoding of natural number n
-
-- ``INT``: Convert ``bytes`` to type ``int`` using big-endian two's complement encoding.
-  The ``bytes`` are allowed to have leading zeros for non-negative numbers and leading ones for negative numbers.
-
-::
-
-    :: bytes : 'S   ->   int : 'S
-
-    > INT / s : S  =>  z : S
-        iff s is a big-endian encoding of integer z
-
-- ``BYTES``: Convert a ``nat`` or an ``int`` to type ``bytes`` using big-endian encoding (and two's complement for ``int``).
-
-::
-
-    :: int : 'S -> bytes : 'S
-    :: nat : 'S -> bytes : 'S
-
-    > BYTES / n : S => s : S
-       iff s is the shortest big-endian encoding of natural number or integer n
-
-Cryptographic primitives
-~~~~~~~~~~~~~~~~~~~~~~~~
-
--  ``HASH_KEY``: Compute the b58check of a public key.
-
-::
-
-    :: key : 'S   ->   key_hash : 'S
-
--  ``BLAKE2B``: Compute a cryptographic hash of the value contents using the
-   Blake2b-256 cryptographic hash function.
-
-::
-
-    :: bytes : 'S   ->   bytes : 'S
-
--  ``KECCAK``: Compute a cryptographic hash of the value contents using the
-   Keccak-256 cryptographic hash function.
-
-::
-
-    :: bytes : 'S   ->   bytes : 'S
-
--  ``SHA256``: Compute a cryptographic hash of the value contents using the
-   Sha256 cryptographic hash function.
-
-::
-
-    :: bytes : 'S   ->   bytes : 'S
-
--  ``SHA512``: Compute a cryptographic hash of the value contents using the
-   Sha512 cryptographic hash function.
-
-::
-
-    :: bytes : 'S   ->   bytes : 'S
-
--  ``SHA3``: Compute a cryptographic hash of the value contents using the
-   SHA3-256 cryptographic hash function.
-
-::
-
-    :: bytes : 'S   ->   bytes : 'S
-
--  ``CHECK_SIGNATURE``: Check that a sequence of bytes has been signed
-   with a given key.
-
-::
-
-    :: key : signature : bytes : 'S   ->   bool : 'S
-
--  ``COMPARE``: Key hash, key and signature comparison
-
-::
-
-    :: key_hash : key_hash : 'S   ->   int : 'S
-    :: key : key : 'S   ->   int : 'S
-    :: signature : signature : 'S   ->   int : 'S
-
-    > COMPARE / x : y : S  =>  -1 : S
-        iff x < y
-    > COMPARE / x : y : S  =>  0 : S
-        iff x = y
-    > COMPARE / x : y : S  =>  1 : S
-        iff x > y
-
-BLS12-381 primitives
-~~~~~~~~~~~~~~~~~~~~~~~~
-
--  ``NEG``: Negate a curve point or field element.
-
-::
-
-    :: bls12_381_g1 : 'S -> bls12_381_g1 : 'S
-    :: bls12_381_g2 : 'S -> bls12_381_g2 : 'S
-    :: bls12_381_fr : 'S -> bls12_381_fr : 'S
-
--  ``ADD``: Add two curve points or field elements.
-
-::
-
-    :: bls12_381_g1 : bls12_381_g1 : 'S -> bls12_381_g1 : 'S
-    :: bls12_381_g2 : bls12_381_g2 : 'S -> bls12_381_g2 : 'S
-    :: bls12_381_fr : bls12_381_fr : 'S -> bls12_381_fr : 'S
-
--  ``MUL``: Multiply a curve point or field element by a scalar field element. Fr
-   elements can be built from naturals by multiplying by the unit of Fr using ``PUSH bls12_381_fr 1; MUL``. Note
-   that the multiplication will be computed using the natural modulo the order
-   of Fr.
-
-::
-
-    :: bls12_381_g1 : bls12_381_fr : 'S -> bls12_381_g1 : 'S
-    :: bls12_381_g2 : bls12_381_fr : 'S -> bls12_381_g2 : 'S
-    :: bls12_381_fr : bls12_381_fr : 'S -> bls12_381_fr : 'S
-    :: nat : bls12_381_fr : 'S -> bls12_381_fr : 'S
-    :: int : bls12_381_fr : 'S -> bls12_381_fr : 'S
-    :: bls12_381_fr : nat : 'S -> bls12_381_fr : 'S
-    :: bls12_381_fr : int : 'S -> bls12_381_fr : 'S
-
-- ``INT``: Convert a field element to type ``int``. The returned value is always between ``0`` (inclusive) and the order of Fr (exclusive).
-
-::
-
-    :: bls12_381_fr : 'S   ->   int : 'S
-
--  ``PAIRING_CHECK``:
-   Verify that the product of pairings of the given list of points is equal to 1 in Fq12. Returns ``true`` if the list is empty.
-   Can be used to verify if two pairings P1 and P2 are equal by verifying P1 * P2^(-1) = 1.
-
-::
-
-    :: list (pair bls12_381_g1 bls12_381_g2) : 'S -> bool : 'S
-
-
-Sapling operations
-~~~~~~~~~~~~~~~~~~
-
-Please see the :doc:`Sapling integration<sapling>` page for a more
-comprehensive description of the Sapling protocol.
-
--  ``SAPLING_VERIFY_UPDATE``: verify and apply a transaction on a Sapling state.
-
-::
-
-    :: sapling_transaction ms : sapling_state ms : 'S   ->   option (pair bytes (pair int (sapling_state ms))): 'S
-
-    > SAPLING_VERIFY_UPDATE / t : s : S  =>  Some (Pair bound_data (Pair balance s')) : S
-        iff the transaction t successfully applied on state s resulting
-        in the bound_data and the balance of the transaction and an updated state s'
-    > SAPLING_VERIFY_UPDATE / t : s : S  =>  None : S
-        iff the transaction t is invalid with respect to the state
-
--  ``SAPLING_EMPTY_STATE ms``: Pushes an empty state on the stack.
-
-   ::
-
-    ::  'S   ->   sapling_state ms: 'S
-
-    > SAPLING_EMPTY_STATE ms /  S  =>  sapling_state ms : S
-        with `sapling_state ms` being the empty state (ie. no one can spend tokens from it)
-        with memo_size `ms`
-
-.. _MichelsonTickets_alpha:
-
-Operations on tickets
-~~~~~~~~~~~~~~~~~~~~~
-
-The following operations deal with tickets. Tickets are a way for smart-contracts
-to authenticate data with respect to a Tezos address. This authentication can
-then be used to build composable permission systems. For a high-level explanation of
-tickets in Tezos, see :doc: `Tickets <tickets>`.
-
-A contract can create a ticket from a value and an amount. The ticket, when
-inspected reveals the value, the amount, and the address of the ticketer (the contract that created the ticket). It is
-impossible for a contract to “forge” a ticket that appears to have been created
-by another ticketer.
-
-The amount is a meta-data that can be used to implement UTXOs.
-
-Tickets cannot be duplicated using the ``DUP`` instruction.
-
-For example, a ticket could represent a Non Fungible Token (NFT) or a Unspent
-Transaction Output (UTXO) which can then be passed around and behave like a value.
-This process can happen without the need to interact with a centralized NFT contract,
-simplifying the code.
-
-- ``TICKET``: Create a ticket with the given content and amount. The ticketer is the address
-  of `SELF`. The resulting value is ``NONE`` if the amount is zero.
-
-::
-
-   :: 'a : nat : 'S -> option ticket 'a : 'S
-
-Type ``'a`` must be comparable (the ``COMPARE`` primitive must be defined over it).
-
-- ``READ_TICKET``: Retrieve the information stored in a ticket. Also return the ticket.
-
-::
-
-   :: ticket 'a : 'S -> pair address 'a nat : ticket 'a : 'S
-
-- ``SPLIT_TICKET``: Delete the given ticket and create two tickets with the
-  same content and ticketer as the original, but with the new provided amounts.
-  (This can be used to easily implement UTXOs.)
-  Return None iff the ticket's original amount is not equal to the sum of the
-  provided amounts, or one of the provided amounts is zero.
-
-::
-
-   :: ticket 'a : (pair nat nat) : 'S ->
-   option (pair (ticket 'a) (ticket 'a)) : 'S
-
-- ``JOIN_TICKETS``: The inverse of ``SPLIT_TICKET``. Delete the given tickets and create a ticket with an amount equal to the
-  sum of the amounts of the input tickets.
-  (This can be used to consolidate UTXOs.)
-  Return None iff the input tickets have a different ticketer or content.
-
-::
-
-   :: (pair (ticket 'a) (ticket 'a)) : 'S ->
-   option (ticket 'a) : 'S
-
-Operations on timelock
-~~~~~~~~~~~~~~~~~~~~~~
-
-- ``OPEN_CHEST``: opens a timelocked chest given its key and the time. The results can be bytes
-  if the opening is correct, or a boolean indicating whether the chest was incorrect,
-  or its opening was. See :doc:`Timelock <timelock>` for more information.
-
-::
-
-   ::  chest_key : chest : nat : 'S -> or bytes bool : 'S
-
-
-Events
-~~~~~~
-
-- ``EMIT %tag 'ty``: constructs an operation that will write an event into
-  the transaction receipt after the successful execution of this contract.
-  It accepts as arguments an annotation as a tag to the emitted event and
-  the type of data attachment.
-
-  See :doc:`Event <event>` for more information.
-
-::
-
-    :: 'ty : 'S -> operation : 'S
-
-
-Removed instructions
-~~~~~~~~~~~~~~~~~~~~
+Types and instructions
+----------------------
+
+The complete sets of Michelson types and instructions are detailed in the
+`interactive Michelson reference page <https://tezos.gitlab.io/michelson-reference/>`__.
+
+- Specifically, it contains synthesis tables for `types <https://tezos.gitlab.io/michelson-reference/#types>`__
+  and for `instructions <https://tezos.gitlab.io/michelson-reference/#instructions>`_.
+- Instructions are also organized by `categories <https://tezos.gitlab.io/michelson-reference/#instructions-by-category>`__.
+- Each instruction is precisely defined using typing and semantic inference rules.
+
+Deprecated and removed instructions and types
+---------------------------------------------
 
 :doc:`../protocols/005_babylon` deprecated the following instructions. Because no smart
 contract used these on Mainnet before they got deprecated, they have been
 removed. The Michelson type-checker will reject any contract using them.
 
--  ``CREATE_CONTRACT { storage 'g ; parameter 'p ; code ... }``:
+-  ``CREATE_CONTRACT { parameter 'p ; storage 'g ; code ... }``:
    Forge a new contract from a literal.
 
-::
+   ::
 
-    :: key_hash : option key_hash : bool : bool : mutez : 'g : 'S
-       -> operation : address : 'S
+      Γ ⊢ CREATE_CONTRACT { parameter 'p ; storage 'g ; code ... }
+      :: key_hash : option key_hash : bool : bool : mutez : 'g : 'S
+      ⇒ operation : address : 'S
 
-See the documentation of the new ``CREATE_CONTRACT`` instruction. The
-first, third, and fourth parameters are ignored.
+   There is a new version of this instruction, see its `documentation <https://tezos.gitlab.io/michelson-reference/#instr-CREATE_CONTRACT>`__.
 
 -  ``CREATE_ACCOUNT``: Forge an account creation operation.
 
-::
+   ::
 
-    :: key_hash : option key_hash : bool : mutez : 'S
-       ->   operation : address : 'S
+      Γ ⊢ CREATE_ACCOUNT :: key_hash : option key_hash : bool : mutez : 'S
+      ⇒ operation : address : 'S
 
-Takes as argument the manager, optional delegate, the delegatable flag
-and finally the initial amount taken from the currently executed
-contract. This instruction originates a contract with two entrypoints;
-``%default`` of type ``unit`` that does nothing and ``%do`` of type
-``lambda unit (list operation)`` that executes and returns the
-parameter if the sender is the contract's manager.
+   Takes as argument the manager, optional delegate, the delegatable flag
+   and finally the initial amount taken from the currently executed
+   contract. This instruction originates a contract with two entrypoints;
+   ``%default`` of type ``unit`` that does nothing and ``%do`` of type
+   ``lambda unit (list operation)`` that executes and returns the
+   parameter if the sender is the contract's manager.
 
 -  ``STEPS_TO_QUOTA``: Push the remaining steps before the contract
    execution must terminate.
 
-::
+   ::
 
-    :: 'S   ->   nat : 'S
+      Γ ⊢ STEPS_TO_QUOTA :: 'S ⇒ nat : 'S
 
-.. _MichelsonViews_alpha:
+:doc:`../protocols/012_ithaca` deprecated the use of the `SUB <https://tezos.gitlab.io/michelson-reference/#instr-SUB>`__ instruction on ``mutez``  arguments, and introduced the `SUB_MUTEZ <https://tezos.gitlab.io/michelson-reference/#instr-SUB_MUTEZ>`__ instruction for dealing with that case.
 
-Operations on views
-~~~~~~~~~~~~~~~~~~~~
+:doc:`../protocols/013_jakarta` renamed an old version of the ``sapling_transaction`` type as ``sapling_transaction_deprecated`` and added a new ``sapling_transaction`` type.
 
-Views are a mechanism for contract calls that:
+:doc:`../protocols/015_lima` renamed an old version of the ``TICKET`` instruction as ``TICKET_DEPRECATED`` and added a new ``TICKET`` instruction.
 
-- are read-only: they may depend on the storage of the contract declaring the view but cannot modify it nor emit operations (but they can call other views),
-- take arguments as input in addition to the contract storage,
-- return results as output,
-- are synchronous: the result is immediately available on the stack of the caller contract.
+:doc:`../protocols/016_mumbai` deprecated the following
+type. Because no smart contract used it on Mainnet before it got
+deprecated, it has been removed. The Michelson type-checker will
+reject any contract using it.
 
-In other words, the execution of a view is included in the operation of caller's contract, but accesses the storage of the declarer's contract, in read-only mode.
-Thus, in terms of execution, views are more like lambda functions rather than contract entrypoints,
-Here is an example:
-
-::
-
-    code {
-    ...;
-    TRANSFER_TOKENS;
-    ...;
-    VIEW "view_ex" unit;
-    ...;
-    };
-
-This contract calls a contract ``TRANSFER_TOKENS``, and, later on, a view called "view_ex".
-No matter if the callee "view_ex" is defined in the same contract with this caller contract or not,
-this view will be executed immediately in the current operation,
-while the operations emitted by ``TRANSFER_TOKENS`` will be executed later on.
-As a result, although it may seem that "view_ex" receives the storage modified by ``TRANSFER_TOKENS``,
-this is not the case.
-In other words, the storage of the view is the same as when the current contract was called.
-In particular, in case of re-entrance, i.e., if a contract A calls a contract B that calls a view on A, the storage of the view will be the same as when B started, not when A started.
-
-Views are **declared** at the toplevel of the script of the contract on which they operate,
-alongside the contract parameter type, storage type, and code.
-To declare a view, the ``view`` keyword is used; its syntax is
-``view name 'arg 'return { instr; ... }`` where:
-
-- ``name`` is a string of at most 31 characters matching the regular expression ``[a-zA-Z0-9_.%@]*``; it is used to identify the view, hence it must be different from the names of the other views declared in the same script;
-- ``'arg`` is the type of the argument of the view;
-- ``'return`` is the type of the result returned by the view;
-- ``{ instr; ... }`` is a sequence of instructions of type ``lambda (pair 'arg 'storage_ty) 'return`` where ``'storage_ty`` is the type of the storage of the current contract. Certain specific instructions have different semantics in ``view``: ``BALANCE`` represents the current amount of mutez held by the contract where ``view`` is; ``SENDER`` represents the contract which is the caller of ``view``; ``SELF_ADDRESS`` represents the contract where ``view`` is; ``AMOUNT`` is always 0 mutez.
-
-Note that in both view input (type ``'arg``) and view output (type ``'return``), the following types are forbidden: ``ticket``, ``operation``, ``big_map`` and ``sapling_state``.
-
-Views are **called** using the following Michelson instruction:
-
--  ``VIEW name 'return``: Call the view named ``name`` from the contract whose address is the second element of the stack, sending it as input the top element of the stack.
-
-::
-
-    :: 'arg : address : 'S  ->  option 'return : 'S
-
-    > VIEW name 'return / x : addr : S  =>  Some y : S
-        iff addr is the address of a smart contract c with storage s
-        where c has a toplevel declaration of the form "view name 'arg 'return { code }"
-        and code / Pair x s : []  =>  y : []
-
-    > VIEW name 'return / _ : _ : S  =>  None : S
-        otherwise
-
-
-
-If the given address is nonexistent or if the contract at that address does not have a view of the expected name and type,
-``None`` will be returned.
-Otherwise, ``Some a`` will be returned where ``a`` is the result of the view call.
-Note that if a contract address containing an entrypoint ``address%entrypoint`` is provided,
-only the ``address`` part will be taken.
-``operation``, ``big_map`` and ``sapling_state`` and ``ticket`` types are forbidden for the ``'return`` type.
-
-
-Here is an example using views, consisting of two contracts.
-The first contract defines two views at toplevel that are named ``add_v`` and ``mul_v``.
-
-::
-
-    { parameter nat;
-      storage nat;
-      code { CAR; NIL operation ; PAIR };
-      view "add_v" nat nat { UNPAIR; ADD };
-      view "mul_v" nat nat { UNPAIR; MUL };
-    }
-
-
-The second contract calls the ``add_v`` view of the above contract and obtains a result immediately.
-
-::
-
-    { parameter (pair nat address) ;
-      storage nat ;
-      code { CAR ; UNPAIR; VIEW "add_v" nat ;
-             IF_SOME { } { FAIL }; NIL operation; PAIR }; }
+-  ``tx_rollup_l2_address``: An address used to identify an account in
+   a transaction rollup ledger. It is the hash of a BLS public key,
+   used to authenticate layer-2 operations to transfer tickets from
+   this account.
 
 Macros
 ------
 
-In addition to the operations above, several extensions have been added
-to the language's concrete syntax. If you are interacting with the node
-via RPC, bypassing the client, which expands away these macros, you will
-need to desugar them yourself.
+In addition to the instructions listed in the `interactive Michelson reference manual <https://tezos.gitlab.io/michelson-reference/>`__,
+several extensions have been added to the language's concrete syntax. If you are
+interacting with the node via RPC, bypassing the client, which expands away
+these macros, you will need to desugar them yourself.
 
 These macros are designed to be unambiguous and reversible, meaning that
 errors are reported in terms of desugared syntax. Below you'll see
@@ -1865,7 +654,7 @@ These macros are simply more convenient syntax for various common
 operations.
 
 -  ``P(\left=A|P(\left)(\right))(\right=I|P(\left)(\right))R``: A syntactic sugar
-   for building nested pairs. In the case of right combs, `PAIR n` is more efficient.
+   for building nested pairs. In the case of right combs, ``PAIR n`` is more efficient.
 
 ::
 
@@ -1946,7 +735,7 @@ A typing rule can be inferred:
     > SET_CDR  =>  CAR ; PAIR
 
 -  ``SET_C[AD]+R``: A syntactic sugar for setting fields in nested
-   pairs. In the case of right combs, `UPDATE n` is more efficient.
+   pairs. In the case of right combs, ``UPDATE n`` is more efficient.
 
 ::
 
@@ -2007,7 +796,7 @@ There are three kinds of constants:
    ``\"``. Unescaped line-breaks (both ``\n`` and ``\r``) cannot
    appear in a Michelson string. Moreover, the current version of
    Michelson restricts strings to be the printable subset of 7-bit
-   ASCII, namely characters with codes from within `[32, 126]` range,
+   ASCII, namely characters with codes from within ``[32, 126]`` range,
    plus the escaped characters mentioned above.
 3. Byte sequences in hexadecimal notation, prefixed with ``0x``.
 
@@ -2047,6 +836,8 @@ parameters require sequences in the concrete syntax.
     IF { instr1_true ; instr2_true ; ... }
        { instr1_false ; instr2_false ; ... }
 
+.. _syntax_of_scripts_alpha:
+
 Main program structure
 ~~~~~~~~~~~~~~~~~~~~~~
 
@@ -2056,6 +847,8 @@ of three primitive applications (in no particular order) that provide its
 
 See the next section for a concrete example.
 
+.. _annotations_alpha:
+
 Annotations
 -----------
 
@@ -2064,7 +857,7 @@ data on the stack and to give additional type constraints. Except for
 a single exception specified just after, annotations are only here to
 add constraints, *i.e.* they cannot turn an otherwise rejected program
 into an accepted one. The notable exception to this rule is for
-entrypoints: the semantics of the `CONTRACT` and `SELF` instructions vary depending on
+entrypoints: the semantics of the ``CONTRACT`` and ``SELF`` instructions vary depending on
 their constructor annotations, and some contract origination may fail due
 to invalid entrypoint constructor annotations.
 
@@ -2078,6 +871,8 @@ We distinguish three kinds of annotations:
 - type annotations, written ``:type_annot``,
 - variable annotations, written ``@var_annot``,
 - and field or constructors annotations, written ``%field_annot``.
+
+Note that all annotations are stripped during :ref:`type normalization <type_normalization_alpha>`.
 
 Type annotations
 ~~~~~~~~~~~~~~~~
@@ -2376,7 +1171,7 @@ Syntax
 Primitive applications can receive one or many annotations.
 
 An annotation is a sequence of characters that matches the regular
-expression ``@%|@%%|%@|[@:%][_0-9a-zA-Z][_0-9a-zA-Z\.%@]*``.
+expression ``@%|@%%|%@|@|:|%|[@:%][_0-9a-zA-Z][_0-9a-zA-Z\.%@]*``.
 Note however that ``@%``, ``@%%`` and ``%@`` are
 :ref:`special annotations <SpecialAnnotations_alpha>` and are not allowed everywhere.
 
@@ -2707,7 +1502,7 @@ that is only well-typed if the current contract has an entrypoint named ``%entry
     :: 'S   ->   contract 'p : 'S
        where   contract 'p is the type of the entrypoint %entrypoint of the current contract
 
-Implicit accounts are considered to have a single ``default``
+User accounts are considered to have a single ``default``
 entrypoint of type ``Unit``.
 
 JSON syntax
@@ -2740,8 +1535,40 @@ Micheline expressions are encoded in JSON like this:
 As in the concrete syntax, all domain specific constants are encoded as
 strings.
 
+Development tools
+-----------------
+
+To ease the development of Michelson scripts, some tools are provided
+to Michelson developers.
+
+Emacs mode
+~~~~~~~~~~
+
+`Emacs <https://www.gnu.org/software/emacs/>`_ can be used as a practical environment for writing,
+editing and debugging Michelson programs. `Install it <https://www.gnu.org/software/emacs/>`_ and follow the
+configuration instructions in the Michelson Emacs README `here <https://gitlab.com/tezos/tezos/-/tree/master/emacs>`__.
+
+Interactive toplevel
+~~~~~~~~~~~~~~~~~~~~
+
+An interactive Michelson toplevel (also known as a `REPL
+<https://en.wikipedia.org/wiki/Read%E2%80%93eval%E2%80%93print_loop>`__)
+built on the :doc:`../user/mockup` mode of Octez client is available in
+``scripts/michelson_repl.sh``, the typical usage is:
+
+::
+
+   $ octez-client --mode mockup --base-dir /tmp/mockup create mockup
+   $ rlwrap scripts/michelson_repl.sh
+   > UNIT
+     { Stack_elt unit Unit }
+   > UNIT
+     { Stack_elt unit Unit ; Stack_elt unit Unit }
+   > COMPARE
+     { Stack_elt int 0 }
+
 Examples
----------
+--------
 
 Contracts in the system are stored as a piece of code and a global data
 storage. The type of the global data of the storage is fixed for each
@@ -2938,6 +1765,31 @@ using the Coq proof assistant.
                      DIP { SWAP ; CAR } ; SWAP ; PAIR ; SWAP }} ;
        PAIR }
 
+Views
+~~~~~
+
+Here is an example using views, consisting of two contracts.
+The first contract defines two views at toplevel that are named ``add_v`` and ``mul_v``.
+
+::
+
+    { parameter nat;
+      storage nat;
+      code { CAR; NIL operation ; PAIR };
+      view "add_v" nat nat { UNPAIR; ADD };
+      view "mul_v" nat nat { UNPAIR; MUL };
+    }
+
+
+The second contract calls the ``add_v`` view of the above contract and obtains a result immediately.
+
+::
+
+    { parameter (pair nat address) ;
+      storage nat ;
+      code { CAR ; UNPAIR; VIEW "add_v" nat ;
+             IF_SOME { } { FAIL }; NIL operation; PAIR }; }
+
 
 
 Full grammar
@@ -3122,7 +1974,6 @@ Full grammar
       | signature
       | timestamp
       | address
-      | tx_rollup_l2_address
       | option <comparable type>
       | or <comparable type> <comparable type>
       | pair <comparable type> <comparable type> ...
@@ -3175,3 +2026,598 @@ The language is implemented in OCaml as follows:
    function is very simple, what we have to check is that we transform a
    ``Prim ("If", ...)`` into an ``If``, a ``Prim ("Dup", ...)`` into a
    ``Dup``, etc.
+
+.. _michelson_tzt_alpha:
+
+TZT, a Syntax extension for writing unit tests
+----------------------------------------------
+
+This section describes the TZT format, an extension of the Michelson
+language allowing to run Michelson unit tests at a finer level than a
+full smart contract script. This extension adds syntax to specify an
+instruction (or sequence of instructions) to test, a concrete input
+stack and the expected output stack.
+
+These unit tests can be useful for both smart contract developers who
+need to independently test various parts of the smart contracts they
+develop and to the developers of new implementations of the Michelson
+interpreter who need to check that their new implementations behave as
+the reference implementation by passing `a conformance test suite
+<https://gitlab.com/tezos/tezos/-/tree/master/tzt_reference_test_suite>`__.
+
+Similarly to Michelson scripts, the concrete syntax of TZT unit tests
+is :doc:`../shell/micheline`.
+
+TZT unit test files usually have the extension ``.tzt``. A unit test
+file describes a single unit test. It consists of a Micheline sequence
+of primitive applications (see :doc:`../shell/micheline`), in no particular order. This is
+:ref:`similar to Michelson scripts <syntax_of_scripts_alpha>` but
+the set of primitives allowed at the toplevel differ; in Michelson
+scripts, the allowed toplevel primitives are ``parameter``
+(mandatory), ``storage`` (mandatory), ``code`` (mandatory), and
+``view`` (optional and repeated). For TZT unit tests, the toplevel
+primitives which can be used are:
+
+- ``input``,
+- ``code``,
+- ``output``,
+- ``now``,
+- ``sender``,
+- ``source``,
+- ``chain_id``,
+- ``self``,
+- ``parameter``,
+- ``amount``,
+- ``balance``,
+- ``other_contracts``,
+- ``big_maps``,
+- ``storages``, and
+- ``views``.
+
+Mandatory primitives
+~~~~~~~~~~~~~~~~~~~~
+
+Each of the mandatory primitives ``input``, ``code``, and ``output``
+must occur exactly once in a unit test file in no particular order.
+
+The ``input`` primitive is used to declare the input stack (see the
+:ref:`syntax of concrete stacks <syntax_of_concrete_stacks_alpha>`).
+
+The ``code`` primitive is used to declare the instruction or sequence
+of instructions to execute.
+
+The ``output`` primitive is used to declare if the execution is
+expected to succeed or fail and what result is expected from the
+execution. For executions expected to succeed, the argument of the
+``output`` primitive is simply the expected output stack (see the
+:ref:`syntax of errors <syntax_of_errors_alpha>`). For executions
+expected to fail, the argument is the expected error. In both cases,
+the :ref:`wildcard pattern <omitting_parts_of_the_output_alpha>` can
+be used to omit part of the expected output.
+
+The simplest test which can be written asserts that executing no
+instruction on the empty stack successfully returns the empty stack:
+
+::
+
+   input {};
+   code {};
+   output {}
+
+Here is a slightly more involved test which demonstrates the effect of the `SWAP
+<https://tezos.gitlab.io/michelson-reference/#instr-SWAP>`__ instruction:
+
+::
+
+   input
+     {
+       Stack_elt nat 8 ;
+       Stack_elt bool False
+     };
+   code SWAP;
+   output
+     {
+       Stack_elt bool False ;
+       Stack_elt nat 8
+     }
+
+It is possible to test the effect of several instructions by wrapping them in a sequence:
+
+::
+
+   input
+     {
+       Stack_elt nat 8 ;
+       Stack_elt bool False
+     };
+   code { SWAP ; SWAP };
+   output
+     {
+       Stack_elt nat 8 ;
+       Stack_elt bool False
+     }
+
+Here is an example showing how to test the ``FAILWITH`` instruction:
+
+::
+
+   input {Stack_elt nat 2};
+   code FAILWITH;
+   output (Failed 2)
+
+Optional primitives
+~~~~~~~~~~~~~~~~~~~
+
+Optional primitives are used to set the execution context for the
+test. Each of the optional primitives can be used at most once, in no
+particular order.
+
+- ``amount`` (optional, defaults to 0): the amount, expressed in
+  mutez, that should be pushed by the `AMOUNT
+  <https://tezos.gitlab.io/michelson-reference/#instr-AMOUNT>`__
+  instruction
+
+- ``balance`` (optional, defaults to 0): the balance, expressed in
+  mutez, that should be pushed by the `BALANCE
+  <https://tezos.gitlab.io/michelson-reference/#instr-BALANCE>`__
+  instruction
+
+- ``now`` (optional, defaults to ``"1970-01-01T00:00:00Z"``): the
+  timestamp that should be pushed by the `NOW
+  <https://tezos.gitlab.io/michelson-reference/#instr-NOW>`__
+  instruction
+
+- ``sender`` (optional, defaults to
+  ``"tz1KqTpEZ7Yob7QbPE4Hy4Wo8fHG8LhKxZSx"``): the sender address
+  that should be pushed by the `SENDER
+  <https://tezos.gitlab.io/michelson-reference/#instr-SENDER>`__
+  instruction
+
+- ``source`` (optional, defaults to
+  ``"tz1KqTpEZ7Yob7QbPE4Hy4Wo8fHG8LhKxZSx"``): the source address
+  that should be pushed by the `SOURCE
+  <https://tezos.gitlab.io/michelson-reference/#instr-SOURCE>`__
+  instruction
+
+- ``chain_id`` (optional, defaults to ``"NetXdQprcVkpaWU"``): the
+  chain identifier that should be pushed by the `CHAIN_ID
+  <https://tezos.gitlab.io/michelson-reference/#instr-CHAIN_ID>`__
+  instruction
+
+- ``self`` (optional, defaults to
+  ``"KT1BEqzn5Wx8uJrZNvuS9DVHmLvG9td3fDLi"``): the address that
+  should be pushed by the `SELF
+  <https://tezos.gitlab.io/michelson-reference/#instr-SELF>`__ and
+  `SELF_ADDRESS
+  <https://tezos.gitlab.io/michelson-reference/#instr-SELF_ADDRESS>`__
+  instructions
+
+- ``parameter`` (optional, defaults to ``unit``): the type of the
+  parameter of the contract pushed by the `SELF
+  <https://tezos.gitlab.io/michelson-reference/#instr-SELF>`__
+  instruction
+
+- ``other_contracts`` (optional, defaults to ``{}``): mapping between
+  the contract addresses that are assumed to exist and their
+  parameter types (see the :ref:`syntax of other contracts
+  specifications <syntax_of_other_contracts_alpha>`)
+
+- ``big_maps`` (optional, defaults to ``{}``): mapping between
+  integers representing ``big_map`` indices and descriptions of big
+  maps (see the :ref:`syntax of extra big maps specifications
+  <syntax_of_extra_big_maps_alpha>`)
+
+- ``storages`` (optional, defaults to ``{}``): mapping between
+  the contract addresses that are assumed to exist and their
+  storage type and storage value (see the :ref:`syntax of storages
+  specifications <syntax_of_storages_alpha>`)
+
+- ``views`` (optional, defaults to ``{}``): mapping between
+  the contract addresses that are assumed to exist and their
+  views (see the :ref:`syntax of views
+  specifications <syntax_of_views_alpha>`). Every address that appears
+  on ``views`` must also appear in ``storages``,
+  since a contract's storage is imperative in the execution of its view.
+
+The following test example asserts that the default value for the `NOW
+<https://tezos.gitlab.io/michelson-reference/#instr-NOW>`__
+instruction is the unix epoch:
+
+::
+
+   input {};
+   code NOW;
+   output { Stack_elt timestamp "1970-01-01T00:00:00Z" }
+
+The following example shows how to use the ``now`` toplevel primitive
+to make the `NOW
+<https://tezos.gitlab.io/michelson-reference/#instr-NOW>`__
+instruction return a chosen timestamp:
+
+::
+
+   input {};
+   now "2020-01-08T07:13:51Z";
+   code NOW;
+   output { Stack_elt timestamp "2020-01-08T07:13:51Z" }
+
+.. _syntax_of_concrete_stacks_alpha:
+
+Syntax of concrete stacks
+~~~~~~~~~~~~~~~~~~~~~~~~~
+
+A concrete stack is written as a Micheline sequence whose elements are
+of the form ``Stack_elt <ty> <x>`` where ``<x>`` is a Michelson value
+and ``<ty>`` is its type. For example, ``{ Stack_elt bool True ;
+Stack_elt nat 42 }`` is a concrete stack of length 2 whose top element
+is the boolean ``True`` and the bottom element is the natural number
+``42``.
+
+.. _omitting_parts_of_the_output_alpha:
+
+Omitting parts of the output
+~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+
+Any part of the ``output`` specification can be replaced with the
+wildcard pattern ``_``.
+
+For example, let's consider the following test of the ``PAIR`` instruction:
+
+::
+
+   input {Stack_elt bool True; Stack_elt string "foo"};
+   code PAIR;
+   output {Stack_elt (pair bool string) (Pair True "foo")}
+
+Omitting the ``True`` argument to the ``Pair`` primitive can be done as follows:
+
+::
+
+   input {Stack_elt bool True; Stack_elt string "foo"};
+   code PAIR;
+   output {Stack_elt (pair bool string) (Pair _ "foo")}
+
+Omitting the ``Pair`` primitive:
+
+::
+
+   input {Stack_elt bool True; Stack_elt string "foo"};
+   code PAIR;
+   output {Stack_elt (pair bool string) (_ True "foo")}
+
+Omitting the ``pair bool string`` type:
+
+::
+
+   input {Stack_elt bool True; Stack_elt string "foo"};
+   code PAIR;
+   output {Stack_elt _ (Pair True "foo")}
+
+Omitting the resulting stack element:
+
+::
+
+   input {Stack_elt bool True; Stack_elt string "foo"};
+   code PAIR;
+   output {_}
+
+Omitting all of the output:
+
+::
+
+   input {Stack_elt bool True; Stack_elt string "foo"};
+   code PAIR;
+   output _
+
+The difference between the last two examples is that ``output {_}``
+means that the instruction is expected to successfully return a stack
+of length 1 while ``output _`` means that nothing in particular is
+expected from the execution of the instruction, not even being
+successful.
+
+The wildcard pattern is typically used to omit unspecified aspects of
+the Michelson language when writing portable tests; in particular the
+cryptographic nonces in values of type ``operation`` (see the
+:ref:`syntax of concrete operations
+<syntax_of_concrete_operations_alpha>`) or implementation-specific
+parts of error outputs (see the :ref:`syntax of errors
+<syntax_of_errors_alpha>`).
+
+.. _output_normalization_alpha:
+
+Output normalization
+~~~~~~~~~~~~~~~~~~~~
+
+The input and output stacks can use the readable and optimized formats
+for Michelson values and even mix the formats; for a test to pass, the
+expected output does not need to syntactically match the result of the
+execution but only to match up to conversion between optimized and
+readable formats; the TZT test runner is responsible for normalizing
+the actual output and the expected one to common format. This means in
+particular that conversion between readable and optimized formats can
+be tested by using ``{}`` as the ``code`` instruction sequence to
+test; for example these two tests pass:
+
+::
+
+   input {Stack_elt address 0x0000e7670f32038107a59a2b9cfefae36ea21f5aa63c};
+   code {};
+   output {Stack_elt address "tz1gjaF81ZRRvdzjobyfVNsAeSC6PScjfQwN"}
+
+::
+
+   input {Stack_elt address "tz1gjaF81ZRRvdzjobyfVNsAeSC6PScjfQwN"};
+   code {};
+   output {Stack_elt address 0x0000e7670f32038107a59a2b9cfefae36ea21f5aa63c}
+
+This normalization feature is however incompatible with using the
+:ref:`wildcard pattern <omitting_parts_of_the_output_alpha>` in the
+output; when using wildcards the output must be formatted using the
+readable format so the following test does not pass:
+
+::
+
+   input {Stack_elt address "tz1gjaF81ZRRvdzjobyfVNsAeSC6PScjfQwN"};
+   code {};
+   output {Stack_elt _ 0x0000e7670f32038107a59a2b9cfefae36ea21f5aa63c}
+
+but the following test does pass:
+
+::
+
+   input {Stack_elt address 0x0000e7670f32038107a59a2b9cfefae36ea21f5aa63c};
+   code {};
+   output {Stack_elt _ "tz1gjaF81ZRRvdzjobyfVNsAeSC6PScjfQwN"}
+
+.. _syntax_of_errors_alpha:
+
+Syntax of errors
+~~~~~~~~~~~~~~~~
+
+To test that the execution of an instruction fails, the following
+syntaxes can be used instead of the output stack as the argument of the
+``output`` toplevel primitive to specify which error the instruction is expected to
+raise:
+
+- ``(StaticError <error description>)``: an error occurred before the
+  instruction was executed; the error description format is
+  unspecified so consider using a :ref:`wildcard
+  <omitting_parts_of_the_output_alpha>` such as ``(StaticError _)``
+  to write portable tests;
+
+- ``(Failed <value>)``: the execution reached a ``FAILWITH``
+  instruction and the topmost element of the stack at this point was
+  ``<value>``;
+
+- ``MutezUnderflow``: a mutez subtraction resulted in a negative
+  value. This should only happen in the case of the deprecated
+  ``mutez`` case of the ``SUB`` instruction;
+
+- ``Overflow``: an overflow was detected. This can happen when an
+  addition or multiplication on type ``mutez`` produces a result
+  which is too large to be represented as a value of type ``mutez``,
+  or when the number of bits to shift using the ``LSL`` or ``LSR``
+  instruction is too large.
+
+
+The following example shows how to test a runtime failure; it asserts
+that the `FAILWITH
+<https://tezos.gitlab.io/michelson-reference/#instr-FAILWITH>`__
+instruction produces a runtime error containing the top of the stack.
+
+::
+
+   input { Stack_elt nat 4 ; Stack_elt bytes 0x };
+   code FAILWITH;
+   output (Failed 4)
+
+The following example shows how to test type checking failure; it
+asserts that the `DUP
+<https://tezos.gitlab.io/michelson-reference/#instr-DUP>`__
+instruction cannot be used on an empty stack.
+
+::
+
+   input {};
+   code DUP;
+   output (StaticError _)
+
+The following example shows another kind of static failure: a string
+cannot be passed as argument to the `DUP
+<https://tezos.gitlab.io/michelson-reference/#instr-DUP>`__
+instruction.
+
+::
+
+   input { Stack_elt nat 8 };
+   code { DUP "foo" };
+   output (StaticError _)
+
+.. _syntax_of_concrete_operations_alpha:
+
+Syntax of concrete operations
+~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+
+The `operation type
+<https://tezos.gitlab.io/michelson-reference/#type-operation>`__ has
+no concrete syntax in Michelson. In order to specify the result of the
+operation forging instructions `TRANSFER_TOKENS
+<https://tezos.gitlab.io/michelson-reference/#instr-TRANSFER_TOKENS>`__,
+`CREATE_CONTRACT
+<https://tezos.gitlab.io/michelson-reference/#instr-CREATE_CONTRACT>`__,
+and `SET_DELEGATE
+<https://tezos.gitlab.io/michelson-reference/#instr-SET_DELEGATE>`__ ,
+the following data constructors are added:
+
+- ``Transfer_tokens``,
+- ``Create_contract``, and
+- ``Set_delegate``.
+
+They take as arguments the inputs of the corresponding operation
+forging instructions plus a cryptographic nonce represented as a byte
+sequence. The result of ``TRANSFER_TOKENS``, ``CREATE_CONTRACT``,
+and ``SET_DELEGATE`` have respectively the following shapes:
+
+- ``Transfer_tokens <argument> <amount in mutez> <address of destination> <nonce>``,
+- ``Create_contract { <script> } <optional delegate> <initial balance in mutez> <initial storage> <nonce>``, and
+- ``Set_delegate <optional delegate> <nonce>``.
+
+The computation of the cryptographic nonce is not specified. To write
+portable tests, the nonces appearing in output stack expectations
+should be replaced by :ref:`a wildcard pattern
+<omitting_parts_of_the_output_alpha>`.
+
+Here is an example unit test for the ``SET_DELEGATE`` instruction used
+to set the delegate of the current contract to the account at address
+``tz1NwQ6hkenkn6aYYio8VnJvjtb4K1pfeU1Z``:
+
+::
+
+  input { Stack_elt (option key_hash) (Some "tz1NwQ6hkenkn6aYYio8VnJvjtb4K1pfeU1Z") } ;
+  code SET_DELEGATE ;
+  output { Stack_elt operation (Set_delegate (Some "tz1NwQ6hkenkn6aYYio8VnJvjtb4K1pfeU1Z") _) }
+
+.. _syntax_of_other_contracts_alpha:
+
+Syntax of other contracts specifications
+~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+
+The behaviour of the `CONTRACT
+<https://tezos.gitlab.io/michelson-reference/#instr-CONTRACT>`__
+instruction depends on whether or not its input is the address of a
+smart contract accepting the expected type as parameter. To test
+it, the ``other_contract`` toplevel primitive can be used to specify
+which contracts are assumed to be originated and which type they
+accept as parameter.
+
+The mapping given to the ``other_contract`` toplevel primitive is a
+Micheline sequence whose elements have the form ``Contract "KT1..."
+<ty>`` where ``"KT1..."`` is a valid smart contract address and
+``<ty>`` is the type of its parameter. Each address should appear at
+most once and the order is irrelevant.
+
+.. _syntax_of_extra_big_maps_alpha:
+
+Syntax of extra big maps specifications
+~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+
+The behaviour of the instructions operating on type `big_map
+<https://tezos.gitlab.io/michelson-reference/#type-big_map>`__ depend
+on the contents of big maps stored in the context. To test them, the
+``big_maps`` toplevel primitive can be used to specify the types and
+contents of the big maps which are assumed to be present.
+
+The mapping given to the ``big_maps`` toplevel primitive is a
+Micheline sequence whose elements have the form ``Big_map <i> <kty>
+<vty> { Elt <k1> <v1>; Elt <k2> <v2>; ...}`` where ``<i>`` is an
+integer (the identifier of the big map), ``<kty>`` is the comparable
+type of keys, ``<vty>`` is the type of values, each ``<ki>`` is of
+type ``<kty>`` and each ``<vi>`` is of type ``<vty>``. Each identifier
+should appear at most once and the order in which big maps are
+specified is irrelevant but each ``{ Elt <k1> <v1>; Elt <k2> <v2>;
+...}`` description of big map contents should be given in increasing
+order of keys.
+
+The following example tests the `GET
+<https://tezos.gitlab.io/michelson-reference/#instr-GET>`__
+instruction in the `big_map
+<https://tezos.gitlab.io/michelson-reference/#type-big_map>`__ case:
+
+::
+
+   big_maps { Big_map 4 string nat { Elt "bar" 42 } };
+   input { Stack_elt (big_map string nat) 4 };
+   code { PUSH string "foo"; GET };
+   output { Stack_elt (option nat) None }
+
+.. _syntax_of_storages_alpha:
+
+Syntax of storages specifications
+~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+
+To test the `VIEW <https://tezos.gitlab.io/michelson-reference/#instr-VIEW>`__
+instruction, the ``storages`` toplevel primitive can be used to specify, for each
+contract address, the type and value of the contract's storage.
+
+The mapping given to the ``storages`` toplevel primitive is a
+Micheline sequence whose elements have the form::
+
+   Storage "KT1..." <ty> <value>
+
+where
+
+-  ``"KT1..."`` is a valid smart contract address,
+- ``<ty>`` is the storage type of that contract, and
+- ``<value>`` is the storage value, which must be of type ``<ty>``.
+
+Each address should appear at most once in the ``storages`` mapping,
+and the order in which storages are specified is irrelevant.
+
+The following example specifies the storage for a single contract
+whose storage type is ``unit`` and whose storage value is ``Unit``::
+
+   storages { Storage "KT1Q36KWPSba7dHsH5E4ZsQHehrChc51e19d" unit Unit };
+
+.. _syntax_of_views_alpha:
+
+Syntax of views specifications
+~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+
+The behaviour of the `VIEW
+<https://tezos.gitlab.io/michelson-reference/#instr-VIEW>`__ instruction
+depends on the set of views declared for contracts in the
+context. The ``views`` toplevel primitive can be used to specify, for
+each contract address, the views that are available, together with
+their argument and return types and their implementation.
+
+The mapping given to the ``views`` toplevel primitive is a Micheline
+sequence whose elements have the form::
+
+   Views "KT1..." { View <name> <arg_ty> <ret_ty> { <code> } ;
+                    View <name2> <arg_ty2> <ret_ty2> { <code2> } ;
+                    ... }
+
+where
+
+- ``"KT1..."`` is a valid smart contract address with storage type ``<storage_ty>``,
+- each ``<name>`` is a Micheline string giving the name of a view
+  defined on that contract,
+- each ``<arg_ty>`` is the input type of the view,
+- each ``<ret_ty>`` is the return type of the view, and
+- each ``{ <code> }`` block is the
+  implementation of the view, written as Michelson code of type ``Pair <arg_ty> <storage_ty> : [] => <ret_ty> : []``.
+
+For a given ``Views <addr> { ... }`` block, each view name should
+appear at most once. The order of contracts in the outer ``views``
+mapping, and the order of view declarations inside each ``Views``
+block, is irrelevant.
+
+Every address in ``views`` must also appear in ``storages`` so that
+the view can be correctly interpreted.
+
+The following example defines a single view ``"a"`` on a contract
+whose storage is of type ``unit`` and which always returns the constant
+``1`` of type ``nat``::
+
+   code { VIEW "a" nat ; };
+
+   input
+     {
+       Stack_elt unit Unit;
+       Stack_elt address "KT1Q36KWPSba7dHsH5E4ZsQHehrChc51e19d"
+     };
+
+   output { Stack_elt (option nat) (Some 1) };
+
+   views
+     {
+       Views
+         "KT1Q36KWPSba7dHsH5E4ZsQHehrChc51e19d"
+         { View "a" unit nat { DROP; PUSH nat 1 } }
+     };
+
+   storages
+     { Storage "KT1Q36KWPSba7dHsH5E4ZsQHehrChc51e19d" unit Unit };
+
+this tests that a call to ``VIEW "a" nat`` on the given address returns
+``Some 1``.

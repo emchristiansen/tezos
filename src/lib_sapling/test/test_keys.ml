@@ -33,7 +33,7 @@ let test_keys () =
       let ka1 = R.ka_agree_sender pkd esk in
       let ka2 = R.ka_agree_receiver epk ivk in
       assert (ka1 = ka2))
-    vectors
+    (Lazy.force vectors)
 
 let test_vectors_zip32 () =
   let open Keys in
@@ -73,11 +73,11 @@ let test_vectors_zip32 () =
           assert (res_jmax = jmax) ;
           assert (address_max.diversifier = d)
       | None -> ())
-    vectors_zip32
+    (Lazy.force vectors_zip32)
 
 let test_zip32 () =
   let open Keys in
-  let v = List.nth vectors_zip32 0 in
+  let v = List.nth (Lazy.force vectors_zip32) 0 in
   let open Sk in
   let open Vk in
   (* tests from zcash/src/gtest/test_zip32.cpp *)
@@ -105,4 +105,4 @@ let tests =
     ("zip32", `Quick, test_zip32);
   ]
 
-let () = Alcotest.run "sapling" [("keys", tests)]
+let () = Alcotest.run ~__FILE__ "sapling" [("keys", tests)]

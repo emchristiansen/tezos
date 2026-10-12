@@ -1,0 +1,40 @@
+; This file was automatically generated, do not edit.
+; Edit file manifest/main.ml instead.
+
+(library
+ (name evm_node_rust_deps)
+ (public_name octez-evm-node-libs.evm_node_rust_deps)
+ (instrumentation (backend bisect_ppx))
+ (foreign_archives octez_evm_node_rust_deps))
+
+(dirs :standard .cargo (not target))
+
+(rule
+ (targets liboctez_evm_node_rust_deps.a dlloctez_evm_node_rust_deps.so)
+ (deps
+  (file build.sh)
+  (file Cargo.toml)
+  (file Cargo.lock)
+  (file ../../rust-toolchain)
+  (source_tree .cargo)
+  (source_tree ../sputnikvm)
+  (source_tree ../kernel_bifrost)
+  (source_tree ../kernel_calypso)
+  (source_tree ../kernel_calypso2)
+  (source_tree ../kernel_dionysus)
+  (source_tree ../kernel_dionysus_r1)
+  (source_tree ../kernel_ebisu)
+  (source_tree ../kernel_farfadet)
+  (source_tree ../kernel_farfadet_r1)
+  (source_tree ../kernel_farfadet_r2_su)
+  (source_tree ../kernel_farfadet_r3_su)
+  (source_tree ../kernel_farfadet_r4_su)
+  (source_tree ../kernel_farfadet_r5_su)
+  (source_tree ../kernel_farfadet_r6_su)
+  (source_tree ../../src/rustzcash_deps)
+  (source_tree ../../src/rust_deps/wasmer-7.2.1)
+  (source_tree ../../src/riscv)
+  (source_tree ../../src/kernel_sdk)
+  (source_tree ../../sdk/rust)
+  (source_tree src))
+ (action (no-infer (system ./build.sh))))

@@ -45,17 +45,11 @@ module type COMMITMENT = sig
 
   val pp : Format.formatter -> t -> unit
 
+  val pp_short : Format.formatter -> t -> unit
+
   val equal : t -> t -> bool
 
-  val zero : t
-end
-
-module type COMMITMENT_PROOF = sig
-  (** A commitment proof. *)
-  type t
-
-  (** An encoding for a commitment proof. This encoding is bounded. *)
-  val encoding : t Data_encoding.t
+  val compare : t -> t -> int
 
   val zero : t
 end
@@ -65,7 +59,7 @@ module type VERIFIER = sig
   type t
 
   (** Parameters to build a value of type [t] *)
-  type parameters = {
+  type parameters = Dal_config.parameters = {
     redundancy_factor : int;
     page_size : int;
     slot_size : int;
@@ -94,7 +88,8 @@ module type VERIFIER = sig
      bounded by a constant. *)
   type commitment_proof
 
-  module Commitment_proof : COMMITMENT_PROOF with type t := commitment_proof
+  module Commitment_proof :
+    Kzg.Interfaces.Degree_check_proof with type t := commitment_proof
 
   (** [verify_commitment t commitment proof] returns [true] if and only if the
       size of the data committed via [commitment] does not exceed the
@@ -128,7 +123,7 @@ module type VERIFIER = sig
       contained in [t] is too small to proceed with the verification
       - [Error `Page_length_mismatch] if the page is not of the expected
       length [page_size] given for the initialisation of [t]
-      - [Error `Segment_index_out_of_range] if [page_index] is out of the
+      - [Error `Page_index_out_of_range] if [page_index] is out of the
       range [0, slot_size/page_size - 1] where [slot_size] and [page_size]
       are given for the initialisation of [t]
 
@@ -150,6 +145,31 @@ module type VERIFIER = sig
          (int, int) error_container
       | `Invalid_page
       | `Page_length_mismatch
-      | `Segment_index_out_of_range ] )
+      | `Page_index_out_of_range ] )
+    Result.t
+
+  type share
+
+  val share_encoding : share Data_encoding.t
+
+  type shard = {index : int; share : share}
+
+  val shard_encoding : shard Data_encoding.t
+
+  type shard_proof
+
+  val shard_proof_encoding : shard_proof Data_encoding.t
+
+  val verify_shard :
+    t ->
+    commitment ->
+    shard ->
+    shard_proof ->
+    ( unit,
+      [> `Invalid_degree_strictly_less_than_expected of
+         (int, int) error_container
+      | `Invalid_shard
+      | `Shard_length_mismatch
+      | `Shard_index_out_of_range of string ] )
     Result.t
 end

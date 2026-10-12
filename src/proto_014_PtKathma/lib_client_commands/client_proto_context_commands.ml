@@ -125,7 +125,7 @@ let commands_ro () =
           ()
         >>=? fun {timestamp = v; _} ->
         (if seconds then cctxt#message "%Ld" (Time.Protocol.to_seconds v)
-        else cctxt#message "%s" (Time.Protocol.to_notation v))
+         else cctxt#message "%s" (Time.Protocol.to_notation v))
         >>= fun () -> return_unit);
     command
       ~group
@@ -156,7 +156,9 @@ let commands_ro () =
       ~desc:"Get the key rank of a cache key."
       no_options
       (prefixes ["get"; "cached"; "contract"; "rank"; "for"]
-      @@ OriginatedContractAlias.destination_param ~name:"src" ~desc:"contract"
+      @@ Originated_contract_alias.destination_param
+           ~name:"src"
+           ~desc:"contract"
       @@ stop)
       (fun () contract (cctxt : Protocol_client_context.full) ->
         contract_rank cctxt ~chain:cctxt#chain ~block:cctxt#block contract
@@ -189,7 +191,7 @@ let commands_ro () =
       ~desc:"Get the balance of a contract."
       no_options
       (prefixes ["get"; "balance"; "for"]
-      @@ ContractAlias.destination_param ~name:"src" ~desc:"source contract"
+      @@ Contract_alias.destination_param ~name:"src" ~desc:"source contract"
       @@ stop)
       (fun () contract (cctxt : Protocol_client_context.full) ->
         get_balance cctxt ~chain:cctxt#chain ~block:cctxt#block contract
@@ -201,7 +203,7 @@ let commands_ro () =
       ~desc:"Get the storage of a contract."
       (args1 (unparsing_mode_arg ~default:"Readable"))
       (prefixes ["get"; "contract"; "storage"; "for"]
-      @@ OriginatedContractAlias.destination_param
+      @@ Originated_contract_alias.destination_param
            ~name:"src"
            ~desc:"source contract"
       @@ stop)
@@ -228,7 +230,7 @@ let commands_ro () =
       @@ prefixes ["of"; "type"]
       @@ Tezos_clic.param ~name:"type" ~desc:"type of the key" data_parameter
       @@ prefix "in"
-      @@ OriginatedContractAlias.destination_param
+      @@ Originated_contract_alias.destination_param
            ~name:"src"
            ~desc:"source contract"
       @@ stop)
@@ -276,13 +278,14 @@ let commands_ro () =
       ~desc:"Get the code of a contract."
       (args2 (unparsing_mode_arg ~default:"Readable") normalize_types_switch)
       (prefixes ["get"; "contract"; "code"; "for"]
-      @@ OriginatedContractAlias.destination_param
+      @@ Originated_contract_alias.destination_param
            ~name:"src"
            ~desc:"source contract"
       @@ stop)
       (fun (unparsing_mode, normalize_types)
            contract
-           (cctxt : Protocol_client_context.full) ->
+           (cctxt : Protocol_client_context.full)
+         ->
         get_script
           cctxt
           ~chain:cctxt#chain
@@ -306,7 +309,7 @@ let commands_ro () =
       ~desc:"Get the `BLAKE2B` script hash of a contract."
       no_options
       (prefixes ["get"; "contract"; "script"; "hash"; "for"]
-      @@ OriginatedContractAlias.destination_param
+      @@ Originated_contract_alias.destination_param
            ~name:"src"
            ~desc:"source contract"
       @@ stop)
@@ -326,14 +329,15 @@ let commands_ro () =
            ~desc:"the entrypoint to describe"
            entrypoint_parameter
       @@ prefixes ["for"]
-      @@ OriginatedContractAlias.destination_param
+      @@ Originated_contract_alias.destination_param
            ~name:"src"
            ~desc:"source contract"
       @@ stop)
       (fun normalize_types
            entrypoint
            contract
-           (cctxt : Protocol_client_context.full) ->
+           (cctxt : Protocol_client_context.full)
+         ->
         Michelson_v1_entrypoints.contract_entrypoint_type
           cctxt
           ~chain:cctxt#chain
@@ -351,7 +355,7 @@ let commands_ro () =
       ~desc:"Get the entrypoint list of a contract."
       (args1 normalize_types_switch)
       (prefixes ["get"; "contract"; "entrypoints"; "for"]
-      @@ OriginatedContractAlias.destination_param
+      @@ Originated_contract_alias.destination_param
            ~name:"src"
            ~desc:"source contract"
       @@ stop)
@@ -371,7 +375,7 @@ let commands_ro () =
       ~desc:"Get the list of unreachable paths in a contract's parameter type."
       no_options
       (prefixes ["get"; "contract"; "unreachable"; "paths"; "for"]
-      @@ OriginatedContractAlias.destination_param
+      @@ Originated_contract_alias.destination_param
            ~name:"src"
            ~desc:"source contract"
       @@ stop)
@@ -390,7 +394,7 @@ let commands_ro () =
       ~desc:"Get the delegate of a contract."
       no_options
       (prefixes ["get"; "delegate"; "for"]
-      @@ ContractAlias.destination_param ~name:"src" ~desc:"source contract"
+      @@ Contract_alias.destination_param ~name:"src" ~desc:"source contract"
       @@ stop)
       (fun () contract (cctxt : Protocol_client_context.full) ->
         Client_proto_contracts.get_delegate
@@ -487,8 +491,8 @@ let commands_ro () =
                           (Tez.of_mutez_exn w)
                           Operation_result.tez_sym
                           (if List.mem ~equal:Protocol_hash.equal p known_protos
-                          then ""
-                          else "not "))
+                           then ""
+                           else "not "))
                       ranks ;
                     pp_close_box ppf ())
               >>= fun () -> return_unit
@@ -562,7 +566,7 @@ let commands_ro () =
       ~desc:"Get the frozen deposits limit of a delegate."
       no_options
       (prefixes ["get"; "deposits"; "limit"; "for"]
-      @@ ContractAlias.destination_param ~name:"src" ~desc:"source delegate"
+      @@ Contract_alias.destination_param ~name:"src" ~desc:"source delegate"
       @@ stop)
       (fun () contract (cctxt : Protocol_client_context.full) ->
         match contract with

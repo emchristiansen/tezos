@@ -1,0 +1,134 @@
+# This file was automatically generated, do not edit.
+# Edit file ci/bin/main.ml instead.
+
+stages:
+- start
+- build
+- publish
+
+datadog_pipeline_trace:
+  image: datadog/ci:v5.18.0@sha256:07475bc65fc5efec461feeaca7a16cc32c13742393db6cce5352fc5f7e1bd5a2
+  stage: start
+  tags:
+  - gcp
+  needs: []
+  dependencies: []
+  allow_failure: true
+  timeout: 60 minutes
+  interruptible: true
+  before_script:
+  - SCRIPT_STEP_BEGIN=$(date +%s)
+  - . ./scripts/ci/datadog_send_job_info.sh
+  - . ./scripts/ci/datadog_send_job_cache_info.sh 'before'
+  script:
+  - CI_MERGE_REQUEST_IID=${CI_MERGE_REQUEST_IID:-none}
+  - DATADOG_SITE=datadoghq.eu datadog-ci tag --level pipeline --tags pipeline_type:$PIPELINE_TYPE
+    --tags mr_number:$CI_MERGE_REQUEST_IID
+  - . ./scripts/ci/datadog_send_job_script_step_time.sh || true
+  after_script:
+  - . ./scripts/ci/datadog_send_job_cache_info.sh 'after'
+
+docker:merge_manifests:
+  image: ${GCP_PROTECTED_REGISTRY}/tezos/tezos/alpine-docker-ci:28.5.1-master-18884dda
+  stage: publish
+  tags:
+  - gcp_not_interruptible
+  needs:
+  - oc.docker:amd64
+  - oc.docker:arm64
+  dependencies: []
+  timeout: 60 minutes
+  interruptible: false
+  before_script:
+  - SCRIPT_STEP_BEGIN=$(date +%s)
+  - . ./scripts/ci/datadog_send_job_info.sh
+  - . ./scripts/ci/datadog_send_job_cache_info.sh 'before'
+  script:
+  - ./scripts/ci/docker_initialize.sh --image-names
+  - ./scripts/ci/docker_merge_manifests.sh
+  - . ./scripts/ci/datadog_send_job_script_step_time.sh || true
+  after_script:
+  - . ./scripts/ci/datadog_send_job_cache_info.sh 'after'
+  services:
+  - docker:28.5.1-dind@sha256:ea9d20492ca1caaaba78e68453433895d256173c79281756e88b745647fcbcfd
+  variables:
+    CI_DOCKER_HUB: "true"
+    DOCKER_VERSION: 28.5.1
+  environment:
+    name: docker-publish
+    action: access
+  retry: 0
+
+oc.docker:amd64:
+  image: ${GCP_PROTECTED_REGISTRY}/tezos/tezos/alpine-docker-ci:28.5.1-master-18884dda
+  stage: build
+  tags:
+  - gcp
+  needs: []
+  dependencies: []
+  allow_failure: false
+  timeout: 60 minutes
+  interruptible: true
+  before_script:
+  - SCRIPT_STEP_BEGIN=$(date +%s)
+  - . ./scripts/ci/datadog_send_job_info.sh
+  - . ./scripts/ci/datadog_send_job_cache_info.sh 'before'
+  script:
+  - ./scripts/ci/docker_initialize.sh --image-names
+  - ./scripts/ci/docker_release.sh --runtime-image ${GCP_PROTECTED_REGISTRY}/tezos/tezos/alpine-runtime:master-18884dda
+    --build-deps-image ${GCP_PROTECTED_REGISTRY}/tezos/tezos/alpine-build:master-18884dda
+  - . ./scripts/ci/datadog_send_job_script_step_time.sh || true
+  after_script:
+  - . ./scripts/ci/datadog_send_job_cache_info.sh 'after'
+  services:
+  - docker:28.5.1-dind@sha256:ea9d20492ca1caaaba78e68453433895d256173c79281756e88b745647fcbcfd
+  variables:
+    CI_DOCKER_HUB: "true"
+    DOCKER_VERSION: 28.5.1
+    EXECUTABLE_FILES: script-inputs/released-executables script-inputs/experimental-executables
+    IMAGE_ARCH_PREFIX: amd64_
+  environment:
+    name: docker-publish
+    action: access
+  retry:
+    max: 2
+    when:
+    - script_failure
+    - runner_system_failure
+
+oc.docker:arm64:
+  image: ${GCP_PROTECTED_REGISTRY}/tezos/tezos/alpine-docker-ci:28.5.1-master-18884dda
+  stage: build
+  tags:
+  - gcp_arm64
+  needs: []
+  dependencies: []
+  allow_failure: false
+  timeout: 60 minutes
+  interruptible: true
+  before_script:
+  - SCRIPT_STEP_BEGIN=$(date +%s)
+  - . ./scripts/ci/datadog_send_job_info.sh
+  - . ./scripts/ci/datadog_send_job_cache_info.sh 'before'
+  script:
+  - ./scripts/ci/docker_initialize.sh --image-names
+  - ./scripts/ci/docker_release.sh --runtime-image ${GCP_PROTECTED_REGISTRY}/tezos/tezos/alpine-runtime:master-18884dda
+    --build-deps-image ${GCP_PROTECTED_REGISTRY}/tezos/tezos/alpine-build:master-18884dda
+  - . ./scripts/ci/datadog_send_job_script_step_time.sh || true
+  after_script:
+  - . ./scripts/ci/datadog_send_job_cache_info.sh 'after'
+  services:
+  - docker:28.5.1-dind@sha256:ea9d20492ca1caaaba78e68453433895d256173c79281756e88b745647fcbcfd
+  variables:
+    CI_DOCKER_HUB: "true"
+    DOCKER_VERSION: 28.5.1
+    EXECUTABLE_FILES: script-inputs/released-executables script-inputs/experimental-executables
+    IMAGE_ARCH_PREFIX: arm64_
+  environment:
+    name: docker-publish
+    action: access
+  retry:
+    max: 2
+    when:
+    - script_failure
+    - runner_system_failure

@@ -23,7 +23,16 @@
 (*                                                                           *)
 (*****************************************************************************)
 
+(** WebAssembly linear memory access.
+
+    Provides bounds-checked byte-level read and write operations on a
+    WebAssembly module's linear memory. The backing storage is a Ctypes
+    C array pointing directly into Wasmer's memory. *)
+
 module Array = Ctypes.CArray
+
+(** Raised when a memory access is out of bounds. *)
+exception Out_of_bounds
 
 type t = {
   raw : Unsigned.uint8 Array.t;
@@ -31,11 +40,43 @@ type t = {
   max : Unsigned.uint32 option;
 }
 
-let get mem = Array.get mem.raw
-
-let set mem = Array.set mem.raw
-
 let length mem = Array.length mem.raw
+
+let bad_bounds mem addr len = addr < 0 || len > length mem - addr
+
+let check_bounds mem addr len =
+  if bad_bounds mem addr len then raise Out_of_bounds
+
+let get mem addr =
+  check_bounds mem addr 1 ;
+  Array.unsafe_get mem.raw addr
+
+let get_string mem ~address ~length =
+  (* Checked in the order the interpreter's [Partial_memory] uses, which
+     this memory has to agree with: a negative [length] is rejected before
+     the address is looked at, and an empty read accesses no byte, hence
+     checks no bound. [set_string] carves out the empty write too. *)
+  if length < 0 then invalid_arg "Memory.get_string: negative length"
+  else if length = 0 then ""
+  else (
+    check_bounds mem address length ;
+    String.init length @@ fun i ->
+    Array.unsafe_get mem.raw (i + address) |> Unsigned.UInt8.to_int |> Char.chr)
+
+let set mem addr value =
+  check_bounds mem addr 1 ;
+  Array.unsafe_set mem.raw addr value
+
+let set_string mem ~address ~data =
+  let len = String.length data in
+  if len > 0 then (
+    (* For compatibility we only check bounds when something shall be written. *)
+    check_bounds mem address len ;
+    for offset = 0 to len - 1 do
+      String.get_uint8 data offset
+      |> Unsigned.UInt8.of_int
+      |> Array.unsafe_set mem.raw (offset + address)
+    done)
 
 module Internal_for_tests = struct
   let of_list (content : Unsigned.uint8 list) =

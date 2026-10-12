@@ -3,10 +3,10 @@
 
 (library
  (name tezos_protocol_environment_015_PtLimaPt)
- (public_name tezos-protocol-015-PtLimaPt.environment)
+ (public_name tezos-protocol-015-PtLimaPt.protocol.environment)
  (instrumentation (backend bisect_ppx))
  (libraries
-  tezos-protocol-environment)
+  octez-proto-libs.protocol-environment)
  (library_flags (:standard -linkall))
  (modules Tezos_protocol_environment_015_PtLimaPt))
 
@@ -19,13 +19,14 @@
 
 (library
  (name tezos_raw_protocol_015_PtLimaPt)
- (public_name tezos-protocol-015-PtLimaPt.raw)
+ (public_name tezos-protocol-015-PtLimaPt.protocol.raw)
  (instrumentation (backend bisect_ppx))
  (libraries
-  tezos-protocol-015-PtLimaPt.environment)
+  tezos-protocol-015-PtLimaPt.protocol.environment)
  (library_flags (:standard -linkall))
  (flags
   (:standard)
+  -w -32-34
   -nostdlib
   -nopervasives
   -open Tezos_protocol_environment_015_PtLimaPt
@@ -262,21 +263,22 @@
 
 (library
  (name tezos_protocol_015_PtLimaPt)
- (public_name tezos-protocol-015-PtLimaPt)
+ (public_name tezos-protocol-015-PtLimaPt.protocol)
  (instrumentation (backend bisect_ppx))
  (libraries
-  tezos-protocol-environment
-  tezos-protocol-environment.sigs
-  tezos-protocol-015-PtLimaPt.raw)
+  octez-proto-libs.protocol-environment
+  octez-proto-libs.protocol-environment.sigs
+  tezos-protocol-015-PtLimaPt.protocol.raw)
  (flags
   (:standard)
+  -w -32-34
   -nopervasives)
  (modules Protocol Tezos_protocol_015_PtLimaPt))
 
 (install
  (package tezos-protocol-015-PtLimaPt)
  (section lib)
- (files (TEZOS_PROTOCOL as raw/TEZOS_PROTOCOL)))
+ (files (TEZOS_PROTOCOL as protocol/raw/TEZOS_PROTOCOL)))
 
 (rule
  (targets protocol.ml)
@@ -526,15 +528,39 @@
   alpha_services.ml alpha_services.mli
   main.ml main.mli
   (:src_dir TEZOS_PROTOCOL))
- (action (run %{bin:octez-protocol-compiler} -warn-error +a .)))
+ (action
+  (run %{bin:octez-protocol-compiler} -warning -32-34 -warn-error +a .)))
+
+(library
+ (name tezos_protocol_015_PtLimaPt_lifted)
+ (public_name tezos-protocol-015-PtLimaPt.protocol.lifted)
+ (instrumentation (backend bisect_ppx))
+ (libraries
+  octez-proto-libs.protocol-environment
+  octez-proto-libs.protocol-environment.sigs
+  tezos-protocol-015-PtLimaPt.protocol)
+ (flags
+  (:standard)
+  -w -32-34
+  -nopervasives
+  -open Tezos_protocol_015_PtLimaPt)
+ (modules Lifted_protocol))
+
+(rule
+ (targets lifted_protocol.ml)
+ (action
+  (write-file
+   %{targets}
+   "\ninclude Environment.Lift (Protocol)\nlet hash = Protocol.hash\n")))
 
 (library
  (name tezos_protocol_015_PtLimaPt_functor)
  (libraries
-  tezos-protocol-environment
-  tezos-protocol-environment.sigs)
+  octez-proto-libs.protocol-environment
+  octez-proto-libs.protocol-environment.sigs)
  (flags
   (:standard)
+  -w -32-34
   -nopervasives)
  (modules Functor))
 
@@ -780,13 +806,16 @@
 
 (library
  (name tezos_embedded_protocol_015_PtLimaPt)
- (public_name tezos-embedded-protocol-015-PtLimaPt)
+ (public_name tezos-protocol-015-PtLimaPt.embedded-protocol)
  (instrumentation (backend bisect_ppx))
  (libraries
-  tezos-protocol-015-PtLimaPt
-  tezos-protocol-updater
-  tezos-protocol-environment)
+  tezos-protocol-015-PtLimaPt.protocol
+  octez-shell-libs.protocol-updater
+  octez-proto-libs.protocol-environment)
  (library_flags (:standard -linkall))
+ (flags
+  (:standard)
+  -w -32-34)
  (modules Registerer))
 
 (rule

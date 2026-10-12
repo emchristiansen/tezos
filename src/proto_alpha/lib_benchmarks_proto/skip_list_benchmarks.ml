@@ -2,6 +2,7 @@
 (*                                                                           *)
 (* Open Source License                                                       *)
 (* Copyright (c) 2022 Nomadic Labs, <contact@nomadic-labs.com>               *)
+(* Copyright (c) 2023  Marigold <contact@marigold.dev>                       *)
 (*                                                                           *)
 (* Permission is hereby granted, free of charge, to any person obtaining a   *)
 (* copy of this software and associated documentation files (the "Software"),*)
@@ -26,19 +27,22 @@
 (** This module provides benchmarks for skip list operations for basis = 4. *)
 
 open Protocol
+open Benchmarks_proto
 
-module Skip_list = Skip_list_repr.Make (struct
+module Skip_list = Skip_list.Make (struct
   (** The benchmarks must be run again if [basis] is changed. *)
   let basis = 4
 end)
 
-let ns = Namespace.make Registration_helpers.ns "skip_list"
+let ns = Namespace.make Registration.ns "skip_list"
 
 let fv s = Free_variable.of_namespace (ns s)
 
 (** Benchmark for the [Skip_list_repr.next] function. It is used for estimating
     the parameters for [Skip_list_cost_model.model_next]. *)
 module Next : Benchmark.S = struct
+  let purpose = Benchmark.Generate_code "skip_list"
+
   include Skip_list
 
   let name = ns "next"
@@ -51,6 +55,10 @@ module Next : Benchmark.S = struct
 
   let default_config = {max_items = 10000}
 
+  let module_filename = __FILE__
+
+  let group = Benchmark.Group "skip_list"
+
   let config_encoding =
     let open Data_encoding in
     conv (fun {max_items} -> max_items) (fun max_items -> {max_items}) int31
@@ -62,11 +70,8 @@ module Next : Benchmark.S = struct
   let workload_to_vector len =
     Sparse_vec.String.of_list [("len", float_of_int @@ len)]
 
-  let next_model =
-    let conv x = (x, ()) in
-    Model.make ~conv ~model:(Model.logn ~name ~coeff:(fv "len_coeff"))
-
-  let models = [("skip_list_next", next_model)]
+  let model =
+    Model.make ~conv:(fun x -> (x, ())) Model.logn ~takes_saturation_reprs:true
 
   let create_skip_list_of_len len =
     let rec go n cell =
@@ -75,8 +80,7 @@ module Next : Benchmark.S = struct
     in
     go len (genesis ())
 
-  let create_benchmarks ~rng_state ~bench_num ({max_items} : config) =
-    List.repeat bench_num @@ fun () ->
+  let create_benchmark ~rng_state ({max_items} : config) =
     let workload =
       (* Since the model we want to infer is logarithmic in
          the length, we sample the logarithm of the length
@@ -97,12 +101,18 @@ end
    function. It is used for estimating the parameters for
    [Skip_list_cost_model.model_hash_cell]. The model estimates hashing
    a skip_list cell content and all its back pointers. *)
-module Hash_cell = struct
+module Hash_cell : Benchmark.S = struct
+  let purpose = Benchmark.Generate_code "skip_list"
+
   let name = ns "hash_cell"
 
   let info = "Estimating the costs of hashing a skip list cell"
 
   let tags = ["skip_list"]
+
+  let module_filename = __FILE__
+
+  let group = Benchmark.Group "skip_list"
 
   include Skip_list
   module Hash = Sc_rollup_inbox_repr.Hash
@@ -137,18 +147,13 @@ module Hash_cell = struct
     Sparse_vec.String.of_list
       [("nb_backpointers", float_of_int nb_backpointers)]
 
-  let hash_skip_list_cell_model =
+  let model =
     Model.make
+      ~takes_saturation_reprs:true
       ~conv:(fun {nb_backpointers} -> (nb_backpointers, ()))
-      ~model:
-        (Model.affine
-           ~name
-           ~intercept:(fv "cost_hash_skip_list_cell")
-           ~coeff:(fv "cost_hash_skip_list_cell_coef"))
+      Model.affine
 
-  let models = [("skip_list_hash", hash_skip_list_cell_model)]
-
-  let benchmark rng_state conf () =
+  let create_benchmark ~rng_state conf =
     (* Since the model we want to infer is logarithmic in
        the length, we sample the logarithm of the length
        (and not the length itself) uniformly in an interval. *)
@@ -176,11 +181,8 @@ module Hash_cell = struct
     let workload = {nb_backpointers} in
     let closure () = ignore (hash cell) in
     Generator.Plain {workload; closure}
-
-  let create_benchmarks ~rng_state ~bench_num config =
-    List.repeat bench_num (benchmark rng_state config)
 end
 
-let () = Registration_helpers.register (module Next)
+let () = Registration.register (module Next)
 
-let () = Registration_helpers.register (module Hash_cell)
+let () = Registration.register (module Hash_cell)

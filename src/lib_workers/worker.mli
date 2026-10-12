@@ -57,6 +57,12 @@ module type T = sig
 
   type dropbox
 
+  type callback
+
+  type scope
+
+  type metadata = {scope : scope option}
+
   (** An error returned when waiting for a message pushed to the worker.
       [Closed errs] is returned if the worker is terminated or has crashed. If the
       worker is terminated, [errs] is an empty list.
@@ -76,8 +82,9 @@ module type T = sig
           dropbox t -> any_request -> any_request option -> any_request option;
       }
         -> dropbox buffer_kind
+    | Callback : (unit -> any_request Lwt.t) -> callback buffer_kind
 
-  and any_request = Any_request : _ Request.t -> any_request
+  and any_request = Any_request : _ Request.t * metadata -> any_request
 
   (** Create a table of workers. *)
   val create_table : 'kind buffer_kind -> 'kind table
@@ -115,14 +122,15 @@ module type T = sig
 
     (** A function called at the end of the worker loop in case of an error. One
         can first log the incoming error. Then, the error can be filtered out by
-        returning [return_unit] and the worker execution continues, or the error
-        can be propagated through a [tzresult], making the worker crash. *)
+        returning [`Continue] and the worker execution continues, [`Shutdown]
+        and the worker shutdowns without crashing, or the error can be propagated
+        through a [tzresult], making the worker crash. *)
     val on_error :
       self ->
       Worker_types.request_status ->
       ('a, 'request_error) Request.t ->
       'request_error ->
-      unit tzresult Lwt.t
+      [`Continue | `Shutdown] tzresult Lwt.t
 
     (** A function called at the end of the worker loop in case of a
         successful treatment of the current request. *)
@@ -149,6 +157,9 @@ module type T = sig
   (** Triggers a worker termination and waits for its completion.
       Cannot be called from within the handlers.  *)
   val shutdown : _ t -> unit Lwt.t
+
+  (** Waits for completion, but doesn't trigger the shutdown. *)
+  val wait_for_completion : _ t -> unit Lwt.t
 
   (** The following interface are common elements of multiple modules below.
       They are used to minimize repetition. *)
@@ -212,8 +223,14 @@ module type T = sig
   (** Triggers a worker termination. *)
   val trigger_shutdown : _ t -> unit
 
+  (** Returns true if the worker is shutting down. *)
+  val is_shutting_down : _ t -> bool
+
   (** Access the internal state, once initialized. *)
   val state : _ t -> Types.state
+
+  (** Access the internal state if available. *)
+  val state_opt : _ t -> Types.state option
 
   (** [with_state w f] calls [f] on the current state of worker [w] if
       it was intialized and not closed or crashed, otherwise

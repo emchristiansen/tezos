@@ -49,6 +49,7 @@ type error +=
   | LedgerError of Ledgerwallet.Transport.error
   | Ledger_signing_hash_mismatch of string * string
   | Ledger_msg_chunk_too_long of string
+  | Ledger_BLS_and_proof_of_possession_not_supported
 
 let error_encoding =
   let open Data_encoding in
@@ -113,6 +114,19 @@ let () =
       | Ledger_signing_hash_mismatch (lh, ch) -> Some (lh, ch) | _ -> None)
     (fun (lh, ch) -> Ledger_signing_hash_mismatch (lh, ch))
 
+let () =
+  let description = "Ledger does not support BLS and proof of possession." in
+  register_error_kind
+    `Permanent
+    ~id:"signer.ledger.BLS_and_proof_of_possession_not_supported"
+    ~title:description
+    ~description
+    ~pp:(fun ppf () -> Format.fprintf ppf "%s" description)
+    Data_encoding.unit
+    (function
+      | Ledger_BLS_and_proof_of_possession_not_supported -> Some () | _ -> None)
+    (fun () -> Ledger_BLS_and_proof_of_possession_not_supported)
+
 let pp_round_opt fmt = function
   | None -> ()
   | Some x -> Format.fprintf fmt " (round: %ld)" x
@@ -130,11 +144,11 @@ module Ledger_commands = struct
             (Buffer.contents buf) ;
           Buffer.clear buf)
     in
-    let res = f pp in
+    let*! res = f pp in
     match res with
     | Error
         (Ledgerwallet.Transport.AppError
-          {status = Ledgerwallet.Status.Incorrect_length_for_ins; msg}) ->
+           {status = Ledgerwallet.Status.Incorrect_length_for_ins; msg}) ->
         tzfail (Ledger_msg_chunk_too_long msg)
     | Error err -> tzfail (LedgerError err)
     | Ok v -> return v
@@ -143,7 +157,7 @@ module Ledger_commands = struct
     let open Lwt_result_syntax in
     let buf = Buffer.create 100 in
     let pp = Format.formatter_of_buffer buf in
-    let version = Ledgerwallet_tezos.get_version ~pp h in
+    let*! version = Ledgerwallet_tezos.get_version ~pp h in
     let*! () = Events.(emit Ledger.communication) (Buffer.contents buf) in
     match version with
     | Error e ->
@@ -276,7 +290,7 @@ module Ledger_commands = struct
       | Error
           (LedgerError
              (AppError
-               {status = Ledgerwallet.Status.Referenced_data_not_found; _})
+                {status = Ledgerwallet.Status.Referenced_data_not_found; _})
           :: _) ->
           return `No_baking_authorized
       | Error _ as e -> Lwt.return e
@@ -292,14 +306,13 @@ module Ledger_commands = struct
     let* hash_opt, signature =
       wrap_ledger_cmd (fun pp ->
           let {Ledgerwallet_tezos.Version.major; minor; patch; _} = version in
-          let open Result_syntax in
           if (major, minor, patch) <= (2, 0, 0) then
-            let* s =
+            let+ s =
               Ledgerwallet_tezos.sign ~pp hid curve path (Cstruct.of_bytes msg)
             in
-            Ok (None, s)
+            (None, s)
           else
-            let* h, s =
+            let+ h, s =
               Ledgerwallet_tezos.sign_and_hash
                 ~pp
                 hid
@@ -307,7 +320,7 @@ module Ledger_commands = struct
                 path
                 (Cstruct.of_bytes msg)
             in
-            Ok (Some h, s))
+            (Some h, s))
     in
     let* () =
       match hash_opt with
@@ -597,7 +610,7 @@ type 'a ledger_function =
 
 let use_ledger ?(filter : Filter.t = `None) (f : 'a ledger_function) =
   let open Lwt_result_syntax in
-  let ledgers = Ledgerwallet.Transport.enumerate () in
+  let*! ledgers = Ledgerwallet.Transport.enumerate () in
   let*! () =
     Events.(emit Ledger.found)
       ( List.length ledgers,
@@ -643,7 +656,8 @@ let use_ledger ?(filter : Filter.t = `None) (f : 'a ledger_function) =
     if not (selected path) then return_none
     else
       let*! () = Events.(emit Ledger.processing) device_name in
-      match Ledgerwallet.Transport.open_path path with
+      let*! open_path = Ledgerwallet.Transport.open_path path in
+      match open_path with
       | None -> return_none
       | Some h ->
           Lwt.finalize
@@ -655,9 +669,7 @@ let use_ledger ?(filter : Filter.t = `None) (f : 'a ledger_function) =
                   let* ledger_id = Ledger_id.get h in
                   f h version_git ~device_path:path ledger_id
               | None | Some _ -> return_none)
-            (fun () ->
-              Ledgerwallet.Transport.close h ;
-              Lwt.return_unit)
+            (fun () -> Ledgerwallet.Transport.close h)
   in
   let rec go = function
     | [] -> return_none
@@ -718,15 +730,14 @@ let use_ledger_or_fail ~ledger_uri ?(filter = `None) ?msg
     match Request_cache.find_opt cache ledger_id with
     | Some {path; version; git_commit; ledger_id}
       when check_filter (path, version, git_commit) -> (
-        match Ledgerwallet.Transport.(open_path path) with
+        let*! open_path = Ledgerwallet.Transport.(open_path path) in
+        match open_path with
         | None -> return_none
         | Some hidapi ->
             Lwt.finalize
               (fun () ->
                 f hidapi (version, git_commit) ~device_path:path ledger_id)
-              (fun () ->
-                Ledgerwallet.Transport.close hidapi ;
-                Lwt.return_unit))
+              (fun () -> Ledgerwallet.Transport.close hidapi))
     | Some _ | None ->
         use_ledger
           ~filter
@@ -835,7 +846,12 @@ module Signer_implementation : Client_keys.SIGNER = struct
   let import_secret_key ~io pk_uri =
     public_key_hash_maybe_prompt ~first_import:io pk_uri
 
-  let sign ?watermark (sk_uri : sk_uri) msg =
+  let list_known_keys _ =
+    failwith "List known keys request not allowed for Ledger."
+
+  let sign ?version:_ ?watermark (sk_uri : sk_uri) msg =
+    (* TODO: https://gitlab.com/tezos/tezos/-/issues/7812
+       handle version *)
     let open Lwt_result_syntax in
     let* ledger_uri = Ledger_uri.parse (sk_uri :> Uri.t) in
     let* {curve; path; _} = Ledger_uri.full_account ledger_uri in
@@ -866,6 +882,9 @@ module Signer_implementation : Client_keys.SIGNER = struct
       (Tezos_crypto.Blake2B.to_bytes (Tezos_crypto.Blake2B.hash_bytes [nonce]))
 
   let supports_deterministic_nonces _ = Lwt_result_syntax.return_true
+
+  let bls_prove_possession ?override_pk:_ _sk_uri =
+    Lwt_result_syntax.tzfail Ledger_BLS_and_proof_of_possession_not_supported
 end
 
 (* The Ledger uses a special value 0x00000000 for the “any” chain-id: *)
@@ -945,7 +964,7 @@ let generic_commands group =
                             pp_print_cut ppf ())
                           (List.filter
                              (is_derivation_scheme_supported version)
-                             [Bip32_ed25519; Ed25519; Secp256k1; Secp256r1]) ;
+                             [Ed25519; Secp256k1; Secp256r1; Bip32_ed25519]) ;
                         pp_close_box ppf () ;
                         pp_print_newline ppf ())
                 in
@@ -1227,11 +1246,11 @@ let baking_commands group =
              ~placeholder:"HWM"
              ~default:"ASK-LEDGER"
              (parameter (fun _ -> function
-                | "ASK-LEDGER" -> return_none
-                | s -> (
-                    try return_some (Int32.of_string s)
-                    with _ ->
-                      failwith "Parameter %S should be a 32-bits integer" s)))
+               | "ASK-LEDGER" -> return_none
+               | s -> (
+                   try return_some (Int32.of_string s)
+                   with _ ->
+                     failwith "Parameter %S should be a 32-bits integer" s)))
          in
          args3
            (default_arg
@@ -1240,23 +1259,24 @@ let baking_commands group =
               ~placeholder:"ID"
               ~default:"ASK-NODE"
               (parameter (fun _ -> function
-                 | "ASK-NODE" -> return `Ask_node
-                 | s -> (
-                     try return (`Int32 (Int32.of_string s))
-                     with _ -> (
-                       try return (`Chain_id (Chain_id.of_b58check_exn s))
-                       with _ ->
-                         failwith
-                           "Parameter %S should be a 32-bits integer or a \
-                            Tezos_crypto.Base58 chain-id"
-                           s)))))
+                | "ASK-NODE" -> return `Ask_node
+                | s -> (
+                    try return (`Int32 (Int32.of_string s))
+                    with _ -> (
+                      try return (`Chain_id (Chain_id.of_b58check_exn s))
+                      with _ ->
+                        failwith
+                          "Parameter %S should be a 32-bits integer or a \
+                           Tezos_crypto.Base58 chain-id"
+                          s)))))
            (hwm_arg "main")
            (hwm_arg "test"))
         (prefixes ["setup"; "ledger"; "to"; "bake"; "for"]
         @@ Ledger_uri.ledger_uri_or_alias_param @@ stop)
         (fun (chain_id_opt, main_hwm_opt, test_hwm_opt)
              ledger_uri
-             (cctxt : Client_context.full) ->
+             (cctxt : Client_context.full)
+           ->
           use_ledger_or_fail
             ~ledger_uri
             ~filter:Filter.is_baking
@@ -1328,8 +1348,7 @@ let baking_commands group =
               in
               let* pk =
                 Ledger_commands.public_key_returning_instruction
-                  (`Setup
-                    (Chain_id.to_string main_chain_id, main_hwm, test_hwm))
+                  (`Setup (Chain_id.to_string main_chain_id, main_hwm, test_hwm))
                   hidapi
                   curve
                   path

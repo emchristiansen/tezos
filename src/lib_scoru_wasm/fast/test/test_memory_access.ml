@@ -23,6 +23,13 @@
 (*                                                                           *)
 (*****************************************************************************)
 
+(** Testing
+    -------
+    Component:    Lib_scoru_wasm_fast
+    Invocation:   dune exec src/lib_scoru_wasm/fast/test/main.exe -- --file test_memory_access.ml
+    Subject:      Tests for the tezos-scoru-wasm library
+*)
+
 module Wasmer = Tezos_wasmer
 module Preimage_map = Map.Make (String)
 module Memory_access_fast = Tezos_scoru_wasm_fast.Memory_access.Wasmer
@@ -79,25 +86,83 @@ let test_store_bytes =
   QCheck2.Test.make
     ~count:50
     ~name:"store_bytes behaves the same on both memory implementations"
-    (triple mem_content int32 string)
+    (triple mem_content mem_address string)
     (fun (memory, address, data) ->
       are_equivalent
         memory
         (fun mem -> Memory_access_slow.store_bytes mem address data)
         (fun mem -> Memory_access_fast.store_bytes mem address data))
 
-let test_load_bytes =
+let test_store_bytes_from_bytes =
   let open Gen in
   let open QCheck2.Gen in
   QCheck2.Test.make
     ~count:50
+    ~name:
+      "store_bytes_from_bytes behaves the same on both memory implementations"
+    (triple mem_content mem_address string)
+    (fun (memory, address, data) ->
+      let data = Bytes.of_string data in
+      are_equivalent
+        memory
+        (fun mem -> Memory_access_slow.store_bytes_from_bytes mem address data)
+        (fun mem -> Memory_access_fast.store_bytes_from_bytes mem address data))
+
+let test_load_bytes =
+  let open Gen in
+  let open QCheck2.Gen in
+  let max_buffer_size =
+    (* This is ~1GiB. We limit the buffer size to avoid the scenario where
+       both variants simply test that they run out of memory. *)
+    1073741823
+  in
+  QCheck2.Test.make
+    ~count:50
     ~name:"load_bytes behaves the same on both memory implementations"
-    (triple mem_content int32 int)
+    (triple mem_content mem_address (0 -- max_buffer_size))
     (fun (memory, address, size) ->
       are_equivalent
         memory
         (fun mem -> Memory_access_slow.load_bytes mem address size)
         (fun mem -> Memory_access_fast.load_bytes mem address size))
+
+(* [test_load_bytes] draws its size from [0 -- max_buffer_size], so it
+   effectively never samples an empty read and never a negative one, yet
+   [Host_funcs.Aux.load_raw_bytes] hands both straight to the memory
+   layer. *)
+let test_load_bytes_degenerate_sizes =
+  let content =
+    Stdlib.List.init (2 * Gen.page_size) (fun _ -> Unsigned.UInt8.zero)
+  in
+  let addresses =
+    Stdlib.List.map
+      (fun pages -> Int32.of_int (pages * Gen.page_size))
+      [0; 1; 2; 3]
+  in
+  Alcotest_lwt.test_case_sync
+    "load_bytes behaves the same on both memory implementations for empty and \
+     negative lengths"
+    `Quick
+    (fun () ->
+      Stdlib.List.iter
+        (fun address ->
+          Stdlib.List.iter
+            (fun size ->
+              if
+                not
+                  (are_equivalent
+                     content
+                     (fun mem -> Memory_access_slow.load_bytes mem address size)
+                     (fun mem -> Memory_access_fast.load_bytes mem address size))
+              then
+                Stdlib.failwith
+                  (Printf.sprintf
+                     "load_bytes of size %d at address %ld differs between the \
+                      two memory implementations"
+                     size
+                     address))
+            [0; -1; -4096])
+        addresses)
 
 let test_store_num =
   let open Gen in
@@ -105,7 +170,7 @@ let test_store_num =
   QCheck2.Test.make
     ~count:50
     ~name:"store_num behaves the same on both memory implementations"
-    (quad mem_content int32 int32 num)
+    (quad mem_content mem_address int32 num)
     (fun (memory, address, offset, num) ->
       are_equivalent
         memory
@@ -113,6 +178,19 @@ let test_store_num =
         (fun mem -> Memory_access_fast.store_num mem address offset num))
 
 let tests : unit Alcotest_lwt.test_case list =
-  List.map
-    Qcheck_helpers.to_alcotest_lwt
-    [test_store_bytes; test_load_bytes; test_store_num]
+  test_load_bytes_degenerate_sizes
+  :: List.map
+       Qcheck_helpers.to_alcotest_lwt
+       [
+         test_store_bytes;
+         test_store_bytes_from_bytes;
+         test_load_bytes;
+         test_store_num;
+       ]
+
+let () =
+  Alcotest_lwt.run
+    ~__FILE__
+    "test lib scoru-wasm-fast"
+    [("Memory access", tests)]
+  |> Lwt_main.run

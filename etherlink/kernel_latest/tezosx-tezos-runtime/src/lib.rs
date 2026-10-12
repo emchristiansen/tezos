@@ -1,0 +1,3986 @@
+// SPDX-FileCopyrightText: 2026 Nomadic Labs <contact@nomadic-labs.com>
+//
+// SPDX-License-Identifier: MIT
+
+use http::StatusCode;
+use mir::ast::{AddressHash, ByteReprTrait};
+use mir::gas::{interpret_cost, Gas, OutOfGas};
+use primitive_types::U256;
+use std::collections::BTreeMap;
+use tezos_crypto_rs::{
+    blake2b,
+    hash::{BlockHash, ChainId, ContractKt1Hash, OperationHash, UnknownSignature},
+};
+use tezos_crypto_rs::{public_key::PublicKey, PublicKeyWithHash};
+use tezos_evm_runtime::runtime_keyspaces::RuntimeKeyspaces;
+use tezosx_types::CheckNativeAddressError;
+// UnknownSignature has a private constructor; use try_from to build one.
+const ZERO_SIGNATURE: [u8; 64] = [0u8; 64];
+use tezos_data_encoding::{enc::BinWriter, types::Narith};
+use tezos_evm_logging::{log, Level::*};
+use tezos_execution::{
+    account_storage::TezosAccount,
+    context, cross_runtime_transfer,
+    enshrined_contracts::{self, CracError},
+    mir_ctx::{InterpretContext, OperationCtx, TcCtx},
+    originate_contract, storage_fees, typecheck_code_and_storage, CracTransferError,
+    TezlinkOperationGas,
+};
+use tezos_protocol::contract::Contract;
+use tezos_smart_rollup::types::PublicKeyHash;
+use tezos_smart_rollup_host::storage::StorageV1;
+use tezos_smart_rollup_keyspace::{KeySpace, KeySpaceLoader};
+// `Parameters` could come from `tezos_protocol::operation`, but we also need
+// `tezos_tezlink` for types that live only there (OperationHash, BlockNumber,
+// TransferError). To avoid the dependency altogether, those types would need
+// to be moved to a shared crate.
+use tezos_tezlink::{
+    block::AppliedOperation,
+    operation::{
+        ManagerOperation, ManagerOperationContent, OriginationContent, Parameters,
+        Script, TransferContent,
+    },
+    operation_result::{
+        ApplyOperationError, ApplyOperationErrors, BacktrackedResult, ContentResult,
+        EventContent, EventSuccess, InternalContentWithMetadata, InternalOperationSum,
+        OperationBatchWithMetadata, OperationDataAndMetadata, OperationResult,
+        OperationResultSum, OperationWithMetadata, OriginationError, OriginationSuccess,
+        TransferError, TransferSuccess, TransferTarget,
+    },
+};
+use tezosx_interfaces::{
+    AliasInfo, AliasResolution, Classification, CrossRuntimeContext, Gas as TezosXGas,
+    Milligas, Origin, Registry, RuntimeId, RuntimeInterface, TezosXRuntimeError,
+    ALIAS_LOOKUP_COST, X_TEZOS_GAS_CONSUMED, X_TEZOS_GAS_LIMIT, X_TEZOS_STORAGE_COST,
+};
+use tezosx_journal::{DispatchSlotError, TezosXJournal};
+
+use tezos_smart_rollup_host::path::OwnedPath;
+
+/// Re-export the canonical null PKH from `tezos_execution` so the rest
+/// of this crate can keep its short name.  Both the synthetic CRAC
+/// markers built here and the `synthetic_crac_marker_tag` helper in
+/// `tezos_execution::enshrined_contracts` match against the same constant.
+pub(crate) use tezos_execution::NULL_PKH;
+
+use tezos_execution::account_storage::{
+    get_tezos_account_info_or_init, narith_to_u256, set_tezos_account_info,
+};
+
+pub struct TezosRuntime(pub ChainId);
+
+pub mod alias_forwarder;
+pub mod headers;
+pub mod url;
+pub mod view;
+
+/// Synthetic "applied" top-level result used by both the success-path
+/// CRAC receipt builder and the post-merge reconciliation in the kernel.
+/// Exposed so the two sites cannot drift: the top-level is a wrapper —
+/// real gas / storage-size / balance-updates live on the internal ops.
+pub fn crac_top_level_applied_result() -> ContentResult<TransferContent> {
+    ContentResult::Applied(TransferTarget::from(TransferSuccess::default()))
+}
+
+/// Synthetic "failed" top-level result used by both the failed-CRAC
+/// receipt builder and the post-merge reconciliation in the kernel.
+/// Exposed so the two sites cannot drift: the error vector is intentionally
+/// empty — indexers read the error on the `alias(E_1)→target` internal op,
+/// so the top-level merely needs to advertise `status: failed`.
+pub fn crac_top_level_failed_result() -> ContentResult<TransferContent> {
+    ContentResult::Failed(ApplyOperationErrors { errors: vec![] })
+}
+
+/// Build an HTTP response from the result of [`execute_request`].
+///
+/// `frame_result` carries the `%collect_result` payload taken out of the
+/// dispatch slot that [`TezosRuntime::serve`] opened for this call. It is
+/// only surfaced on 2xx responses — on 4xx/5xx the operation is about to
+/// be reverted, so the payload is discarded.
+///
+/// Request-level errors are turned into HTTP error responses:
+/// - `Ok(())` → 200, body = `frame_result` (or empty), `Content-Type: application/octet-stream`
+/// - `BadRequest` → 400
+/// - `NotFound` → 404
+///
+/// All other errors propagate as `Err` — they indicate infrastructure
+/// problems that cannot be meaningfully represented as HTTP responses.
+///
+// TODO: Review `Custom` errors in `execute_request` to extract more
+// structured variants (and corresponding HTTP status codes) where
+// possible.
+fn build_response(
+    result: Result<ExecuteRequestOutcome, RequestFailure>,
+    frame_result: Option<Vec<u8>>,
+) -> http::Response<Vec<u8>> {
+    // Success carries a measured value; a failure carries Some when it
+    // metered or when finalize substituted the op limit. None omits the
+    // header, reached only when the op limit is unknown.
+    let consumed_milligas = match &result {
+        Ok(outcome) => Some(outcome.consumed_milligas),
+        Err(failure) => failure.consumed_milligas,
+    };
+    let mut builder = http::Response::builder();
+    if let Some(gas) = consumed_milligas {
+        builder = builder.header(
+            X_TEZOS_GAS_CONSUMED,
+            TezosXGas::new(gas, RuntimeId::Tezos).to_string(),
+        );
+    }
+    let (status, body) = match result {
+        Ok(outcome) => {
+            builder =
+                builder.header(http::header::CONTENT_TYPE, "application/octet-stream");
+            if outcome.delegated_storage_cost > 0 {
+                builder = builder.header(
+                    X_TEZOS_STORAGE_COST,
+                    outcome.delegated_storage_cost.to_string(),
+                );
+            }
+            (StatusCode::OK, frame_result.unwrap_or_default())
+        }
+        Err(RequestFailure { error, .. }) => match error {
+            TezosXRuntimeError::BadRequest(msg) => {
+                (StatusCode::BAD_REQUEST, msg.into_bytes())
+            }
+            TezosXRuntimeError::NotFound(msg) => {
+                (StatusCode::NOT_FOUND, msg.into_bytes())
+            }
+            TezosXRuntimeError::MethodNotAllowed(msg) => {
+                (StatusCode::METHOD_NOT_ALLOWED, msg.into_bytes())
+            }
+            TezosXRuntimeError::OutOfGas => {
+                (StatusCode::TOO_MANY_REQUESTS, b"OOG".to_vec())
+            }
+            e => (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                format!("{e:?}").into_bytes(),
+            ),
+        },
+    };
+    // Safe to unwrap: status is a predefined constant, header names are
+    // static ASCII strings, and the values are ASCII-only.
+    builder.status(status).body(body).unwrap()
+}
+
+/// Reconcile the `execute_request` outcome with the dispatch-slot take
+/// and build the HTTP response.
+///
+/// The dispatch slot is opened at `serve` entry and taken here.
+/// `Err(NoSlot)` means the slot was popped by an intermediate caller
+/// — a kernel bug.  When `result` is `Ok(())` we escalate that case to
+/// a `Custom` error so the response is a 500 rather than an empty 2xx
+/// that hides the inconsistency; when `result` is already `Err` the
+/// request error takes precedence and the dispatch payload (if any)
+/// is dropped on the floor, as it would be for any non-2xx.
+fn finalize_response(
+    result: Result<ExecuteRequestOutcome, RequestFailure>,
+    op_gas: Option<u64>,
+    dispatch: Result<Option<Vec<u8>>, DispatchSlotError>,
+) -> http::Response<Vec<u8>> {
+    let result = match (result, &dispatch) {
+        (Ok(outcome), Err(e)) => Err(RequestFailure {
+            error: TezosXRuntimeError::Custom(format!(
+                "dispatch slot inconsistency: {e}"
+            )),
+            consumed_milligas: Some(outcome.consumed_milligas),
+        }),
+        (other, _) => other,
+    };
+    // A failure that never started metering carries no figure; report the
+    // op limit for it so the caller charges the granted budget rather than
+    // nothing.
+    let result = result.map_err(|mut failure| {
+        if failure.consumed_milligas.is_none() {
+            log!(
+                Info,
+                "Cross-runtime call failed before metering; reporting the op limit as consumed gas: {op_gas:?}"
+            );
+            failure.consumed_milligas = op_gas;
+        }
+        failure
+    });
+    let frame_result = dispatch.ok().flatten();
+    build_response(result, frame_result)
+}
+
+/// Build a synthetic kernel-emitted CRAC frame marker event.
+///
+/// `tag` is either [`tezos_execution::enshrined_contracts::SYNTHETIC_CRAC_EVENT_TAG`]
+/// (begin) or [`tezos_execution::enshrined_contracts::SYNTHETIC_CRAC_END_EVENT_TAG`]
+/// (end).  Both share the same null implicit sender, same payload (the CRAC-ID
+/// string), and sponsored gas encoding (the encode runs against a dedicated
+/// kernel-owned counter rather than the caller's budget so it is infallible
+/// by construction).
+///
+/// `applied` controls the internal-op result status: `true` → Applied,
+/// `false` → Backtracked (used by failed CRAC receipts whose events must
+/// be backtracked to match Tezos protocol semantics).
+fn build_synthetic_crac_marker(
+    null_pkh: &PublicKeyHash,
+    tag: &str,
+    crac_id: &str,
+    nonce: u16,
+    applied: bool,
+) -> Result<InternalOperationSum, TezosXRuntimeError> {
+    use mir::{
+        ast::annotations::NO_ANNS, ast::micheline::Micheline, ast::Entrypoint, lexer,
+    };
+    let mut sponsored_event_gas = Gas::default();
+    let ty = Micheline::App(lexer::Prim::string, &[], NO_ANNS)
+        .encode(&mut sponsored_event_gas)
+        .map_err(|OutOfGas| TezosXRuntimeError::OutOfGas)?
+        .map_err(|e| {
+            TezosXRuntimeError::Custom(format!(
+                "Failed to encode cross-runtime call marker type: {e}"
+            ))
+        })?;
+    let payload = Micheline::from(crac_id.to_string())
+        .encode(&mut sponsored_event_gas)
+        .map_err(|OutOfGas| TezosXRuntimeError::OutOfGas)?
+        .map_err(|e| {
+            TezosXRuntimeError::Custom(format!(
+                "Failed to encode cross-runtime call marker payload: {e}"
+            ))
+        })?;
+    let result = if applied {
+        ContentResult::Applied(EventSuccess {
+            consumed_milligas: Narith(0u64.into()),
+        })
+    } else {
+        ContentResult::BackTracked(BacktrackedResult {
+            errors: None,
+            result: EventSuccess {
+                consumed_milligas: Narith(0u64.into()),
+            },
+        })
+    };
+    Ok(InternalOperationSum::Event(InternalContentWithMetadata {
+        content: EventContent {
+            tag: Some(Entrypoint::from_string_unchecked(tag.into())),
+            payload: Some(payload.into()),
+            ty: ty.into(),
+        },
+        sender: Contract::Implicit(null_pkh.clone()),
+        nonce,
+        result,
+    }))
+}
+
+/// Build a serialized two-step receipt for an incoming CRAC (EVM → Michelson).
+///
+/// The receipt structure (CRAC Derived Block Contents):
+///
+/// **Top-level**: handler (tz1) → source_alias (alias(E_0)), Applied
+///   - **Internal op #0**: CRAC begin event with CRAC-ID
+///   - **Internal op #1**: sender_alias (alias(E_1)) → target, Applied(transfer result)
+///   - **Internal ops 2..N**: further ops from Michelson execution
+///
+/// `source_contract` is alias(E_0) — the alias of the EVM tx originator
+/// (from `X-Tezos-Source`). It is the destination of the top-level op.
+///
+/// `sender_contract` is alias(E_1) — the alias of the immediate EVM caller
+/// (from `X-Tezos-Sender`). It is the sender of the internal op.
+///
+/// Returns the `AppliedOperation` that the block builder will store
+/// in the Michelson runtime block.
+/// [`operation_hash`] becomes the receipt's `AppliedOperation::hash`: the
+/// journal's seed, which for an EVM-entered operation is derived from the
+/// originating Ethereum transaction. Taking it from the journal — as the
+/// Tezos-entered path does — keeps the hash unique per operation and stable
+/// across the merging and nonce renumbering the receipt still undergoes
+/// before it reaches the block.
+#[allow(clippy::too_many_arguments)]
+fn build_crac_receipt(
+    null_pkh: &PublicKeyHash,
+    source_contract: &Contract,
+    sender_contract: &Contract,
+    amount: &Narith,
+    destination: &Contract,
+    parameters: &Parameters,
+    target: TransferTarget,
+    pre_transfer_internals: Vec<InternalOperationSum>,
+    internal_receipts: Vec<InternalOperationSum>,
+    crac_id: &str,
+    base_nonce: u16,
+    operation_hash: &OperationHash,
+) -> Result<AppliedOperation, TezosXRuntimeError> {
+    // Combine, in execution order:
+    //   [CRAC begin event, ...pre_transfer_internals, alias(E_1)→target, ...further internal ops]
+    // The begin event is always the first internal operation (#0).
+    // `pre_transfer_internals` carries the alias-forwarder origination
+    // internal ops materialized during alias resolution — they must
+    // appear BEFORE the synthetic transfer because the EVM precompile
+    // materializes the aliases before initiating the cross-runtime
+    // call those aliases participate in.
+    // Nonces written here are local placeholders; `renumber_nonces`
+    // reassigns them block-wide from the flat list order at block
+    // finalization, so what matters is the position in
+    // `internal_operation_results`, not the numeric value below.
+    let mut all_internal = Vec::new();
+    let mut next_nonce = base_nonce;
+
+    // Begin marker: first internal op of the frame.
+    all_internal.push(build_synthetic_crac_marker(
+        null_pkh,
+        tezos_execution::enshrined_contracts::SYNTHETIC_CRAC_EVENT_TAG,
+        crac_id,
+        next_nonce,
+        true,
+    )?);
+    next_nonce = next_nonce.saturating_add(1);
+
+    all_internal.extend(pre_transfer_internals);
+
+    let transfer_nonce = next_nonce;
+    next_nonce = next_nonce.saturating_add(1);
+    let transfer_internal = InternalOperationSum::Transfer(InternalContentWithMetadata {
+        sender: sender_contract.clone(),
+        nonce: transfer_nonce,
+        content: TransferContent {
+            amount: amount.clone(),
+            destination: destination.clone(),
+            parameters: parameters.clone(),
+        },
+        result: ContentResult::Applied(target),
+    });
+    all_internal.push(transfer_internal);
+
+    // Carry internal receipts from nested Michelson execution, then close
+    // the frame with the end marker.
+    // The nonce here is a placeholder; `renumber_nonces` reassigns all
+    // internal nonces positionally at block finalization.
+    let end_nonce = next_nonce;
+    all_internal.extend(internal_receipts);
+    all_internal.push(build_synthetic_crac_marker(
+        null_pkh,
+        tezos_execution::enshrined_contracts::SYNTHETIC_CRAC_END_EVENT_TAG,
+        crac_id,
+        end_nonce,
+        true,
+    )?);
+
+    // Top-level result: handler → alias(E_0) (applied, with all internals nested).
+    // TransferSuccess::default() is intentional — this is a synthetic wrapper;
+    // actual consumed_milligas, storage_size, etc. are in the internal ops.
+    let top_level_result = OperationResult {
+        balance_updates: vec![],
+        result: crac_top_level_applied_result(),
+        internal_operation_results: all_internal,
+    };
+
+    let signature =
+        UnknownSignature::try_from(ZERO_SIGNATURE.as_slice()).map_err(|e| {
+            TezosXRuntimeError::Custom(format!("Failed to build zero signature: {e}"))
+        })?;
+
+    let op_data =
+        OperationDataAndMetadata::OperationWithMetadata(OperationBatchWithMetadata {
+            operations: vec![OperationWithMetadata {
+                content: ManagerOperationContent::Transaction(ManagerOperation {
+                    source: null_pkh.clone(),
+                    fee: Narith(0u64.into()),
+                    counter: Narith(0u64.into()),
+                    gas_limit: Narith(0u64.into()),
+                    storage_limit: Narith(0u64.into()),
+                    operation: TransferContent {
+                        // The top-level op is a synthetic container
+                        // (handler → alias(E_0)); real amount is on the
+                        // internal op, so we zero it like fee/gas_limit.
+                        amount: Narith(0u64.into()),
+                        destination: source_contract.clone(),
+                        // Only the internal op carries the real target
+                        // parameters.
+                        parameters: Parameters::default(),
+                    },
+                }),
+                receipt: OperationResultSum::Transfer(top_level_result),
+            }],
+            signature,
+        });
+
+    Ok(AppliedOperation {
+        hash: operation_hash.clone(),
+        branch: BlockHash::default(),
+        op_and_receipt: op_data,
+    })
+}
+
+/// Build a failed CRAC receipt.
+///
+/// When `cross_runtime_transfer` fails, we still need a receipt in the
+/// Michelson block so indexers see the failed CRAC.  The top-level
+/// operation has `status: failed` with an empty error vector (see
+/// [`crac_top_level_failed_result`]).
+///
+/// The `alias(E_1)→target` synthetic internal transfer op is marked
+/// according to how the failure occurred:
+///
+/// * **Immediate failure** (`deep_failure = false`): the target's own
+///   call failed.  `alias→target` is `Failed(error)`, carrying the
+///   error exactly once so indexers see which contract was attempted
+///   and why it failed.
+///
+/// * **Deep failure** (`deep_failure = true`): the target's call
+///   returned successfully, but one of its internal operations
+///   subsequently failed.  The real error is already present as a
+///   `Failed` entry in `internal_receipts`; marking `alias→target` as
+///   `Failed` again would duplicate it.  Instead `alias→target` is
+///   `BackTracked(None)`, matching native Tezos L1 semantics where
+///   ancestor ops are backtracked and the error lives once on the
+///   actually-failing descendant.
+///
+/// [`operation_hash`] becomes the receipt's `AppliedOperation::hash`: the
+/// journal's seed, which for an EVM-entered operation is derived from the
+/// originating Ethereum transaction. Taking it from the journal — as the
+/// Tezos-entered path does — keeps the hash unique per operation and stable
+/// across the merging and nonce renumbering the receipt still undergoes
+/// before it reaches the block.
+#[allow(clippy::too_many_arguments)]
+fn build_failed_crac_receipt(
+    null_pkh: &PublicKeyHash,
+    source_contract: &Contract,
+    sender_contract: &Contract,
+    amount: &Narith,
+    destination: &Contract,
+    parameters: &Parameters,
+    error: TransferError,
+    mut pre_transfer_internals: Vec<InternalOperationSum>,
+    internal_receipts: Vec<InternalOperationSum>,
+    crac_id: &str,
+    base_nonce: u16,
+    deep_failure: bool,
+    operation_hash: &OperationHash,
+) -> Result<AppliedOperation, TezosXRuntimeError> {
+    // The CRAC begin event is always first, even on failure.
+    // Since the downstream transfer failed, the event is backtracked
+    // (matching Tezos protocol semantics where all applied internal ops
+    // preceding a failure are backtracked).
+    // `pre_transfer_internals` (alias-forwarder originations) are
+    // backtracked for the same reason: the forwarder KT1 is written to
+    // Michelson durable storage inside the enclosing EVM frame, so it
+    // does NOT survive that frame's revert nor the enclosing batch's
+    // SafeStorage revert.
+    pre_transfer_internals
+        .iter_mut()
+        .for_each(InternalOperationSum::transform_result_backtrack);
+    let mut all_internal = Vec::new();
+    let mut next_nonce = base_nonce;
+
+    // Begin marker: first internal op, backtracked (the failure
+    // backtracks all ops that had not yet completed).
+    // Sponsored encoding — like the success path, encoded against a
+    // dedicated kernel-owned counter so it never draws on the caller's
+    // leftover gas; a gas-tight failed CRAC still records its receipt.
+    all_internal.push(build_synthetic_crac_marker(
+        null_pkh,
+        tezos_execution::enshrined_contracts::SYNTHETIC_CRAC_EVENT_TAG,
+        crac_id,
+        next_nonce,
+        false,
+    )?);
+    next_nonce = next_nonce.saturating_add(1);
+
+    all_internal.extend(pre_transfer_internals);
+
+    // Include the alias(E_1)→target internal transfer so indexers see
+    // which contract call was attempted.  The result depends on whether
+    // the failure was immediate (the target itself failed) or deep (the
+    // target succeeded but one of its internal ops failed):
+    //
+    // - Immediate: alias→target carries the error as Failed(error).
+    // - Deep: alias→target is BackTracked(None); the real error is
+    //   already on the deeper Failed entry in internal_receipts.
+    let transfer_nonce = next_nonce;
+    next_nonce = next_nonce.saturating_add(1);
+    let alias_target_result = if deep_failure {
+        ContentResult::BackTracked(BacktrackedResult {
+            errors: None,
+            result: TransferTarget::ToContract(TransferSuccess::default()),
+        })
+    } else {
+        ContentResult::Failed(ApplyOperationErrors::from(ApplyOperationError::Transfer(
+            error,
+        )))
+    };
+    all_internal.push(InternalOperationSum::Transfer(
+        InternalContentWithMetadata {
+            sender: sender_contract.clone(),
+            nonce: transfer_nonce,
+            content: TransferContent {
+                amount: amount.clone(),
+                destination: destination.clone(),
+                parameters: parameters.clone(),
+            },
+            result: alias_target_result,
+        },
+    ));
+
+    // Internal receipts already have block-global nonces from execution.
+    // End marker closes the frame; also backtracked on failure.
+    // The nonce here is a placeholder; `renumber_nonces` reassigns all
+    // internal nonces positionally at block finalization.
+    let end_nonce = next_nonce;
+    all_internal.extend(internal_receipts);
+    all_internal.push(build_synthetic_crac_marker(
+        null_pkh,
+        tezos_execution::enshrined_contracts::SYNTHETIC_CRAC_END_EVENT_TAG,
+        crac_id,
+        end_nonce,
+        false,
+    )?);
+
+    let top_level_result = OperationResult {
+        balance_updates: vec![],
+        result: crac_top_level_failed_result(),
+        internal_operation_results: all_internal,
+    };
+
+    let signature =
+        UnknownSignature::try_from(ZERO_SIGNATURE.as_slice()).map_err(|e| {
+            TezosXRuntimeError::Custom(format!("Failed to build zero signature: {e}"))
+        })?;
+
+    let op_data =
+        OperationDataAndMetadata::OperationWithMetadata(OperationBatchWithMetadata {
+            operations: vec![OperationWithMetadata {
+                content: ManagerOperationContent::Transaction(ManagerOperation {
+                    source: null_pkh.clone(),
+                    fee: Narith(0u64.into()),
+                    counter: Narith(0u64.into()),
+                    gas_limit: Narith(0u64.into()),
+                    storage_limit: Narith(0u64.into()),
+                    operation: TransferContent {
+                        amount: Narith(0u64.into()),
+                        destination: source_contract.clone(),
+                        parameters: Parameters::default(),
+                    },
+                }),
+                receipt: OperationResultSum::Transfer(top_level_result),
+            }],
+            signature,
+        });
+
+    Ok(AppliedOperation {
+        hash: operation_hash.clone(),
+        branch: BlockHash::default(),
+        op_and_receipt: op_data,
+    })
+}
+
+/// Build an [`InternalOperationSum::Origination`] surfacing an
+/// alias-forwarder materialization (`ensure_alias` branch 3). The
+/// `nonce` is a 0 placeholder; the receiving runtime stamps the real
+/// nonce when assembling the CRAC receipt. The result carries the
+/// [`OriginationSuccess`] returned by [`originate_contract`] —
+/// script, balance updates, consumed gas, `originated_contracts`.
+fn build_alias_origination_internal(
+    null_pkh: &PublicKeyHash,
+    script: Script,
+    success: OriginationSuccess,
+) -> InternalOperationSum {
+    InternalOperationSum::Origination(InternalContentWithMetadata {
+        sender: Contract::Implicit(null_pkh.clone()),
+        nonce: 0,
+        content: OriginationContent {
+            balance: Narith(0u64.into()),
+            delegate: None,
+            script,
+        },
+        result: ContentResult::Applied(success),
+    })
+}
+
+#[derive(Default)]
+pub(crate) struct ExecuteRequestOutcome {
+    delegated_storage_cost: u64,
+    /// Milligas metered by this request, reported back to the caller.
+    consumed_milligas: u64,
+}
+
+/// A request failure carrying the milligas metered before it occurred.
+///
+/// `Some(n)` means metering had started and charged `n`. `None` means the
+/// failure preceded metering, so no figure was taken; the caller charges
+/// the op limit for it. A bare `?` yields `None` through the [`From`] below.
+//
+// TODO https://linear.app/tezos/issue/L2-1787
+// Making this a plain `u64` (op-limit fallback done in `build_response`)
+// is blocked on generalizing parsing and splitting the pre-metering
+// failure type, since `op_gas` is itself an `Option`. Deferred; see issue.
+pub(crate) struct RequestFailure {
+    error: TezosXRuntimeError,
+    consumed_milligas: Option<u64>,
+}
+
+impl<E> From<E> for RequestFailure
+where
+    E: Into<TezosXRuntimeError>,
+{
+    fn from(error: E) -> Self {
+        Self {
+            error: error.into(),
+            consumed_milligas: None,
+        }
+    }
+}
+
+/// Execute a cross-runtime request: dispatches on the HTTP method.
+///
+/// - `POST` → entrypoint call (existing state-mutating transfer path).
+/// - `GET`  → view call (read-only execution of a named Michelson view).
+/// - anything else → catchable 405 (`MethodNotAllowed`).
+///
+/// This is the core logic behind [`TezosRuntime::serve`], separated so
+/// that `serve` only handles the error-to-HTTP-status mapping.
+///
+/// The consumed milligas rides in the return type, in
+/// [`ExecuteRequestOutcome`] on success or [`RequestFailure`] on error;
+/// a failure before metering carries no value and reports as unset.
+fn execute_request<Host, KS>(
+    chain_id: &ChainId,
+    registry: &impl Registry<Journal = TezosXJournal>,
+    rk: &mut RuntimeKeyspaces<'_, Host, KS>,
+    journal: &mut TezosXJournal,
+    request: http::Request<Vec<u8>>,
+) -> Result<ExecuteRequestOutcome, RequestFailure>
+where
+    Host: StorageV1 + KeySpaceLoader<KeySpace = KS>,
+    KS: KeySpace,
+{
+    match *request.method() {
+        http::Method::POST => {
+            execute_entrypoint_call(chain_id, registry, rk, journal, request)
+        }
+        http::Method::GET => {
+            // The view path doesn't mutate storage or push a CRAC
+            // receipt, but it still deposits its Micheline result into
+            // the dispatch slot opened by `serve` (same slot the
+            // entrypoint path fills via `%collect_result`), so the
+            // journal is threaded through. The registry is threaded
+            // too so the view can issue nested cross-runtime reads
+            // through the gateway's `staticcall_evm` synthetic view
+            // (L2-1259).
+            view::execute_view_call(chain_id, registry, rk, journal, request)
+        }
+        ref other => Err(TezosXRuntimeError::MethodNotAllowed(format!(
+            "HTTP method {other} not allowed (use POST for entrypoint calls or GET for views)"
+        ))
+        .into()),
+    }
+}
+
+/// Execute an entrypoint call (state-mutating transfer targeting a
+/// Michelson contract or implicit account). On success, returns the
+/// total mutez storage cost this frame delegates upward — the sum
+/// of the values received from inner outgoing CRACs and the
+/// standalone cost of this frame's own internal operations.
+fn execute_entrypoint_call<Host, KS>(
+    chain_id: &ChainId,
+    registry: &impl Registry<Journal = TezosXJournal>,
+    rk: &mut RuntimeKeyspaces<'_, Host, KS>,
+    journal: &mut TezosXJournal,
+    request: http::Request<Vec<u8>>,
+) -> Result<ExecuteRequestOutcome, RequestFailure>
+where
+    Host: StorageV1 + KeySpaceLoader<KeySpace = KS>,
+    KS: KeySpace,
+{
+    // Drain on entry, NOT on exit: pending alias-origination
+    // internal ops in the journal at this point can only belong
+    // to THIS call's gateway precompile invocation, since:
+    //   (a) any prior outer cross-runtime call has already entered
+    //       its own `execute_entrypoint_call` and drained whatever
+    //       was pending for IT,
+    //   (b) any re-entrant inner cross-runtime call that
+    //       `cross_runtime_transfer` triggers below will, in turn,
+    //       drain its own aliases at its entry — never seeing our
+    //       captured ones because we already moved them out of the
+    //       journal here.
+    // The result is per-call scoping with no watermarking logic.
+    let alias_origination_internals =
+        journal.michelson.take_pending_alias_origination_internals();
+    let parsed = url::parse_tezos_url(request.uri())?;
+    let hdrs = headers::parse_request_headers(request.headers())?;
+
+    // Assign the dispatch slot's owner to the serve target BEFORE its
+    // code runs. Only this address's own `%collect_result` may write
+    // the slot (enforced by the entrypoint handler); a native callee
+    // reached from the target's own execution presents a different
+    // `SENDER` and is rejected. Must match the `AddressHash` the
+    // target's own `%collect_result` will observe as `ctx.sender()`
+    // (`ExecCtx::create`'s `self_address`, derived the same way).
+    let dispatch_owner = match &parsed.destination {
+        Contract::Implicit(pkh) => AddressHash::Implicit(pkh.clone()),
+        Contract::Originated(kt1) => AddressHash::Kt1(kt1.clone()),
+    };
+    let mut owner_bytes = Vec::new();
+    dispatch_owner.to_bytes(&mut owner_bytes);
+    journal.michelson.set_current_dispatch_owner(owner_bytes);
+
+    // Start the op-gas counter early so the Unit fallback below can be
+    // metered against the user's actual budget.
+    let mut gas =
+        TezlinkOperationGas::start_milligas(u64::from(Milligas::from(hdrs.gas_limit)))
+            .map_err(|e| {
+                TezosXRuntimeError::Custom(format!("Failed to start gas: {e:?}"))
+            })?;
+
+    let body = request.into_body();
+    // An empty body means "no parameters" which defaults to Micheline Unit.
+    // This is required for implicit account transfers where the Michelson VM
+    // checks that param == Unit.
+    let value = if body.is_empty() {
+        mir::ast::micheline::Micheline::from(())
+            .encode(&mut gas.remaining)
+            .map_err(|OutOfGas| TezosXRuntimeError::OutOfGas)?
+            .map_err(|e| {
+                TezosXRuntimeError::Custom(format!("Failed to encode Unit: {e}"))
+            })?
+    } else {
+        body
+    };
+    let parameters = Parameters {
+        entrypoint: parsed.entrypoint,
+        value,
+    };
+
+    // Verify the incoming CRAC ID matches the journal's (set by the
+    // block builder).  This ensures consistency across runtime boundaries.
+    if let Some(ref crac_id) = hdrs.crac_id {
+        journal.verify_crac_id(crac_id).map_err(|e| {
+            TezosXRuntimeError::Custom(format!("cross-runtime call ID mismatch: {e}"))
+        })?;
+    }
+
+    // SOURCE is always the null implicit account.  Michelson requires
+    // SOURCE to be tz1/tz2/tz3; the null PKH fills that role for both
+    // CRAC and non-CRAC requests.
+    let is_crac = hdrs.crac_origin_contract.is_some();
+    let source_pkh = PublicKeyHash::from_b58check(NULL_PKH).map_err(|e| {
+        TezosXRuntimeError::ConversionError(format!("Failed to parse null address: {e}"))
+    })?;
+    let source_account =
+        context::implicit_from_public_key_hash(&source_pkh).map_err(|e| {
+            TezosXRuntimeError::Custom(format!("Failed to fetch source account: {e:?}"))
+        })?;
+
+    let mut tc_ctx = TcCtx {
+        rk: &mut *rk,
+        operation_gas: &mut gas,
+        big_map_diff: BTreeMap::new(),
+        interpret_context: InterpretContext::new(),
+        temporary_big_map_id_allocator: journal
+            .michelson
+            .temporary_big_map_id_allocator(),
+    };
+    // Nothing to set up for the origination nonce: it lives on the
+    // Michelson journal, which owns it for the whole manager operation,
+    // and `Ctx::origination_counter` claims indices straight from there
+    // (`MichelsonJournal::next_origination_index`). That is what keeps
+    // two sequential inbound CRACs — and a native origination in the
+    // same operation — on distinct child KT1s: child KT1 is
+    // `digest_160(operation_hash[32] || index[4])`, so a per-frame index
+    // restarting at 0 would collide (L2-1366). Claiming rather than
+    // resuming a local copy also covers the nested case, where an outer
+    // frame's copy would go stale as soon as an inner frame originated.
+    //
+    // Resume the MIR internal-operation counter from the Michelson
+    // journal (L2-1676). The counter is the replay identity L1 enforces
+    // for internal operations; without resuming it, each reentrant
+    // inbound Michelson frame would restart from 0, so two internal
+    // operations in an `EVM → Michelson → EVM → Michelson` chain could
+    // share the same counter and break L1's single internal-nonce
+    // namespace for the manager operation's internal-op tree. The
+    // post-execution value is written back below
+    // (`set_internal_operation_counter`), and a subsequent
+    // `revert_frame` rolls it back to the value captured at frame entry.
+    let mut counter = journal.michelson.internal_operation_counter();
+    let mut operation_ctx = OperationCtx {
+        source: &source_account,
+        counter: &mut counter,
+        // Fresh per inbound CRAC servicing, scoped exactly like
+        // `counter`: an internal-operation replay (a DUP'd `operation`
+        // emitted twice) within this sub-execution is rejected here
+        // just as on the native path (L2-1637).
+        applied_counters: std::collections::BTreeSet::new(),
+        level: &hdrs.block_number,
+        now: &hdrs.timestamp,
+        chain_id,
+        source_public_key: &[],
+        crac_chain_depth: hdrs.crac_depth,
+        // Retain the inbound CRAC originator so the gateway can forward
+        // it (translated) as the outbound source, keeping `tx.origin`
+        // invariant across runtime hops (L2-1363). May be `Originated(KT1)`
+        // (EVM alias) or `Implicit(pkh)` (native Michelson origin). `None`
+        // only for a top-level Michelson tx (absent `X-Tezos-Source`).
+        crac_origin: hdrs.crac_origin_contract.clone(),
+        delegated_storage_cost: 0,
+    };
+    let parser = mir::parser::Parser::new();
+
+    // Each operation uses 0-based nonces; block-sequential nonces are
+    // assigned at block finalization by renumber_nonces().
+    let base_nonce: u16 = 0;
+    // Pre-allocate nonce slots for the begin event (nonce 0) and the
+    // synthetic transfer (nonce 1) that build_crac_receipt prepends, so
+    // MIR ops start at nonce 2.  The end event's nonce is computed
+    // after internal_receipts are assembled and does not need a slot here.
+    let mut nonce_counter: u16 = if is_crac { 2 } else { 0 };
+    // Stamp the alias-forwarder origination internal ops (drained
+    // from the journal at function entry) with placeholder nonces
+    // taken from `nonce_counter` BEFORE running `cross_runtime_transfer`,
+    // so MIR ops receive higher local nonces than the alias ops. The
+    // alias ops are passed to `build_crac_receipt` separately and get
+    // placed between the synthetic CRAC event and the synthetic
+    // transfer in the final receipt — the cross-runtime call enters
+    // Michelson AFTER its aliases have been materialized. The flat-
+    // list order is what matters: `renumber_nonces` reassigns
+    // block-global nonces at block finalization based on that order.
+    let alias_origination_internals: Vec<InternalOperationSum> =
+        alias_origination_internals
+            .into_iter()
+            .map(|op| {
+                let n = nonce_counter;
+                nonce_counter = nonce_counter.checked_add(1).ok_or_else(|| {
+                    TezosXRuntimeError::Custom(
+                        "alias-origination internal-op nonce counter overflowed"
+                            .to_string(),
+                    )
+                })?;
+                Ok(match op {
+                    InternalOperationSum::Origination(mut meta) => {
+                        meta.nonce = n;
+                        InternalOperationSum::Origination(meta)
+                    }
+                    other => other,
+                })
+            })
+            .collect::<Result<_, TezosXRuntimeError>>()?;
+    // Dispatch on the parsed `Contract` variant to build the right
+    // concrete account, mirroring the pattern used by
+    // `tezos_execution::transfer` for the destination.
+    let transfer_result = match &hdrs.sender {
+        Contract::Originated(kt1) => {
+            let sender_account = context::originated_from_kt1(kt1).map_err(|e| {
+                TezosXRuntimeError::Custom(format!(
+                    "Failed to fetch sender account: {e:?}"
+                ))
+            })?;
+            cross_runtime_transfer(
+                &mut tc_ctx,
+                &mut operation_ctx,
+                registry,
+                journal,
+                &sender_account,
+                &hdrs.amount,
+                &parsed.destination,
+                &parameters,
+                &parser,
+                &mut nonce_counter,
+            )
+        }
+        Contract::Implicit(pkh) => {
+            let sender_account =
+                context::implicit_from_public_key_hash(pkh).map_err(|e| {
+                    TezosXRuntimeError::Custom(format!(
+                        "Failed to fetch sender account: {e:?}"
+                    ))
+                })?;
+            cross_runtime_transfer(
+                &mut tc_ctx,
+                &mut operation_ctx,
+                registry,
+                journal,
+                &sender_account,
+                &hdrs.amount,
+                &parsed.destination,
+                &parameters,
+                &parser,
+                &mut nonce_counter,
+            )
+        }
+    };
+    let received_delegated_storage_cost = operation_ctx.delegated_storage_cost;
+    // Capture the post-execution MIR counter before `operation_ctx`
+    // (which borrows the local `counter`) is dropped, so it can be
+    // persisted back to the journal below for the next reentrant frame
+    // to resume from (L2-1676).
+    let final_internal_operation_counter = *operation_ctx.counter;
+    // The origination index needs no write-back: MIR claimed its indices
+    // directly from the journal during execution, so the journal already
+    // reflects every `CREATE_CONTRACT` this inbound CRAC performed. A
+    // subsequent `revert_frame` on the enclosing EVM frame rolls it back
+    // to the value captured at frame entry.
+    //
+    // Persist the post-execution MIR internal-operation counter back to
+    // the journal on every path (success, failure, OOG): the next
+    // reentrant inbound Michelson frame resumes from this value so
+    // internal-operation replay identities stay monotonic across the
+    // whole NAC transaction, and a subsequent `revert_frame` on the
+    // enclosing EVM frame rolls it back to the frame-entry value
+    // (L2-1676).
+    journal
+        .michelson
+        .set_internal_operation_counter(final_internal_operation_counter);
+    let result = match transfer_result {
+        Ok(r) => r,
+        Err(CracTransferError {
+            error,
+            internal_receipts,
+            deep_failure,
+        }) => {
+            // Map CracError to its TezosXRuntimeError HTTP-status equivalent.
+            // OutOfGas → 429 (catchable revert); user-facing TransferError
+            // variants → 400 (catchable revert); BlockAbort → 500 (abort
+            // the EVM caller's frame, then the block).
+            //
+            // The infra-class TransferError variants (FailedTo*) are routed
+            // to BlockAbort upstream by `From<TransferError> for CracError`
+            // — see `enshrined_contracts.rs:56-`. They never appear here as
+            // CracError::Operation, so this match doesn't enumerate them.
+            let rt_err = match &error {
+                CracError::Operation(TransferError::OutOfGas(OutOfGas)) => {
+                    TezosXRuntimeError::OutOfGas
+                }
+                CracError::Operation(e) => TezosXRuntimeError::BadRequest(e.to_string()),
+                CracError::BlockAbort(msg) => {
+                    TezosXRuntimeError::Custom(format!("block abort: {msg}"))
+                }
+            };
+            if is_crac {
+                // Build a failed receipt so the Michelson block records the
+                // failed CRAC (RFC Example 4), including any partial
+                // internal operations with backtracked/failed/skipped statuses.
+                // Only emitted for operation-level failures; BlockAbort aborts
+                // the whole block, so no per-operation receipt is produced.
+                //
+                // The builder sponsors its own synthetic-event encoding
+                // (see `build_failed_crac_receipt`), so it does NOT draw on
+                // the caller's leftover gas and cannot fail with OutOfGas —
+                // a gas-tight failed CRAC still records its receipt here
+                // (L2-1464). The `Err` arm below therefore only covers the
+                // (practically unreachable) serialization/signature paths.
+                if let (Some(source_contract), CracError::Operation(te)) =
+                    (hdrs.crac_origin_contract.as_ref(), error)
+                {
+                    let crac_id_str = journal.crac_id().to_string();
+                    match build_failed_crac_receipt(
+                        &source_pkh,
+                        source_contract,
+                        &hdrs.sender,
+                        &hdrs.amount,
+                        &parsed.destination,
+                        &parameters,
+                        te,
+                        alias_origination_internals,
+                        internal_receipts,
+                        &crac_id_str,
+                        base_nonce,
+                        deep_failure,
+                        journal.michelson.operation_hash(),
+                    ) {
+                        Ok(receipt) => {
+                            #[cfg(debug_assertions)]
+                            assert_receipt_markers_balanced(&receipt);
+                            journal.michelson.push_failed_crac_receipt(receipt);
+                        }
+                        Err(e) => {
+                            log!(Error, "Failed to build failed cross-runtime call receipt: {e:?}");
+                        }
+                    }
+                }
+            }
+            // Metering had started, so report the real consumed gas. This
+            // is a metered failure, not an unset one, so the caller charges
+            // this figure rather than the op limit.
+            return Err(RequestFailure {
+                error: rt_err,
+                consumed_milligas: Some(gas.total_milligas_consumed().into()),
+            });
+        }
+    };
+
+    if is_crac {
+        let source_contract = hdrs.crac_origin_contract.as_ref().ok_or_else(|| {
+            TezosXRuntimeError::Custom(
+                "is_crac set but crac_origin_contract is None".into(),
+            )
+        })?;
+        // Pass the alias-forwarder origination internals separately so
+        // `build_crac_receipt` can insert them BETWEEN the CRAC event
+        // and the synthetic transfer — the materializations happen
+        // before the cross-runtime transfer they participate in.
+        let crac_id_str = journal.crac_id().to_string();
+        let receipt = build_crac_receipt(
+            &source_pkh,
+            source_contract,
+            &hdrs.sender,
+            &hdrs.amount,
+            &parsed.destination,
+            &parameters,
+            result.target,
+            alias_origination_internals,
+            result.internal_receipts,
+            &crac_id_str,
+            base_nonce,
+            journal.michelson.operation_hash(),
+        )?;
+        #[cfg(debug_assertions)]
+        assert_receipt_markers_balanced(&receipt);
+        journal.michelson.push_pending_crac_receipt(receipt);
+    };
+    let consumed_milligas = gas.total_milligas_consumed().into();
+
+    let delegated_storage_cost =
+        result.own_storage_cost + received_delegated_storage_cost;
+
+    let delegated_storage_cost = u64::try_from(delegated_storage_cost).map_err(|e| {
+        TezosXRuntimeError::ConversionError(format!(
+            "Delegated storage cost does not fit in u64: {e}"
+        ))
+    })?;
+
+    Ok(ExecuteRequestOutcome {
+        delegated_storage_cost,
+        consumed_milligas,
+    })
+}
+
+/// Assert that the CRAC frame markers in a receipt are balanced.
+///
+/// Gated to debug/test builds (`#[cfg(debug_assertions)]`): compiled out
+/// of every release build — the production kernel and the release kernel
+/// the tezt suite runs — so it adds no runtime cost and cannot affect the
+/// block hash.
+///
+/// A production check would be redundant: marker balance holds by
+/// construction (both builders emit the begin/end pair atomically, and no
+/// later splice/merge step can unbalance a receipt).  Asserting that
+/// directly for every CRAC shape is awkward, so instead this walks the
+/// fully-assembled receipt at push time whenever the kernel runs under
+/// `cargo test`, turning any such run into an indirect balance check that
+/// trips on a regression in the builders, the splice, or the merge.
+///
+/// Steps through `internal_operation_results` using
+/// [`tezos_execution::enshrined_contracts::synthetic_crac_marker_tag`] to
+/// identify null-sender events with tag `"cross_runtime_call"` (push) or `"cross_runtime_call_end"`
+/// (pop).  Asserts depth never goes negative and that the final depth is
+/// zero.  Events with the null sender but a different tag (e.g. `"deposit"`)
+/// return `None` from the helper and do not affect the walk.
+#[cfg(debug_assertions)]
+fn assert_receipt_markers_balanced(receipt: &tezos_tezlink::block::AppliedOperation) {
+    use tezos_execution::enshrined_contracts::{
+        synthetic_crac_marker_tag, SYNTHETIC_CRAC_END_EVENT_TAG, SYNTHETIC_CRAC_EVENT_TAG,
+    };
+    use tezos_tezlink::operation_result::{OperationDataAndMetadata, OperationResultSum};
+    let OperationDataAndMetadata::OperationWithMetadata(ref batch) =
+        receipt.op_and_receipt;
+    let Some(op) = batch.operations.first() else {
+        return;
+    };
+    let OperationResultSum::Transfer(ref result) = op.receipt else {
+        return;
+    };
+    let mut depth: i64 = 0;
+    for iop in &result.internal_operation_results {
+        if let Some(tag) = synthetic_crac_marker_tag(iop) {
+            if tag == SYNTHETIC_CRAC_EVENT_TAG {
+                depth += 1;
+            } else if tag == SYNTHETIC_CRAC_END_EVENT_TAG {
+                depth -= 1;
+                debug_assert!(
+                    depth >= 0,
+                    "cross-runtime call marker imbalance: end marker without matching begin"
+                );
+            }
+        }
+    }
+    debug_assert_eq!(
+        depth, 0,
+        "cross-runtime call marker imbalance: unmatched begin markers"
+    );
+}
+
+impl RuntimeInterface for TezosRuntime {
+    type Journal = TezosXJournal;
+
+    fn create_alias<Host, KS>(
+        &self,
+        _registry: &impl Registry<Journal = TezosXJournal>,
+        rk: &mut RuntimeKeyspaces<'_, Host, KS>,
+        journal: &mut TezosXJournal,
+        alias: &str,
+        alias_info: AliasInfo,
+        _native_public_key: Option<&[u8]>,
+        _context: CrossRuntimeContext,
+        gas_remaining: TezosXGas,
+    ) -> Result<AliasResolution, TezosXRuntimeError>
+    where
+        Host: StorageV1 + KeySpaceLoader<KeySpace = KS>,
+        KS: KeySpace,
+    {
+        // Gas costs in milligas, charged incrementally so we fail early.
+        // The closure pattern would persist a borrow on `remaining`; a
+        // free function lets the borrow last only for the duration of
+        // each call so we can also pass `remaining` to
+        // `TezlinkOperationGas::start_milligas` below.
+        let mut remaining = gas_remaining.as_runtime(RuntimeId::Tezos);
+        fn consume(remaining: &mut u64, cost: u64) -> Result<(), TezosXRuntimeError> {
+            *remaining = remaining
+                .checked_sub(cost)
+                .ok_or(TezosXRuntimeError::OutOfGas)?;
+            Ok(())
+        }
+        // Running out of gas means the whole budget was used: reported as
+        // such, so the caller charges it rather than dropping it. The
+        // typechecker reports it as text, hence the look at the counter.
+        fn origination_error(
+            gas: &TezlinkOperationGas,
+            context: &str,
+            e: OriginationError,
+        ) -> TezosXRuntimeError {
+            if gas.remaining.milligas().is_none()
+                || matches!(e, OriginationError::OutOfGas(_))
+            {
+                TezosXRuntimeError::OutOfGas
+            } else {
+                TezosXRuntimeError::Custom(format!("{context}: {e:?}"))
+            }
+        }
+
+        let kt1 = ContractKt1Hash::from_base58_check(alias).map_err(|err| {
+            TezosXRuntimeError::Custom(format!(
+                "Failed to parse KT1 address from alias: {err}"
+            ))
+        })?;
+
+        let world_state = OwnedPath::from(
+            &tezos_evm_runtime::runtime_keyspaces::TEZ_ACCOUNTS_ROOT_PATH,
+        );
+        journal
+            .michelson
+            .checkpoint(rk.host_mut(), &world_state)
+            .map_err(|e| {
+                TezosXRuntimeError::Custom(format!(
+                    "Failed to snapshot world state for alias: {e:?}"
+                ))
+            })?;
+
+        // Deploy the forwarder via the
+        // shared `originate_contract` path, passing `Origin::Alias` so
+        // the classification write is performed in the same call.
+
+        // L2-1529: guarantee the shared implementation slot is seeded before a
+        // code-less alias is created, so a code-less `Origin::Alias` account
+        // can never coexist with an unseeded slot (which would make `code()`
+        // resolution fail). Idempotent — a no-op once the slot exists (seeded
+        // at runtime activation / migration). This makes "seed precedes alias"
+        // hold by construction, on every network.
+        crate::alias_forwarder::init_alias_implementation(rk.host_mut())?;
+
+        let code = alias_forwarder::forwarder_code().map_err(|e| {
+            TezosXRuntimeError::Custom(format!(
+                "Failed to decode forwarder code from hex: {e}"
+            ))
+        })?;
+        // Initialize the encoding counter with the remaining op-gas
+        // budget so the encoding work is metered against the user's
+        // actual budget; OOG inside the encode means insufficient
+        // budget, not a synthetic high-cap failure.
+        let mut encoding_gas = Gas::new(u32::try_from(remaining).unwrap_or(u32::MAX));
+        let storage = alias_forwarder::forwarder_storage(
+            &alias_info.native_address,
+            &mut encoding_gas,
+        )
+        .map_err(|OutOfGas| TezosXRuntimeError::OutOfGas)?
+        .map_err(|e| {
+            TezosXRuntimeError::Custom(format!("Failed to encode forwarder storage: {e}"))
+        })?;
+
+        // `forwarder_storage` returned `Ok`, so the counter cannot be
+        // exhausted. Surface a clear error rather than silently
+        // miscounting if a future refactor ever breaks that invariant.
+        let remaining_after_encode = encoding_gas.milligas().ok_or_else(|| {
+            TezosXRuntimeError::Custom(
+                "internal invariant violated: forwarder_storage returned Ok \
+                 but encoding_gas counter is exhausted"
+                    .into(),
+            )
+        })?;
+        remaining = remaining_after_encode.into();
+
+        // Build the synthetic source/sender account. NULL_PKH carries
+        // zero balance, which matches the initial-balance transfer of
+        // zero requested below.
+        let null_pkh = PublicKeyHash::from_b58check(NULL_PKH).map_err(|e| {
+            TezosXRuntimeError::ConversionError(format!("Failed to parse null PKH: {e}"))
+        })?;
+        let source_account =
+            context::implicit_from_public_key_hash(&null_pkh).map_err(|e| {
+                TezosXRuntimeError::Custom(format!(
+                    "Failed to fetch null source account: {e:?}"
+                ))
+            })?;
+
+        let script = Script { code, storage };
+        let origin = Origin::Alias(alias_info);
+        let receipt = {
+            let mut gas =
+                TezlinkOperationGas::start_milligas(remaining).map_err(|e| {
+                    TezosXRuntimeError::Custom(format!("Failed to start gas: {e:?}"))
+                })?;
+            let mut tc_ctx = TcCtx {
+                rk: &mut *rk,
+                operation_gas: &mut gas,
+                big_map_diff: BTreeMap::new(),
+                interpret_context: InterpretContext::new(),
+                temporary_big_map_id_allocator: journal
+                    .michelson
+                    .temporary_big_map_id_allocator(),
+            };
+            let parser = mir::parser::Parser::new();
+            let typed_storage = typecheck_code_and_storage(&mut tc_ctx, &parser, &script)
+                .map_err(|e| {
+                    origination_error(
+                        tc_ctx.operation_gas,
+                        "Failed to typecheck forwarder script",
+                        e,
+                    )
+                })?;
+            // L2-1529: materialize the alias *code-less*. Passing `None` writes
+            // no `/data/code`, so the alias resolves to the single shared
+            // implementation (see `TezosOriginatedAccount::code`). The
+            // per-alias `/data/storage` (the native address) is still written.
+            // The internal operation built below keeps the full forwarder
+            // script, preserving the receipt indexers saw before the switch.
+            originate_contract(
+                &mut tc_ctx,
+                kt1,
+                &source_account,
+                &Narith(0u64.into()),
+                None,
+                mir::ast::RcTypedValue::new(typed_storage),
+                &origin,
+            )
+            .map_err(|e| {
+                origination_error(
+                    tc_ctx.operation_gas,
+                    "Failed to originate alias forwarder",
+                    e,
+                )
+            })?
+        };
+        let consumed: u64 = (&receipt.consumed_milligas.0).try_into().map_err(|_| {
+            TezosXRuntimeError::Custom(
+                "consumed_milligas does not fit in u64".to_string(),
+            )
+        })?;
+        consume(&mut remaining, consumed)?;
+
+        // Park the internal `Origination` on the Michelson journal.
+        // `execute_entrypoint_call` drains the journal at entry of
+        // every cross-runtime call it serves and folds the entries
+        // into THAT call's CRAC receipt. The kernel never sees a
+        // separate AppliedOperation for the alias materialization;
+        // it surfaces only as an internal op of the enclosing CRAC.
+        let internal_op = build_alias_origination_internal(&null_pkh, script, receipt);
+
+        let alias_storage_cost =
+            storage_fees::compute_internal_op_storage_fees(&internal_op).map_err(|e| {
+                TezosXRuntimeError::Custom(format!(
+                    "Failed to compute storage fees for the alias forwarder origination: {e:?}"
+                ))
+            })?;
+
+        let alias_storage_cost = u64::try_from(alias_storage_cost).map_err(|e| {
+            TezosXRuntimeError::ConversionError(format!(
+                "Alias storage cost does not fit in u64: {e}"
+            ))
+        })?;
+
+        journal
+            .michelson
+            .push_pending_alias_origination_internal(internal_op);
+
+        Ok(AliasResolution::build_with_delegated_storage_cost(
+            tezosx_interfaces::Gas::new(remaining, RuntimeId::Tezos),
+            alias_storage_cost,
+        ))
+    }
+
+    fn alias_exists<Host, KS>(
+        &self,
+        rk: &mut RuntimeKeyspaces<'_, Host, KS>,
+        _journal: &mut Self::Journal,
+        alias: &str,
+    ) -> Result<bool, TezosXRuntimeError>
+    where
+        Host: StorageV1,
+        KS: KeySpace,
+    {
+        let kt1 = ContractKt1Hash::from_base58_check(alias).map_err(|err| {
+            TezosXRuntimeError::ConversionError(format!(
+                "Failed to parse alias from string: {err}"
+            ))
+        })?;
+        let account = context::originated_from_kt1(&kt1)?;
+
+        match account.origin(rk.host())? {
+            Some(Origin::Alias(_)) => Ok(true),
+            Some(Origin::Native) => Err(TezosXRuntimeError::Custom(format!(
+                "alias_exists: account {alias} is recorded as Native"
+            ))),
+            None => Ok(false),
+        }
+    }
+
+    fn compute_alias(&self, native_address: &[u8]) -> Result<String, TezosXRuntimeError> {
+        let kt1 = ContractKt1Hash::from(blake2b::digest_160(native_address));
+        Ok(kt1.to_base58_check())
+    }
+
+    /// Execute a cross-runtime call where the sender's balance was already
+    /// debited by the calling runtime (e.g. EVM gateway). This handles both
+    /// implicit and originated destinations, including Michelson code execution
+    /// and internal operations.
+    fn serve<Host, KS>(
+        &self,
+        registry: &impl Registry<Journal = TezosXJournal>,
+        rk: &mut RuntimeKeyspaces<'_, Host, KS>,
+        journal: &mut TezosXJournal,
+        request: http::Request<Vec<u8>>,
+    ) -> http::Response<Vec<u8>>
+    where
+        Host: StorageV1 + KeySpaceLoader<KeySpace = KS>,
+        KS: KeySpace,
+    {
+        // Open a dispatch slot for this CRAC entry so that any inner
+        // %collect_result deposits land here. The slot is owned by
+        // `serve` and is disjoint from REVM's external_checkpoints
+        // stack — durable-state isolation across CRAC boundaries is
+        // handled separately by `cross_runtime_transfer`'s own
+        // snapshot mechanism.
+        journal.michelson.push_dispatch_slot();
+        // The gas budget granted to this call. A failure that never started
+        // metering reports it as consumed, so the caller charges the op
+        // limit rather than nothing.
+        let op_gas = request
+            .headers()
+            .get(X_TEZOS_GAS_LIMIT)
+            .and_then(|v| v.to_str().ok())
+            .and_then(|s| s.parse::<u64>().ok());
+        let result = execute_request(&self.0, registry, rk, journal, request);
+        finalize_response(result, op_gas, journal.michelson.take_dispatch_result())
+    }
+
+    fn host(&self) -> &'static str {
+        "tezos"
+    }
+
+    fn address_from_string(
+        &self,
+        address_str: &str,
+    ) -> Result<Vec<u8>, TezosXRuntimeError> {
+        let contract = Contract::from_b58check(address_str).map_err(|e| {
+            TezosXRuntimeError::ConversionError(format!(
+                "Failed to parse address from string: {e}"
+            ))
+        })?;
+        contract.to_bytes().map_err(|e| {
+            TezosXRuntimeError::ConversionError(format!(
+                "Failed to encode address to bytes: {e}"
+            ))
+        })
+    }
+
+    fn public_key_from_string(
+        &self,
+        public_key: &str,
+    ) -> Result<Vec<u8>, TezosXRuntimeError> {
+        let public_key = PublicKey::from_b58check(public_key)
+            .map_err(|_| CheckNativeAddressError::MalformedPublicKey)?;
+        let mut bytes = Vec::new();
+        public_key
+            .bin_write(&mut bytes)
+            .map_err(|_| CheckNativeAddressError::MalformedPublicKey)?;
+        Ok(bytes)
+    }
+
+    fn read_origin<Host, KS>(
+        &self,
+        rk: &RuntimeKeyspaces<'_, Host, KS>,
+        addr: &str,
+        budget: TezosXGas,
+    ) -> Result<(Classification, TezosXGas), TezosXRuntimeError>
+    where
+        Host: StorageV1,
+        KS: KeySpace,
+    {
+        let host = rk.host();
+        // Malformed → Unknown, no charge.
+        let contract = match Contract::from_b58check(addr) {
+            Ok(c) => c,
+            Err(_) => return Ok((Classification::Unknown, TezosXGas::ZERO)),
+        };
+
+        let consumed = ALIAS_LOOKUP_COST;
+        if budget < consumed {
+            return Err(TezosXRuntimeError::OutOfGas);
+        }
+        let address_hash = match contract {
+            Contract::Implicit(pkh) => AddressHash::Implicit(pkh),
+            Contract::Originated(kt1) => AddressHash::Kt1(kt1),
+        };
+        let origin = context::read_origin_for_address(host, &address_hash)?;
+        Ok((Classification::from(origin), consumed))
+    }
+
+    fn check_is_native_address<Host, KS>(
+        &self,
+        rk: &RuntimeKeyspaces<'_, Host, KS>,
+        address: &str,
+        public_key: Option<&str>,
+        budget: &mut TezosXGas,
+    ) -> Result<(), TezosXRuntimeError>
+    where
+        Host: StorageV1,
+        KS: KeySpace,
+    {
+        let host = rk.host();
+        let contract = Contract::from_b58check(address)
+            .map_err(|_| CheckNativeAddressError::MalformedAddress)?;
+        let kt1 = match contract {
+            // An implicit account is native by construction. Its public key
+            // is still required and must match the address, because the
+            // materialized alias stores it (e.g. for EIP-1271 signature
+            // checks): otherwise anyone could materialize the alias of
+            // someone else with a wrong key.
+            Contract::Implicit(pkh) => {
+                let public_key =
+                    public_key.ok_or(CheckNativeAddressError::MissingPublicKey)?;
+                let public_key = PublicKey::from_b58check(public_key)
+                    .map_err(|_| CheckNativeAddressError::MalformedPublicKey)?;
+                budget.consume(TezosXGas::new(
+                    interpret_cost::HASH_KEY.into(),
+                    RuntimeId::Tezos,
+                ))?;
+                return if public_key.pk_hash() == pkh {
+                    Ok(())
+                } else {
+                    Err(CheckNativeAddressError::PublicKeyMismatch.into())
+                };
+            }
+            // A contract has no public key: none must be given.
+            Contract::Originated(_) if public_key.is_some() => {
+                return Err(CheckNativeAddressError::UnexpectedPublicKey.into())
+            }
+            Contract::Originated(kt1) => kt1,
+        };
+        // Enshrined contracts, like the gateway, have no account behind them
+        // that could own an alias. Their code is synthetic, so the code check
+        // below would wrongly accept them.
+        if enshrined_contracts::is_enshrined(&kt1) {
+            return Err(CheckNativeAddressError::Precompile.into());
+        }
+        budget.consume(ALIAS_LOOKUP_COST)?;
+        // if it's already classified as origin
+        let origin =
+            context::read_origin_for_address(host, &AddressHash::Kt1(kt1.clone()))?;
+        match origin {
+            Some(Origin::Native) => return Ok(()),
+            Some(Origin::Alias(_)) => {
+                return Err(CheckNativeAddressError::NotProvablyNative.into())
+            }
+            _ => {}
+        }
+        // An unclassified KT1 is native only if a contract was actually
+        // originated there, i.e. it has code (enshrined contracts are
+        // rejected above). We don't compare that code with
+        // the aliases one because aliases are, by construction, tagged as
+        // aliases in their `Origin` (handled above). A code comparison would
+        // bring no new cases, and would not be future proof when upgrading
+        // aliases code.
+        budget.consume(ALIAS_LOOKUP_COST)?;
+        let account = context::originated_from_kt1(&kt1)?;
+        if account.exists(host)? {
+            Ok(())
+        } else {
+            Err(CheckNativeAddressError::NotProvablyNative.into())
+        }
+    }
+
+    // Need to implement this only for IDE. Not needed in compilation or tests.
+    /// # Panics
+    ///
+    /// Always panics: only the test mocks of this trait return a balance.
+    #[cfg(feature = "testing")]
+    fn get_balance(&self, _accounts: &impl KeySpace, _address: &[u8]) -> U256 {
+        unimplemented!("Use mocks if you are in tests")
+    }
+
+    // Need to implement this only for IDE. Not needed in compilation or tests.
+    #[cfg(feature = "testing")]
+    fn string_from_address(&self, _address: &[u8]) -> Result<String, TezosXRuntimeError> {
+        unimplemented!("Use mocks if you are in tests")
+    }
+}
+
+impl TezosRuntime {
+    pub fn new(chain_id: ChainId) -> Self {
+        Self(chain_id)
+    }
+
+    pub fn add_balance(
+        tez_accounts: &mut impl KeySpace,
+        pub_key_hash: &PublicKeyHash,
+        amount: U256,
+    ) -> Result<(), TezosXRuntimeError> {
+        let mut info = get_tezos_account_info_or_init(tez_accounts, pub_key_hash)?;
+        info.balance = info
+            .balance
+            .checked_add(amount)
+            .ok_or(TezosXRuntimeError::Custom("Balance overflow".to_string()))?;
+        set_tezos_account_info(tez_accounts, pub_key_hash, info)
+    }
+
+    // Used for debug while we don't have our own originated account implementation.
+    pub fn get_originated_account_balance(
+        host: &impl StorageV1,
+        kt1: &ContractKt1Hash,
+    ) -> Result<U256, TezosXRuntimeError> {
+        let originated_account = context::originated_from_kt1(kt1)?;
+        let balance = originated_account.balance(host)?;
+        narith_to_u256(&balance)
+    }
+}
+
+#[cfg(all(test, feature = "testing"))]
+mod tests {
+    use tezos_crypto_rs::hash::HashTrait;
+    use tezos_data_encoding::types::Zarith;
+    use tezos_ethereum::block::BlockConstants;
+    use tezos_evm_runtime::runtime::MockKernelHost;
+    use tezos_evm_runtime::runtime_keyspaces::{MockRuntimeKeyspaces, RuntimeKeyspaces};
+    use tezosx_journal::TezosXHashes;
+
+    use super::*;
+    use tezos_tezlink::operation_result::OperationKind;
+
+    trait ContentResultExt<M: OperationKind> {
+        fn is_failed(&self) -> bool;
+    }
+
+    impl<M: OperationKind> ContentResultExt<M> for ContentResult<M> {
+        fn is_failed(&self) -> bool {
+            matches!(self, ContentResult::Failed(_))
+        }
+    }
+
+    #[test]
+    fn build_response_success_uses_frame_result() {
+        let resp = build_response(
+            Ok(ExecuteRequestOutcome::default()),
+            Some(b"collected".to_vec()),
+        );
+        assert_eq!(resp.status(), StatusCode::OK);
+        assert_eq!(resp.body(), b"collected");
+        assert_eq!(
+            resp.headers()
+                .get(http::header::CONTENT_TYPE)
+                .and_then(|v| v.to_str().ok()),
+            Some("application/octet-stream")
+        );
+    }
+
+    #[test]
+    fn build_response_success_no_frame_result() {
+        let resp = build_response(Ok(ExecuteRequestOutcome::default()), None);
+        assert_eq!(resp.status(), StatusCode::OK);
+        assert!(resp.body().is_empty());
+        assert_eq!(
+            resp.headers()
+                .get(http::header::CONTENT_TYPE)
+                .and_then(|v| v.to_str().ok()),
+            Some("application/octet-stream")
+        );
+    }
+
+    #[test]
+    fn build_response_success_empty_frame_result() {
+        let resp = build_response(Ok(ExecuteRequestOutcome::default()), Some(vec![]));
+        assert_eq!(resp.status(), StatusCode::OK);
+        assert!(resp.body().is_empty());
+        assert_eq!(
+            resp.headers()
+                .get(http::header::CONTENT_TYPE)
+                .and_then(|v| v.to_str().ok()),
+            Some("application/octet-stream")
+        );
+    }
+
+    #[test]
+    fn build_response_error_discards_frame_result() {
+        // On revert, the %collect_result payload must not surface.
+        let resp = build_response(
+            Err(TezosXRuntimeError::BadRequest("invalid URL".into()).into()),
+            Some(b"leaked".to_vec()),
+        );
+        assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
+        assert!(String::from_utf8_lossy(resp.body()).contains("invalid URL"));
+        assert!(
+            !resp.body().windows(6).any(|w| w == b"leaked"),
+            "frame_result bytes must not appear in error body"
+        );
+        assert!(
+            resp.headers().get(http::header::CONTENT_TYPE).is_none(),
+            "Content-Type must not be set on error responses"
+        );
+    }
+
+    #[test]
+    fn build_response_bad_request() {
+        let resp = build_response(
+            Err(TezosXRuntimeError::BadRequest("invalid URL".into()).into()),
+            None,
+        );
+        assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
+        assert!(String::from_utf8_lossy(resp.body()).contains("invalid URL"));
+    }
+
+    #[test]
+    fn build_response_not_found() {
+        let resp = build_response(
+            Err(TezosXRuntimeError::NotFound("KT1 not found".into()).into()),
+            None,
+        );
+        assert_eq!(resp.status(), StatusCode::NOT_FOUND);
+        assert!(String::from_utf8_lossy(resp.body()).contains("KT1 not found"));
+    }
+
+    #[test]
+    fn build_response_method_not_allowed() {
+        let resp = build_response(
+            Err(TezosXRuntimeError::MethodNotAllowed("PUT not allowed".into()).into()),
+            None,
+        );
+        assert_eq!(resp.status(), StatusCode::METHOD_NOT_ALLOWED);
+        assert!(String::from_utf8_lossy(resp.body()).contains("PUT not allowed"));
+    }
+
+    #[test]
+    fn build_response_success_has_gas_consumed_header() {
+        // consumed_milligas = 0 → reported as 0
+        let resp = build_response(Ok(ExecuteRequestOutcome::default()), None);
+        assert_eq!(
+            resp.headers()
+                .get(X_TEZOS_GAS_CONSUMED)
+                .and_then(|v| v.to_str().ok()),
+            Some("0")
+        );
+    }
+
+    #[test]
+    fn build_response_gas_consumed_reports_milligas() {
+        // 5000 milligas → reported as 5000
+        let resp = build_response(
+            Ok(ExecuteRequestOutcome {
+                delegated_storage_cost: 0,
+                consumed_milligas: 5000,
+            }),
+            None,
+        );
+        assert_eq!(
+            resp.headers()
+                .get(X_TEZOS_GAS_CONSUMED)
+                .and_then(|v| v.to_str().ok()),
+            Some("5000")
+        );
+    }
+
+    // A metered failure carries its figure: the 4xx response reports that
+    // value in the gas-consumed header.
+    #[test]
+    fn build_response_metered_error_reports_carried_gas() {
+        let resp = build_response(
+            Err(RequestFailure {
+                error: TezosXRuntimeError::BadRequest("err".into()),
+                consumed_milligas: Some(5000),
+            }),
+            None,
+        );
+        assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
+        assert_eq!(
+            resp.headers()
+                .get(X_TEZOS_GAS_CONSUMED)
+                .and_then(|v| v.to_str().ok()),
+            Some("5000")
+        );
+    }
+
+    // A failure raised before the gas counter exists is unset: the header
+    // is omitted, which tells the caller to charge the op limit.
+    #[test]
+    fn build_response_unset_error_omits_gas_header() {
+        let resp = build_response(
+            Err(TezosXRuntimeError::BadRequest("err".into()).into()),
+            None,
+        );
+        assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
+        assert!(
+            resp.headers().get(X_TEZOS_GAS_CONSUMED).is_none(),
+            "an unset failure must omit the gas-consumed header"
+        );
+    }
+
+    /// `delegated_storage_cost = 0` on a 2xx response: the header is
+    /// omitted entirely. Absence signals "nothing to delegate".
+    #[test]
+    fn build_response_no_storage_cost_header_when_zero() {
+        let resp = build_response(Ok(ExecuteRequestOutcome::default()), None);
+        assert!(
+            resp.headers().get(X_TEZOS_STORAGE_COST).is_none(),
+            "X-Tezos-Storage-Cost must be absent when delegated cost is 0"
+        );
+    }
+
+    /// `delegated_storage_cost > 0` on a 2xx response: the header is
+    /// present, ASCII-decimal, exact value match (no leading zeros,
+    /// no spaces).
+    #[test]
+    fn build_response_emits_storage_cost_header_on_2xx() {
+        let resp = build_response(
+            Ok(ExecuteRequestOutcome {
+                delegated_storage_cost: 12345,
+                consumed_milligas: 0,
+            }),
+            None,
+        );
+        assert_eq!(
+            resp.headers()
+                .get(X_TEZOS_STORAGE_COST)
+                .and_then(|v| v.to_str().ok()),
+            Some("12345"),
+            "X-Tezos-Storage-Cost must carry the exact mutez value"
+        );
+    }
+
+    // --- finalize_response tests ---
+    //
+    // Four cases of `(execute_request result, dispatch slot take)`:
+    // success+payload, error+payload, success+unbalanced, error+
+    // unbalanced.  Pin the contract that `finalize_response` reconciles
+    // them as serve's tail.
+
+    // Happy path: execution succeeded and the dispatch slot holds a
+    // payload — 200 with the payload as body.
+    #[test]
+    fn finalize_response_success_with_payload() {
+        let resp = finalize_response(
+            Ok(ExecuteRequestOutcome::default()),
+            None,
+            Ok(Some(b"collected".to_vec())),
+        );
+        assert_eq!(resp.status(), StatusCode::OK);
+        assert_eq!(resp.body(), b"collected");
+        assert_eq!(
+            resp.headers()
+                .get(http::header::CONTENT_TYPE)
+                .and_then(|v| v.to_str().ok()),
+            Some("application/octet-stream")
+        );
+    }
+
+    // Execute_request returned an error while the dispatch slot still
+    // holds a payload: the request error wins, the payload is dropped,
+    // and no Content-Type is set on the error body.
+    #[test]
+    fn finalize_response_error_discards_payload() {
+        let resp = finalize_response(
+            Err(TezosXRuntimeError::BadRequest("nope".into()).into()),
+            None,
+            Ok(Some(b"leaked".to_vec())),
+        );
+        assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
+        assert!(
+            !resp.body().windows(6).any(|w| w == b"leaked"),
+            "dispatch payload must not leak into error body"
+        );
+        assert!(
+            resp.headers().get(http::header::CONTENT_TYPE).is_none(),
+            "Content-Type must not be set on error responses"
+        );
+    }
+
+    // Kernel bug: execute_request returned `Ok` but the dispatch slot
+    // is missing — escalate to 500 rather than masking as an empty
+    // 2xx response.
+    #[test]
+    fn finalize_response_success_with_unbalanced_slot_escalates_to_500() {
+        let resp = finalize_response(
+            Ok(ExecuteRequestOutcome::default()),
+            None,
+            Err(DispatchSlotError::NoSlot),
+        );
+        assert_eq!(resp.status(), StatusCode::INTERNAL_SERVER_ERROR);
+        assert!(
+            String::from_utf8_lossy(resp.body()).contains("dispatch slot inconsistency"),
+            "body should explain the inconsistency: {:?}",
+            String::from_utf8_lossy(resp.body())
+        );
+    }
+
+    // Kernel bug coincident with a request error: the request error
+    // takes precedence over the dispatch-slot inconsistency.  We don't
+    // need to surface both; the user-visible failure is the request,
+    // and the slot bug is a separate concern best caught by tests and
+    // assertions elsewhere.
+    #[test]
+    fn finalize_response_error_with_unbalanced_slot_preserves_request_error() {
+        let resp = finalize_response(
+            Err(TezosXRuntimeError::NotFound("KT1 missing".into()).into()),
+            None,
+            Err(DispatchSlotError::NoSlot),
+        );
+        assert_eq!(resp.status(), StatusCode::NOT_FOUND);
+        assert!(
+            String::from_utf8_lossy(resp.body()).contains("KT1 missing"),
+            "original request error must dominate"
+        );
+    }
+
+    // An unset failure reports the op limit: finalize substitutes the
+    // granted budget so the gas-consumed header carries it.
+    #[test]
+    fn finalize_response_unset_error_reports_op_limit() {
+        let resp = finalize_response(
+            Err(TezosXRuntimeError::BadRequest("nope".into()).into()),
+            Some(4242),
+            Ok(None),
+        );
+        assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
+        assert_eq!(
+            resp.headers()
+                .get(X_TEZOS_GAS_CONSUMED)
+                .and_then(|v| v.to_str().ok()),
+            Some("4242")
+        );
+    }
+
+    // --- ensure_alias tests ---
+
+    use tezos_crypto_rs::hash::ChainId;
+    use tezosx_interfaces::testing::NotWiredRegistry;
+    use tezosx_interfaces::{AliasInfo, RuntimeId};
+
+    fn test_context() -> CrossRuntimeContext {
+        CrossRuntimeContext {
+            timestamp: U256::from(0),
+            block_number: U256::from(0),
+        }
+    }
+
+    fn test_runtime() -> TezosRuntime {
+        TezosRuntime::new(ChainId::default())
+    }
+
+    fn evm_alias_info(addr: &str) -> AliasInfo {
+        AliasInfo {
+            runtime: RuntimeId::Ethereum,
+            native_address: addr.to_string(),
+        }
+    }
+
+    // Seed the Michelson world state so the alias snapshot has a subtree
+    // to copy, as in production where migration creates it.
+    fn test_rk(host: &mut MockKernelHost) -> MockRuntimeKeyspaces<'_> {
+        let mut rk = RuntimeKeyspaces::init(host).unwrap();
+        let null_pkh = PublicKeyHash::from_b58check(NULL_PKH).unwrap();
+        let account = context::implicit_from_public_key_hash(&null_pkh).unwrap();
+        account.allocate(rk.tez_accounts_mut()).unwrap();
+        rk
+    }
+
+    #[test]
+    fn compute_alias_returns_valid_kt1_string() {
+        let runtime = test_runtime();
+
+        let alias = runtime
+            .compute_alias("0x1234567890abcdef1234567890abcdef12345678".as_bytes())
+            .expect("compute_alias should succeed");
+
+        // The alias should be a valid KT1 base58check string
+        assert!(
+            alias.starts_with("KT1"),
+            "Alias should be a KT1 address: {alias}"
+        );
+    }
+
+    // An alias creation that runs out of gas reports `OutOfGas`, so the
+    // caller knows the whole budget was used: with half the budget it needs,
+    // which runs out while originating the forwarder, and with one
+    // unit short of it.
+    #[test]
+    fn create_alias_out_of_gas_is_reported_as_such() {
+        let evm_address = "0x1234567890abcdef1234567890abcdef12345678";
+        let create = |budget: u64| {
+            let mut host = MockKernelHost::default();
+            let mut rk = test_rk(&mut host);
+            let mut journal = TezosXJournal::mock(RuntimeId::Ethereum);
+            let runtime = test_runtime();
+            let alias = runtime.compute_alias(evm_address.as_bytes()).unwrap();
+            runtime
+                .create_alias(
+                    &NotWiredRegistry,
+                    &mut rk,
+                    &mut journal,
+                    &alias,
+                    evm_alias_info(evm_address),
+                    None,
+                    test_context(),
+                    TezosXGas::new(budget, RuntimeId::Tezos),
+                )
+                .map(|_| ())
+        };
+        // The budget the creation needs: the smallest that succeeds.
+        let (mut lo, mut hi) = (0u64, 5_000_000u64);
+        assert_eq!(create(hi), Ok(()));
+        while lo + 1 < hi {
+            let mid = (lo + hi) / 2;
+            if create(mid).is_ok() {
+                hi = mid
+            } else {
+                lo = mid
+            }
+        }
+        for budget in [hi / 2, hi - 1] {
+            assert_eq!(
+                create(budget),
+                Err(TezosXRuntimeError::OutOfGas),
+                "budget {budget} of the {hi} needed"
+            );
+        }
+    }
+
+    #[test]
+    fn ensure_alias_materializes_code_less() {
+        let mut host = MockKernelHost::default();
+        let mut rk = test_rk(&mut host);
+        let mut journal = TezosXJournal::mock(RuntimeId::Ethereum);
+        let runtime = test_runtime();
+        let evm_address = "0x1234567890abcdef1234567890abcdef12345678";
+        let alias = runtime.compute_alias(evm_address.as_bytes()).unwrap();
+
+        runtime
+            .create_alias(
+                &NotWiredRegistry,
+                &mut rk,
+                &mut journal,
+                &alias,
+                evm_alias_info(evm_address),
+                None,
+                test_context(),
+                TezosXGas::new(5_000_000, RuntimeId::Tezos),
+            )
+            .expect("ensure_alias should succeed");
+
+        let kt1 = ContractKt1Hash::from(blake2b::digest_160(evm_address.as_bytes()));
+        let account = context::originated_from_kt1(&kt1).unwrap();
+
+        // L2-1529: a materialized alias carries no per-contract script —
+        // nothing is written at `/data/code`. Its code is the single shared
+        // implementation.
+        let code_path = tezos_execution::context::code::code_path(&account).unwrap();
+        assert!(
+            rk.host().store_has(&code_path).unwrap().is_none(),
+            "a materialized alias must not store its own /data/code"
+        );
+
+        // Code-less storage accounting: a definite code size of 0 (the shared
+        // code is not charged per alias), and used/paid bytes account for the
+        // per-alias storage only. This also pins the receipt's
+        // `paid_storage_size_diff`, which derives from these watermarks.
+        let storage_len = account.storage(rk.host()).unwrap().len() as u64;
+        assert_eq!(account.code_size(rk.host()).unwrap(), Zarith::from(0u64));
+        assert_eq!(
+            account.used_bytes(rk.host()).unwrap(),
+            Zarith::from(storage_len)
+        );
+        assert_eq!(
+            account.paid_bytes(rk.host()).unwrap(),
+            Zarith::from(storage_len)
+        );
+
+        // It is classified as an alias, so once the shared slot is seeded its
+        // code resolves to the forwarder.
+        assert!(matches!(
+            account.origin(rk.host()).unwrap(),
+            Some(Origin::Alias(_))
+        ));
+        crate::alias_forwarder::init_alias_implementation(rk.host_mut()).unwrap();
+        match account.code(rk.host()).unwrap() {
+            tezos_execution::account_storage::Code::Code(bytes) => assert_eq!(
+                bytes,
+                alias_forwarder::forwarder_code()
+                    .expect("FORWARDER_CODE_HEX is a valid hex constant")
+            ),
+            _ => panic!("Expected resolved code, not enshrined"),
+        }
+    }
+
+    #[test]
+    fn create_alias_stores_evm_address_in_storage() {
+        let mut host = MockKernelHost::default();
+        let mut rk = test_rk(&mut host);
+        let mut journal = TezosXJournal::mock(RuntimeId::Ethereum);
+        let runtime = test_runtime();
+        let evm_address = "0xdeadbeefdeadbeefdeadbeefdeadbeefdeadbeef";
+        let alias = runtime
+            .compute_alias(evm_address.as_bytes())
+            .expect("compute_alias should succeed");
+
+        runtime
+            .create_alias(
+                &NotWiredRegistry,
+                &mut rk,
+                &mut journal,
+                &alias,
+                evm_alias_info(evm_address),
+                None,
+                test_context(),
+                TezosXGas::new(5_000_000, RuntimeId::Tezos),
+            )
+            .expect("ensure_alias should succeed");
+
+        let kt1 = ContractKt1Hash::from(blake2b::digest_160(evm_address.as_bytes()));
+        let account = context::originated_from_kt1(&kt1).unwrap();
+
+        let storage = account.storage(rk.host()).unwrap();
+        let expected =
+            alias_forwarder::forwarder_storage(evm_address, &mut Gas::default())
+                .unwrap()
+                .unwrap();
+        assert_eq!(storage, expected);
+    }
+
+    #[test]
+    fn ensure_alias_sets_zero_balance() {
+        let mut host = MockKernelHost::default();
+        let mut rk = test_rk(&mut host);
+        let mut journal = TezosXJournal::mock(RuntimeId::Ethereum);
+        let runtime = test_runtime();
+        let evm_address = "0xabcdefabcdefabcdefabcdefabcdefabcdefabcd";
+        let alias = runtime.compute_alias(evm_address.as_bytes()).unwrap();
+
+        runtime
+            .create_alias(
+                &NotWiredRegistry,
+                &mut rk,
+                &mut journal,
+                &alias,
+                evm_alias_info(evm_address),
+                None,
+                test_context(),
+                TezosXGas::new(5_000_000, RuntimeId::Tezos),
+            )
+            .expect("ensure_alias should succeed");
+
+        let kt1 = ContractKt1Hash::from(blake2b::digest_160(evm_address.as_bytes()));
+        let balance = TezosRuntime::get_originated_account_balance(rk.host(), &kt1)
+            .expect("should read balance");
+        assert_eq!(balance, U256::zero());
+    }
+
+    #[test]
+    fn compute_alias_is_deterministic() {
+        let runtime = test_runtime();
+        let evm_address = "0x1111111111111111111111111111111111111111";
+
+        let alias1 = runtime.compute_alias(evm_address.as_bytes()).unwrap();
+        let alias2 = runtime.compute_alias(evm_address.as_bytes()).unwrap();
+
+        assert_eq!(alias1, alias2);
+    }
+
+    #[test]
+    fn compute_alias_different_addresses_produce_different_aliases() {
+        let runtime = test_runtime();
+
+        let alias1 = runtime
+            .compute_alias("0x1111111111111111111111111111111111111111".as_bytes())
+            .unwrap();
+        let alias2 = runtime
+            .compute_alias("0x2222222222222222222222222222222222222222".as_bytes())
+            .unwrap();
+
+        assert_ne!(alias1, alias2);
+    }
+
+    #[test]
+    fn alias_exists_rejects_native_classification() {
+        // The kernel must never reach an alias address that has been
+        // classified as Native. If it does, the call returns an error
+        // rather than overwriting the classification.
+        let mut host = MockKernelHost::default();
+        let mut rk = RuntimeKeyspaces::init(&mut host).unwrap();
+        let mut journal = TezosXJournal::mock(RuntimeId::Ethereum);
+        let runtime = test_runtime();
+        let evm_address = "0x5555555555555555555555555555555555555555";
+        let kt1 = ContractKt1Hash::from(blake2b::digest_160(evm_address.as_bytes()));
+        let account = context::originated_from_kt1(&kt1).unwrap();
+
+        account.set_origin(rk.host_mut(), &Origin::Native).unwrap();
+
+        // `alias_exists` takes the alias in its own runtime's canonical
+        // form (base58 KT1). Passing the EVM address would fail the
+        // base58 decode and never reach the classification check.
+        let res = runtime.alias_exists(&mut rk, &mut journal, &kt1.to_base58_check());
+        assert!(matches!(res, Err(TezosXRuntimeError::Custom(_))));
+    }
+
+    // ── RFC Example 2: EVM → Michelson (incoming CRAC receipt) ──────────
+    //
+    // When a CRAC enters Michelson, the Michelson block shows:
+    //
+    //   Top-level:
+    //     source: tz1<Handler_M>
+    //     destination: KT1<alias(E_0)>
+    //     Internal op #0:
+    //       sender: KT1<alias(E_1)>
+    //       destination: KT1<M_1>
+    //       amount: 50 tez
+    //       entrypoint: swap
+    //
+    // `build_crac_receipt` constructs this structure and serialises it.
+    // This test verifies the round-trip and the key structural properties.
+
+    #[test]
+    fn build_crac_receipt_top_level_source_is_handler() {
+        let null_pkh = PublicKeyHash::from_b58check(NULL_PKH).unwrap();
+        // alias(E_0) — container destination of the top-level op
+        let source_contract = Contract::Originated(
+            ContractKt1Hash::from_b58check("KT18amZmM5W7qDWVt2pH6uj7sCEd3kbzLrHT")
+                .unwrap(),
+        );
+        // alias(E_1) — sender of the first internal op
+        let sender_contract = Contract::Originated(
+            ContractKt1Hash::from_b58check("KT1GRAN26ni19mgd6xpL6tsH52LNnhKSQzP2")
+                .unwrap(),
+        );
+        // M_1 — target Michelson contract
+        let destination = Contract::Originated(
+            ContractKt1Hash::from_b58check("KT18oDJJKXMKhfE1bSuAPGp92pYcwVDiqsPw")
+                .unwrap(),
+        );
+        let amount = Narith(50_000_000u64.into()); // 50 tez in mutez
+        let parameters = Parameters {
+            entrypoint: mir::ast::Entrypoint::from_string_unchecked("swap".into()),
+            value: mir::ast::micheline::Micheline::from(())
+                .encode(&mut Gas::default())
+                .unwrap()
+                .unwrap(),
+        };
+        let target = TransferTarget::from(TransferSuccess::default());
+
+        let crac_id = "1-0";
+        let applied = build_crac_receipt(
+            &null_pkh,
+            &source_contract,
+            &sender_contract,
+            &amount,
+            &destination,
+            &parameters,
+            target,
+            vec![],
+            vec![],
+            crac_id,
+            0,
+            &OperationHash::default(),
+        )
+        .expect("build_crac_receipt should succeed");
+
+        let OperationDataAndMetadata::OperationWithMetadata(batch) =
+            &applied.op_and_receipt;
+        assert_eq!(batch.operations.len(), 1, "one top-level operation");
+
+        let op = &batch.operations[0];
+
+        // Top-level source must be the handler implicit account.
+        let ManagerOperationContent::Transaction(ref mgr_op) = op.content else {
+            panic!("expected Transaction content");
+        };
+        assert_eq!(
+            mgr_op.source, null_pkh,
+            "top-level source must be Handler_M"
+        );
+
+        // Top-level destination must be alias(E_0).
+        assert_eq!(
+            mgr_op.operation.destination, source_contract,
+            "top-level destination must be alias(E_0)"
+        );
+
+        // Check internal operations
+        let OperationResultSum::Transfer(ref result) = op.receipt else {
+            panic!("expected Transfer receipt");
+        };
+        // Internal op #0 = CRAC begin event, #1 = transfer, #2 = CRAC end event
+        assert_eq!(
+            result.internal_operation_results.len(),
+            3,
+            "three internal operations (CRAC begin + transfer + CRAC end)"
+        );
+
+        // Internal op #0: CRAC begin event
+        let InternalOperationSum::Event(ref event) = result.internal_operation_results[0]
+        else {
+            panic!(
+                "expected Event, got {:?}",
+                result.internal_operation_results[0]
+            );
+        };
+        assert_eq!(
+            event.content.tag.as_ref().and_then(|e| e.as_str()),
+            Some("cross_runtime_call"),
+            "event tag must be 'crac'"
+        );
+        assert_eq!(
+            event.sender,
+            Contract::Implicit(null_pkh.clone()),
+            "event sender must be the handler implicit account"
+        );
+
+        // Internal op #1: alias(E_1) → M_1
+        let InternalOperationSum::Transfer(ref internal) =
+            result.internal_operation_results[1]
+        else {
+            panic!("expected internal Transfer");
+        };
+        assert_eq!(
+            internal.sender, sender_contract,
+            "internal sender must be alias(E_1)"
+        );
+        assert_eq!(
+            internal.content.destination, destination,
+            "internal destination must be M_1"
+        );
+        assert_eq!(
+            internal.content.amount, amount,
+            "internal amount must match"
+        );
+
+        // Internal op #2: CRAC end event
+        let InternalOperationSum::Event(ref end_event) =
+            result.internal_operation_results[2]
+        else {
+            panic!(
+                "expected Event at index 2, got {:?}",
+                result.internal_operation_results[2]
+            );
+        };
+        assert_eq!(
+            end_event.content.tag.as_ref().and_then(|e| e.as_str()),
+            Some("cross_runtime_call_end"),
+            "last internal op tag must be 'cross_runtime_call_end'"
+        );
+        assert_eq!(
+            end_event.sender,
+            Contract::Implicit(null_pkh.clone()),
+            "cross_runtime_call_end sender must be the handler implicit account"
+        );
+        assert!(
+            matches!(end_event.result, ContentResult::Applied(_)),
+            "cross_runtime_call_end must be Applied on the success path"
+        );
+        // Payload must equal the CRAC-ID string encoded as Micheline string bytes.
+        let expected_payload = {
+            use mir::ast::micheline::Micheline;
+            use mir::serializer::MichelineExpr;
+            let bytes = Micheline::from(crac_id.to_string())
+                .encode(&mut Gas::default())
+                .expect("gas should not be exhausted")
+                .expect("crac_id Micheline encoding must succeed");
+            MichelineExpr::from(bytes)
+        };
+        assert_eq!(
+            end_event.content.payload,
+            Some(expected_payload),
+            "cross_runtime_call_end payload must equal the CRAC-ID string encoded as Micheline"
+        );
+
+        // Round-trip: serialize and read back
+        use tezos_data_encoding::{enc::BinWriter, nom::NomReader};
+        let bytes = applied.op_and_receipt.to_bytes().expect("serialization");
+        let (remaining, round_tripped) =
+            OperationDataAndMetadata::nom_read(&bytes).expect("deserialization");
+        assert!(remaining.is_empty(), "all bytes consumed");
+        assert_eq!(
+            applied.op_and_receipt, round_tripped,
+            "round-trip must be identical"
+        );
+    }
+
+    /// RFC Example 2 variant: when alias(E_0) == alias(E_1) (direct call,
+    /// no intermediary), the container and caller are the same alias.
+    #[test]
+    fn build_crac_receipt_direct_caller_alias_equals_source() {
+        let null_pkh = PublicKeyHash::from_b58check(NULL_PKH).unwrap();
+        // E_0 calls gateway directly: alias(E_0) == alias(E_1)
+        let alias = Contract::Originated(
+            ContractKt1Hash::from_b58check("KT18amZmM5W7qDWVt2pH6uj7sCEd3kbzLrHT")
+                .unwrap(),
+        );
+        let destination = Contract::Originated(
+            ContractKt1Hash::from_b58check("KT18oDJJKXMKhfE1bSuAPGp92pYcwVDiqsPw")
+                .unwrap(),
+        );
+        let amount = Narith(100_000_000u64.into());
+        let parameters = Parameters {
+            entrypoint: mir::ast::Entrypoint::default(),
+            value: mir::ast::micheline::Micheline::from(())
+                .encode(&mut Gas::default())
+                .unwrap()
+                .unwrap(),
+        };
+        let target = TransferTarget::from(TransferSuccess::default());
+
+        let applied = build_crac_receipt(
+            &null_pkh,
+            &alias, // source_contract = alias(E_0)
+            &alias, // sender_contract = alias(E_1) = alias(E_0) when direct call
+            &amount,
+            &destination,
+            &parameters,
+            target,
+            vec![],
+            vec![],
+            "1-0",
+            0,
+            &OperationHash::default(),
+        )
+        .expect("build_crac_receipt should succeed");
+
+        let OperationDataAndMetadata::OperationWithMetadata(batch) =
+            &applied.op_and_receipt;
+        assert_eq!(batch.operations.len(), 1, "one top-level operation");
+
+        let op = &batch.operations[0];
+        let ManagerOperationContent::Transaction(ref mgr_op) = op.content else {
+            panic!("expected Transaction content");
+        };
+
+        // Top-level source is the handler.
+        assert_eq!(mgr_op.source, null_pkh);
+        // Top-level destination is alias(E_0).
+        assert_eq!(
+            mgr_op.operation.destination, alias,
+            "top-level destination must be alias"
+        );
+
+        let OperationResultSum::Transfer(ref result) = op.receipt else {
+            panic!("expected Transfer receipt");
+        };
+        // CRAC begin event at #0, synthetic transfer at #1, CRAC end event at #2.
+        assert_eq!(
+            result.internal_operation_results.len(),
+            3,
+            "three internal operations (CRAC begin + transfer + CRAC end)"
+        );
+
+        assert!(
+            matches!(
+                result.internal_operation_results[0],
+                InternalOperationSum::Event(_)
+            ),
+            "internal op #0 must be the CRAC begin event"
+        );
+
+        let InternalOperationSum::Transfer(ref internal) =
+            result.internal_operation_results[1]
+        else {
+            panic!("expected internal Transfer at index 1");
+        };
+        // When E_0 == E_1, the internal sender equals the top-level destination.
+        assert_eq!(
+            internal.sender,
+            Contract::Originated(
+                ContractKt1Hash::from_b58check("KT18amZmM5W7qDWVt2pH6uj7sCEd3kbzLrHT")
+                    .unwrap()
+            ),
+            "internal sender must be alias (= top-level destination)"
+        );
+        assert_eq!(
+            internal.content.destination, destination,
+            "internal destination must be the target contract"
+        );
+        assert_eq!(
+            internal.content.amount, amount,
+            "internal amount must match"
+        );
+        assert!(
+            matches!(internal.result, ContentResult::Applied(_)),
+            "internal op must be applied"
+        );
+
+        // Internal op #2: CRAC end event
+        let InternalOperationSum::Event(ref end_event) =
+            result.internal_operation_results[2]
+        else {
+            panic!(
+                "expected Event at index 2, got {:?}",
+                result.internal_operation_results[2]
+            );
+        };
+        assert_eq!(
+            end_event.content.tag.as_ref().and_then(|e| e.as_str()),
+            Some("cross_runtime_call_end"),
+            "last internal op tag must be 'cross_runtime_call_end'"
+        );
+        assert_eq!(
+            end_event.sender,
+            Contract::Implicit(null_pkh.clone()),
+            "cross_runtime_call_end sender must be the handler implicit account (null)"
+        );
+        assert!(
+            matches!(end_event.result, ContentResult::Applied(_)),
+            "cross_runtime_call_end must be Applied on the success path"
+        );
+    }
+
+    #[test]
+    fn build_failed_crac_receipt_backtracks_event() {
+        let null_pkh = PublicKeyHash::from_b58check(NULL_PKH).unwrap();
+        let source_contract = Contract::Originated(
+            ContractKt1Hash::from_b58check("KT18amZmM5W7qDWVt2pH6uj7sCEd3kbzLrHT")
+                .unwrap(),
+        );
+        let sender_contract = Contract::Originated(
+            ContractKt1Hash::from_b58check("KT1GRAN26ni19mgd6xpL6tsH52LNnhKSQzP2")
+                .unwrap(),
+        );
+        let destination = Contract::Originated(
+            ContractKt1Hash::from_b58check("KT18oDJJKXMKhfE1bSuAPGp92pYcwVDiqsPw")
+                .unwrap(),
+        );
+        let amount = Narith(50_000_000u64.into());
+        let parameters = Parameters {
+            entrypoint: mir::ast::Entrypoint::from_string_unchecked("swap".into()),
+            value: mir::ast::micheline::Micheline::from(())
+                .encode(&mut Gas::default())
+                .unwrap()
+                .unwrap(),
+        };
+        let error =
+            TransferError::FailedToExecuteInternalOperation("test failure".into());
+
+        let applied = build_failed_crac_receipt(
+            &null_pkh,
+            &source_contract,
+            &sender_contract,
+            &amount,
+            &destination,
+            &parameters,
+            error,
+            vec![],
+            vec![],
+            "1-0",
+            0,
+            false, // immediate failure: alias→target must be Failed
+            &OperationHash::default(),
+        )
+        .expect("build_failed_crac_receipt should succeed");
+
+        let OperationDataAndMetadata::OperationWithMetadata(batch) =
+            &applied.op_and_receipt;
+        let op = &batch.operations[0];
+        let OperationResultSum::Transfer(ref result) = op.receipt else {
+            panic!("expected Transfer receipt");
+        };
+
+        // Top-level must be failed
+        assert!(result.result.is_failed(), "top-level result must be failed");
+
+        assert_eq!(
+            result.internal_operation_results.len(),
+            3,
+            "three internal operations (CRAC begin + failed transfer + CRAC end)"
+        );
+
+        // Internal op #0: CRAC begin event must be backtracked
+        let InternalOperationSum::Event(ref event) = result.internal_operation_results[0]
+        else {
+            panic!("expected Event");
+        };
+        assert!(
+            matches!(event.result, ContentResult::BackTracked(_)),
+            "CRAC begin event must be backtracked when downstream transfer fails"
+        );
+
+        // Internal op #1: transfer must be failed (immediate failure, deep_failure=false)
+        let InternalOperationSum::Transfer(ref transfer) =
+            result.internal_operation_results[1]
+        else {
+            panic!("expected Transfer");
+        };
+        assert!(transfer.result.is_failed(), "transfer must be failed");
+
+        // Internal op #2: CRAC end event must also be backtracked
+        let InternalOperationSum::Event(ref end_event) =
+            result.internal_operation_results[2]
+        else {
+            panic!(
+                "expected Event at index 2, got {:?}",
+                result.internal_operation_results[2]
+            );
+        };
+        assert_eq!(
+            end_event.content.tag.as_ref().and_then(|e| e.as_str()),
+            Some("cross_runtime_call_end"),
+            "last internal op tag must be 'cross_runtime_call_end'"
+        );
+        assert_eq!(
+            end_event.sender,
+            Contract::Implicit(null_pkh.clone()),
+            "cross_runtime_call_end sender must be the handler implicit account (null)"
+        );
+        assert!(
+            matches!(end_event.result, ContentResult::BackTracked(_)),
+            "cross_runtime_call_end must be BackTracked when the frame failed"
+        );
+    }
+
+    /// The error of a failed CRAC receipt is persisted **once** — on the
+    /// synthetic alias(E_1)→target failed-transfer internal op so indexers see
+    /// the attempted call.  The top-level operation result carries an empty
+    /// error vector (`status: failed`, no payload).  This test pins the
+    /// premise so `charge_persisted_error`'s 1× factor and the receipt shape
+    /// cannot silently drift apart.
+    #[test]
+    fn failed_crac_receipt_persists_top_level_error_once() {
+        use tezos_tezlink::operation_result::{
+            OperationDataAndMetadata, OperationResultSum,
+        };
+
+        let null_pkh = PublicKeyHash::from_b58check(NULL_PKH).unwrap();
+        let source_contract = Contract::Originated(
+            ContractKt1Hash::from_b58check("KT18amZmM5W7qDWVt2pH6uj7sCEd3kbzLrHT")
+                .unwrap(),
+        );
+        let sender_contract = Contract::Originated(
+            ContractKt1Hash::from_b58check("KT1GRAN26ni19mgd6xpL6tsH52LNnhKSQzP2")
+                .unwrap(),
+        );
+        let destination = Contract::Originated(
+            ContractKt1Hash::from_b58check("KT18oDJJKXMKhfE1bSuAPGp92pYcwVDiqsPw")
+                .unwrap(),
+        );
+        let amount = Narith(0u64.into());
+        let parameters = Parameters::default();
+
+        // A distinctive, attacker-shaped payload that won't otherwise appear
+        // in the serialized op. Bounded by `"` on both sides once rendered as
+        // `MichelsonContractInterpretError("ZZZ…")`, so a window of exactly
+        // its length matches once per persisted copy.
+        let payload = "Z".repeat(2000);
+        let error = TransferError::MichelsonContractInterpretError(payload.clone());
+
+        let applied = build_failed_crac_receipt(
+            &null_pkh,
+            &source_contract,
+            &sender_contract,
+            &amount,
+            &destination,
+            &parameters,
+            error,
+            vec![],
+            vec![],
+            "1-0",
+            0,
+            false, // immediate failure: error lives on alias→target
+            &OperationHash::default(),
+        )
+        .expect("build_failed_crac_receipt should succeed");
+
+        // Assert top-level has empty error vector.
+        let OperationDataAndMetadata::OperationWithMetadata(ref batch) =
+            applied.op_and_receipt;
+        let top = batch.operations.first().expect("single op in batch");
+        if let OperationResultSum::Transfer(ref result) = top.receipt {
+            match &result.result {
+                ContentResult::Failed(errs) => assert!(
+                    errs.errors.is_empty(),
+                    "top-level error vector must be empty; got: {:?}",
+                    errs.errors
+                ),
+                other => panic!("top-level result must be Failed, got: {other:?}"),
+            }
+        } else {
+            panic!("top-level receipt must be Transfer");
+        }
+
+        // Assert the payload appears exactly once in the serialized binary
+        // (on the alias(E_1)→target internal op, not on the top-level).
+        let mut serialized = Vec::new();
+        applied
+            .op_and_receipt
+            .bin_write(&mut serialized)
+            .expect("serialize failed CRAC receipt");
+
+        let needle = payload.as_bytes();
+        let occurrences = serialized
+            .windows(needle.len())
+            .filter(|w| *w == needle)
+            .count();
+        assert_eq!(
+            occurrences, 1,
+            "error payload must appear exactly once (alias→target internal op only); \
+             charge_persisted_error prices 1× on this"
+        );
+    }
+
+    /// `pre_transfer_internals` — the alias-forwarder originations from
+    /// `ensure_alias` branch 3 — are handed to `build_failed_crac_receipt`
+    /// as `Applied`, but the forwarder write does not survive the failing
+    /// frame's revert, so the receipt must report them as backtracked.
+    #[test]
+    fn build_failed_crac_receipt_backtracks_alias_origination() {
+        use tezos_tezlink::operation_result::{
+            OperationDataAndMetadata, OperationResultSum,
+        };
+
+        let null_pkh = PublicKeyHash::from_b58check(NULL_PKH).unwrap();
+        let kt1 =
+            |s: &str| Contract::Originated(ContractKt1Hash::from_b58check(s).unwrap());
+
+        let alias_origination = build_alias_origination_internal(
+            &null_pkh,
+            Script {
+                code: vec![],
+                storage: vec![],
+            },
+            OriginationSuccess {
+                balance_updates: vec![],
+                originated_contracts: vec![],
+                consumed_milligas: Narith(0u64.into()),
+                storage_size: Zarith(0.into()),
+                paid_storage_size_diff: Zarith(0.into()),
+                lazy_storage_diff: None,
+            },
+        );
+        assert!(
+            alias_origination.is_applied(),
+            "fixture must start Applied, otherwise the test is vacuous"
+        );
+
+        let applied = build_failed_crac_receipt(
+            &null_pkh,
+            &kt1("KT18amZmM5W7qDWVt2pH6uj7sCEd3kbzLrHT"),
+            &kt1("KT1GRAN26ni19mgd6xpL6tsH52LNnhKSQzP2"),
+            &Narith(0u64.into()),
+            &kt1("KT18oDJJKXMKhfE1bSuAPGp92pYcwVDiqsPw"),
+            &Parameters::default(),
+            TransferError::FailedToExecuteInternalOperation("test failure".into()),
+            vec![alias_origination],
+            vec![],
+            "1-0",
+            0,
+            false,
+            &OperationHash::default(),
+        )
+        .expect("build_failed_crac_receipt should succeed");
+
+        let OperationDataAndMetadata::OperationWithMetadata(batch) =
+            &applied.op_and_receipt;
+        let OperationResultSum::Transfer(ref result) = batch.operations[0].receipt else {
+            panic!("expected Transfer receipt");
+        };
+
+        // Layout: [begin_event, alias_origination, alias→target, end_event]
+        let InternalOperationSum::Origination(ref origination) =
+            result.internal_operation_results[1]
+        else {
+            panic!(
+                "expected Origination at index 1, got {:?}",
+                result.internal_operation_results[1]
+            );
+        };
+        assert!(
+            matches!(origination.result, ContentResult::BackTracked(_)),
+            "alias-forwarder origination must be BackTracked when the CRAC fails; \
+             got: {:?}",
+            origination.result
+        );
+    }
+
+    /// When `deep_failure = true` (the target's own call succeeded but one
+    /// of its internal operations failed), the `alias→target` synthetic op
+    /// must be `BackTracked(None)` — not `Failed`.  The real error lives
+    /// exactly once on the deeper `Failed` entry already present in
+    /// `internal_receipts`.
+    ///
+    /// Without `deep_failure`, `build_failed_crac_receipt` would produce
+    /// `Failed(error)` on `alias→target` unconditionally, duplicating the
+    /// error that already lives on the deeper `Failed` entry.
+    #[test]
+    fn build_failed_crac_receipt_deep_failure_backtracks_alias_target() {
+        use tezos_tezlink::operation_result::{
+            OperationDataAndMetadata, OperationResultSum,
+        };
+
+        let null_pkh = PublicKeyHash::from_b58check(NULL_PKH).unwrap();
+        let source_contract = Contract::Originated(
+            ContractKt1Hash::from_b58check("KT18amZmM5W7qDWVt2pH6uj7sCEd3kbzLrHT")
+                .unwrap(),
+        );
+        let sender_contract = Contract::Originated(
+            ContractKt1Hash::from_b58check("KT1GRAN26ni19mgd6xpL6tsH52LNnhKSQzP2")
+                .unwrap(),
+        );
+        let destination = Contract::Originated(
+            ContractKt1Hash::from_b58check("KT18oDJJKXMKhfE1bSuAPGp92pYcwVDiqsPw")
+                .unwrap(),
+        );
+        let amount = Narith(0u64.into());
+        let parameters = Parameters::default();
+
+        // The wrapper error passed to the builder — present because the
+        // internal-op path still requires a TransferError.  With
+        // deep_failure=true the builder must NOT put this on alias→target.
+        let wrapper_error = TransferError::FailedToExecuteInternalOperation(
+            "internal operation failed during cross-runtime call".into(),
+        );
+
+        // Build a synthetic internal_receipts vec containing a deeper
+        // Failed entry (the contract that actually FAILWITHed) and a
+        // Backtracked sibling — mirroring what cross_runtime_transfer
+        // produces on the deep-failure path.
+        // Use a distinct KT1 (different from `destination`) to identify
+        // the deeply failing contract in assertions.
+        let deep_kt1 = Contract::Originated(
+            ContractKt1Hash::from_b58check("KT1RJ6PbjHpwc3M5rw5s2Nbmefwbuwbdxton")
+                .unwrap(),
+        );
+        let deeper_error_payload = "DEEP_FAILWITH_MARKER";
+        let deeper_failed_iop =
+            InternalOperationSum::Transfer(InternalContentWithMetadata {
+                sender: destination.clone(),
+                nonce: 5,
+                content: TransferContent {
+                    amount: Narith(0u64.into()),
+                    destination: deep_kt1.clone(),
+                    parameters: Parameters::default(),
+                },
+                result: ContentResult::Failed(ApplyOperationErrors::from(
+                    ApplyOperationError::Transfer(
+                        TransferError::FailedToExecuteInternalOperation(
+                            deeper_error_payload.into(),
+                        ),
+                    ),
+                )),
+            });
+        let internal_receipts = vec![deeper_failed_iop];
+
+        let applied = build_failed_crac_receipt(
+            &null_pkh,
+            &source_contract,
+            &sender_contract,
+            &amount,
+            &destination,
+            &parameters,
+            wrapper_error,
+            vec![],
+            internal_receipts,
+            "1-0",
+            0,
+            true, // deep failure: alias→target must be BackTracked
+            &OperationHash::default(),
+        )
+        .expect("build_failed_crac_receipt should succeed");
+
+        let OperationDataAndMetadata::OperationWithMetadata(batch) =
+            &applied.op_and_receipt;
+        let op = &batch.operations[0];
+        let OperationResultSum::Transfer(ref result) = op.receipt else {
+            panic!("expected Transfer receipt");
+        };
+
+        // Top-level is still Failed (the whole CRAC failed).
+        assert!(result.result.is_failed(), "top-level result must be Failed");
+
+        // Receipt layout: [begin_event, alias→destination, deeper_failed_iop, end_event]
+        assert_eq!(
+            result.internal_operation_results.len(),
+            4,
+            "expected 4 internal ops: begin + alias→target + deeper failed + end"
+        );
+
+        // Internal op #1: alias→destination must be BackTracked(None),
+        // NOT Failed.  The wrapper error must not appear here.
+        let InternalOperationSum::Transfer(ref alias_target) =
+            result.internal_operation_results[1]
+        else {
+            panic!(
+                "expected Transfer at index 1, got {:?}",
+                result.internal_operation_results[1]
+            );
+        };
+        assert!(
+            matches!(
+                alias_target.result,
+                ContentResult::BackTracked(BacktrackedResult { errors: None, .. })
+            ),
+            "alias→target must be BackTracked(None) on deep failure; without the \
+             fix it would be Failed. Got: {:?}",
+            alias_target.result
+        );
+        assert_eq!(
+            alias_target.content.destination, destination,
+            "alias→target destination must be the CRAC target"
+        );
+
+        // Internal op #2: the deeper Failed entry must be preserved intact.
+        let InternalOperationSum::Transfer(ref deeper) =
+            result.internal_operation_results[2]
+        else {
+            panic!(
+                "expected Transfer at index 2, got {:?}",
+                result.internal_operation_results[2]
+            );
+        };
+        assert!(
+            deeper.result.is_failed(),
+            "deeper internal op must stay Failed"
+        );
+        assert_eq!(
+            deeper.content.destination, deep_kt1,
+            "deeper internal op destination must be the deeply failing contract"
+        );
+    }
+
+    // `serve` opens its own dispatch slot and only takes from that one;
+    // an outer slot sitting on the stack must survive untouched.  This
+    // test fails at URL parsing, so it does NOT exercise serve's
+    // error-with-payload tail (covered separately by the
+    // `finalize_response_*` tests above); the property it pins is the
+    // slot-stack discipline.
+    #[test]
+    fn serve_does_not_touch_outer_dispatch_slot() {
+        let mut host = MockKernelHost::default();
+        let mut rk = RuntimeKeyspaces::init(&mut host).unwrap();
+        let runtime = test_runtime();
+        let registry = NotWiredRegistry;
+
+        let mut journal = TezosXJournal::mock(RuntimeId::Ethereum);
+        journal.michelson.push_dispatch_slot();
+        journal
+            .michelson
+            .set_dispatch_result(b"TOP-SECRET".to_vec())
+            .unwrap();
+
+        // `http://evm/...` has the wrong authority for the Tezos runtime;
+        // the URL parser maps it to `NotFound` (HTTP 404). This fails
+        // before any account lookup, so no storage setup is needed.
+        let request = http::Request::builder()
+            .uri("http://evm/KT18amZmM5W7qDWVt2pH6uj7sCEd3kbzLrHT")
+            .body(vec![])
+            .unwrap();
+        let resp = runtime.serve(&registry, &mut rk, &mut journal, request);
+
+        assert_eq!(resp.status(), StatusCode::NOT_FOUND);
+        assert!(
+            !resp.body().windows(10).any(|w| w == b"TOP-SECRET"),
+            "seeded dispatch result must not appear in error body"
+        );
+        assert!(
+            resp.headers().get(http::header::CONTENT_TYPE).is_none(),
+            "Content-Type must not be set on error responses"
+        );
+        // The outer slot is untouched: `serve` opened its own slot and
+        // took only that one.
+        assert_eq!(
+            journal.michelson.take_dispatch_result(),
+            Ok(Some(b"TOP-SECRET".to_vec()))
+        );
+    }
+
+    // Regression test: an early 4xx fails before metering, so the runtime
+    // reports the granted op limit as consumed. The caller then charges the
+    // op limit. Reverting the fix omits or misreports it.
+    #[test]
+    fn serve_early_4xx_reports_op_limit() {
+        use crate::headers::X_TEZOS_GAS_LIMIT;
+
+        let mut host = MockKernelHost::default();
+        let mut rk = RuntimeKeyspaces::init(&mut host).unwrap();
+        let runtime = test_runtime();
+        let registry = NotWiredRegistry;
+        let mut journal = TezosXJournal::mock(RuntimeId::Ethereum);
+
+        // Wrong-authority URL: parsing fails before metering starts.
+        let request = http::Request::builder()
+            .uri("http://evm/KT18amZmM5W7qDWVt2pH6uj7sCEd3kbzLrHT")
+            .header(X_TEZOS_GAS_LIMIT, "150")
+            .body(vec![])
+            .unwrap();
+        let resp = runtime.serve(&registry, &mut rk, &mut journal, request);
+
+        assert_eq!(resp.status(), StatusCode::NOT_FOUND);
+        assert_eq!(
+            resp.headers()
+                .get(X_TEZOS_GAS_CONSUMED)
+                .and_then(|v| v.to_str().ok()),
+            Some("150"),
+            "an unmetered early 4xx must report the granted op limit"
+        );
+    }
+
+    // A failure after metering has begun must report the gas it metered,
+    // not zero. The destination exists and runs to a failure, so real gas
+    // is charged before the catchable 400.
+    #[test]
+    fn serve_metered_failure_reports_consumed_gas() {
+        use crate::headers::{
+            X_TEZOS_AMOUNT, X_TEZOS_BLOCK_NUMBER, X_TEZOS_GAS_LIMIT, X_TEZOS_SENDER,
+            X_TEZOS_TIMESTAMP,
+        };
+        use mir::ast::micheline::Micheline;
+        use tezos_crypto_rs::blake2b::digest_160;
+        use tezos_crypto_rs::hash::ContractKt1Hash;
+
+        const SENDER_KT1: &str = "KT1GRAN26ni19mgd6xpL6tsH52LNnhKSQzP2";
+        const GAS_LIMIT: u64 = 600_000_000;
+
+        let mut host = MockKernelHost::default();
+
+        let mut rk = test_rk(&mut host);
+        let runtime = test_runtime();
+        let registry = NotWiredRegistry;
+        let mut journal = TezosXJournal::mock(RuntimeId::Ethereum);
+
+        let parser = mir::parser::Parser::new();
+        let dest_kt1 = ContractKt1Hash::from(digest_160(b"l2-1439-failwith"));
+        let dest = context::originated_from_kt1(&dest_kt1).unwrap();
+        let script = parser
+            .parse_top_level(
+                r#"parameter unit; storage unit;
+                   code { DROP; PUSH string "boom"; FAILWITH }"#,
+            )
+            .unwrap();
+        dest.init(
+            rk.host_mut(),
+            Some(&script.encode(&mut Gas::default()).unwrap().unwrap()),
+            &Micheline::from(())
+                .encode(&mut Gas::default())
+                .unwrap()
+                .unwrap(),
+            0.into(),
+        )
+        .unwrap();
+
+        let request = http::Request::builder()
+            .method(http::Method::POST)
+            .uri(format!("http://tezos/{}", dest_kt1.to_base58_check()))
+            .header(X_TEZOS_AMOUNT, "0")
+            .header(X_TEZOS_GAS_LIMIT, GAS_LIMIT.to_string())
+            .header(X_TEZOS_TIMESTAMP, "1000000")
+            .header(X_TEZOS_BLOCK_NUMBER, "1")
+            .header(X_TEZOS_SENDER, SENDER_KT1)
+            .body(vec![])
+            .unwrap();
+        let resp = runtime.serve(&registry, &mut rk, &mut journal, request);
+
+        assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
+        let consumed: u64 = resp
+            .headers()
+            .get(X_TEZOS_GAS_CONSUMED)
+            .and_then(|v| v.to_str().ok())
+            .and_then(|s| s.parse().ok())
+            .expect("gas-consumed header must parse");
+        assert!(
+            consumed > 0 && consumed < GAS_LIMIT,
+            "metered failure must report a nonzero count within budget, got {consumed}"
+        );
+    }
+
+    /// A call whose target runs out of gas in MIR is the caller's budget
+    /// problem: it surfaces as the catchable 429 with the `OOG` body, like
+    /// any other gas exhaustion, not as a 400 carrying the interpreter
+    /// message.
+    #[test]
+    fn serve_mir_out_of_gas_is_429() {
+        use crate::headers::{
+            X_TEZOS_AMOUNT, X_TEZOS_BLOCK_NUMBER, X_TEZOS_GAS_LIMIT, X_TEZOS_SENDER,
+            X_TEZOS_TIMESTAMP,
+        };
+        use mir::ast::micheline::Micheline;
+        use tezos_crypto_rs::blake2b::digest_160;
+        use tezos_crypto_rs::hash::ContractKt1Hash;
+
+        const SENDER_KT1: &str = "KT1GRAN26ni19mgd6xpL6tsH52LNnhKSQzP2";
+        const GAS_LIMIT: u64 = 100_000_000;
+
+        let mut host = MockKernelHost::default();
+        let mut rk = test_rk(&mut host);
+        let runtime = test_runtime();
+        let registry = NotWiredRegistry;
+        let mut journal = TezosXJournal::mock(RuntimeId::Ethereum);
+
+        let parser = mir::parser::Parser::new();
+        let dest_kt1 = ContractKt1Hash::from(digest_160(b"l2-2069-mir-out-of-gas"));
+        let dest = context::originated_from_kt1(&dest_kt1).unwrap();
+        // Loops until the budget is exhausted.
+        let script = parser
+            .parse_top_level(
+                r#"parameter unit; storage unit;
+                   code { DROP; PUSH bool True; LOOP { PUSH bool True };
+                          UNIT; NIL operation; PAIR }"#,
+            )
+            .unwrap();
+        dest.init(
+            rk.host_mut(),
+            Some(&script.encode(&mut Gas::default()).unwrap().unwrap()),
+            &Micheline::from(())
+                .encode(&mut Gas::default())
+                .unwrap()
+                .unwrap(),
+            0.into(),
+        )
+        .unwrap();
+
+        let request = http::Request::builder()
+            .method(http::Method::POST)
+            .uri(format!("http://tezos/{}", dest_kt1.to_base58_check()))
+            .header(X_TEZOS_AMOUNT, "0")
+            .header(X_TEZOS_GAS_LIMIT, GAS_LIMIT.to_string())
+            .header(X_TEZOS_TIMESTAMP, "1000000")
+            .header(X_TEZOS_BLOCK_NUMBER, "1")
+            .header(X_TEZOS_SENDER, SENDER_KT1)
+            .body(vec![])
+            .unwrap();
+        let resp = runtime.serve(&registry, &mut rk, &mut journal, request);
+
+        assert_eq!(
+            resp.status(),
+            StatusCode::TOO_MANY_REQUESTS,
+            "body: {}",
+            String::from_utf8_lossy(resp.body())
+        );
+        assert_eq!(resp.body().as_slice(), b"OOG");
+    }
+
+    // A view that fails after metering must report the gas it metered,
+    // not zero.
+    #[test]
+    fn serve_view_failure_reports_consumed_gas() {
+        use crate::headers::{
+            X_TEZOS_AMOUNT, X_TEZOS_BLOCK_NUMBER, X_TEZOS_GAS_LIMIT, X_TEZOS_SENDER,
+            X_TEZOS_TIMESTAMP,
+        };
+        use mir::ast::micheline::Micheline;
+        use tezos_crypto_rs::blake2b::digest_160;
+        use tezos_crypto_rs::hash::ContractKt1Hash;
+
+        const SENDER_KT1: &str = "KT1GRAN26ni19mgd6xpL6tsH52LNnhKSQzP2";
+        const GAS_LIMIT: u64 = 600_000_000;
+
+        let mut host = MockKernelHost::default();
+
+        let mut rk = test_rk(&mut host);
+        let runtime = test_runtime();
+        let registry = NotWiredRegistry;
+        let mut journal = TezosXJournal::mock(RuntimeId::Ethereum);
+
+        let parser = mir::parser::Parser::new();
+        let dest_kt1 = ContractKt1Hash::from(digest_160(b"l2-1439-view-failwith"));
+        let dest = context::originated_from_kt1(&dest_kt1).unwrap();
+        let script = parser
+            .parse_top_level(
+                r#"parameter unit; storage unit;
+                   code { CDR; NIL operation; PAIR };
+                   view "boom" unit unit { DROP; PUSH string "boom"; FAILWITH }"#,
+            )
+            .unwrap();
+        dest.init(
+            rk.host_mut(),
+            Some(&script.encode(&mut Gas::default()).unwrap().unwrap()),
+            &Micheline::from(())
+                .encode(&mut Gas::default())
+                .unwrap()
+                .unwrap(),
+            0.into(),
+        )
+        .unwrap();
+
+        let request = http::Request::builder()
+            .method(http::Method::GET)
+            .uri(format!("http://tezos/{}/boom", dest_kt1.to_base58_check()))
+            .header(X_TEZOS_AMOUNT, "0")
+            .header(X_TEZOS_GAS_LIMIT, GAS_LIMIT.to_string())
+            .header(X_TEZOS_TIMESTAMP, "1000000")
+            .header(X_TEZOS_BLOCK_NUMBER, "1")
+            .header(X_TEZOS_SENDER, SENDER_KT1)
+            .body(vec![])
+            .unwrap();
+        let resp = runtime.serve(&registry, &mut rk, &mut journal, request);
+
+        assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
+        let consumed: u64 = resp
+            .headers()
+            .get(X_TEZOS_GAS_CONSUMED)
+            .and_then(|v| v.to_str().ok())
+            .and_then(|s| s.parse().ok())
+            .expect("gas-consumed header must parse");
+        assert!(
+            consumed > 0 && consumed < GAS_LIMIT,
+            "view failure must report a nonzero count within budget, got {consumed}"
+        );
+    }
+
+    /// A view lookup that runs out of gas while decoding the target's
+    /// script is the caller's budget problem, not a kernel fault: it must
+    /// surface as the catchable 429, never as a 500 that aborts the block.
+    #[test]
+    fn serve_view_lookup_out_of_gas_is_429() {
+        use crate::headers::{
+            X_TEZOS_AMOUNT, X_TEZOS_BLOCK_NUMBER, X_TEZOS_GAS_LIMIT, X_TEZOS_SENDER,
+            X_TEZOS_TIMESTAMP,
+        };
+        use mir::ast::micheline::Micheline;
+        use tezos_crypto_rs::blake2b::digest_160;
+        use tezos_crypto_rs::hash::ContractKt1Hash;
+
+        const SENDER_KT1: &str = "KT1GRAN26ni19mgd6xpL6tsH52LNnhKSQzP2";
+        // Enough to start metering, not enough to decode the script
+        // (20 milligas per byte).
+        const GAS_LIMIT: u64 = 110;
+
+        let mut host = MockKernelHost::default();
+        let mut rk = test_rk(&mut host);
+        let runtime = test_runtime();
+        let registry = NotWiredRegistry;
+        let mut journal = TezosXJournal::mock(RuntimeId::Ethereum);
+
+        let parser = mir::parser::Parser::new();
+        let dest_kt1 = ContractKt1Hash::from(digest_160(b"view-lookup-out-of-gas"));
+        let dest = context::originated_from_kt1(&dest_kt1).unwrap();
+        let script = parser
+            .parse_top_level(
+                r#"parameter unit; storage unit;
+                   code { CDR; NIL operation; PAIR };
+                   view "v" unit unit { DROP; UNIT }"#,
+            )
+            .unwrap();
+        dest.init(
+            rk.host_mut(),
+            Some(&script.encode(&mut Gas::default()).unwrap().unwrap()),
+            &Micheline::from(())
+                .encode(&mut Gas::default())
+                .unwrap()
+                .unwrap(),
+            0.into(),
+        )
+        .unwrap();
+
+        let request = http::Request::builder()
+            .method(http::Method::GET)
+            .uri(format!("http://tezos/{}/v", dest_kt1.to_base58_check()))
+            .header(X_TEZOS_AMOUNT, "0")
+            .header(X_TEZOS_GAS_LIMIT, GAS_LIMIT.to_string())
+            .header(X_TEZOS_TIMESTAMP, "1000000")
+            .header(X_TEZOS_BLOCK_NUMBER, "1")
+            .header(X_TEZOS_SENDER, SENDER_KT1)
+            .body(vec![])
+            .unwrap();
+        let resp = runtime.serve(&registry, &mut rk, &mut journal, request);
+
+        assert_eq!(
+            resp.status(),
+            StatusCode::TOO_MANY_REQUESTS,
+            "body: {}",
+            String::from_utf8_lossy(resp.body())
+        );
+        let consumed: u64 = resp
+            .headers()
+            .get(X_TEZOS_GAS_CONSUMED)
+            .and_then(|v| v.to_str().ok())
+            .and_then(|s| s.parse().ok())
+            .expect("gas-consumed header must parse");
+        assert_eq!(
+            consumed, GAS_LIMIT,
+            "an out-of-gas view must report its whole budget"
+        );
+    }
+
+    /// Regression test for L2-1464: a gas-tight failed CRAC must still
+    /// record its failed receipt for indexers / call-graph
+    /// reconstruction.
+    ///
+    /// Drives a real inbound EVM→Michelson CRAC (origin runtime =
+    /// Ethereum, so the kernel emits the synthetic CRAC-ID event — the
+    /// gas-charged step the bug hinged on) whose transfer targets a
+    /// never-originated KT1. The transfer fails with the catchable
+    /// operation-level error `ContractDoesNotExist`, and the gas limit
+    /// is set below what encoding the synthetic CRAC event would cost.
+    ///
+    /// Before the fix, `build_failed_crac_receipt` encoded that event
+    /// against the caller's (now near-empty) gas counter, hit
+    /// `OutOfGas`, and the receipt was logged-and-dropped — leaving
+    /// `failed_crac_receipts` empty while still returning a catchable
+    /// `BadRequest` to the EVM caller. With the event encoding now
+    /// sponsored against a dedicated kernel-owned counter, the receipt
+    /// is built regardless of the caller's leftover gas, so it survives.
+    /// Reverting the sponsoring fix makes this test fail (receipt count
+    /// drops to 0).
+    #[test]
+    fn gas_tight_failed_crac_still_records_failed_receipt() {
+        use crate::headers::{
+            X_TEZOS_AMOUNT, X_TEZOS_BLOCK_NUMBER, X_TEZOS_CRAC_ID, X_TEZOS_GAS_LIMIT,
+            X_TEZOS_SENDER, X_TEZOS_SOURCE, X_TEZOS_TIMESTAMP,
+        };
+
+        use tezosx_journal::CracId;
+
+        // alias(E_0): EVM tx originator alias — top-level CRAC source.
+        const SOURCE_KT1: &str = "KT18amZmM5W7qDWVt2pH6uj7sCEd3kbzLrHT";
+        // alias(E_1): immediate EVM caller alias — internal-op sender.
+        const SENDER_KT1: &str = "KT1GRAN26ni19mgd6xpL6tsH52LNnhKSQzP2";
+        // Never originated in this host → ContractDoesNotExist on transfer.
+        const MISSING_DEST_KT1: &str = "KT18oDJJKXMKhfE1bSuAPGp92pYcwVDiqsPw";
+
+        let mut host = MockKernelHost::default();
+        let mut rk = RuntimeKeyspaces::init(&mut host).unwrap();
+        let runtime = test_runtime();
+        let registry = NotWiredRegistry;
+
+        // Ethereum-origin CRAC (origin_runtime != Tezos) so the kernel
+        // emits the synthetic CRAC-ID event. The CRAC-Id header must
+        // match the journal's id for `verify_crac_id` to pass.
+        let crac_id = CracId::new(u8::from(RuntimeId::Ethereum), 0);
+        let crac_id_str = crac_id.to_string();
+        let mut journal =
+            TezosXJournal::new(crac_id, TezosXHashes::zero(), BlockConstants::dummy());
+
+        // Non-empty body holding an encoded Unit: skips the empty-body
+        // Unit fallback (which would itself draw on the tight gas) and
+        // decodes cheaply, so essentially the whole budget is still
+        // available for the would-be event encode after the transfer
+        // fails.
+        let body = mir::ast::micheline::Micheline::from(())
+            .encode(&mut Gas::default())
+            .unwrap()
+            .unwrap();
+
+        // Enough milligas to decode the Unit body and reach the
+        // (storage-read-only, uncharged) destination-existence guard,
+        // but below the cost of Micheline-encoding the synthetic CRAC
+        // event — the window in which the unfixed builder ran out of gas
+        // and dropped the receipt (the L2-1464 repro found the boundary
+        // around 230 milligas).
+        let request = http::Request::builder()
+            .method(http::Method::POST)
+            .uri(format!("http://tezos/{MISSING_DEST_KT1}"))
+            .header(X_TEZOS_AMOUNT, "0")
+            .header(X_TEZOS_GAS_LIMIT, "150")
+            .header(X_TEZOS_TIMESTAMP, "1000000")
+            .header(X_TEZOS_BLOCK_NUMBER, "1")
+            .header(X_TEZOS_SENDER, SENDER_KT1)
+            .header(X_TEZOS_SOURCE, SOURCE_KT1)
+            .header(X_TEZOS_CRAC_ID, crac_id_str.as_str())
+            .body(body)
+            .unwrap();
+
+        let resp = runtime.serve(&registry, &mut rk, &mut journal, request);
+
+        // The EVM caller still observes a catchable failure ...
+        assert_eq!(
+            resp.status(),
+            StatusCode::BAD_REQUEST,
+            "operation-level CRAC failure must stay a catchable 4xx, got {:?} ({})",
+            resp.status(),
+            String::from_utf8_lossy(resp.body())
+        );
+
+        // ... and crucially the failed CRAC receipt is preserved despite
+        // the gas-tight builder (the property L2-1464 fixes).
+        assert_eq!(
+            journal.michelson.failed_crac_receipts.len(),
+            1,
+            "gas-tight failed CRAC must still record its failed receipt"
+        );
+
+        // The receipt is a Failed top-level whose first internal op is
+        // the synthetic CRAC-ID event — i.e. the very thing whose
+        // encoding was previously dropping the whole receipt.
+        let (_seq, receipt) = &journal.michelson.failed_crac_receipts[0];
+        let OperationDataAndMetadata::OperationWithMetadata(batch) =
+            &receipt.op_and_receipt;
+        let op = &batch.operations[0];
+        let OperationResultSum::Transfer(ref result) = op.receipt else {
+            panic!("expected Transfer receipt");
+        };
+        assert!(
+            matches!(result.result, ContentResult::Failed(_)),
+            "top-level result must be Failed"
+        );
+        let InternalOperationSum::Event(ref event) = result.internal_operation_results[0]
+        else {
+            panic!("expected synthetic CRAC event as first internal op");
+        };
+        assert_eq!(
+            event.content.tag.as_ref().and_then(|e| e.as_str()),
+            Some("cross_runtime_call"),
+            "first internal op must be the synthetic CRAC-ID event"
+        );
+    }
+
+    /// L2-1676: the MIR internal-operation counter — the replay
+    /// identity L1 enforces — must be resumed from (and written back to)
+    /// the Michelson journal so it stays monotonic across reentrant
+    /// inbound Michelson frames, matching L1's single internal-nonce
+    /// namespace for the manager operation's internal-op tree. Each
+    /// inbound CRAC builds a fresh `OperationCtx`; before this fix its
+    /// `counter` restarted at 0, so two internal operations in distinct
+    /// frames of an `EVM → Michelson → EVM → Michelson` chain could
+    /// share one counter.
+    ///
+    /// This drives a single inbound CRAC to a contract that emits one
+    /// internal transfer, with the journal counter pre-seeded to a
+    /// sentinel. If the counter is correctly resumed, the emitted
+    /// internal operation takes `sentinel + 1` and that value is
+    /// persisted back. Reverting either half of the wiring (the
+    /// frame-entry resume or the frame-exit persist) makes the final
+    /// counter `1` rather than `sentinel + 1`, failing the test.
+    #[test]
+    fn inbound_crac_resumes_internal_operation_counter() {
+        use crate::headers::{
+            X_TEZOS_AMOUNT, X_TEZOS_BLOCK_NUMBER, X_TEZOS_CRAC_ID, X_TEZOS_GAS_LIMIT,
+            X_TEZOS_SENDER, X_TEZOS_SOURCE, X_TEZOS_TIMESTAMP,
+        };
+        use mir::ast::micheline::Micheline;
+        use tezos_crypto_rs::blake2b::digest_160;
+        use tezos_crypto_rs::hash::ContractKt1Hash;
+        use tezosx_journal::CracId;
+
+        // The frame's counter is resumed from this sentinel. A non-zero,
+        // non-one value disambiguates "resumed from the journal" from
+        // "restarted at 0" — the unfixed behaviour would yield 1.
+        const SEEDED_COUNTER: u128 = 41;
+
+        // alias(E_0)/alias(E_1): top-level CRAC source and immediate
+        // caller — valid KT1 aliases, not otherwise exercised here.
+        const SOURCE_KT1: &str = "KT18amZmM5W7qDWVt2pH6uj7sCEd3kbzLrHT";
+        const SENDER_KT1: &str = "KT1GRAN26ni19mgd6xpL6tsH52LNnhKSQzP2";
+
+        let mut host = MockKernelHost::default();
+        let mut rk = RuntimeKeyspaces::init(&mut host).unwrap();
+        let runtime = test_runtime();
+        let registry = NotWiredRegistry;
+
+        let parser = mir::parser::Parser::new();
+
+        // Receiver: accepts unit, emits nothing — so it contributes no
+        // further counter increments.
+        let receiver_kt1 = ContractKt1Hash::from(digest_160(b"l2-1676-receiver"));
+        let receiver = context::originated_from_kt1(&receiver_kt1).unwrap();
+        let receiver_script = parser
+            .parse_top_level(
+                "parameter unit; storage unit; code { CDR; NIL operation; PAIR }",
+            )
+            .unwrap();
+        receiver
+            .init(
+                rk.host_mut(),
+                Some(
+                    &receiver_script
+                        .encode(&mut Gas::default())
+                        .unwrap()
+                        .unwrap(),
+                ),
+                &Micheline::from(())
+                    .encode(&mut Gas::default())
+                    .unwrap()
+                    .unwrap(),
+                0.into(),
+            )
+            .unwrap();
+
+        // Parent: on call, emits exactly one internal transfer to the
+        // address passed as parameter — a single `operation_counter()`
+        // increment.
+        let parent_kt1 = ContractKt1Hash::from(digest_160(b"l2-1676-parent"));
+        let parent = context::originated_from_kt1(&parent_kt1).unwrap();
+        let parent_script = parser
+            .parse_top_level(
+                r#"
+                parameter address;
+                storage unit;
+                code {
+                    CAR;
+                    CONTRACT unit;
+                    IF_NONE { PUSH string "Invalid contract address"; FAILWITH } {};
+                    PUSH mutez 0;
+                    PUSH unit Unit;
+                    TRANSFER_TOKENS;
+                    NIL operation;
+                    SWAP; CONS;
+                    PUSH unit Unit;
+                    SWAP;
+                    PAIR
+                }"#,
+            )
+            .unwrap();
+        parent
+            .init(
+                rk.host_mut(),
+                Some(&parent_script.encode(&mut Gas::default()).unwrap().unwrap()),
+                &Micheline::from(())
+                    .encode(&mut Gas::default())
+                    .unwrap()
+                    .unwrap(),
+                0.into(),
+            )
+            .unwrap();
+
+        let crac_id = CracId::new(u8::from(RuntimeId::Ethereum), 0);
+        let crac_id_str = crac_id.to_string();
+        let mut journal =
+            TezosXJournal::new(crac_id, TezosXHashes::zero(), BlockConstants::dummy());
+
+        // Pre-seed the journal counter to model a prior reentrant frame
+        // having already assigned identities up to SEEDED_COUNTER.
+        journal
+            .michelson
+            .set_internal_operation_counter(SEEDED_COUNTER);
+
+        // The parameter is the receiver address the parent forwards to.
+        let body =
+            Micheline::Bytes(Contract::Originated(receiver_kt1).to_bytes().unwrap())
+                .encode(&mut Gas::default())
+                .unwrap()
+                .unwrap();
+
+        let request = http::Request::builder()
+            .method(http::Method::POST)
+            .uri(format!("http://tezos/{}", parent_kt1.to_base58_check()))
+            .header(X_TEZOS_AMOUNT, "0")
+            .header(X_TEZOS_GAS_LIMIT, "600000000")
+            .header(X_TEZOS_TIMESTAMP, "1000000")
+            .header(X_TEZOS_BLOCK_NUMBER, "1")
+            .header(X_TEZOS_SENDER, SENDER_KT1)
+            .header(X_TEZOS_SOURCE, SOURCE_KT1)
+            .header(X_TEZOS_CRAC_ID, crac_id_str.as_str())
+            .body(body)
+            .unwrap();
+
+        let resp = runtime.serve(&registry, &mut rk, &mut journal, request);
+
+        assert_eq!(
+            resp.status(),
+            StatusCode::OK,
+            "inbound CRAC must succeed, got {:?} ({})",
+            resp.status(),
+            String::from_utf8_lossy(resp.body())
+        );
+
+        // The parent emitted one internal operation, which must have
+        // taken the identity SEEDED_COUNTER + 1 (resumed, not reset),
+        // and that value must be persisted back to the journal for the
+        // next reentrant frame.
+        assert_eq!(
+            journal.michelson.internal_operation_counter(),
+            SEEDED_COUNTER + 1,
+            "the frame must resume the MIR counter from the journal \
+             (got {}, expected {}); a value of 1 means the counter \
+             reset to 0 instead of resuming",
+            journal.michelson.internal_operation_counter(),
+            SEEDED_COUNTER + 1
+        );
+    }
+
+    /// L2-1727: an EVM-origin (inbound) CRAC is subject to L1's per-block
+    /// internal-operation cap *cumulatively*. The kernel seeds the Michelson
+    /// journal counter with the block's prior internal-op count
+    /// (`apply_ethereum_transaction_common`), so a sub-operation that would
+    /// allocate a counter at the cap fails the CRAC *in isolation* (op-level,
+    /// HTTP 400) rather than being applied. Pre-MR the EVM path always started
+    /// at 0, so this never fired. Mirrors the native-path boundary in
+    /// `tezos_execution`'s `internal_operation_cap_is_block_cumulative`.
+    #[test]
+    fn inbound_crac_internal_op_cap_is_cumulative() {
+        use crate::headers::{
+            X_TEZOS_AMOUNT, X_TEZOS_BLOCK_NUMBER, X_TEZOS_CRAC_ID, X_TEZOS_GAS_LIMIT,
+            X_TEZOS_SENDER, X_TEZOS_SOURCE, X_TEZOS_TIMESTAMP,
+        };
+        use mir::ast::micheline::Micheline;
+        use mir::interpreter::MAX_INTERNAL_OPERATIONS;
+        use tezos_crypto_rs::blake2b::digest_160;
+        use tezos_crypto_rs::hash::ContractKt1Hash;
+        use tezosx_journal::CracId;
+
+        const SOURCE_KT1: &str = "KT18amZmM5W7qDWVt2pH6uj7sCEd3kbzLrHT";
+        const SENDER_KT1: &str = "KT1GRAN26ni19mgd6xpL6tsH52LNnhKSQzP2";
+
+        // Drive a single inbound CRAC whose parent emits exactly one internal
+        // transfer, with the journal counter pre-seeded to `base` (the block's
+        // prior internal-op count). Returns the CRAC's HTTP status.
+        let run = |base: u128| {
+            let mut host = MockKernelHost::default();
+            let mut rk = RuntimeKeyspaces::init(&mut host).unwrap();
+            let runtime = test_runtime();
+            let registry = NotWiredRegistry;
+            let parser = mir::parser::Parser::new();
+
+            let receiver_kt1 = ContractKt1Hash::from(digest_160(b"l2-1727-receiver"));
+            let receiver = context::originated_from_kt1(&receiver_kt1).unwrap();
+            let receiver_script = parser
+                .parse_top_level(
+                    "parameter unit; storage unit; code { CDR; NIL operation; PAIR }",
+                )
+                .unwrap();
+            receiver
+                .init(
+                    rk.host_mut(),
+                    Some(
+                        &receiver_script
+                            .encode(&mut Gas::default())
+                            .unwrap()
+                            .unwrap(),
+                    ),
+                    &Micheline::from(())
+                        .encode(&mut Gas::default())
+                        .unwrap()
+                        .unwrap(),
+                    0.into(),
+                )
+                .unwrap();
+
+            let parent_kt1 = ContractKt1Hash::from(digest_160(b"l2-1727-parent"));
+            let parent = context::originated_from_kt1(&parent_kt1).unwrap();
+            let parent_script = parser
+                .parse_top_level(
+                    r#"
+                    parameter address;
+                    storage unit;
+                    code {
+                        CAR;
+                        CONTRACT unit;
+                        IF_NONE { PUSH string "Invalid contract address"; FAILWITH } {};
+                        PUSH mutez 0;
+                        PUSH unit Unit;
+                        TRANSFER_TOKENS;
+                        NIL operation;
+                        SWAP; CONS;
+                        PUSH unit Unit;
+                        SWAP;
+                        PAIR
+                    }"#,
+                )
+                .unwrap();
+            parent
+                .init(
+                    rk.host_mut(),
+                    Some(&parent_script.encode(&mut Gas::default()).unwrap().unwrap()),
+                    &Micheline::from(())
+                        .encode(&mut Gas::default())
+                        .unwrap()
+                        .unwrap(),
+                    0.into(),
+                )
+                .unwrap();
+
+            let crac_id = CracId::new(u8::from(RuntimeId::Ethereum), 0);
+            let crac_id_str = crac_id.to_string();
+            let mut journal = TezosXJournal::new(
+                crac_id,
+                TezosXHashes::zero(),
+                BlockConstants::dummy(),
+            );
+            journal.michelson.set_internal_operation_counter(base);
+
+            let body =
+                Micheline::Bytes(Contract::Originated(receiver_kt1).to_bytes().unwrap())
+                    .encode(&mut Gas::default())
+                    .unwrap()
+                    .unwrap();
+            let request = http::Request::builder()
+                .method(http::Method::POST)
+                .uri(format!("http://tezos/{}", parent_kt1.to_base58_check()))
+                .header(X_TEZOS_AMOUNT, "0")
+                .header(X_TEZOS_GAS_LIMIT, "600000000")
+                .header(X_TEZOS_TIMESTAMP, "1000000")
+                .header(X_TEZOS_BLOCK_NUMBER, "1")
+                .header(X_TEZOS_SENDER, SENDER_KT1)
+                .header(X_TEZOS_SOURCE, SOURCE_KT1)
+                .header(X_TEZOS_CRAC_ID, crac_id_str.as_str())
+                .body(body)
+                .unwrap();
+
+            runtime
+                .serve(&registry, &mut rk, &mut journal, request)
+                .status()
+        };
+
+        // Just below the cap: the parent's internal transfer takes a counter
+        // under the limit and the CRAC succeeds.
+        assert_eq!(
+            run(MAX_INTERNAL_OPERATIONS - 1),
+            StatusCode::OK,
+            "below the cap the inbound CRAC must succeed"
+        );
+        // At the cap: allocating the counter fails L1's
+        // Too_many_internal_operations, so the CRAC fails op-level (400 — a
+        // catchable revert), not a 500 block abort.
+        assert_eq!(
+            run(MAX_INTERNAL_OPERATIONS),
+            StatusCode::BAD_REQUEST,
+            "at the cap the inbound CRAC must fail in isolation (op-level)"
+        );
+    }
+
+    // ── TezosRuntime::read_origin tests ──────────────────────────────────
+
+    mod read_origin_tests {
+        use super::*;
+        use tezos_crypto_rs::hash::ChainId;
+        use tezosx_interfaces::{
+            Classification, Gas as TezosXGas, Origin, RuntimeInterface, ALIAS_LOOKUP_COST,
+        };
+
+        fn test_runtime() -> TezosRuntime {
+            TezosRuntime::new(ChainId::default())
+        }
+
+        // (a) Implicit address (tz1) → Native by construction (no durable read,
+        //     no stored `/origin`), even when unrecorded. Charges ALIAS_LOOKUP_COST.
+        #[test]
+        fn read_origin_implicit_returns_native() {
+            let mut host = MockKernelHost::default();
+            let rk = MockRuntimeKeyspaces::init(&mut host).unwrap();
+            let runtime = test_runtime();
+
+            let budget = TezosXGas::new(1_000_000, RuntimeId::Tezos);
+            let (class, consumed) = runtime
+                .read_origin(&rk, "tz1KqTpEZ7Yob7QbPE4Hy4Wo8fHG8LhKxZSx", budget)
+                .unwrap();
+            assert_eq!(class, Classification::Native);
+            assert_eq!(consumed, ALIAS_LOOKUP_COST);
+        }
+
+        // (d) Malformed address → Unknown, no charge
+        #[test]
+        fn read_origin_malformed_address_returns_unknown_no_charge() {
+            let mut host = MockKernelHost::default();
+            let rk = MockRuntimeKeyspaces::init(&mut host).unwrap();
+            let runtime = test_runtime();
+
+            let budget = TezosXGas::new(1_000_000, RuntimeId::Tezos);
+            let (class, consumed) = runtime
+                .read_origin(&rk, "not-a-tezos-address", budget)
+                .unwrap();
+            assert_eq!(class, Classification::Unknown);
+            assert_eq!(consumed, TezosXGas::ZERO); // malformed → no charge
+        }
+
+        // (e) KT1 address with recorded classification
+        #[test]
+        fn read_origin_kt1_address_returns_native() {
+            use tezos_crypto_rs::hash::ContractKt1Hash;
+
+            let mut host = MockKernelHost::default();
+            let mut rk = MockRuntimeKeyspaces::init(&mut host).unwrap();
+            let runtime = test_runtime();
+
+            // Use a real-looking KT1 derived from blake2b to avoid parse errors.
+            let kt1 = ContractKt1Hash::from(tezos_crypto_rs::blake2b::digest_160(
+                b"test_kt1_seed",
+            ));
+            let kt1_b58 = kt1.to_base58_check();
+            let account = context::originated_from_kt1(&kt1).unwrap();
+            account.set_origin(rk.host_mut(), &Origin::Native).unwrap();
+
+            let budget = TezosXGas::new(1_000_000, RuntimeId::Tezos);
+            let (class, consumed) = runtime.read_origin(&rk, &kt1_b58, budget).unwrap();
+            assert_eq!(class, Classification::Native);
+            assert_eq!(consumed, ALIAS_LOOKUP_COST);
+        }
+    }
+
+    // ── TezosRuntime::check_is_native_address tests ──────────────────────
+
+    mod check_is_native_address_tests {
+        use super::*;
+        use tezos_crypto_rs::hash::{ChainId, ContractKt1Hash};
+        use tezosx_interfaces::{
+            AliasInfo, Gas as TezosXGas, Origin, RuntimeInterface, TezosXRuntimeError,
+            ALIAS_LOOKUP_COST,
+        };
+        use tezosx_types::CheckNativeAddressError;
+
+        // Sandbox `bootstrap1` account and its public key.
+        const IMPLICIT: &str = "tz1KqTpEZ7Yob7QbPE4Hy4Wo8fHG8LhKxZSx";
+        const PUBLIC_KEY: &str = "edpkuBknW28nW72KG6RoHtYW7p12T6GKc7nAbwYX5m8Wd9sDVC9yav";
+        // Public key of the sandbox `bootstrap2` account.
+        const OTHER_PUBLIC_KEY: &str =
+            "edpktzNbDAUjUk697W7gYg2CRuBQjyPxbEg8dLccYYwKSKvkPvjtV9";
+        const BUDGET_MILLIGAS: u64 = 100_000_000;
+
+        fn budget() -> TezosXGas {
+            TezosXGas::new(BUDGET_MILLIGAS, RuntimeId::Tezos)
+        }
+
+        fn milligas(gas: u64) -> TezosXGas {
+            TezosXGas::new(gas, RuntimeId::Tezos)
+        }
+
+        fn lookup_cost() -> u64 {
+            ALIAS_LOOKUP_COST.as_runtime(RuntimeId::Tezos)
+        }
+
+        fn hash_cost() -> u64 {
+            interpret_cost::HASH_KEY.into()
+        }
+
+        fn kt1(seed: &[u8]) -> ContractKt1Hash {
+            ContractKt1Hash::from(tezos_crypto_rs::blake2b::digest_160(seed))
+        }
+
+        fn check<KS: KeySpace>(
+            rk: &RuntimeKeyspaces<'_, MockKernelHost, KS>,
+            address: &str,
+            public_key: Option<&str>,
+            budget: TezosXGas,
+        ) -> Result<TezosXGas, TezosXRuntimeError> {
+            let mut budget = budget;
+            TezosRuntime::new(ChainId::default()).check_is_native_address(
+                rk,
+                address,
+                public_key,
+                &mut budget,
+            )?;
+            Ok(budget)
+        }
+
+        // The binary encoding is the curve tag followed by the key: the one
+        // an alias materialized by a NAC stores.
+        #[test]
+        fn public_key_from_string_returns_the_binary_encoding() {
+            let bytes = TezosRuntime::new(ChainId::default())
+                .public_key_from_string(PUBLIC_KEY)
+                .unwrap();
+            let mut expected = Vec::new();
+            PublicKey::from_b58check(PUBLIC_KEY)
+                .unwrap()
+                .bin_write(&mut expected)
+                .unwrap();
+            assert_eq!(bytes, expected);
+            assert_eq!(bytes.len(), 33);
+            assert_eq!(bytes[0], 0, "ed25519 tag");
+        }
+
+        #[test]
+        fn public_key_from_string_rejects_a_malformed_key() {
+            let err = TezosRuntime::new(ChainId::default())
+                .public_key_from_string("edpk-not-a-key")
+                .unwrap_err();
+            assert_eq!(err, CheckNativeAddressError::MalformedPublicKey.into());
+        }
+
+        #[test]
+        fn implicit_address_with_matching_public_key_is_native() {
+            let mut host = MockKernelHost::default();
+            let rk = MockRuntimeKeyspaces::init(&mut host).unwrap();
+
+            let remaining = check(&rk, IMPLICIT, Some(PUBLIC_KEY), budget()).unwrap();
+            assert_eq!(remaining, milligas(BUDGET_MILLIGAS - hash_cost()));
+        }
+
+        #[test]
+        fn implicit_address_without_public_key_is_rejected() {
+            let mut host = MockKernelHost::default();
+            let rk = MockRuntimeKeyspaces::init(&mut host).unwrap();
+
+            let err = check(&rk, IMPLICIT, None, budget()).unwrap_err();
+            assert_eq!(err, CheckNativeAddressError::MissingPublicKey.into());
+        }
+
+        #[test]
+        // The hash of the key is charged even though the key doesn't match.
+        fn implicit_address_with_public_key_of_another_account_is_a_mismatch() {
+            let mut host = MockKernelHost::default();
+            let rk = MockRuntimeKeyspaces::init(&mut host).unwrap();
+
+            let mut budget = budget();
+            let err = TezosRuntime::new(ChainId::default())
+                .check_is_native_address(
+                    &rk,
+                    IMPLICIT,
+                    Some(OTHER_PUBLIC_KEY),
+                    &mut budget,
+                )
+                .unwrap_err();
+            assert_eq!(err, CheckNativeAddressError::PublicKeyMismatch.into());
+            assert_eq!(budget, milligas(BUDGET_MILLIGAS - hash_cost()));
+        }
+
+        #[test]
+        fn implicit_address_with_malformed_public_key_is_rejected() {
+            let mut host = MockKernelHost::default();
+            let rk = MockRuntimeKeyspaces::init(&mut host).unwrap();
+
+            let err = check(&rk, IMPLICIT, Some("edpk-not-a-key"), budget()).unwrap_err();
+            assert_eq!(err, CheckNativeAddressError::MalformedPublicKey.into());
+        }
+
+        #[test]
+        fn implicit_address_with_budget_below_hash_cost_is_out_of_gas() {
+            let mut host = MockKernelHost::default();
+            let rk = MockRuntimeKeyspaces::init(&mut host).unwrap();
+
+            let err = check(&rk, IMPLICIT, Some(PUBLIC_KEY), milligas(hash_cost() - 1))
+                .unwrap_err();
+            assert_eq!(err, TezosXRuntimeError::OutOfGas);
+        }
+
+        #[test]
+        fn malformed_address_is_rejected() {
+            let mut host = MockKernelHost::default();
+            let rk = MockRuntimeKeyspaces::init(&mut host).unwrap();
+
+            let err = check(&rk, "not-a-tezos-address", None, budget()).unwrap_err();
+            assert_eq!(err, CheckNativeAddressError::MalformedAddress.into());
+        }
+
+        #[test]
+        fn kt1_recorded_native_is_native() {
+            let mut host = MockKernelHost::default();
+            let mut rk = MockRuntimeKeyspaces::init(&mut host).unwrap();
+            let kt1 = kt1(b"native_kt1");
+            let account = context::originated_from_kt1(&kt1).unwrap();
+            account.set_origin(rk.host_mut(), &Origin::Native).unwrap();
+
+            let remaining = check(&rk, &kt1.to_base58_check(), None, budget()).unwrap();
+            assert_eq!(remaining, milligas(BUDGET_MILLIGAS - lookup_cost()));
+        }
+
+        #[test]
+        fn kt1_with_public_key_is_rejected() {
+            let mut host = MockKernelHost::default();
+            let mut rk = MockRuntimeKeyspaces::init(&mut host).unwrap();
+            let kt1 = kt1(b"native_kt1_with_key");
+            let account = context::originated_from_kt1(&kt1).unwrap();
+            account.set_origin(rk.host_mut(), &Origin::Native).unwrap();
+
+            let err = check(&rk, &kt1.to_base58_check(), Some(PUBLIC_KEY), budget())
+                .unwrap_err();
+            assert_eq!(err, CheckNativeAddressError::UnexpectedPublicKey.into());
+        }
+
+        #[test]
+        fn kt1_recorded_alias_is_not_provably_native() {
+            let mut host = MockKernelHost::default();
+            let mut rk = MockRuntimeKeyspaces::init(&mut host).unwrap();
+            let kt1 = kt1(b"alias_kt1");
+            let account = context::originated_from_kt1(&kt1).unwrap();
+            let origin = Origin::Alias(AliasInfo {
+                runtime: RuntimeId::Ethereum,
+                native_address: "0x7e5f4552091a69125d5dfcb7b8c2659029395bdf".to_string(),
+            });
+            account.set_origin(rk.host_mut(), &origin).unwrap();
+
+            let err = check(&rk, &kt1.to_base58_check(), None, budget()).unwrap_err();
+            assert_eq!(err, CheckNativeAddressError::NotProvablyNative.into());
+        }
+
+        // A contract originated before classification existed carries no
+        // `/origin` record: its code is what proves it is native.
+        #[test]
+        fn unclassified_kt1_with_code_is_native() {
+            let mut host = MockKernelHost::default();
+            let mut rk = MockRuntimeKeyspaces::init(&mut host).unwrap();
+            let kt1 = kt1(b"unclassified_kt1_with_code");
+            let account = context::originated_from_kt1(&kt1).unwrap();
+            account
+                .init(rk.host_mut(), Some(&[0x02, 0, 0, 0, 0]), &[], 0.into())
+                .unwrap();
+
+            let remaining = check(&rk, &kt1.to_base58_check(), None, budget()).unwrap();
+            assert_eq!(remaining, milligas(BUDGET_MILLIGAS - 2 * lookup_cost()));
+        }
+
+        // An unclassified KT1 without code is either not originated yet or
+        // the address of an alias not materialized yet: it is not a proof.
+        #[test]
+        fn unclassified_kt1_without_code_is_not_provably_native() {
+            let mut host = MockKernelHost::default();
+            let rk = MockRuntimeKeyspaces::init(&mut host).unwrap();
+            let kt1 = kt1(b"unclassified_kt1_without_code");
+
+            let err = check(&rk, &kt1.to_base58_check(), None, budget()).unwrap_err();
+            assert_eq!(err, CheckNativeAddressError::NotProvablyNative.into());
+        }
+
+        // A failure after a charge keeps it: the caller is billed for the
+        // two reads done before the error.
+        #[test]
+        fn unclassified_kt1_without_code_still_consumes_gas() {
+            let mut host = MockKernelHost::default();
+            let rk = MockRuntimeKeyspaces::init(&mut host).unwrap();
+            let kt1 = kt1(b"unclassified_kt1_consumes_gas");
+            let mut budget = budget();
+
+            let err = TezosRuntime::new(ChainId::default())
+                .check_is_native_address(&rk, &kt1.to_base58_check(), None, &mut budget)
+                .unwrap_err();
+            assert_eq!(err, CheckNativeAddressError::NotProvablyNative.into());
+            assert_eq!(budget, milligas(BUDGET_MILLIGAS - 2 * lookup_cost()));
+        }
+
+        // Enshrined contracts, like the gateway, have no account behind them
+        // that could own an alias.
+        #[test]
+        fn enshrined_contract_is_rejected() {
+            let mut host = MockKernelHost::default();
+            let rk = MockRuntimeKeyspaces::init(&mut host).unwrap();
+            let gateway = "KT18oDJJKXMKhfE1bSuAPGp92pYcwVDiqsPw";
+
+            let err = check(&rk, gateway, None, budget()).unwrap_err();
+            assert_eq!(err, CheckNativeAddressError::Precompile.into());
+        }
+
+        #[test]
+        fn kt1_with_budget_below_origin_lookup_is_out_of_gas() {
+            let mut host = MockKernelHost::default();
+            let rk = MockRuntimeKeyspaces::init(&mut host).unwrap();
+            let kt1 = kt1(b"oog_origin_lookup");
+
+            let err = check(
+                &rk,
+                &kt1.to_base58_check(),
+                None,
+                milligas(lookup_cost() - 1),
+            )
+            .unwrap_err();
+            assert_eq!(err, TezosXRuntimeError::OutOfGas);
+        }
+
+        #[test]
+        fn unclassified_kt1_with_budget_below_code_lookup_is_out_of_gas() {
+            let mut host = MockKernelHost::default();
+            let mut rk = MockRuntimeKeyspaces::init(&mut host).unwrap();
+            let kt1 = kt1(b"oog_code_lookup");
+            let account = context::originated_from_kt1(&kt1).unwrap();
+            account
+                .init(rk.host_mut(), Some(&[0x02, 0, 0, 0, 0]), &[], 0.into())
+                .unwrap();
+
+            let err = check(
+                &rk,
+                &kt1.to_base58_check(),
+                None,
+                milligas(2 * lookup_cost() - 1),
+            )
+            .unwrap_err();
+            assert_eq!(err, TezosXRuntimeError::OutOfGas);
+        }
+    }
+}

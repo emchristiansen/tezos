@@ -26,9 +26,9 @@ Emmy+
 -----
 
 Protocol 004 implements a consensus algorithm nick-named
-`Emmy`.
+``Emmy``.
 Protocol 005 introduces several improvements to this algorithm,
-regrouped under the name `Emmy+`.
+regrouped under the name ``Emmy+``.
 In particular:
 
 - the fewer endorsements a block carries the longer it takes before it
@@ -142,6 +142,7 @@ moving average of the participation.
 
 `MR52. <https://gitlab.com/nomadic-labs/tezos/-/merge_requests/52>`_
 
+.. _babylon_introduced_delegation:
 
 Make implicit accounts delegatable
 ----------------------------------
@@ -349,13 +350,13 @@ data).
 
 The entrypoint format is as follows:
 
- - one byte ``0`` for entrypoint ``%default``
- - one byte ``1`` for entrypoint ``%root``
- - one byte ``2`` for entrypoint ``%do``
- - one byte ``3`` for entrypoint ``%set_delegate``
- - one byte ``4`` for entrypoint ``%remove_delegate``
- - one byte ``255`` for a named entrypoint, then one byte of entrypoint
-   name size (limited to 31), and the name itself
+- one byte ``0`` for entrypoint ``%default``
+- one byte ``1`` for entrypoint ``%root``
+- one byte ``2`` for entrypoint ``%do``
+- one byte ``3`` for entrypoint ``%set_delegate``
+- one byte ``4`` for entrypoint ``%remove_delegate``
+- one byte ``255`` for a named entrypoint, then one byte of entrypoint
+  name size (limited to 31), and the name itself
 
 Bytes ``5`` to ``254`` are unused and may be used in future update to
 optimize in size frequent calls to common entrypoints.
@@ -367,10 +368,10 @@ In Babylon, smart contracts do not have a manager anymore, and must have a scrip
 
 The following field thus disappear:
 
- - the manager public key (21 bytes),
- - the spendable flag (1 byte),
- - the delegatable flag (1 byte),
- - the presence flag before the script field (1 byte).
+- the manager public key (21 bytes),
+- the spendable flag (1 byte),
+- the delegatable flag (1 byte),
+- the presence flag before the script field (1 byte).
 
 The tags of all manager operations are shifted by ``100``
 ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
@@ -379,10 +380,10 @@ Because of the incompatibilities above, all manager operations see
 their tags changed. The transaction format incompatibility between
 Athens and Babylon is made explicit by this change.
 
-  - the reveal operation tag goes from ``7`` to ``107``,
-  - the transaction operation tag goes from ``8`` to ``108``,
-  - the origination operation tag goes from ``9`` to ``109``,
-  - the delegation operation tag goes from ``10`` to ``110``.
+- the reveal operation tag goes from ``7`` to ``107``,
+- the transaction operation tag goes from ``8`` to ``108``,
+- the origination operation tag goes from ``9`` to ``109``,
+- the delegation operation tag goes from ``10`` to ``110``.
 
 Developers who inject transactions in the chain must adapt to this new
 tagging policy. The recommended procedure is to make a dynamic test,
@@ -393,6 +394,8 @@ Transactions that are emitted in the last moments of Athens and that
 do not get included in a block because of network latency will not
 survive the migration to Babylon. They will have to be emitted again
 in the new format.
+
+.. _migrating_scriptless_contracts:
 
 Migration from scriptless KT1s to ``manager.tz``
 ------------------------------------------------------------------
@@ -569,21 +572,21 @@ Bug affecting Bigmaps in 005_PsBABY5H
 
 Protocol 005_PsBABY5H contains a bug affecting Bigmaps.
 
-The `has_big_map` function used to compute whether or not a Michelson
-type contains a `big_map` was wrongly implemented and always returned
-`false`. This had the following consequences:
+The ``has_big_map`` function used to compute whether or not a Michelson
+type contains a ``big_map`` was wrongly implemented and always returned
+``false``. This had the following consequences:
 
-- For newly originated contracts, storing several `big_map`s and
-  operating on them is possible but regular `map`s are used under the
+- For newly originated contracts, storing several ``big_map``\ s and
+  operating on them is possible but regular maps are used under the
   hood so the efficiency is much worse than expected. Sending a
-  `big_map` to another contract is not always possible.
+  ``big_map`` to another contract is not always possible.
 
-- For migrated contracts storing a `big_map`, updating the
-  stored `big_map` is not possible anymore; getting the stored values
+- For migrated contracts storing a ``big_map``, updating the
+  stored ``big_map`` is not possible anymore; getting the stored values
   is possible but less efficient than expected.
 
 Additionally there is also a small regression affecting the
-`trace_code` RPC.
+``trace_code`` RPC.
 As a result, the tracing functionality of the interpreter was
 disabled.
 
@@ -703,14 +706,14 @@ Michelson
     allow external tools such as steppers or debuggers to control more
     finely the Michelson interpreter from outside the protocol.
 
-- Proto/Michelson: add `APPLY` instruction to partially apply a lambda
+- Proto/Michelson: add ``APPLY`` instruction to partially apply a lambda
 
 ::
 
     This instruction applies a tuplified function from the stack.  Such a
     lambda is storable, and thus values that cannot be stored (values of
     type `operation`, `contract _` and `big_map _ _`) cannot be
-    captured by `APPLY` (cannot appear in ``'a``).
+    captured by `APPLY` (cannot appear in `'a`).
 
 - Proto/Michelson: relax big_map restrictions
 
@@ -810,14 +813,14 @@ Michelson
 ::
 
     Michelson's `COMPARE` instruction can currently only compare simple
-    values (`string`s, `int`s, etc.). This limitation also applies to
+    values (`string`\ s, `int`\ s, etc.). This limitation also applies to
     `set`, `map` and `big_map` indexes.
 
-    This is an issue in particular for `big_map`s that cannot be nested,
+    This is an issue in particular for `big_map`\ s that cannot be nested,
     because it prevents indexing data by a pair of indexes, such as a
     `key_hash` and a `string`.
 
-    This patch lifts that restriction, allowing to compare `pair`s of
+    This patch lifts that restriction, allowing to compare `pair`\ s of
     values, as long as their left component remains a simple value,
     implicitly making comparable values right combs whose leaves are simple
     values. The ordering is naturally lexicographic.
@@ -842,7 +845,7 @@ Michelson
 
     This fixes issue #546
 
-- Proto/Michelson: add special encoding for `do` and `set/remove_delegate` entrypoints
+- Proto/Michelson: add special encoding for ``do`` and ``set/remove_delegate`` entrypoints
 
 ::
 
@@ -870,7 +873,7 @@ Michelson
     This is to implement replay protection between the main chain and the
     test chain spawned in phase 3 of the voting procedure.
 
-- Proto/Michelson: new instructions `DIG n`, `DUG n`, `DIP n { code }`, `DROP n`
+- Proto/Michelson: new instructions ``DIG n``, ``DUG n``, ``DIP n { code }``, ``DROP n``
 
 ::
 
@@ -1013,7 +1016,7 @@ Michelson
     the new protocol, or simply avoid hardcoding the `CREATE_CONTRACT`
     instruction when possible.
 
-- Proto/Michelson: disable storing values of type `contract t` in newly originated contracts
+- Proto/Michelson: disable storing values of type ``contract t`` in newly originated contracts
 
 ::
 
@@ -1035,7 +1038,7 @@ Michelson
      - everything added to the chain (parameters of transactions and code
        and storage of originations cannot.
 
-    Smart contract developers should adapt their code to store `address`es
+    Smart contract developers should adapt their code to store `address`\ es
     and use instruction `CONTRACT`.
 
 - Proto/Michelson: eliminate useless storage read for parse_contract
@@ -1113,7 +1116,7 @@ Accounts rehaul
     delegatable flags disappear from the origination operation format
     (JSON and binary) as well as everywhere in the RPC API.
 
-- Proto: add code stubs to handle `%default` entrypoints originated before migration
+- Proto: add code stubs to handle ``%default`` entrypoints originated before migration
 
 ::
 
@@ -1164,7 +1167,7 @@ Accounts rehaul
 Migration
 ~~~~~~~~~
 
-- Proto/Migration: switch scripted KT1s to new `big_map` storage
+- Proto/Migration: switch scripted KT1s to new ``big_map`` storage
 
 ::
 

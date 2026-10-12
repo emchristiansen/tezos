@@ -40,14 +40,38 @@ type t
 (** The empty configuration. It doesn't activate any sink. *)
 val empty : t
 
-(** The configuration with only an lwt-log sink. *)
-val lwt_log : t
+(** [make_config_uri kind] builds a configuration URI using the optional
+    parameters with the given [kind]. The arguments are the options documented
+    in [Tezos_stdlib_unix.File_descriptor_sink].
+*)
+val make_config_uri :
+  ?level:Internal_event.Level.t ->
+  ?daily_logs:int ->
+  ?create_dirs:bool ->
+  ?format:string ->
+  ?chmod:int ->
+  ?with_pid:bool ->
+  ?colors:bool ->
+  ?fresh:bool ->
+  ?section_prefixes:(string * Internal_event.level option) list ->
+  ?advertise_levels:bool ->
+  [`Stdout | `Stderr | `Path of string | `Null | `Syslog of string] ->
+  Uri.t
+
+(** The configuration uri for an stdout sink. *)
+val short_stdout_uri : Uri.t
+
+(** The configuration with only an stdout sink. *)
+val stdout : t
 
 (** Check if the configuration is empty. *)
 val is_empty : t -> bool
 
 (** Allows to make custom list of uris. *)
 val make_custom : Uri.t list -> t
+
+(** Adds a config uri to a config. *)
+val add_uri_to_config : Uri.t -> t -> t
 
 (** The serialization format. *)
 val encoding : t Data_encoding.t

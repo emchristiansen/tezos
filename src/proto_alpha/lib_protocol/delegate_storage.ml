@@ -25,8 +25,26 @@
 (*                                                                           *)
 (*****************************************************************************)
 
-type error +=
-  | (* `Permanent *) Unregistered_delegate of Signature.Public_key_hash.t
+(*
+  Some invariants:
+
+  A contract is a delegate <=>
+    - it is registered (i.e. in the set {!Storage.Delegates.mem}), and
+    - its full staking balance is initialized.
+
+  If a contract is a delegate then :
+    - it has no stake in another account, though it may (still) have unstake
+        requests from another contract.
+
+  If a contract is not a delegate then:
+    - it has no *own* frozen stake (a.k.a. frozen deposits),
+    - it has no consensus key.
+
+  Once a contract has become a delegate, it is so forever. There are no ways
+  to unregister.
+*)
+
+type error += (* `Permanent *) Unregistered_delegate of Implicit_account_repr.t
 
 let () =
   (* Unregistered delegate *)
@@ -40,29 +58,35 @@ let () =
         ppf
         "The provided public key (with hash %a) is not registered as valid \
          delegate key."
-        Signature.Public_key_hash.pp
+        Implicit_account_repr.pp
         k)
-    Data_encoding.(obj1 (req "hash" Signature.Public_key_hash.encoding))
+    Data_encoding.(obj1 (req "hash" Implicit_account_repr.encoding))
     (function Unregistered_delegate k -> Some k | _ -> None)
     (fun k -> Unregistered_delegate k)
+
+type error += No_previous_cycle
 
 let registered = Storage.Delegates.mem
 
 module Contract = struct
   let init ctxt contract delegate =
-    Contract_manager_storage.is_manager_key_revealed ctxt delegate
-    >>=? fun known_delegate ->
-    error_unless known_delegate (Unregistered_delegate delegate) >>?= fun () ->
-    registered ctxt delegate >>= fun is_registered ->
-    error_unless is_registered (Unregistered_delegate delegate) >>?= fun () ->
-    Contract_delegate_storage.init ctxt contract delegate >>=? fun ctxt ->
-    Contract_storage.get_balance_and_frozen_bonds ctxt contract
-    >>=? fun balance_and_frozen_bonds ->
-    Stake_storage.add_stake ctxt delegate balance_and_frozen_bonds
+    let open Lwt_result_syntax in
+    let* known_delegate =
+      Contract_manager_storage.is_manager_key_revealed ctxt delegate
+    in
+    let*? () = error_unless known_delegate (Unregistered_delegate delegate) in
+    let*! is_registered = registered ctxt delegate in
+    let*? () = error_unless is_registered (Unregistered_delegate delegate) in
+    let* ctxt = Contract_delegate_storage.init ctxt contract delegate in
+    let* balance_and_frozen_bonds =
+      Contract_storage.get_balance_and_frozen_bonds ctxt contract
+    in
+    Stake_storage.add_delegated_stake ctxt delegate balance_and_frozen_bonds
 
   type error +=
     | (* `Temporary *) Active_delegate
-    | (* `Permanent *) Empty_delegate_account of Signature.Public_key_hash.t
+    | (* `Permanent *) Empty_delegate_account of Implicit_account_repr.t
+    | (* `Permanent *) Tz5_cannot_be_a_delegate of Mldsa44.Public_key_hash.t
 
   let () =
     register_error_kind
@@ -86,22 +110,47 @@ module Contract = struct
           ppf
           "Delegate registration is forbidden when the delegate\n\
           \           implicit account is empty (%a)"
-          Signature.Public_key_hash.pp
+          Implicit_account_repr.pp
           delegate)
-      Data_encoding.(obj1 (req "delegate" Signature.Public_key_hash.encoding))
+      Data_encoding.(obj1 (req "delegate" Implicit_account_repr.encoding))
       (function Empty_delegate_account c -> Some c | _ -> None)
-      (fun c -> Empty_delegate_account c)
+      (fun c -> Empty_delegate_account c) ;
+    register_error_kind
+      `Branch
+      ~id:"delegate.tz5_cannot_be_a_delegate"
+      ~title:"Tz5 cannot be a delegate"
+      ~description:
+        "Tz5 (ML-DSA-44) account is forbidden to be registered as a delegate."
+      ~pp:(fun ppf implicit ->
+        Format.fprintf
+          ppf
+          "The account %a cannot be registered as a delegate because it is an \
+           ML-DSA-44 public key hash."
+          Mldsa44.Public_key_hash.pp
+          implicit)
+      Data_encoding.(obj1 (req "delegate" Mldsa44.Public_key_hash.encoding))
+      (function Tz5_cannot_be_a_delegate d -> Some d | _ -> None)
+      (fun d -> Tz5_cannot_be_a_delegate d)
+
+  let check_not_tz5 : Implicit_account_repr.t -> unit tzresult =
+    let open Result_syntax in
+    fun delegate ->
+      if Implicit_account_repr.is_tz5 delegate then
+        (* FIXME-PA *)
+        match Implicit_account_repr.Forbidden.to_pkh delegate with
+        | Mldsa44 tz5 -> tzfail (Tz5_cannot_be_a_delegate tz5)
+        | Ed25519 _ | Secp256k1 _ | P256 _ | Bls _ -> return_unit
+      else return_unit
 
   let set_self_delegate c delegate =
     let open Lwt_result_syntax in
     let*! is_registered = registered c delegate in
     if is_registered then
-      let* () =
-        let* is_inactive = Delegate_activation_storage.is_inactive c delegate in
-        fail_unless is_inactive Active_delegate
-      in
+      let* is_inactive = Delegate_activation_storage.is_inactive c delegate in
+      let* () = fail_unless is_inactive Active_delegate in
       Stake_storage.set_active c delegate
     else
+      let*? () = check_not_tz5 delegate in
       let contract = Contract_repr.Implicit delegate in
       let* pk =
         Contract_manager_storage.get_manager_key
@@ -117,17 +166,26 @@ module Contract = struct
         Contract_storage.get_balance_and_frozen_bonds c contract
       in
       let* c =
-        Stake_storage.remove_contract_stake c contract balance_and_frozen_bonds
+        Stake_storage.remove_contract_delegated_stake
+          c
+          contract
+          balance_and_frozen_bonds
       in
       let* c = Contract_delegate_storage.set c contract delegate in
-      let* c = Stake_storage.add_stake c delegate balance_and_frozen_bonds in
+      let* c =
+        (* Initializes the full staking balance of [delegate]. *)
+        Stake_storage.initialize_delegate
+          c
+          delegate
+          ~delegated:balance_and_frozen_bonds
+      in
       let*! c = Storage.Delegates.add c delegate in
       let* c = Delegate_consensus_key.init c delegate pk in
       let* c = Stake_storage.set_active c delegate in
       return c
 
   type error +=
-    | (* `Permanent *) No_deletion of Signature.Public_key_hash.t
+    | (* `Permanent *) No_deletion of Implicit_account_repr.t
     | (* `Temporary *) Current_delegate
 
   let () =
@@ -140,9 +198,9 @@ module Contract = struct
         Format.fprintf
           ppf
           "Delegate deletion is forbidden (%a)"
-          Signature.Public_key_hash.pp
+          Implicit_account_repr.pp
           delegate)
-      Data_encoding.(obj1 (req "delegate" Signature.Public_key_hash.encoding))
+      Data_encoding.(obj1 (req "delegate" Implicit_account_repr.encoding))
       (function No_deletion c -> Some c | _ -> None)
       (fun c -> No_deletion c) ;
     register_error_kind
@@ -175,7 +233,7 @@ module Contract = struct
              existing smart contracts. *)
           return_unit
       | Some delegate, Some current_delegate
-        when Signature.Public_key_hash.equal delegate current_delegate ->
+        when Implicit_account_repr.equal delegate current_delegate ->
           tzfail Current_delegate
       | _ -> return_unit
     in
@@ -183,13 +241,17 @@ module Contract = struct
       Contract_storage.get_balance_and_frozen_bonds c contract
     in
     let* c =
-      Stake_storage.remove_contract_stake c contract balance_and_frozen_bonds
+      Stake_storage.remove_contract_delegated_stake
+        c
+        contract
+        balance_and_frozen_bonds
     in
     match delegate with
     | None ->
         let* c = Contract_delegate_storage.delete c contract in
         return c
     | Some delegate ->
+        let*? () = check_not_tz5 delegate in
         let* () =
           let*! is_delegate_registered = registered c delegate in
           fail_when
@@ -197,13 +259,15 @@ module Contract = struct
             (Unregistered_delegate delegate)
         in
         let* c = Contract_delegate_storage.set c contract delegate in
-        let* c = Stake_storage.add_stake c delegate balance_and_frozen_bonds in
+        let* c =
+          Stake_storage.add_delegated_stake c delegate balance_and_frozen_bonds
+        in
         return c
 
   let set c contract delegate =
     match (delegate, contract) with
     | Some delegate, Contract_repr.Implicit source
-      when Signature.Public_key_hash.equal source delegate ->
+      when Implicit_account_repr.equal source delegate ->
         set_self_delegate c delegate
     | _ -> set_delegate c contract delegate
 end
@@ -211,6 +275,53 @@ end
 let fold = Storage.Delegates.fold
 
 let list = Storage.Delegates.elements
+
+let initial_frozen_deposits ctxt delegate =
+  let open Lwt_result_syntax in
+  let* ctxt, stake_opt =
+    match Raw_context.find_stake_distribution_for_current_cycle ctxt with
+    | Some distribution ->
+        return (ctxt, Implicit_account_repr.Map.find delegate distribution)
+    | None ->
+        (* This branch happens when the stake distribution is not initialized in
+           [ctxt], e.g. when RPCs are called or operations are simulated. *)
+        let current_cycle = (Raw_context.current_level ctxt).cycle in
+        let+ ctxt, stakes =
+          Stake_storage.get_selected_distribution ctxt current_cycle
+        in
+        (ctxt, List.assoc ~equal:Implicit_account_repr.equal delegate stakes)
+  in
+  match stake_opt with
+  | None -> return (ctxt, Tez_repr.zero)
+  | Some {frozen; weighted_delegated = _} -> return (ctxt, frozen)
+
+let initial_frozen_deposits_of_previous_cycle ctxt delegate =
+  let open Lwt_result_syntax in
+  let current_cycle = (Raw_context.current_level ctxt).cycle in
+  match Cycle_repr.pred current_cycle with
+  | None -> tzfail No_previous_cycle
+  | Some previous_cycle -> (
+      let+ ctxt, stakes =
+        Stake_storage.get_selected_distribution ctxt previous_cycle
+      in
+      match List.assoc ~equal:Implicit_account_repr.equal delegate stakes with
+      | None -> (ctxt, Tez_repr.zero)
+      | Some {frozen; weighted_delegated = _} -> (ctxt, frozen))
+
+let current_frozen_deposits ctxt delegate =
+  let open Lwt_result_syntax in
+  let* full_staking_balance =
+    Stake_storage.get_full_staking_balance ctxt delegate
+  in
+  Lwt.return (Full_staking_balance_repr.total_frozen full_staking_balance)
+
+let current_frozen_deposits_with_stez ctxt delegate =
+  let open Lwt_result_syntax in
+  let* full_staking_balance =
+    Stake_storage.get_full_staking_balance ctxt delegate
+  in
+  Lwt.return
+    (Full_staking_balance_repr.total_frozen_with_stez full_staking_balance)
 
 let frozen_deposits_limit ctxt delegate =
   Storage.Contract.Frozen_deposits_limit.find
@@ -223,30 +334,9 @@ let set_frozen_deposits_limit ctxt delegate limit =
     (Contract_repr.Implicit delegate)
     limit
 
-let frozen_deposits ctxt delegate =
-  Frozen_deposits_storage.get ctxt (Contract_repr.Implicit delegate)
-
 let spendable_balance ctxt delegate =
   let contract = Contract_repr.Implicit delegate in
   Storage.Contract.Spendable_balance.get ctxt contract
-
-let staking_balance ctxt delegate =
-  registered ctxt delegate >>= fun is_registered ->
-  if is_registered then Stake_storage.get_staking_balance ctxt delegate
-  else return Tez_repr.zero
-
-let full_balance ctxt delegate =
-  frozen_deposits ctxt delegate >>=? fun frozen_deposits ->
-  let delegate_contract = Contract_repr.Implicit delegate in
-  Contract_storage.get_balance_and_frozen_bonds ctxt delegate_contract
-  >>=? fun balance_and_frozen_bonds ->
-  Lwt.return
-    Tez_repr.(frozen_deposits.current_amount +? balance_and_frozen_bonds)
-
-let delegated_balance ctxt delegate =
-  staking_balance ctxt delegate >>=? fun staking_balance ->
-  full_balance ctxt delegate >>=? fun self_staking_balance ->
-  Lwt.return Tez_repr.(staking_balance -? self_staking_balance)
 
 let drain ctxt ~delegate ~destination =
   let open Lwt_result_syntax in
@@ -279,3 +369,83 @@ let drain ctxt ~delegate ~destination =
       not is_destination_allocated,
       fees,
       balance_updates1 @ balance_updates2 )
+
+module For_RPC = struct
+  let full_balance ctxt delegate =
+    let open Lwt_result_syntax in
+    let* own_frozen_deposits =
+      Staking_pseudotokens_storage.For_RPC.staked_balance
+        ctxt
+        ~delegate
+        ~contract:(Contract_repr.Implicit delegate)
+    in
+    let* unstaked_frozen =
+      let* result =
+        Unstake_requests_storage.For_RPC.prepare_finalize_unstake
+          ctxt
+          (Contract_repr.Implicit delegate)
+      in
+      match result with
+      | None -> return Tez_repr.zero
+      | Some {finalizable; unfinalizable} ->
+          let* unfinalizable_requests =
+            Unstake_requests_storage.For_RPC
+            .apply_slash_to_unstaked_unfinalizable
+              ctxt
+              unfinalizable
+          in
+          let*? sum_unfinalizable =
+            List.fold_left_e
+              (fun acc (_cycle, tz) -> Tez_repr.(acc +? tz))
+              Tez_repr.zero
+              unfinalizable_requests
+          in
+          let*? sum =
+            List.fold_left_e
+              (fun acc (_, _cycle, tz) -> Tez_repr.(acc +? tz))
+              sum_unfinalizable
+              finalizable
+          in
+          return sum
+    in
+    let*? all_frozen = Tez_repr.(own_frozen_deposits +? unstaked_frozen) in
+    let delegate_contract = Contract_repr.Implicit delegate in
+    let* balance_and_frozen_bonds =
+      Contract_storage.get_balance_and_frozen_bonds ctxt delegate_contract
+    in
+    let*? sum = Tez_repr.(all_frozen +? balance_and_frozen_bonds) in
+    return sum
+
+  let staking_balance ctxt delegate =
+    let open Lwt_result_syntax in
+    let*! is_registered = registered ctxt delegate in
+    if is_registered then
+      Stake_storage.For_RPC.get_staking_balance ctxt delegate
+    else return Tez_repr.zero
+
+  let min_delegated_in_current_cycle ctxt delegate =
+    let open Lwt_result_syntax in
+    let current_level = Raw_context.current_level ctxt in
+    let cycle_eras = Raw_context.cycle_eras ctxt in
+    let*! is_registered = registered ctxt delegate in
+    if is_registered then
+      let* staking_balance =
+        Stake_storage.get_full_staking_balance ctxt delegate
+      in
+      let min_delegated, min_delegated_level =
+        Full_staking_balance_repr.Internal_for_tests_and_RPCs
+        .min_delegated_and_level
+          ~cycle_eras
+          ~current_level
+          staking_balance
+      in
+      return (min_delegated, Some min_delegated_level)
+    else return (Tez_repr.zero, None)
+
+  let delegated_balance ctxt delegate =
+    let open Lwt_result_syntax in
+    let* staking_balance = staking_balance ctxt delegate in
+    let* self_staking_balance = full_balance ctxt delegate in
+    let*? sum = Tez_repr.(staking_balance -? self_staking_balance) in
+    return sum
+end

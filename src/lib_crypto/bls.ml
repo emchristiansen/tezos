@@ -330,13 +330,29 @@ let sign ?watermark sk msg =
   let msg =
     match watermark with None -> msg | Some prefix -> Bytes.cat prefix msg
   in
+  Bls12_381_signature.MinPk.Pop.sign sk msg
+
+let sign_aug ?watermark sk msg =
+  let msg =
+    match watermark with None -> msg | Some prefix -> Bytes.cat prefix msg
+  in
   Bls12_381_signature.MinPk.Aug.sign sk msg
+
+let check_aug ?watermark pk signature msg =
+  let msg =
+    match watermark with None -> msg | Some prefix -> Bytes.cat prefix msg
+  in
+  Bls12_381_signature.MinPk.Aug.verify pk msg signature
 
 let check ?watermark pk signature msg =
   let msg =
     match watermark with None -> msg | Some prefix -> Bytes.cat prefix msg
   in
-  Bls12_381_signature.MinPk.Aug.verify pk msg signature
+  Bls12_381_signature.MinPk.Pop.verify pk msg signature
+
+let pop_prove = Bls12_381_signature.MinPk.Pop.pop_prove
+
+let pop_verify = Bls12_381_signature.MinPk.Pop.pop_verify
 
 (* [seed] must be at least of 32 bytes or [Bls12_381_signature.generate_sk] will
    throw an error. *)
@@ -361,6 +377,33 @@ let deterministic_nonce sk msg =
 let deterministic_nonce_hash sk msg =
   Blake2B.to_bytes (Blake2B.hash_bytes [deterministic_nonce sk msg])
 
+let share_secret_key secret_key ~m ~n =
+  if not Compare.Int.(1 < m && m <= n) then
+    raise
+      (Invalid_argument
+         (Printf.sprintf "Invalid parameters for N = %d and M = %d" n m)) ;
+
+  let s_0 = secret_key in
+  (* Secret polynomial:
+     s(x) = s_0 + s_1 * x + s_2 * x^2 + .. + s_{m-1} * x^{m-1}
+     - s_0 is a master secret key
+     - s_1, .., s_{m-1} are random secret keys *)
+  let poly_s =
+    s_0
+    :: Stdlib.List.init (m - 1) (fun _i ->
+           Bls12_381_signature.generate_sk @@ Hacl.Rand.gen 32)
+  in
+  Bls12_381_signature.share_secret_key poly_s ~n
+
+let generate_threshold_key sk ~m ~n =
+  let pk = Bls12_381_signature.MinPk.derive_pk sk in
+  let pkh = Public_key.hash pk in
+  let proof = Bls12_381_signature.MinPk.Pop.pop_prove sk in
+  let secret_shares = share_secret_key sk ~n ~m in
+  (pk, pkh, proof, secret_shares)
+
+let threshold_signature_opt = Bls12_381_signature.MinPk.threshold_signature_opt
+
 let aggregate_check pk_msg_list signature =
   let pk_msg_list =
     List.map
@@ -376,6 +419,15 @@ let aggregate_check pk_msg_list signature =
   Bls12_381_signature.MinPk.Aug.aggregate_verify pk_msg_list signature
 
 let aggregate_signature_opt = Bls12_381_signature.MinPk.aggregate_signature_opt
+
+let aggregate_signature_weighted_opt =
+  Bls12_381_signature.MinPk.aggregate_signature_weighted_opt
+
+let aggregate_public_key_opt =
+  Bls12_381_signature.MinPk.aggregate_public_key_opt
+
+let aggregate_public_key_weighted_opt =
+  Bls12_381_signature.MinPk.aggregate_public_key_weighted_opt
 
 module Primitive = struct
   include Bls12_381

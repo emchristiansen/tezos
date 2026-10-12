@@ -25,12 +25,14 @@
 
 open Store_errors
 
+module Profiler = (val Profiler.wrap Shell_profiling.merge_profiler)
+
 (* Cemented files overlay:
 
-   | <n> x <offset (4 bytes)> | <n> x <blocks> |
+   | <n> x <offset (8 bytes)> | <n> x <blocks> |
 
    <offset> is an absolute offset in the file.
-   <blocks> are prefixed by 4 bytes of length
+   <blocks> are prefixed by 8 bytes of length
 *)
 (* On-disk index of block's hashes to level *)
 module Cemented_block_level_index =
@@ -46,17 +48,30 @@ type cemented_metadata_file = {
   metadata_file : [`Cemented_blocks_metadata] Naming.file;
 }
 
+module Metadata_fd_cache =
+  Aches.Rache.Borrow
+    (Aches.Rache.LRU)
+    (struct
+      include String
+
+      let hash = Stdlib.Hashtbl.hash
+    end)
+
 type cemented_blocks_file = {
   start_level : int32;
   end_level : int32;
   file : [`Cemented_blocks_file] Naming.file;
 }
 
+type metadata_handler = {fd : Zip.in_file; waiter : Lwt_idle_waiter.t}
+
 type t = {
   cemented_blocks_dir : [`Cemented_blocks_dir] Naming.directory;
   cemented_block_level_index : Cemented_block_level_index.t;
   cemented_block_hash_index : Cemented_block_hash_index.t;
   mutable cemented_blocks_files : cemented_blocks_file array option;
+  metadata_fd_cache : metadata_handler Metadata_fd_cache.t;
+  readonly : bool;
 }
 
 type chunk_iterator = {
@@ -88,15 +103,45 @@ let cemented_block_level_index {cemented_block_level_index; _} =
 let cemented_block_hash_index {cemented_block_hash_index; _} =
   cemented_block_hash_index
 
+let may_synchronize_indexes
+    {cemented_block_level_index; cemented_block_hash_index; readonly; _} =
+  if readonly then
+    let () = Cemented_block_level_index.sync cemented_block_level_index in
+    Cemented_block_hash_index.sync cemented_block_hash_index
+
 (* The log_size corresponds to the maximum size of the memory zone
    allocated in memory before flushing it onto the disk. It is
    basically a cache which is use for the index. The cache size is
    `log_size * log_entry` where a `log_entry` is roughly 56 bytes. *)
 let default_index_log_size = 10_000
 
+(* Default Zip compression level. This is an integer between 0 and 9,
+   with 0 meaning no compression (store as is), 1 lowest compression,
+   9 highest compression. *)
 let default_compression_level = 9
 
-let create ~log_size cemented_blocks_dir =
+(* Defines the maximum number of file descriptors that are cached to
+   speed up the read of metadata from the cemented store. As these
+   file descriptors are kept open, this limit should not be increased
+   too much to avoid resources starvation. *)
+let default_metadata_fd_cache_size = 5
+
+let init_metadata_fd_cache () =
+  let destroyer _key {fd; waiter} =
+    Unit.catch (fun () ->
+        Lwt.dont_wait
+          (fun () ->
+            (* [task] is lower priority than [force_idle], which is
+               used for reading part, closing fd won't occur until all
+               the scheduled reads are fully performed. *)
+            Lwt_idle_waiter.task waiter @@ fun () ->
+            Zip.close_in fd ;
+            Lwt.return_unit)
+          (fun _exn -> ()))
+  in
+  Metadata_fd_cache.create destroyer default_metadata_fd_cache_size
+
+let create ~log_size ~readonly cemented_blocks_dir =
   let open Lwt_result_syntax in
   protect (fun () ->
       let cemented_blocks_dir_path = Naming.dir_path cemented_blocks_dir in
@@ -119,7 +164,7 @@ let create ~log_size cemented_blocks_dir =
                 tzfail
                   (Store_errors.Failed_to_init_cemented_block_store
                      cemented_blocks_dir_path)
-            | e -> Lwt.fail e)
+            | e -> Lwt.reraise e)
       in
       let cemented_block_level_index =
         Cemented_block_level_index.v
@@ -137,12 +182,15 @@ let create ~log_size cemented_blocks_dir =
       in
       (* Empty table at first *)
       let cemented_blocks_files = None in
+      let metadata_fd_cache = init_metadata_fd_cache () in
       let cemented_store =
         {
           cemented_blocks_dir;
           cemented_block_level_index;
           cemented_block_hash_index;
           cemented_blocks_files;
+          metadata_fd_cache;
+          readonly;
         }
       in
       return cemented_store)
@@ -277,15 +325,24 @@ let load ~readonly ~log_size cemented_blocks_dir =
      |> Naming.dir_path)
   in
   let* cemented_blocks_files = load_table cemented_blocks_dir in
+  let metadata_fd_cache = init_metadata_fd_cache () in
   let cemented_store =
     {
       cemented_blocks_dir;
       cemented_block_level_index;
       cemented_block_hash_index;
       cemented_blocks_files;
+      metadata_fd_cache;
+      readonly;
     }
   in
   return cemented_store
+
+let reload_cemented_blocks_files t =
+  let open Lwt_result_syntax in
+  let* cemented_blocks_files = load_table t.cemented_blocks_dir in
+  t.cemented_blocks_files <- cemented_blocks_files ;
+  return_unit
 
 let init ?(log_size = default_index_log_size) chain_dir ~readonly =
   let open Lwt_result_syntax in
@@ -303,18 +360,21 @@ let init ?(log_size = default_index_log_size) chain_dir ~readonly =
           (Failed_to_init_cemented_block_store cemented_blocks_dir_path)
       in
       load ~readonly ~log_size cemented_blocks_dir
-  | false -> create ~log_size cemented_blocks_dir
+  | false -> create ~log_size ~readonly cemented_blocks_dir
 
 let close cemented_store =
   (try
      Cemented_block_level_index.close cemented_store.cemented_block_level_index
    with Index.Closed -> ()) ;
-  try Cemented_block_hash_index.close cemented_store.cemented_block_hash_index
-  with Index.Closed -> ()
+  (try Cemented_block_hash_index.close cemented_store.cemented_block_hash_index
+   with Index.Closed -> ()) ;
+  (* The cache element's [destroyer] is asynchronous so this call
+     won't hang. In practice, this function is only called when the
+     store is closed which is one of the last component to be
+     terminated which means potential new reads won't be scheduled. *)
+  Metadata_fd_cache.clear cemented_store.metadata_fd_cache
 
-let offset_length = 4 (* file offset *)
-
-let offset_encoding = Data_encoding.int31
+let offset_length = 8 (* file offset *)
 
 let find_block_file cemented_store block_level =
   try
@@ -347,7 +407,8 @@ let find_block_file cemented_store block_level =
               if
                 Compare.Int32.(
                   block_level >= start_level && block_level <= end_level)
-              then (* Found *)
+              then
+                (* Found *)
                 Some res
               else if Compare.Int32.(block_level > end_level) then
                 (* Making sure the pivot is strictly increasing *)
@@ -391,6 +452,57 @@ let get_cemented_block_hash cemented_store level =
          level)
   with Not_found -> None
 
+let read_block_metadata cemented_store metadata_file_path block_level =
+  let open Lwt_result_syntax in
+  let*! b = Lwt_unix.file_exists metadata_file_path in
+  match b with
+  | false -> return_none
+  | true ->
+      Lwt.catch
+        (fun () ->
+          let cache = cemented_store.metadata_fd_cache in
+          (* Exceptions will be caught by the enclosing [catch] *)
+          let mk_metadata_handler path =
+            (* The file descriptor will be closed when the cache
+               clears the value and calls its finalizer defined at the
+               cache creation which will wait for the potential
+               metadata reads to be performed. *)
+            let fd = Zip.open_in path in
+            let waiter = Lwt_idle_waiter.create () in
+            {fd; waiter}
+          in
+          let {fd; waiter} =
+            Metadata_fd_cache.borrow_or_make
+              cache
+              metadata_file_path
+              mk_metadata_handler
+              Fun.id
+          in
+          let*! metadata =
+            (* Using [force_idle] prevents the cache's resource
+               cleaner to acquire the lock needed (through [task]) to
+               close the file descriptor while a read is happening. *)
+            Lwt_idle_waiter.force_idle waiter (fun () ->
+                Lwt_preemptive.detach
+                  (fun () ->
+                    let entry =
+                      (* Note that the `fd` here is used outside of the
+                         borrowed scope. In this specific case it is ok
+                         because the destructor for the resource is wrapped
+                         inside a `Lwt_ide_waiter.when_idle` which will
+                         only run after all the reads are done. *)
+                      Zip.find_entry fd (Int32.to_string block_level)
+                    in
+                    Zip.read_entry fd entry)
+                  ())
+          in
+          Block_repr.decode_metadata metadata |> return)
+        (fun exn ->
+          let*! () =
+            Store_events.(emit metadata_read_error (Printexc.to_string exn))
+          in
+          return_none)
+
 let read_block_metadata ?location cemented_store block_level =
   let open Lwt_result_syntax in
   let location =
@@ -400,35 +512,13 @@ let read_block_metadata ?location cemented_store block_level =
   in
   match location with
   | None -> return_none
-  | Some (cemented_file, _block_number) -> (
+  | Some (cemented_file, _block_number) ->
       let metadata_file =
         Naming.(
           cemented_store.cemented_blocks_dir |> cemented_blocks_metadata_dir
           |> fun d -> cemented_blocks_metadata_file d cemented_file |> file_path)
       in
-      let*! b = Lwt_unix.file_exists metadata_file in
-      match b with
-      | false -> return_none
-      | true ->
-          Lwt.catch
-            (fun () ->
-              let*! in_file = Lwt_preemptive.detach Zip.open_in metadata_file in
-              Lwt.finalize
-                (fun () ->
-                  let*! entry =
-                    Lwt_preemptive.detach
-                      (fun () ->
-                        Zip.find_entry in_file (Int32.to_string block_level))
-                      ()
-                  in
-                  let*! metadata =
-                    Lwt_preemptive.detach
-                      (fun () -> Zip.read_entry in_file entry)
-                      ()
-                  in
-                  Block_repr.decode_metadata metadata |> return)
-                (fun () -> Lwt_preemptive.detach Zip.close_in in_file))
-            (fun _ -> return_none))
+      read_block_metadata cemented_store metadata_file block_level
 
 let cement_blocks_metadata cemented_store blocks =
   let open Lwt_result_syntax in
@@ -498,10 +588,8 @@ let read_block fd block_number =
   let* () =
     Lwt_utils_unix.read_bytes ~pos:0 ~len:offset_length fd offset_buffer
   in
-  let offset =
-    Data_encoding.(Binary.of_bytes_exn offset_encoding offset_buffer)
-  in
-  let* _ofs = Lwt_unix.lseek fd offset Unix.SEEK_SET in
+  let offset = Bytes.get_int64_be offset_buffer 0 in
+  let* _ofs = Lwt_unix.LargeFile.lseek fd offset Unix.SEEK_SET in
   (* We move the cursor to the element's position *)
   let* block, _len = Block_repr_unix.read_next_block_exn fd in
   Lwt.return block
@@ -631,29 +719,32 @@ let cement_blocks ?(check_consistency = true) (cemented_store : t)
       in
       let metadata_writer
           (block_bytes, total_block_length, block_level, metadata_offset) =
-        Lwt_preemptive.detach
-          (fun () ->
-            let add, finish =
-              Zip.add_entry_generator
-                out_file
-                ~level:default_compression_level
-                (Int32.to_string block_level)
-            in
-            add
-              block_bytes
-              metadata_offset
-              (total_block_length - metadata_offset) ;
-            finish ())
-          ()
+        (Lwt_preemptive.detach
+           (fun () ->
+             let add, finish =
+               Zip.add_entry_generator
+                 out_file
+                 ~level:default_compression_level
+                 (Int32.to_string block_level)
+             in
+             add
+               block_bytes
+               metadata_offset
+               (total_block_length - metadata_offset) ;
+             finish ())
+           () [@profiler.aggregate_f {verbosity = Debug} "metadata_writer"])
       in
       let metadata_finalizer () =
-        let*! () = Lwt_preemptive.detach Zip.close_out out_file in
-        let metadata_file_path =
-          Naming.cemented_blocks_metadata_file cemented_metadata_dir file
-          |> Naming.file_path
-        in
-        let*! () = Lwt_unix.rename tmp_metadata_file_path metadata_file_path in
-        return_unit
+        ((let*! () = Lwt_preemptive.detach Zip.close_out out_file in
+          let metadata_file_path =
+            Naming.cemented_blocks_metadata_file cemented_metadata_dir file
+            |> Naming.file_path
+          in
+          let*! () =
+            Lwt_unix.rename tmp_metadata_file_path metadata_file_path
+          in
+          return_unit)
+        [@profiler.aggregate_s {verbosity = Debug} "metadata_finalizer"])
       in
       return (metadata_writer, metadata_finalizer)
     else return ((fun _ -> Lwt.return_unit), fun () -> return_unit)
@@ -673,71 +764,87 @@ let cement_blocks ?(check_consistency = true) (cemented_store : t)
         let first_offset = preamble_length in
         (* Cursor is now at the beginning of the element section *)
         let*! _ =
-          Seq.ES.fold_left
-            (fun (i, current_offset) block_read ->
-              let* block_hash, total_block_length, block_bytes = block_read in
-              let pruned_block_length =
-                (* This call rewrites [block_bytes] to a pruned block
-                   (with its size modified) *)
-                Block_repr_unix.prune_raw_block_bytes block_bytes
-              in
-              (* We start by blitting the corresponding offset in the preamble part *)
-              Bytes.set_int32_be
-                offsets_buffer
-                (i * offset_length)
-                (Int32.of_int current_offset) ;
-              (* We write the block in the file *)
-              let*! () =
-                Lwt_utils_unix.write_bytes
-                  ~pos:0
-                  ~len:pruned_block_length
-                  fd
-                  block_bytes
-              in
-              let block_level = Int32.(add first_block_level (of_int i)) in
-              let* () =
-                protect (fun () ->
-                    if total_block_length > pruned_block_length then
-                      (* Do not try to write to block's metadata if
-                         there are none *)
-                      let*! () =
-                        metadata_writer
-                          ( block_bytes,
-                            total_block_length,
-                            block_level,
-                            pruned_block_length )
-                      in
-                      return_unit
-                    else return_unit)
-              in
-              (* We also populate the indexes *)
-              Cemented_block_level_index.replace
-                cemented_store.cemented_block_level_index
-                block_hash
-                block_level ;
-              Cemented_block_hash_index.replace
-                cemented_store.cemented_block_hash_index
-                block_level
-                block_hash ;
-              return (succ i, current_offset + pruned_block_length))
-            (0, first_offset)
-            reading_sequence
+          (Seq.ES.fold_left
+             (fun (i, current_offset) block_read ->
+               let* block_hash, total_block_length, block_bytes = block_read in
+               let pruned_block_length =
+                 (* This call rewrites [block_bytes] to a pruned block
+                    (with its size modified) *)
+                 (Block_repr_unix.prune_raw_block_bytes
+                    block_bytes
+                  [@profiler.aggregate_f {verbosity = Debug} "prune raw block"])
+               in
+               (* We start by blitting the corresponding offset in the preamble part *)
+               Bytes.set_int64_be
+                 offsets_buffer
+                 (i * offset_length)
+                 (Int64.of_int current_offset) ;
+               (* We write the block in the file *)
+               let*! () =
+                 (Lwt_utils_unix.write_bytes
+                    ~pos:0
+                    ~len:pruned_block_length
+                    fd
+                    block_bytes
+                  [@profiler.aggregate_s
+                    {verbosity = Debug} "write pruned block"])
+               in
+               let block_level = Int32.(add first_block_level (of_int i)) in
+               let* () =
+                 protect (fun () ->
+                     if total_block_length > pruned_block_length then
+                       (* Do not try to write to block's metadata if
+                          there are none *)
+                       let*! () =
+                         metadata_writer
+                           ( block_bytes,
+                             total_block_length,
+                             block_level,
+                             pruned_block_length )
+                       in
+                       return_unit
+                     else return_unit)
+               in
+               (* We also populate the indexes *)
+               Cemented_block_level_index.replace
+                 cemented_store.cemented_block_level_index
+                 block_hash
+                 block_level ;
+               Cemented_block_hash_index.replace
+                 cemented_store.cemented_block_hash_index
+                 block_level
+                 block_hash ;
+               return (succ i, current_offset + pruned_block_length))
+             (0, first_offset)
+             reading_sequence
+           [@profiler.record_s {verbosity = Debug} "write cemented cycle"])
         in
         (* We now write the real offsets in the preamble *)
         let*! _ofs = Lwt_unix.lseek fd 0 Unix.SEEK_SET in
-        Lwt_utils_unix.write_bytes ~pos:0 ~len:preamble_length fd offsets_buffer)
+        (Lwt_utils_unix.write_bytes
+           ~pos:0
+           ~len:preamble_length
+           fd
+           offsets_buffer
+         [@profiler.record_s {verbosity = Debug} "blit cemented cycle offsets"]))
       (fun () ->
         let*! _ = Lwt_utils_unix.safe_close fd in
         Lwt.return_unit)
   in
-  let*! () = Lwt_unix.rename tmp_file_path final_path in
+  let*! () =
+    (Lwt_unix.rename
+       tmp_file_path
+       final_path
+     [@profiler.record_s {verbosity = Debug} "mv temp file to final file"])
+  in
   (* Flush the indexes to make sure that the data is stored on disk *)
-  Cemented_block_level_index.flush
-    ~with_fsync:true
-    cemented_store.cemented_block_level_index ;
-  Cemented_block_hash_index.flush
-    ~with_fsync:true
-    cemented_store.cemented_block_hash_index ;
+  (Cemented_block_level_index.flush
+     ~with_fsync:true
+     cemented_store.cemented_block_level_index ;
+   Cemented_block_hash_index.flush
+     ~with_fsync:true
+     cemented_store.cemented_block_hash_index)
+  [@profiler.record_f {verbosity = Debug} "flush indexes"] ;
   (* Update table *)
   let cemented_block_interval =
     {start_level = first_block_level; end_level = last_block_level; file}
@@ -757,7 +864,9 @@ let cement_blocks ?(check_consistency = true) (cemented_store : t)
   if write_metadata then metadata_finalizer () else return_unit
 
 let trigger_full_gc cemented_store cemented_blocks_files offset =
+  let open Lwt_syntax in
   let nb_files = Array.length cemented_blocks_files in
+  () [@profiler.mark {verbosity = Debug} ["trigger full gc"]] ;
   if nb_files <= offset then Lwt.return_unit
   else
     let cemented_files = Array.to_list cemented_blocks_files in
@@ -774,12 +883,18 @@ let trigger_full_gc cemented_store cemented_blocks_files offset =
               file
             |> file_path)
         in
-        Unit.catch_s (fun () -> Lwt_unix.unlink metadata_file_path))
+        let* () = Unit.catch_s (fun () -> Lwt_unix.unlink metadata_file_path) in
+        (* Remove the metadata's fd from the cache *)
+        Metadata_fd_cache.remove
+          cemented_store.metadata_fd_cache
+          metadata_file_path ;
+        return_unit)
       files_to_remove
 
 let trigger_rolling_gc cemented_store cemented_blocks_files offset =
   let open Lwt_syntax in
   let nb_files = Array.length cemented_blocks_files in
+  () [@profiler.mark {verbosity = Debug} ["trigger rolling gc"]] ;
   if nb_files <= offset then Lwt.return_unit
   else
     let {end_level = last_level_to_purge; _} =
@@ -808,13 +923,22 @@ let trigger_rolling_gc cemented_store cemented_blocks_files offset =
             |> file_path)
         in
         let* () = Unit.catch_s (fun () -> Lwt_unix.unlink metadata_file_path) in
-        Unit.catch_s (fun () -> Lwt_unix.unlink (Naming.file_path file)))
+        (* Remove the metadata's fd from the cache *)
+        Metadata_fd_cache.remove
+          cemented_store.metadata_fd_cache
+          metadata_file_path ;
+        let* () =
+          Unit.catch_s (fun () -> Lwt_unix.unlink (Naming.file_path file))
+        in
+        return_unit)
       files_to_remove
 
 let trigger_gc cemented_store history_mode =
   let open Lwt_syntax in
   let* () = Store_events.(emit start_store_garbage_collection) () in
-  match cemented_store.cemented_blocks_files with
+  match[@profiler.record_s {verbosity = Debug} "trigger gc"]
+    cemented_store.cemented_blocks_files
+  with
   | None -> return_unit
   | Some cemented_blocks_files -> (
       match history_mode with
@@ -845,8 +969,8 @@ let raw_iter_cemented_file f ({file; _} as cemented_blocks_file) =
     file_path
     (fun channel ->
       let nb_blocks = cemented_blocks_file_length cemented_blocks_file in
-      let* first_block_offset = Lwt_io.BE.read_int channel in
-      let* () = Lwt_io.set_position channel (Int64.of_int first_block_offset) in
+      let* first_block_offset = Lwt_io.BE.read_int64 channel in
+      let* () = Lwt_io.set_position channel first_block_offset in
       let rec loop n =
         if n = 0 then Lwt.return_unit
         else
@@ -925,7 +1049,7 @@ let check_indexes_consistency ?(post_step = fun () -> Lwt.return_unit)
                 let*! () = Lwt_utils_unix.read_bytes ~len:len_offset fd bytes in
                 let offsets =
                   Data_encoding.Binary.of_bytes_exn
-                    Data_encoding.(Variable.array ~max_length:nb_blocks int31)
+                    Data_encoding.(Variable.array ~max_length:nb_blocks int64)
                     bytes
                 in
                 (* Cursor is now after the offset region *)
@@ -935,7 +1059,7 @@ let check_indexes_consistency ?(post_step = fun () -> Lwt.return_unit)
                     let*! cur_offset = Lwt_unix.lseek fd 0 Unix.SEEK_CUR in
                     let* () =
                       fail_unless
-                        Compare.Int.(cur_offset = offsets.(n))
+                        Compare.Int64.(Int64.of_int cur_offset = offsets.(n))
                         (Inconsistent_cemented_store
                            (Bad_offset
                               {level = n; cycle = Naming.file_path file}))
@@ -981,5 +1105,265 @@ let check_indexes_consistency ?(post_step = fun () -> Lwt.return_unit)
                 let*! _ = Lwt_utils_unix.safe_close fd in
                 Lwt.return_unit))
           table_list
+      in
+      return_unit
+
+(* For each given block metadata, returns the
+   Store_types.metadata_stat of it. *)
+let stat_metadata ~block_level (metadata : Block_repr.metadata option) =
+  let open Lwt_result_syntax in
+  match metadata with
+  | Some metadata ->
+      let block_metadata_size =
+        Int64.of_int (Bytes.length metadata.block_metadata)
+      in
+      let operation_metadata_arity =
+        List.map List.length metadata.operations_metadata
+      in
+      let operation_metadata_size, too_large_operation_metadata_count =
+        List.fold_left
+          (fun (acc_size, acc_count) pass ->
+            let sum_size, sum_count =
+              List.fold_left
+                (fun (size, too_large_count) opm ->
+                  match opm with
+                  | Block_validation.Metadata bytes ->
+                      Int64.
+                        (add size (of_int (Bytes.length bytes)), too_large_count)
+                  | Too_large_metadata -> (size, Int64.(add too_large_count one)))
+                (0L, 0L)
+                pass
+            in
+            Int64.(add acc_size sum_size, add acc_count sum_count))
+          (0L, 0L)
+          metadata.operations_metadata
+      in
+      let* manager_operation_metadata_sizes =
+        match metadata.operations_metadata with
+        | [_; _; _; manager] ->
+            return
+            @@ List.map
+                 (function
+                   | Block_validation.Metadata bytes -> Bytes.length bytes
+                   | Block_validation.Too_large_metadata -> 0)
+                 manager
+        | _ -> return_nil
+      in
+      return
+        Store_types.
+          {
+            block_level;
+            block_metadata_size;
+            operation_metadata_arity;
+            operation_metadata_size;
+            manager_operation_metadata_sizes;
+            too_large_operation_metadata_count;
+          }
+  | None -> tzfail (Inconsistent_store_state "cannot read metadata")
+
+(* [map_over_metadata_file cemented_blocks_dir_path cemented_cycle ~f]
+   applies [f] of the given [cemented_cycle]. *)
+let map_over_metadata_file cemented_blocks_dir_path
+    {start_level; end_level; file}
+    ~(f :
+       block_level:Int32.t ->
+       Block_repr.metadata option ->
+       Store_types.metadata_stat tzresult Lwt.t) =
+  let open Lwt_result_syntax in
+  let metadata_file =
+    Naming.(
+      cemented_blocks_dir_path |> cemented_blocks_metadata_dir |> fun d ->
+      cemented_blocks_metadata_file d file |> file_path)
+  in
+  let*! b = Lwt_unix.file_exists metadata_file in
+  if b then
+    let fd = Zip.open_in metadata_file in
+    let rec loop level acc =
+      if level > end_level then return (List.rev acc)
+      else
+        let entry = Zip.find_entry fd (Int32.to_string level) in
+        let metadata = Zip.read_entry fd entry in
+        let* app = f ~block_level:level (Block_repr.decode_metadata metadata) in
+        loop Int32.(add level one) (app :: acc)
+    in
+    let* res = loop start_level [] in
+    let () = Zip.close_in fd in
+    return res
+  else return_nil
+
+(* Computes the metadata stats for each cemented metadata available in
+   the store. *)
+let stat_metadata_cycles cemented_store =
+  let open Lwt_result_syntax in
+  match cemented_store.cemented_blocks_files with
+  | Some files ->
+      let files = Array.to_list files in
+      let nb_cycles = List.length files in
+      let* res =
+        Animation.display_progress
+          ~pp_print_step:(fun fmt i ->
+            Format.fprintf fmt "Processing metadata %d/%d" i nb_cycles)
+          ~progress_display_mode:Always
+          (fun notify ->
+            List.map_es
+              (fun metadata_file ->
+                let*! () = notify () in
+                let* res =
+                  map_over_metadata_file
+                    cemented_store.cemented_blocks_dir
+                    metadata_file
+                    ~f:stat_metadata
+                in
+                return (Naming.(metadata_file.file |> file_path), res))
+              files)
+      in
+      return res
+  | None -> tzfail (Inconsistent_store_state "cannot find any metadata file")
+
+let get_and_upgrade_offsets fd nb_blocks =
+  let open Lwt_syntax in
+  (* Obtain the list of offsets (32-bit format) *)
+  let preamble_length = 4 * nb_blocks in
+  let bytes = Bytes.create preamble_length in
+  let* () = Lwt_utils_unix.read_bytes ~len:preamble_length fd bytes in
+  let offsets_32_bits =
+    Data_encoding.Binary.of_bytes_exn
+      Data_encoding.(Variable.array ~max_length:nb_blocks int32)
+      bytes
+  in
+  (* Transform the 32-bit offsets into 64-bit offsets and add preamble_length to all values.
+     The reasoning behind this is that we shift the blocks positions in the file with
+     (<new_offset_format_size> - <old_offset_format_size>) * nb_blocks = (8 - 4) * nb_blocks *)
+  let offsets_64_bits =
+    Array.map
+      (fun offset -> Int64.(add (of_int32 offset) (of_int preamble_length)))
+      offsets_32_bits
+  in
+  Lwt.return
+  @@ Data_encoding.Binary.to_bytes_exn
+       Data_encoding.(Variable.array ~max_length:nb_blocks int64)
+       offsets_64_bits
+
+(** [is_using_32_bit_offsets fd nb_blocks] checks whether the cemented file
+    given by [fd] is formatted with 32 bit offsets; the decision
+    is taken based on whether the first offset points correctly to the first
+    block in the file or not;
+    - offset = first 32 bits decoded as an int32
+    - first_block_offset = 4 (bytes) * [nb_blocks] (first block offset, given
+      that the file has 32-bit offsets)
+    Check whether (offset = first_block_offset) holds. If not, then we cannot
+    do the upgrade procedure. *)
+let is_using_32_bit_offsets fd nb_blocks =
+  let open Lwt_syntax in
+  (* For a 32-bit offset the size will be 4 bytes *)
+  let legacy_offset_length = 4 in
+  (* Save the current position of the file descriptor *)
+  let* current_position = Lwt_unix.lseek fd 0 Unix.SEEK_CUR in
+  (* Obtain the first offset of the file, altering the file descriptor position *)
+  let* _ofs = Lwt_unix.lseek fd 0 Unix.SEEK_SET in
+  let offset_buffer = Bytes.create legacy_offset_length in
+  (* Read the first offset in the offset array *)
+  let* () =
+    Lwt_utils_unix.read_bytes ~pos:0 ~len:legacy_offset_length fd offset_buffer
+  in
+  let offset = Bytes.get_int32_be offset_buffer 0 in
+  (* Restore the former position of the file descriptor *)
+  let* _ofs = Lwt_unix.lseek fd current_position Unix.SEEK_SET in
+  return Int32.(equal offset (mul (of_int legacy_offset_length) nb_blocks))
+
+(* Hypothesis: we expect a directory of cemented files with 32-bit offsets *)
+let v_3_2_upgrade chain_dir =
+  let open Lwt_result_syntax in
+  let cemented_blocks_dir = Naming.cemented_blocks_dir chain_dir in
+  let* cemented_blocks_files_opt = load_table cemented_blocks_dir in
+  match cemented_blocks_files_opt with
+  | None ->
+      (* This might be the case for rolling nodes, where no upgrade is needed as
+         there are not cemented block files. *)
+      return_unit
+  | Some cemented_blocks_files ->
+      let cemented_blocks_files = Array.to_list cemented_blocks_files in
+      let nb_cemented_files = List.length cemented_blocks_files in
+      let* () =
+        Animation.display_progress
+          ~pp_print_step:(fun fmt i ->
+            Format.fprintf
+              fmt
+              "Upgrading cemented files: %d/%d files"
+              i
+              nb_cemented_files)
+          ~progress_display_mode:Always
+          (fun notify ->
+            List.iter_es
+              (fun cemented_blocks_file ->
+                (* Original cemented blocks file *)
+                let file_path = Naming.file_path cemented_blocks_file.file in
+                let*! fd =
+                  Lwt_unix.openfile file_path [Unix.O_RDONLY; O_CLOEXEC] 0o444
+                in
+                (* Check if the file has 32-bit offsets format *)
+                let nb_blocks =
+                  cemented_blocks_file_length cemented_blocks_file
+                in
+                let*! has_32_bit_offsets =
+                  is_using_32_bit_offsets fd nb_blocks
+                in
+                if not has_32_bit_offsets then
+                  let*! () =
+                    Store_events.(emit upgrade_cemented_file_skip file_path)
+                  in
+                  return_unit
+                else
+                  (* Upgraded cemented blocks file *)
+                  let upgraded_file_path = file_path ^ "_upgraded" in
+                  let*! upgraded_fd =
+                    Lwt_unix.openfile
+                      upgraded_file_path
+                      [Unix.O_WRONLY; Unix.O_CREAT; Unix.O_TRUNC]
+                      0o644
+                  in
+                  (* Total number of blocks stored in the cemented blocks file*)
+                  let nb_blocks =
+                    Int32.to_int
+                    @@ cemented_blocks_file_length cemented_blocks_file
+                  in
+                  Lwt.finalize
+                    (fun () ->
+                      let*! bytes = get_and_upgrade_offsets fd nb_blocks in
+                      (* Write the 64-bit offsets list into the new file *)
+                      let*! () =
+                        Lwt_utils_unix.write_bytes
+                          ~pos:0
+                          ~len:(8 * nb_blocks)
+                          upgraded_fd
+                          bytes
+                      in
+                      (* Copy the rest of the block file *)
+                      let buffer_size = 4096 * 1024 in
+                      let buffer = Bytes.create buffer_size in
+                      let copy_bytes fd_in fd_out =
+                        let rec loop () =
+                          let*! bytes_read =
+                            Lwt_unix.read fd_in buffer 0 buffer_size
+                          in
+                          if bytes_read = 0 then Lwt.return_unit
+                          else
+                            let*! _bytes_written =
+                              Lwt_unix.write fd_out buffer 0 bytes_read
+                            in
+                            loop ()
+                        in
+                        loop ()
+                      in
+                      let*! () = copy_bytes fd upgraded_fd in
+                      (* Atomically replace the old cemented file with the upgraded one *)
+                      let*! () = Lwt_unix.rename upgraded_file_path file_path in
+                      return_unit)
+                    (fun () ->
+                      let*! () = Lwt_unix.close fd in
+                      let*! () = Lwt_unix.close upgraded_fd in
+                      let*! () = notify () in
+                      Lwt.return_unit))
+              cemented_blocks_files)
       in
       return_unit

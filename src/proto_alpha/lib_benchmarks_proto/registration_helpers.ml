@@ -2,6 +2,7 @@
 (*                                                                           *)
 (* Open Source License                                                       *)
 (* Copyright (c) 2021 Nomadic Labs, <contact@nomadic-labs.com>               *)
+(* Copyright (c) 2023 Marigold <contact@marigold.dev>                        *)
 (*                                                                           *)
 (* Permission is hereby granted, free of charge, to any person obtaining a   *)
 (* copy of this software and associated documentation files (the "Software"),*)
@@ -23,12 +24,35 @@
 (*                                                                           *)
 (*****************************************************************************)
 
-let ns = Namespace.(make (make root "proto") Protocol.name)
+let ns = Namespace.root
 
-let register ((module Bench) : Benchmark.t) =
+let adjust_tags tags = Tags.common :: tags
+
+type benchmark_type = Time | Alloc
+
+let register ?(benchmark_type = Time) ((module Bench) : Benchmark.t) =
   let module B : Benchmark.S = struct
     include Bench
 
-    let tags = Protocol.name :: tags
+    let tags = adjust_tags tags
   end in
-  Registration.register (module B)
+  Registration.register ~add_timer:(benchmark_type = Time) (module B)
+
+let register_simple ?(benchmark_type = Time) (module Bench : Benchmark.Simple) =
+  let module B = struct
+    include Bench
+
+    let tags = adjust_tags tags
+  end in
+  Registration.register_simple ~add_timer:(benchmark_type = Time) (module B)
+
+let register_simple_with_num ?(benchmark_type = Time)
+    (module Bench : Benchmark.Simple_with_num) =
+  let module B = struct
+    include Bench
+
+    let tags = adjust_tags tags
+  end in
+  Registration.register_simple_with_num
+    ~add_timer:(benchmark_type = Time)
+    (module B)

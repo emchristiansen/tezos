@@ -1,25 +1,7 @@
 (*****************************************************************************)
 (*                                                                           *)
-(* Open Source License                                                       *)
-(* Copyright (c) 2020 Nomadic Labs <contact@nomadic-labs.com>                *)
-(*                                                                           *)
-(* Permission is hereby granted, free of charge, to any person obtaining a   *)
-(* copy of this software and associated documentation files (the "Software"),*)
-(* to deal in the Software without restriction, including without limitation *)
-(* the rights to use, copy, modify, merge, publish, distribute, sublicense,  *)
-(* and/or sell copies of the Software, and to permit persons to whom the     *)
-(* Software is furnished to do so, subject to the following conditions:      *)
-(*                                                                           *)
-(* The above copyright notice and this permission notice shall be included   *)
-(* in all copies or substantial portions of the Software.                    *)
-(*                                                                           *)
-(* THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR*)
-(* IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,  *)
-(* FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL   *)
-(* THE AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER*)
-(* LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING   *)
-(* FROM, OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER       *)
-(* DEALINGS IN THE SOFTWARE.                                                 *)
+(* SPDX-License-Identifier: MIT                                              *)
+(* Copyright (c) 2020 Nomadic Labs, <contact@nomadic-labs.com>               *)
 (*                                                                           *)
 (*****************************************************************************)
 
@@ -85,7 +67,7 @@ let get_storage client ~contract =
   return (String.trim storage)
 
 let get_storage_json client ~contract =
-  RPC.Client.call ~hooks client
+  Client.RPC.call ~hooks client
   @@ RPC.get_chain_block_context_contract_storage ~id:contract ()
 
 let check_storage ~__LOC__ client ~contract expected_storage =
@@ -151,7 +133,7 @@ let test_now protocol client =
        the minimum time between blocks. *)
     let* minimal_block_delay =
       let* constants =
-        RPC.Client.call client @@ RPC.get_chain_block_context_constants ()
+        Client.RPC.call client @@ RPC.get_chain_block_context_constants ()
       in
       return JSON.(constants |-> "minimal_block_delay" |> as_int)
     in
@@ -386,7 +368,7 @@ let test_level protocol client =
   let* contract =
     originate client ~storage:"9999999" protocol ["opcodes"; "level"]
   in
-  (* Note: we're using mockup mode so no need to wait. *)
+  (* Note: [bake_for_and_wait] is unneeded (and unusable) in mockup mode. *)
   let bake () = Client.bake_for ~minimal_timestamp:true client in
   (* Now at level 1 *)
   let* () = transfer client ~contract in
@@ -835,6 +817,7 @@ module Tickets = struct
           ~__FILE__
           ~title:("Contract onchain opcodes: " ^ title)
           ~tags:["contract"; "onchain"; "opcodes"]
+          ~uses_node:false
           (fun protocol ->
             let* client = Client.init_mockup ~protocol () in
             body protocol client)
@@ -852,6 +835,335 @@ module Tickets = struct
       ]
 end
 
+let get_first_transaction_address_registry_diff client =
+  let* head_block_operations =
+    Client.RPC.call client
+    @@ RPC.get_chain_block_operations ~metadata:true ~force_metadata:true ()
+  in
+  let first_transaction_address_registry_diff =
+    JSON.(
+      head_block_operations |=> 3 |=> 0 |-> "contents" |=> 0 |-> "metadata"
+      |-> "operation_result" |-> "address_registry_diff" |> as_list)
+  in
+  return
+  @@ List.map
+       (fun diff ->
+         JSON.(diff |-> "address" |> as_string, diff |-> "index" |> as_int))
+       first_transaction_address_registry_diff
+
+let call_and_check_diff client contract addresses expected =
+  let addresses = List.map (fun s -> sf {|"%s"|} s) addresses in
+  let arg = "{" ^ String.concat ";" addresses ^ "}" in
+  let* () =
+    Client.transfer
+      ~giver:Account.Bootstrap.keys.(1).alias
+      ~receiver:contract
+      ~amount:Tez.zero
+      ~arg
+      ~burn_cap:Tez.one
+      client
+  in
+  let* () = Client.bake_for_and_wait client in
+  let* diffs = get_first_transaction_address_registry_diff client in
+  Check.((diffs = expected) (list (tuple2 string int)))
+    ~error_msg:"Expected diff %R, but got %L" ;
+  unit
+
+(* Test that operation metadata contains newly added address through
+   INDEX_ADDRESS, but not those already in the storage. *)
+let test_index_address_diffs ~protocols =
+  Protocol.register_test
+    ~__FILE__
+    ~title:"Contract onchain opcodes: test index_address diffs"
+    ~tags:["contract"; "onchain"; "opcodes"]
+    ~supports:(Protocol.From_protocol 24)
+    (fun protocol ->
+      let* _node, client = Client.init_with_protocol ~protocol `Client () in
+      let bootstrap1 = Account.Bootstrap.keys.(1) in
+      let bootstrap2 = Account.Bootstrap.keys.(2) in
+
+      let* contract, _address =
+        Client.originate_contract_at
+          ~amount:(Tez.of_int 1000)
+          ~src:"bootstrap1"
+          ~init:"{}"
+          ~burn_cap:Tez.one
+          client
+          ["opcodes"; "index_addresses"]
+          protocol
+      in
+      let* () = Client.bake_for_and_wait client in
+
+      (* First diff should only contain bootstrap1 address. *)
+      let* () =
+        call_and_check_diff
+          client
+          contract
+          [bootstrap1.public_key_hash]
+          [(bootstrap1.public_key_hash, 1)]
+      in
+
+      (* Second call with another address, counter has been incremented. *)
+      let* () =
+        call_and_check_diff
+          client
+          contract
+          [bootstrap2.public_key_hash]
+          [(bootstrap2.public_key_hash, 2)]
+      in
+
+      (* Third call with an already revealed address, the diff is empty. *)
+      let* () =
+        call_and_check_diff client contract [bootstrap2.public_key_hash] []
+      in
+
+      (* Fourth call with multiple reveal address. *)
+      let* () =
+        call_and_check_diff
+          client
+          contract
+          [
+            "tz1TXhefsLkdNcoFA3pFW7t1oxs2UQrkGQQr";
+            "tz4YEFnMnqGvKW5io6hR1EwGzxa1341Boc8Z";
+            "tz1auQsqioeYNAEAXN8QU9omqhkuM9hkGnj7";
+          ]
+          [
+            ("tz1TXhefsLkdNcoFA3pFW7t1oxs2UQrkGQQr", 3);
+            ("tz4YEFnMnqGvKW5io6hR1EwGzxa1341Boc8Z", 4);
+            ("tz1auQsqioeYNAEAXN8QU9omqhkuM9hkGnj7", 5);
+          ]
+      in
+      unit)
+    protocols
+
+let test_get_address_index ~protocols =
+  Protocol.register_test
+    ~__FILE__
+    ~title:"Contract onchain opcodes: test GET_ADDRESS_INDEX"
+    ~tags:["contract"; "onchain"; "opcodes"]
+    ~supports:(Protocol.From_protocol 24)
+    (fun protocol ->
+      let* _node, client = Client.init_with_protocol ~protocol `Client () in
+
+      let* contract, _address =
+        Client.originate_contract_at
+          ~amount:(Tez.of_int 1000)
+          ~src:"bootstrap1"
+          ~init:"{}"
+          ~burn_cap:Tez.one
+          client
+          ["opcodes"; "index_addresses"]
+          protocol
+      in
+      let* () = Client.bake_for_and_wait client in
+
+      let addr1 = "tz1TXhefsLkdNcoFA3pFW7t1oxs2UQrkGQQr" in
+      let addr2 = "tz4YEFnMnqGvKW5io6hR1EwGzxa1341Boc8Z" in
+      let addr3 = "tz1auQsqioeYNAEAXN8QU9omqhkuM9hkGnj7" in
+      let* () =
+        call_and_check_diff
+          client
+          contract
+          [addr1; addr2; addr3]
+          [(addr1, 1); (addr2, 2); (addr3, 3)]
+      in
+
+      let parse_int_option (s : string) : int option =
+        let s = String.trim s in
+        if s = "None" then None
+        else if
+          String.length s >= 7
+          && String.sub s 0 6 = "(Some "
+          && s.[String.length s - 1] = ')'
+        then
+          let inner = String.sub s 6 (String.length s - 7) |> String.trim in
+          Some (int_of_string inner)
+        else Test.fail "Invalid format: %s" s
+      in
+
+      (* Calls `GET_ADDRESS_INDEX` via a view, it must return the sames indexes
+         as found in the operation's metadata. *)
+      let check_get_address_index addr expected =
+        let* index =
+          Client.run_view ~view:"v" ~contract ~input:(sf {|"%s"|} addr) client
+        in
+        let* rpc_index =
+          Client.RPC.call client
+          @@ RPC.get_chain_block_context_destination_index addr
+        in
+        let index = parse_int_option index in
+        Check.((index = expected) (option int))
+          ~error_msg:(sf "Expected index %%R for %s got %%L" addr1) ;
+        Check.((rpc_index = expected) (option int))
+          ~error_msg:(sf "Expected index %%R for %s got %%L" addr1) ;
+        unit
+      in
+
+      let* () = check_get_address_index addr1 (Some 1) in
+      let* () = check_get_address_index addr2 (Some 2) in
+      let* () = check_get_address_index addr3 (Some 3) in
+
+      (* Check a not indexed address. *)
+      let* () =
+        check_get_address_index "tz1KmScKtmTaeVQQBPXqi29Q846VkEbh39DQ" None
+      in
+      unit)
+    protocols
+
+(* A view cannot contain INDEX_ADDRESS directly (see
+   [test_forbidden_op_in_view] in test_typechecking.ml), but the restriction
+   does not cross lambda boundaries: a lambda EXEC'd by the view reaches the
+   instruction at runtime and registers the address. Pin the resulting L1
+   semantics — the registration made inside the view shares the fate of the
+   calling operation — so the Tezos X runtime can be compared against it (see
+   "Michelson INDEX_ADDRESS in a view lambda on Tezos X" in
+   etherlink/tezt/tests/tezosx.ml):
+   - if the caller fails after the view returns, the operation is included as
+     failed and the registration is reverted with it: no registry entry, and
+     the registry counter does not advance;
+   - if the caller succeeds, the registration persists and is reported on the
+     caller's address_registry_diff. *)
+let test_index_address_in_view_lambda ~protocols =
+  Protocol.register_test
+    ~__FILE__
+    ~title:"Contract onchain opcodes: INDEX_ADDRESS in a view lambda"
+    ~tags:["contract"; "onchain"; "opcodes"; "view"]
+    ~supports:(Protocol.From_protocol 24)
+    (fun protocol ->
+      let* _node, client = Client.init_with_protocol ~protocol `Client () in
+      let src = Account.Bootstrap.keys.(0).alias in
+      let* _target_alias, target =
+        Client.originate_contract_at
+          ~amount:Tez.zero
+          ~src
+          ~init:"Unit"
+          ~burn_cap:Tez.one
+          client
+          ["opcodes"; "index_address_view_lambda"]
+          protocol
+      in
+      let* () = Client.bake_for_and_wait client in
+      let* caller, _caller_address =
+        Client.originate_contract_at
+          ~amount:Tez.zero
+          ~src
+          ~init:"None"
+          ~burn_cap:Tez.one
+          client
+          ["opcodes"; "index_address_view_lambda_caller"]
+          protocol
+      in
+      let* () = Client.bake_for_and_wait client in
+      (* Registers its parameter addresses directly (not through a view);
+         used below to observe the registry counter. *)
+      let* probe, _probe_address =
+        Client.originate_contract_at
+          ~amount:Tez.zero
+          ~src
+          ~init:"{}"
+          ~burn_cap:Tez.one
+          client
+          ["opcodes"; "index_addresses"]
+          protocol
+      in
+      let* () = Client.bake_for_and_wait client in
+      let registrand = Account.Bootstrap.keys.(2).public_key_hash in
+      let check_registry_index ~__LOC__ address expected =
+        let* index =
+          Client.RPC.call client
+          @@ RPC.get_chain_block_context_destination_index address
+        in
+        Check.(
+          (index = expected)
+            (option int)
+            ~__LOC__
+            ~error_msg:"Expected registry index %R but got %L") ;
+        unit
+      in
+      (* Failure leg: the caller FAILWITHs (with the index the view just
+         returned) after the view call. [~force] injects the operation the
+         client predicts will fail, so the failed operation is actually
+         included in a block and its revert is exercised. *)
+      let* () =
+        Client.transfer
+          ~force:true
+          ~giver:src
+          ~receiver:caller
+          ~amount:Tez.zero
+          ~arg:(sf {|Pair "%s" "%s" True|} target registrand)
+          ~gas_limit:100_000
+          ~storage_limit:100
+          ~fee:Tez.one
+          client
+      in
+      let* () = Client.bake_for_and_wait client in
+      let* operations =
+        Client.RPC.call client
+        @@ RPC.get_chain_block_operations ~metadata:true ~force_metadata:true ()
+      in
+      let operation_result =
+        JSON.(
+          operations |=> 3 |=> 0 |-> "contents" |=> 0 |-> "metadata"
+          |-> "operation_result")
+      in
+      Check.(
+        (JSON.(operation_result |-> "status" |> as_string) = "failed")
+          string
+          ~__LOC__
+          ~error_msg:"Expected operation status %R but got %L") ;
+      (* The rejection value is the index INDEX_ADDRESS assigned inside the
+         view before the operation was reverted: index 0 is the pre-registered
+         zero address, so the first fresh registration takes 1. This pins that
+         the instruction did run and the write was then undone — rather than
+         never having happened. *)
+      let reject_value =
+        JSON.(operation_result |-> "errors" |> as_list)
+        |> List.find_map (fun err ->
+               JSON.(err |-> "with" |-> "int" |> as_string_opt))
+      in
+      Check.(
+        (reject_value = Some "1")
+          (option string)
+          ~__LOC__
+          ~error_msg:"Expected the operation to be rejected with %R, got %L") ;
+      (* The reverted registration left no trace: no entry for the address... *)
+      let* () = check_registry_index ~__LOC__ registrand None in
+      (* ...and the counter did not advance: the next fresh registration still
+         takes index 1. *)
+      let counter_probe = "tz1TXhefsLkdNcoFA3pFW7t1oxs2UQrkGQQr" in
+      let* () =
+        call_and_check_diff client probe [counter_probe] [(counter_probe, 1)]
+      in
+      (* Success leg: same call without the deliberate failure. The
+         registration made inside the view persists, is reported on the
+         *caller*'s address_registry_diff... *)
+      let* () =
+        Client.transfer
+          ~giver:src
+          ~receiver:caller
+          ~amount:Tez.zero
+          ~arg:(sf {|Pair "%s" "%s" False|} target registrand)
+          ~burn_cap:Tez.one
+          client
+      in
+      let* () = Client.bake_for_and_wait client in
+      let* diffs = get_first_transaction_address_registry_diff client in
+      Check.(
+        (diffs = [(registrand, 2)])
+          (list (tuple2 string int))
+          ~__LOC__
+          ~error_msg:"Expected diff %R, but got %L") ;
+      (* ...lands in the caller's storage... *)
+      let* storage = Client.contract_storage caller client in
+      Check.(
+        (String.trim storage = "Some 2")
+          string
+          ~__LOC__
+          ~error_msg:"Expected caller storage %R but got %L") ;
+      (* ...and is durably visible in the registry. *)
+      check_registry_index ~__LOC__ registrand (Some 2))
+    protocols
+
 let register ~protocols =
   List.iter
     (fun (title, body) ->
@@ -859,6 +1171,7 @@ let register ~protocols =
         ~__FILE__
         ~title:("Contract onchain opcodes: " ^ title)
         ~tags:["contract"; "onchain"; "opcodes"]
+        ~uses_node:false
         (fun protocol ->
           let* client = Client.init_mockup ~protocol () in
           body protocol client)
@@ -883,4 +1196,7 @@ let register ~protocols =
       ("test_level", test_level);
       ("test_big_map_origination", test_big_map_origination);
     ] ;
-  Tickets.register ~protocols
+  Tickets.register ~protocols ;
+  test_index_address_diffs ~protocols ;
+  test_get_address_index ~protocols ;
+  test_index_address_in_view_lambda ~protocols

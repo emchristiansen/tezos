@@ -57,6 +57,13 @@ module Probing_bench = struct
 
   let default_config = {max_bytes = 1 lsl 16}
 
+  let module_filename = __FILE__
+
+  let purpose =
+    Benchmark.Other_purpose
+      "Checks that benchmarks with a probe succeed. Actual measure results are \
+       discarded, so there is no need for a complexity model."
+
   (* The encoding is used by `tezos-snoop` to load the config from json
      files. *)
   let config_encoding =
@@ -135,7 +142,7 @@ end
 let bench_opts =
   let open Measure in
   {
-    seed = Some 1337;
+    seed = 1337;
     nsamples = 30;
     bench_number = 10;
     minor_heap_size = `words (256 * 1024);
@@ -150,4 +157,6 @@ let do_bench () =
 
 let tests = [Test.tztest_assert "probing bench" `Quick do_bench]
 
-let () = Alcotest_lwt.run "tezos-benchmark" [("probe", tests)] |> Lwt_main.run
+let () =
+  Alcotest_lwt.run ~__FILE__ "tezos-benchmark" [("probe", tests)]
+  |> Lwt_main.run

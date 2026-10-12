@@ -24,6 +24,14 @@
 (*****************************************************************************)
 
 open Protocol
+
+module Encodings =
+Tezos_shell_benchmarks.Encoding_benchmarks_helpers.Make (struct
+  let file = __FILE__
+
+  let purpose = Benchmark.Generate_code "michelson_v1_gas"
+end)
+
 module Size = Gas_input_size
 
 let ns = Namespace.make Registration_helpers.ns "encoding"
@@ -100,26 +108,28 @@ module Micheline_common = struct
 
   let model_size name =
     Model.make
+      ~takes_saturation_reprs:true
       ~conv:(fun {size = {Size.traversal; int_bytes; string_bytes}; _} ->
         (traversal, (int_bytes, (string_bytes, ()))))
-      ~model:
-        (Model.trilinear
-           ~name:(ns name)
-           ~coeff1:(fv (Format.asprintf "%s_micheline_traversal" name))
-           ~coeff2:(fv (Format.asprintf "%s_micheline_int_bytes" name))
-           ~coeff3:(fv (Format.asprintf "%s_micheline_string_bytes" name)))
+      (Model.trilinear
+         ~name:(ns name)
+         ~coeff1:(fv (Format.asprintf "%s_micheline_traversal" name))
+         ~coeff2:(fv (Format.asprintf "%s_micheline_int_bytes" name))
+         ~coeff3:(fv (Format.asprintf "%s_micheline_string_bytes" name)))
 
   let model_bytes name =
     Model.make
+      ~takes_saturation_reprs:true
       ~conv:(fun {bytes; _} -> (bytes, ()))
-      ~model:
-        (Model.linear
-           ~name:(ns name)
-           ~coeff:(fv (Format.asprintf "%s_micheline_bytes" name)))
+      (Model.linear
+         ~name:(ns (name ^ "_bytes"))
+         ~coeff:(fv (Format.asprintf "%s_micheline_bytes" name)))
 
   let models name =
     [("micheline", model_size name); ("micheline_bytes", model_bytes name)]
 end
+
+let group = Benchmark.Group "script_repr"
 
 module Encoding_micheline : Benchmark.S = struct
   include Translator_benchmarks.Config
@@ -128,6 +138,10 @@ module Encoding_micheline : Benchmark.S = struct
   let name = ns "ENCODING_MICHELINE"
 
   let info = "Benchmarking strip_location + encoding of Micheline to bytes"
+
+  let module_filename = __FILE__
+
+  let purpose = Benchmark.Generate_code "script_repr"
 
   let micheline_serialization_trace (micheline_node : Alpha_context.Script.node)
       =
@@ -185,7 +199,10 @@ module Encoding_micheline : Benchmark.S = struct
   let models = models (Namespace.basename name)
 end
 
-let () = Registration_helpers.register (module Encoding_micheline)
+let () =
+  Benchmarks_proto.Registration.register_as_simple_with_num
+    ~group
+    (module Encoding_micheline)
 
 module Decoding_micheline : Benchmark.S = struct
   include Translator_benchmarks.Config
@@ -194,6 +211,10 @@ module Decoding_micheline : Benchmark.S = struct
   let name = ns "DECODING_MICHELINE"
 
   let info = "Decoding of bytes to Micheline"
+
+  let module_filename = __FILE__
+
+  let purpose = Benchmark.Generate_code "script_repr"
 
   let micheline_deserialization_trace (micheline_str : string) =
     match
@@ -255,28 +276,32 @@ module Decoding_micheline : Benchmark.S = struct
   let models = models (Namespace.basename name)
 end
 
-let () = Registration_helpers.register (module Decoding_micheline)
+let () =
+  Benchmarks_proto.Registration.register_as_simple_with_num
+    ~group
+    (module Decoding_micheline)
 
 module Timestamp = struct
+  open Encodings
+
   let () =
-    Registration_helpers.register
-    @@
-    let open Tezos_shell_benchmarks.Encoding_benchmarks_helpers in
-    fixed_size_shared
-      ~name:"TIMESTAMP_READABLE_ENCODING"
-      ~generator:(fun rng_state ->
-        let seconds_in_year = 30_000_000 in
-        let offset = Random.State.int rng_state seconds_in_year in
-        Script_timestamp.of_zint (Z.of_int (1597764116 + offset)))
-      ~make_bench:(fun generator () ->
-        let tstamp_string = generator () in
-        let closure () = ignore (Script_timestamp.to_notation tstamp_string) in
-        Generator.Plain {workload = (); closure})
-      ()
+    Registration_helpers.register_simple_with_num
+    @@ fixed_size_shared
+         ~name:"TIMESTAMP_READABLE_ENCODING"
+         ~generator:(fun rng_state ->
+           let seconds_in_year = 30_000_000 in
+           let offset = Random.State.int rng_state seconds_in_year in
+           Script_timestamp.of_zint (Z.of_int (1597764116 + offset)))
+         ~make_bench:(fun generator () ->
+           let tstamp_string = generator () in
+           let closure () =
+             ignore (Script_timestamp.to_notation tstamp_string)
+           in
+           Generator.Plain {workload = (); closure})
+         ()
 
   let () =
     let b, b_intercept =
-      let open Tezos_shell_benchmarks.Encoding_benchmarks_helpers in
       nsqrtn_shared_with_intercept
         ~name:"TIMESTAMP_READABLE_DECODING"
         ~generator:(fun rng_state ->
@@ -287,7 +312,7 @@ module Timestamp = struct
             Script_timestamp.of_zint Z.(of_int 1597764116 + offset)
           in
           Script_timestamp.to_string tstamp)
-        ~make_bench:(fun generator () ->
+        ~make_bench:(fun generator ->
           let tstamp_string = generator () in
           let bytes = String.length tstamp_string in
           let closure () = ignore (Script_timestamp.of_string tstamp_string) in
@@ -299,20 +324,20 @@ module Timestamp = struct
             Script_timestamp.of_zint (Z.of_int (1597764116 + offset))
           in
           Script_timestamp.to_string tstamp)
-        ~make_bench_intercept:(fun generator () ->
+        ~make_bench_intercept:(fun generator ->
           let tstamp_string = generator () in
           let closure () = ignore (Script_timestamp.of_string tstamp_string) in
           Generator.Plain {workload = {bytes = 0}; closure})
     in
-    Registration_helpers.register b ;
-    Registration_helpers.register b_intercept
+    Registration_helpers.register_simple b ;
+    Registration_helpers.register_simple b_intercept
 end
 
 (* when benchmarking, compile bls12-381 without ADX, see
    https://gitlab.com/dannywillems/ocaml-bls12-381/-/blob/71d0b4d467fbfaa6452d702fcc408d7a70916a80/README.md#install
 *)
 module BLS = struct
-  open Tezos_shell_benchmarks.Encoding_benchmarks_helpers
+  open Encodings
 
   let check () =
     if not Bls12_381.built_with_blst_portable then (
@@ -323,7 +348,7 @@ module BLS = struct
       Stdlib.failwith "bls_not_built_with_blst_portable")
 
   let () =
-    Registration_helpers.register
+    Registration_helpers.register_simple_with_num
     @@ make_encode_fixed_size_to_bytes
          ~check
          ~name:"ENCODING_BLS_FR"
@@ -332,7 +357,7 @@ module BLS = struct
          ()
 
   let () =
-    Registration_helpers.register
+    Registration_helpers.register_simple_with_num
     @@ make_encode_fixed_size_to_bytes
          ~check
          ~name:"ENCODING_BLS_G1"
@@ -341,7 +366,7 @@ module BLS = struct
          ()
 
   let () =
-    Registration_helpers.register
+    Registration_helpers.register_simple_with_num
     @@ make_encode_fixed_size_to_bytes
          ~check
          ~name:"ENCODING_BLS_G2"
@@ -350,7 +375,7 @@ module BLS = struct
          ()
 
   let () =
-    Registration_helpers.register
+    Registration_helpers.register_simple_with_num
     @@ make_decode_fixed_size_from_bytes
          ~check
          ~name:"DECODING_BLS_FR"
@@ -360,7 +385,7 @@ module BLS = struct
          ()
 
   let () =
-    Registration_helpers.register
+    Registration_helpers.register_simple_with_num
     @@ make_decode_fixed_size_from_bytes
          ~check
          ~name:"DECODING_BLS_G1"
@@ -370,7 +395,7 @@ module BLS = struct
          ()
 
   let () =
-    Registration_helpers.register
+    Registration_helpers.register_simple_with_num
     @@ make_decode_fixed_size_from_bytes
          ~check
          ~name:"DECODING_BLS_G2"
@@ -380,7 +405,7 @@ module BLS = struct
          ()
 
   let () =
-    Registration_helpers.register
+    Registration_helpers.register_simple_with_num
     @@ fixed_size_shared
          ~check
          ~name:"BLS_FR_FROM_Z"
@@ -393,7 +418,7 @@ module BLS = struct
          ()
 
   let () =
-    Registration_helpers.register
+    Registration_helpers.register_simple_with_num
     @@ fixed_size_shared
          ~check
          ~name:"BLS_FR_TO_Z"
@@ -406,13 +431,13 @@ module BLS = struct
 end
 
 module Timelock = struct
-  open Tezos_shell_benchmarks.Encoding_benchmarks_helpers
+  open Encodings
 
   let generator rng_state =
     let log_time =
-      Base_samplers.sample_in_interval ~range:{min = 0; max = 29} rng_state
+      Base_samplers.sample_in_interval ~range:{min = 0; max = 20} rng_state
     in
-    let time = Random.State.int rng_state (Int.shift_left 1 log_time) in
+    let time = Int.shift_left 1 log_time in
     let plaintext_size =
       Base_samplers.sample_in_interval ~range:{min = 1; max = 10000} rng_state
     in
@@ -422,7 +447,7 @@ module Timelock = struct
     ((chest, chest_key), plaintext_size)
 
   let () =
-    Registration_helpers.register
+    Registration_helpers.register_simple_with_num
     @@ make_encode_variable_size_to_string
          ~name:"ENCODING_Chest"
          ~to_string:
@@ -434,7 +459,7 @@ module Timelock = struct
          ()
 
   let () =
-    Registration_helpers.register
+    Registration_helpers.register_simple_with_num
     @@ make_encode_fixed_size_to_string
          ~name:"ENCODING_Chest_key"
          ~to_string:
@@ -446,7 +471,7 @@ module Timelock = struct
          ()
 
   let () =
-    Registration_helpers.register
+    Registration_helpers.register_simple_with_num
     @@ make_decode_variable_size_from_bytes
          ~name:"DECODING_Chest"
          ~to_bytes:
@@ -466,7 +491,7 @@ module Timelock = struct
          ()
 
   let () =
-    Registration_helpers.register
+    Registration_helpers.register_simple_with_num
     @@ make_decode_fixed_size_from_bytes
          ~name:"DECODING_Chest_key"
          ~to_bytes:

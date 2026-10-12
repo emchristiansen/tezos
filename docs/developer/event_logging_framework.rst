@@ -6,7 +6,7 @@ for the :doc:`Logging subsystem <../user/logging>`.
 
 In the Octez code base, logging is instrumented using an asynchronous event
 system, where log events are emitted in various part of the code and consumed by
-the so called sinks.  This is done by using the `tezos-event-logging` library.
+the so called sinks.  This is done by using the :package-api:`Tezos_event_logging <octez-libs/Tezos_event_logging/index.html>` library.
 
 We use two levels of abstraction to define these events. Heavy events are
 defined using the most generic API and have the full expressive power and
@@ -26,7 +26,7 @@ Simple events are record-like structures which are constructed directly
 programmatically). The API is less generic than the “Heavy” Events'.
 
 See for instance
-:src:`src/lib_node_config/config_file.ml` (search for the string `declare_`):
+:src:`src/lib_node_config/config_file.ml` (search for the string ``declare_``):
 
 -  one declares typed-record events with
    ``Internal_event.Simple.declare_<number-of-fields>``,
@@ -34,7 +34,7 @@ See for instance
    ``val Simple.emit: 'a Simple.t -> 'a -> (unit, trace) result Lwt.t``.
 
 Please read the guidelines that are documented in
-`the Internal_event.Simple module. <../api/odoc/_html/tezos-event-logging/Tezos_event_logging/Internal_event/Simple/index.html>`__
+:package-api:`the Internal_event.Simple module. <octez-libs/Tezos_event_logging/Internal_event/Simple/index.html>`.
 
 
 “Heavy” Events
@@ -66,4 +66,4 @@ See for instance:
 -  The (simplest) module ``Lwt_log_sink``:
    :src:`src/lib_event_logging/internal_event.ml`,
 -  or, the much more complex,
-   :src:`src/lib_stdlib_unix/file_descriptor_sink.ml`.
+   :src:`src/lib_base/unix/file_descriptor_sink.ml`.

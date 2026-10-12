@@ -23,6 +23,14 @@
 (*                                                                           *)
 (*****************************************************************************)
 
+(* Testing
+   -------
+   Component:    Context
+   Invocation:   dune exec src/lib_context/test/main.exe \
+                  -- --file test_merkle_proof.ml
+   Subject:      Test merkle proof.
+*)
+
 open Tezos_context_disk
 open Context.Proof
 open Qcheck2_helpers
@@ -264,8 +272,11 @@ module Proof32 (Encoding : Tezos_context_sigs.Context.PROOF_ENCODING) = struct
       Gen.stream_proof
       (encoding_test
          Encoding.stream_proof_encoding
-         (fun (* stream proof uses Seq.t *)
-                a b ->
+         (fun
+           (* stream proof uses Seq.t *)
+             a
+           b
+         ->
            a.version = b.version && a.before = b.before && a.after = b.after
            && List.of_seq a.state = List.of_seq b.state))
 
@@ -474,8 +485,11 @@ module Proof2 (Encoding : Tezos_context_sigs.Context.PROOF_ENCODING) = struct
       Gen.stream_proof
       (encoding_test
          Encoding.stream_proof_encoding
-         (fun (* stream proof uses Seq.t *)
-                a b ->
+         (fun
+           (* stream proof uses Seq.t *)
+             a
+           b
+         ->
            a.version = b.version && a.before = b.before && a.after = b.after
            && List.of_seq a.state = List.of_seq b.state))
 
@@ -577,6 +591,7 @@ let () =
   let module Proof2_V2 =
     Proof2 (Tezos_context_merkle_proof_encoding.Merkle_proof_encoding.V2.Tree2) in
   Alcotest.run
+    ~__FILE__
     "test_merkle_proof"
     [
       ("sample32_v1", [("sample", `Quick, Proof32_V1.test_sample)]);

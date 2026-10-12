@@ -4,6 +4,7 @@
 (* Copyright (c) 2018 Dynamic Ledger Solutions, Inc. <contact@tezos.com>     *)
 (* Copyright (c) 2020-2021 Nomadic Labs <contact@nomadic-labs.com>           *)
 (* Copyright (c) 2021-2022 Trili Tech, <contact@trili.tech>                  *)
+(* Copyright (c) 2023 Marigold, <contact@marigold.dev>                       *)
 (*                                                                           *)
 (* Permission is hereby granted, free of charge, to any person obtaining a   *)
 (* copy of this software and associated documentation files (the "Software"),*)
@@ -25,67 +26,87 @@
 (*                                                                           *)
 (*****************************************************************************)
 
+(** Protocol-specific constants.
+
+    When the protocol is activated via migration from its predecessor
+    (e.g. on mainnet, ghostnet, <proto-name>net), these constants are
+    fully controlled by {!Raw_context.prepare_first_block}, which
+    copies over the value from the previous protocol for most
+    constants, but may also modify some of them and/or initialize new
+    constants.
+
+    When the protocol is activated from Genesis, e.g. in most tests,
+    constant values must be provided through a parameter file (or
+    internal arguments, depending of the level of abstraction). Typical
+    default values for various situations are available in
+    [lib_parameters/default_parameters.ml].
+
+    Note that there are also "hard" constants (non-parametric: cannot
+    be adjusted in tests) which are defined in {!Constants_repr}.
+
+    Documentation on individual constants can be found either in this
+    file or in [lib_parameters/default_parameters.ml]. Eventually, we
+    would like to keep the constant's documentation mainly into
+    [lib_parameters/default_parameters.ml] as it allows it to be
+    rights next to each constant's current value, no matter whether the
+    constant has been updated in the current protocol or not (whereas
+    only the values of modified constants can be found in
+    {!Raw_context.prepare_first_block}, so it's not a good place to put
+    the documentation).
+
+    In order to add or modify a protocol constant, you should
+    therefore:
+
+    - Add/update its value in {!Raw_context.prepare_first_block}, in
+      the branch of the pattern matching corresponding to [alpha]'s
+      predecessor.
+
+    - Add/update the same value in [lib_parameters/default_parameters.ml].
+
+    - Add/update the documentation on the constant in
+      [lib_parameters/default_parameters.ml]. If the constant is already
+      documented elsewhere, please move the documentation there.
+
+    (The CI will fail if you don't update [default_parameters.ml] accordingly.)
+*)
+
 type dal = {
   feature_enable : bool;
+  incentives_enable : bool;
+  dynamic_lag_enable : bool;
   number_of_slots : int;
   attestation_lag : int;
-  availability_threshold : int;
+  attestation_lags : int list;
+  attestation_threshold : int;
   cryptobox_parameters : Dal.parameters;
+  minimal_participation_ratio : Q.t;
+      (* the ratio of the protocol-attested slots that need to be attested by an
+         attester in order to receive rewards *)
+  rewards_ratio : Q.t; (* the ratio of DAL rewards versus total rewards *)
+  traps_fraction : Q.t; (* probability that a given shard is a trap *)
+}
+
+type past_dal_parameters = {
+  dal_parameters : dal;
+  next_protocol_activation : Raw_level_repr.t;
 }
 
 val dal_encoding : dal Data_encoding.t
 
-type tx_rollup = {
-  enable : bool;
-  origination_size : int;
-  (* the maximum amount of bytes messages can allocate in an inbox *)
-  hard_size_limit_per_inbox : int;
-  (* the maximum amount of bytes one batch can allocate in an inbox *)
-  hard_size_limit_per_message : int;
-  (* the amount of tez to bond a tx rollup commitment *)
-  commitment_bond : Tez_repr.t;
-  (* the number of blocks before a tx rollup block is final *)
-  finality_period : int;
-  (* the maximum number of levels that can be left unfinalized
-     before we stop accepting new inboxes for a tx rollup *)
-  (* the minimum number of blocks to wait before removing a finalised
-     commitment from the context. *)
-  withdraw_period : int;
-  max_inboxes_count : int;
-  (* the maximum number of messages in an inbox.  This bounds the
-     size of a commitment. *)
-  max_messages_per_inbox : int;
-  (* the maximum number of finalized commitments, to ensure that
-     remove_commitment is ever called *)
-  max_commitments_count : int;
-  (* The number of blocks used to compute the ema factor determining
-     the cost per byte for new messages in the inbox. *)
-  cost_per_byte_ema_factor : int;
-  (* Tickets are transmitted in batches in the
-     [Tx_rollup_dispatch_tickets] operation.
+val past_dal_parameters_encoding : past_dal_parameters Data_encoding.t
 
-     The semantics is that this operation is used to
-     concretize the withdraw orders emitted by the layer-2,
-     one layer-1 operation per messages of an
-     inbox. Therefore, it is of significant importance that
-     a valid batch does not produce a list of withdraw
-     orders which could not fit in a layer-1 operation.
+type sc_rollup_reveal_hashing_schemes = {blake2B : Raw_level_repr.t}
 
-     With these values, at least 2048 bytes remain available
-     to store the rest of the operands of
-     [Tx_rollup_dispatch_tickets] (in practice, even more,
-     because we overapproximate the size of tickets). So we
-     are safe. *)
-  max_ticket_payload_size : int;
-  max_withdrawals_per_batch : int;
-  (* The maximum size, in bytes, of a Merkle proof.  Operations which would
-     require proofs larger than this should be no-ops. *)
-  rejection_max_proof_size : int;
-  sunset_level : int32;
+(** Associates reveal kinds to their activation level. *)
+type sc_rollup_reveal_activation_level = {
+  raw_data : sc_rollup_reveal_hashing_schemes;
+  metadata : Raw_level_repr.t;
+  dal_page : Raw_level_repr.t;
+  dal_parameters : Raw_level_repr.t;
+  dal_attested_slots_validity_lag : int;
 }
 
 type sc_rollup = {
-  enable : bool;
   arith_pvm_enable : bool;
   origination_size : int;
   challenge_window_in_blocks : int;
@@ -123,6 +144,14 @@ type sc_rollup = {
   max_number_of_stored_cemented_commitments : int;
   (* The maximum number of parallel games played by a given staker. *)
   max_number_of_parallel_games : int;
+  (* Activation's block level of reveal kinds. *)
+  reveal_activation_level : sc_rollup_reveal_activation_level;
+  (* Activates an updatable whitelist of stakers. Only keys in the whitelist are
+     allowed to stake and publish a commitment. *)
+  private_enable : bool;
+  (* Activates the RISC-V pvm. *)
+  riscv_pvm_enable : bool;
+  canonical_rollup_address : Smart_rollup.Address.t option;
 }
 
 type zk_rollup = {
@@ -135,25 +164,76 @@ type zk_rollup = {
      That is, every update must process at least
      [min(length pending_list, min_pending_to_process)] pending operations. *)
   min_pending_to_process : int;
+  max_ticket_payload_size : int;
+}
+
+type adaptive_rewards_params = {
+  issuance_ratio_final_min : (* Minimum yearly issuance rate *) Q.t;
+  issuance_ratio_final_max : (* Maximum yearly issuance rate *) Q.t;
+  issuance_ratio_initial_min :
+    (* Minimum yearly issuance rate at adaptive issuance activation *) Q.t;
+  issuance_ratio_initial_max :
+    (* Maximum yearly issuance rate at adaptive issuance activation *) Q.t;
+  initial_period :
+    (* Period in cycles during which the minimum and maximum yearly
+       issuance rate values stay at their initial values *)
+    int;
+  transition_period :
+    (* Period in cycles during which the minimum and maximum yearly
+       issuance rate values decrease/increase until they reach their global values *)
+    int;
+  max_bonus : (* Maximum issuance bonus value *) Issuance_bonus_repr.max_bonus;
+  growth_rate : (* Bonus value's growth rate *) Q.t;
+  center_dz : (* Center for bonus *) Q.t;
+  radius_dz :
+    (* Minimum distance from center required for non-zero growth *) Q.t;
+}
+
+type adaptive_issuance = {
+  global_limit_of_staking_over_baking
+    (* Global maximum stake tokens taken into account per baking token. Each baker can set their own lower limit. *) :
+    int;
+  edge_of_staking_over_delegation :
+    (* Weight of staking over delegation. *) int;
+  adaptive_rewards_params :
+    (* Parameters for the reward mechanism *) adaptive_rewards_params;
+}
+
+type issuance_weights = {
+  (* [base_total_issued_per_minute] is the total amount of rewards expected to
+     be distributed every minute *)
+  base_total_issued_per_minute : Tez_repr.t;
+  (* The following fields represent the "weights" of the respective reward kinds.
+     The actual reward values are computed proportionally from the other weights
+     as a portion of the [base_total_issued_per_minute]. See the module
+     {!Delegate_rewards} for more details *)
+  baking_reward_fixed_portion_weight : int;
+  baking_reward_bonus_weight : int;
+  attesting_reward_weight : int;
+  seed_nonce_revelation_tip_weight : int;
+  vdf_revelation_tip_weight : int;
+  dal_rewards_weight : int;
 }
 
 type t = {
-  preserved_cycles : int;
+  consensus_rights_delay : int;
+  (* Number of past cycles about which the protocol hints the shell that it should
+     keep them in its history. *)
+  blocks_preservation_cycles : int;
+  delegate_parameters_activation_delay : int;
+  tolerated_inactivity_period : int;
   blocks_per_cycle : int32;
   blocks_per_commitment : int32;
   nonce_revelation_threshold : int32;
-  blocks_per_stake_snapshot : int32;
   cycles_per_voting_period : int32;
   hard_gas_limit_per_operation : Gas_limit_repr.Arith.integral;
   hard_gas_limit_per_block : Gas_limit_repr.Arith.integral;
   proof_of_work_threshold : int64;
   minimal_stake : Tez_repr.t;
+  minimal_frozen_stake : Tez_repr.t;
   vdf_difficulty : int64;
-  seed_nonce_revelation_tip : Tez_repr.t;
   origination_size : int;
-  baking_reward_fixed_portion : Tez_repr.t;
-  baking_reward_bonus_per_slot : Tez_repr.t;
-  endorsing_reward_per_slot : Tez_repr.t;
+  issuance_weights : issuance_weights;
   cost_per_byte : Tez_repr.t;
   hard_storage_limit_per_operation : Z.t;
   quorum_min : int32;
@@ -168,15 +248,14 @@ type t = {
   minimal_participation_ratio : Ratio_repr.t;
   consensus_committee_size : int;
   (* in slots *)
-  consensus_threshold : int;
+  consensus_threshold_size : int;
   (* in slots *)
-  max_slashing_period : int;
-  (* in cycles *)
-  frozen_deposits_percentage : int;
-  (* that is, (100 * delegated tz / own tz) *)
-  double_baking_punishment : Tez_repr.t;
-  ratio_of_frozen_deposits_slashed_per_double_endorsement : Ratio_repr.t;
-  testnet_dictator : Signature.Public_key_hash.t option;
+  limit_of_delegation_over_baking : int;
+  (* upper bound on the (delegated tz / own frozen tz) ratio *)
+  percentage_of_frozen_deposits_slashed_per_double_baking : Percentage.t;
+  max_slashing_per_block : Percentage.t;
+  max_slashing_threshold : Ratio_repr.t;
+  testnet_dictator : Implicit_account_repr.t option;
   initial_seed : State_hash.t option;
   cache_script_size : int;
   (* in bytes *)
@@ -184,10 +263,62 @@ type t = {
   (* in cycles *)
   cache_sampler_state_cycles : int;
   (* in cycles *)
-  tx_rollup : tx_rollup;
+  cache_stake_info_cycles : int;
+  (* in cycles *)
+  cache_swrr_selected_distribution_cycles : int;
+  (* Cache size (in cycles) for precomputed SWRR selected bakers.
+
+   Limits how many past cycles of baker arrays are kept in memory.
+   Memory usage is O(cache_cycles × bakers_per_cycle).
+
+   Entries are removed by Swrr_sampler.clear_outdated_sampling_data
+   after the preserved_cycles window.
+  
+  *)
   dal : dal;
   sc_rollup : sc_rollup;
   zk_rollup : zk_rollup;
+  adaptive_issuance : adaptive_issuance;
+  direct_ticket_spending_enable : bool;
+  (* attestation aggregation feature flag *)
+  aggregate_attestation : bool;
+  allow_tz4_delegate_enable : bool;
+  (* Portion of tz4 bakers required to activate all bakers attest *)
+  all_bakers_attest_activation_threshold : Ratio_repr.t;
+  (* Native contracts feature flag *)
+  native_contracts_enable : bool;
+  (* Feature flag to enable/disable SWRR baker lottery.
+
+     When true: use deterministic SWRR precomputed selections
+     When false: fall back to legacy alias sampler (Sampler)
+
+     Migration safety:
+     - Can be toggled between cycles without breaking consensus
+     - Both systems maintain independent state (no conflicts)
+     - Smooth protocol upgrade path from alias sampler to deterministic selection
+
+     Toggling behavior:
+     - Disabled → Enabled: SWRR is used to compute future cycles instead of alias; 
+     already computed cycles with alias are used until then. *)
+  swrr_new_baker_lottery_enable : bool;
+  (* Tz5 ML-DSA-44 account feature flag *)
+  tz5_account_enable : bool;
 }
 
 val encoding : t Data_encoding.encoding
+
+(** [update_sc_rollup_parameter ratio_f c] updates the smart rollups constants
+    expressed in number of blocks (e.g., [commitment_period_in_blocks]) to
+    preserve their average duration with a new block time.
+
+    This function is primilarly intended to be used by the [Init_storage]
+    module. [ratio_f] is a function used to compute the new constants. For
+    instance, if the block time is multiplied by 4/5, then the constant should
+    be multiplied by 5/4. *)
+val update_sc_rollup_parameter : (int32 -> int32) -> sc_rollup -> sc_rollup
+
+val update_sc_rollup_parameter_with_block_time : int -> sc_rollup -> sc_rollup
+
+module Internal_for_tests : sig
+  val sc_rollup_encoding : sc_rollup Data_encoding.t
+end

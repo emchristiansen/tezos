@@ -44,6 +44,14 @@ val get_ongoing_games_for_staker :
   tzresult
   Lwt.t
 
+(** [get_game ctxt rollup stakers] returns the [game] between
+    [stakers.alice] and [stakers.bob]. *)
+val find_game :
+  Raw_context.t ->
+  Sc_rollup_repr.t ->
+  Sc_rollup_game_repr.Index.t ->
+  (Raw_context.t * Sc_rollup_game_repr.t option) tzresult Lwt.t
+
 (** A conflict between a staker and an [other] staker. The conflict is
    about the commitment that follows the [parent_commitment]:
    [their_commitment] and [our_commitment] are distinct, hence in
@@ -79,8 +87,8 @@ val conflicting_stakers_uncarbonated :
 val start_game :
   Raw_context.t ->
   Sc_rollup_repr.t ->
-  player:Signature.public_key_hash * Sc_rollup_commitment_repr.Hash.t ->
-  opponent:Signature.public_key_hash * Sc_rollup_commitment_repr.Hash.t ->
+  player:Implicit_account_repr.t * Sc_rollup_commitment_repr.Hash.t ->
+  opponent:Implicit_account_repr.t * Sc_rollup_commitment_repr.Hash.t ->
   Raw_context.t tzresult Lwt.t
 
 (** [game_move ctxt rollup player opponent refutation]
@@ -181,6 +189,30 @@ val apply_game_result :
   (Sc_rollup_game_repr.status * Raw_context.t * Receipt_repr.balance_updates)
   tzresult
   Lwt.t
+
+(** Removes pending refutation games in the context where the players
+    are no longer staked. *)
+val migrate_clean_refutation_games :
+  Raw_context.t -> Raw_context.t tzresult Lwt.t
+
+(** [check_conflict_point ctxt rollup ~refuter ~refuter_commitment_hash
+    ~defender ~defender_commitment_hash] checks that the refuter is staked on
+    [commitment] with hash [refuter_commitment_hash], res. for [defender] and
+    [defender_commitment] with hash [defender_commitment_hash]. Fails with
+    {!Sc_rollup_errors.Sc_rollup_wrong_staker_for_conflict_commitment}.
+
+    It also verifies that both are pointing to the same predecessor and thus are
+    in conflict, fails with
+    {!Sc_rollup_errors.Sc_rollup_not_first_conflict_between_stakers} otherwise.
+    Finally it returns the defender's commitment. *)
+val check_conflict_point :
+  Raw_context.t ->
+  Sc_rollup_repr.t ->
+  refuter:Implicit_account_repr.t ->
+  refuter_commitment_hash:Commitment_hash.t ->
+  defender:Implicit_account_repr.t ->
+  defender_commitment_hash:Commitment_hash.t ->
+  (Sc_rollup_commitment_repr.t * Raw_context.t) tzresult Lwt.t
 
 (**/**)
 

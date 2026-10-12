@@ -1,31 +1,13 @@
 (*****************************************************************************)
 (*                                                                           *)
-(* Open Source License                                                       *)
-(* Copyright (c) 2022 Nomadic-Labs. <contact@nomadic-labs.com>               *)
-(*                                                                           *)
-(* Permission  is hereby granted, free of charge, to any person obtaining a  *)
-(* copy of this software and associated documentation files (the "Software"),*)
-(* to deal in the Software without restriction, including without limitation *)
-(* the rights to use, copy, modify, merge, publish, distribute, sublicense,  *)
-(* and/or sell copies of the Software, and to permit persons to whom the     *)
-(* Software is furnished to do so, subject to the following conditions:      *)
-(*                                                                           *)
-(* The above copyright notice and this permission notice shall be included   *)
-(* in all copies or substantial portions of the Software.                    *)
-(*                                                                           *)
-(* THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR*)
-(* IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,  *)
-(* FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL   *)
-(* THE AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER*)
-(* LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING   *)
-(* FROM, OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER       *)
-(* DEALINGS IN THE SOFTWARE.                                                 *)
+(* SPDX-License-Identifier: MIT                                              *)
+(* Copyright (c) 2022 Nomadic Labs, <contact@nomadic-labs.com>               *)
 (*                                                                           *)
 (*****************************************************************************)
 
 open Protocol
 open Alpha_context
-open Test_tez
+open Tez_helpers
 
 (** {2 Constants} *)
 
@@ -42,7 +24,7 @@ let default_fund = Tez.of_mutez_exn 400_000_000_000L
 (** Context abstraction in a test. *)
 type ctxt = {
   block : Block.t;
-  bootstraps : public_key_hash list;
+  bootstraps : Implicit_account_repr.t list;
   originated_contract : Contract_hash.t option;
   sc_rollup : Sc_rollup.t option;
   zk_rollup : Zk_rollup.t option;
@@ -62,7 +44,7 @@ type accounts = {
 }
 
 (** Feature flags requirements for a context setting for a test. *)
-type feature_flags = {dal : bool; scoru : bool; toru : bool; zkru : bool}
+type feature_flags = {dal : bool; scoru_arith : bool; zkru : bool}
 
 (** Infos describes the information of the setting for a test: the
    context and used accounts. *)
@@ -93,7 +75,7 @@ type manager_operation_kind =
   | K_Sc_rollup_timeout
   | K_Sc_rollup_execute_outbox_message
   | K_Sc_rollup_recover_bond
-  | K_Dal_publish_slot_header
+  | K_Dal_publish_commitment
   | K_Zk_rollup_origination
   | K_Zk_rollup_publish
   | K_Zk_rollup_update
@@ -130,13 +112,11 @@ type ctxt_req = {
 type mode = Construction | Mempool | Application
 
 (** {2 Default values} *)
-let all_enabled = {dal = true; scoru = true; toru = true; zkru = true}
+let all_enabled = {dal = true; scoru_arith = true; zkru = true}
 
 let disabled_dal = {all_enabled with dal = false}
 
-let disabled_scoru = {all_enabled with scoru = false}
-
-let disabled_toru = {all_enabled with toru = false}
+let disabled_scoru_arith = {all_enabled with scoru_arith = false}
 
 let disabled_zkru = {all_enabled with zkru = false}
 
@@ -186,7 +166,7 @@ let kind_to_string = function
   | K_Sc_rollup_add_messages -> "Sc_rollup_add_messages"
   | K_Sc_rollup_execute_outbox_message -> "Sc_rollup_execute_outbox_message"
   | K_Sc_rollup_recover_bond -> "Sc_rollup_recover_bond"
-  | K_Dal_publish_slot_header -> "Dal_publish_slot_header"
+  | K_Dal_publish_commitment -> "Dal_publish_commitment"
   | K_Zk_rollup_origination -> "Zk_rollup_origination"
   | K_Zk_rollup_publish -> "Zk_rollup_publish"
   | K_Zk_rollup_update -> "Zk_rollup_update"
@@ -254,8 +234,7 @@ let pp_ctxt_req pp
      fund_sc: %a tz@,\
      fund_zk: %a tz@,\
      dal_flag: %a@,\
-     scoru_flag: %a@,\
-     toru_flag: %a@,\
+     scoru_arith_flag: %a@,\
      zkru_flag: %a@,\
      @]"
     (pp_opt Gas.Arith.pp_integral)
@@ -274,9 +253,7 @@ let pp_ctxt_req pp
     Format.pp_print_bool
     flags.dal
     Format.pp_print_bool
-    flags.scoru
-    Format.pp_print_bool
-    flags.toru
+    flags.scoru_arith
     Format.pp_print_bool
     flags.zkru
 
@@ -286,7 +263,9 @@ let pp_mode pp = function
   | Application -> Format.fprintf pp "Block"
 
 (** {2 Short-cuts} *)
-let contract_of (account : Account.t) = Contract.Implicit account.pkh
+let contract_of (account : Account.t) =
+  (* FIXME-PA *)
+  Contract.Implicit (Implicit_account_repr.Forbidden.of_pkh account.pkh)
 
 (** Make a [mempool_mode], aka a boolean, as used in incremental from
    a [mode]. *)
@@ -319,12 +298,19 @@ let delegation block source delegate =
       ~force_reveal:true
       (B block)
       contract_source
-      (Some delegate_pkh)
+      (* FIXME-PA *)
+      (Some (Implicit_account_repr.Forbidden.of_pkh delegate_pkh))
   in
   let* block = Block.bake block ~operation in
   let* del_opt_new = Context.Contract.delegate_opt (B block) contract_source in
   let* del = Assert.get_some ~loc:__LOC__ del_opt_new in
-  let* () = Assert.equal_pkh ~loc:__LOC__ del delegate_pkh in
+  let* () =
+    Assert.equal_pkh
+      ~loc:__LOC__
+      del
+      (* FIXME-PA *)
+      (Implicit_account_repr.Forbidden.of_pkh delegate_pkh)
+  in
   return block
 
 let originate_sc_rollup block rollup_account =
@@ -350,14 +336,15 @@ end)
 let originate_zk_rollup block rollup_account =
   let open Lwt_result_syntax in
   let rollup_contract = contract_of rollup_account in
+  let _prover_pp, public_parameters = Lazy.force ZKOperator.lazy_pp in
   let* rollup_origination, zk_rollup =
     Op.zk_rollup_origination
       ~force_reveal:true
       (B block)
       rollup_contract
-      ~public_parameters:ZKOperator.public_parameters
+      ~public_parameters
       ~circuits_info:
-        (Zk_rollup.Account.SMap.of_seq @@ Plonk.SMap.to_seq ZKOperator.circuits)
+        (Zk_rollup.Account.SMap.of_seq @@ Kzg.SMap.to_seq ZKOperator.circuits)
       ~init_state:ZKOperator.init_state
       ~nb_ops:1
   in
@@ -369,14 +356,15 @@ let originate_zk_rollup block rollup_account =
 (** {2 Setting's context construction} *)
 
 let fund_account_op block bootstrap account fund counter =
-  let open Lwt_result_syntax in
+  let open Lwt_result_wrap_syntax in
   let* fund =
     match fund with
     | None -> return Tez.one
     | Some fund ->
         let* source_balance = Context.Contract.balance (B block) bootstrap in
         if Tez.(fund > source_balance) then
-          Lwt.return (Environment.wrap_tzresult Tez.(source_balance -? one))
+          let*?@ result = Tez.(source_balance -? one) in
+          return result
         else return fund
   in
   let+ op =
@@ -405,33 +393,15 @@ let manager_parameters : Parameters.t -> ctxt_req -> Parameters.t =
   let hard_gas_limit_per_block =
     match hard_gas_limit_per_block with
     | Some gb -> gb
-    | None -> Gas.Arith.(integral_of_int_exn 5_200_000)
+    | None -> Default_parameters.constants_mainnet.hard_gas_limit_per_block
   in
   let dal = {params.constants.dal with feature_enable = flags.dal} in
-  let tx_rollup =
-    {
-      params.constants.tx_rollup with
-      sunset_level = Int32.max_int;
-      enable = flags.toru;
-    }
-  in
   let sc_rollup =
-    {
-      params.constants.sc_rollup with
-      enable = flags.scoru;
-      arith_pvm_enable = flags.scoru;
-    }
+    {params.constants.sc_rollup with arith_pvm_enable = flags.scoru_arith}
   in
   let zk_rollup = {params.constants.zk_rollup with enable = flags.zkru} in
   let constants =
-    {
-      params.constants with
-      hard_gas_limit_per_block;
-      dal;
-      tx_rollup;
-      zk_rollup;
-      sc_rollup;
-    }
+    {params.constants with hard_gas_limit_per_block; dal; zk_rollup; sc_rollup}
   in
   {params with constants}
 
@@ -441,9 +411,9 @@ let init_ctxt_only ctxtreq =
   let open Lwt_result_syntax in
   let initial_params =
     Tezos_protocol_alpha_parameters.Default_parameters.parameters_of_constants
-      {Context.default_test_constants with consensus_threshold = 0}
+      {Context.default_test_constants with consensus_threshold_size = 0}
   in
-  let*? _cryptobox =
+  let* _cryptobox =
     Dal_helpers.mk_cryptobox initial_params.constants.dal.cryptobox_parameters
   in
   let* block, contracts =
@@ -458,7 +428,8 @@ let init_ctxt_only ctxtreq =
 (** Build a generic setting for a test according to a context requirement
     on an existing context with 7 bootstraps accounts. *)
 let init_infos :
-    ctxt_req -> Block.t -> public_key_hash list -> infos tzresult Lwt.t =
+    ctxt_req -> Block.t -> Implicit_account_repr.t list -> infos tzresult Lwt.t
+    =
  fun ctxtreq block bootstraps ->
   let {
     fund_src;
@@ -478,7 +449,14 @@ let init_infos :
     | None -> return (block, None, None)
     | Some _ ->
         let account = Account.new_account () in
-        let* block = fund_account block bootstrap account.pkh fund in
+        (* FIXME-PA *)
+        let* block =
+          fund_account
+            block
+            bootstrap
+            (Implicit_account_repr.Forbidden.of_pkh account.pkh)
+            fund
+        in
         let* block, rollup =
           match originate_rollup with
           | None -> return (block, None)
@@ -502,7 +480,12 @@ let init_infos :
   in
   let source = Account.new_account () in
   let* block =
-    fund_account block (get_bootstrap bootstraps 0) source.pkh fund_src
+    (* FIXME-PA *)
+    fund_account
+      block
+      (get_bootstrap bootstraps 0)
+      (Implicit_account_repr.Forbidden.of_pkh source.pkh)
+      fund_src
   in
   let* block, dest, _ =
     create_and_fund block (get_bootstrap bootstraps 1) fund_dest
@@ -511,7 +494,7 @@ let init_infos :
     create_and_fund block (get_bootstrap bootstraps 2) fund_del
   in
   let* block, sc, sc_rollup =
-    if flags.scoru then
+    if flags.scoru_arith then
       create_and_fund
         ~originate_rollup:originate_sc_rollup
         block
@@ -538,7 +521,7 @@ let init_infos :
   let* reveal_operations =
     if reveal_accounts then
       reveal_accounts_operations block [Some source; dest; del]
-    else return []
+    else return_nil
   in
   let operations = create_contract_hash :: reveal_operations in
   let+ block = Block.bake ~operations block in
@@ -575,7 +558,12 @@ let ctxt_with_self_delegation : ctxt_req -> infos tzresult Lwt.t =
  fun ctxt_req ->
   let open Lwt_result_syntax in
   let* infos = init_ctxt ctxt_req in
-  let+ block = self_delegate infos.ctxt.block (get_source infos).pkh in
+  (* FIXME-PA *)
+  let+ block =
+    self_delegate
+      infos.ctxt.block
+      (Implicit_account_repr.Forbidden.of_pkh (get_source infos).pkh)
+  in
   let ctxt = {infos.ctxt with block} in
   {infos with ctxt}
 
@@ -637,8 +625,12 @@ let mk_delegation (oinfos : operation_req) (infos : infos) =
     (contract_of (get_source infos))
     (Some
        (match infos.accounts.del with
-       | None -> (get_source infos).pkh
-       | Some delegate -> delegate.pkh))
+       | None ->
+           (* FIXME-PA *)
+           Implicit_account_repr.Forbidden.of_pkh (get_source infos).pkh
+       | Some delegate ->
+           (* FIXME-PA *)
+           Implicit_account_repr.Forbidden.of_pkh delegate.pkh))
 
 let mk_undelegation (oinfos : operation_req) (infos : infos) =
   Op.delegation
@@ -660,7 +652,8 @@ let mk_self_delegation (oinfos : operation_req) (infos : infos) =
     ?storage_limit:oinfos.storage_limit
     (B infos.ctxt.block)
     (contract_of (get_source infos))
-    (Some (get_source infos).pkh)
+    (* FIXME-PA *)
+    (Some (Implicit_account_repr.Forbidden.of_pkh (get_source infos).pkh))
 
 let mk_origination (oinfos : operation_req) (infos : infos) =
   let open Lwt_result_syntax in
@@ -744,11 +737,15 @@ let mk_reveal (oinfos : operation_req) (infos : infos) =
     (B infos.ctxt.block)
     pk
 
-let sc_rollup_of = function
+let sc_rollup_of =
+  let open Lwt_result_syntax in
+  function
   | Some sc_rollup -> return sc_rollup
   | None -> failwith "Sc_rollup not created in this context"
 
-let zk_rollup_of = function
+let zk_rollup_of =
+  let open Lwt_result_syntax in
+  function
   | Some zk_rollup -> return zk_rollup
   | None -> failwith "Zk_rollup not created in this context"
 
@@ -832,7 +829,6 @@ let mk_sc_rollup_cement (oinfos : operation_req) (infos : infos) =
     (B infos.ctxt.block)
     (contract_of (get_source infos))
     sc_rollup
-    (Sc_rollup.Commitment.hash_uncarbonated sc_dummy_commitment)
 
 let mk_sc_rollup_refute (oinfos : operation_req) (infos : infos) =
   let open Lwt_result_syntax in
@@ -849,9 +845,10 @@ let mk_sc_rollup_refute (oinfos : operation_req) (infos : infos) =
     (B infos.ctxt.block)
     (contract_of (get_source infos))
     sc_rollup
+    (* FIXME-PA *)
     (match infos.accounts.dest with
-    | None -> (get_source infos).pkh
-    | Some dest -> dest.pkh)
+    | None -> Implicit_account_repr.Forbidden.of_pkh (get_source infos).pkh
+    | Some dest -> Implicit_account_repr.Forbidden.of_pkh dest.pkh)
     refutation
 
 let mk_sc_rollup_add_messages (oinfos : operation_req) (infos : infos) =
@@ -877,11 +874,12 @@ let mk_sc_rollup_timeout (oinfos : operation_req) (infos : infos) =
     (B infos.ctxt.block)
     (contract_of (get_source infos))
     sc_rollup
+    (* FIXME-PA *)
     (Sc_rollup.Game.Index.make
-       (get_source infos).pkh
+       (Implicit_account_repr.Forbidden.of_pkh (get_source infos).pkh)
        (match infos.accounts.dest with
-       | None -> (get_source infos).pkh
-       | Some dest -> dest.pkh))
+       | None -> Implicit_account_repr.Forbidden.of_pkh (get_source infos).pkh
+       | Some dest -> Implicit_account_repr.Forbidden.of_pkh dest.pkh))
 
 let mk_sc_rollup_execute_outbox_message (oinfos : operation_req) (infos : infos)
     =
@@ -918,19 +916,14 @@ let mk_sc_rollup_return_bond (oinfos : operation_req) (infos : infos) =
     sc_rollup
     staker
 
-let mk_dal_publish_slot_header (oinfos : operation_req) (infos : infos) =
-  let published_level =
-    Alpha_context.Raw_level.succ
-    @@ Alpha_context.Raw_level.of_int32_exn infos.ctxt.block.header.shell.level
-  in
+let mk_dal_publish_commitment (oinfos : operation_req) (infos : infos) =
   let slot_index = Alpha_context.Dal.Slot_index.zero in
   let commitment = Alpha_context.Dal.Slot.Commitment.zero in
   let commitment_proof = Alpha_context.Dal.Slot.Commitment_proof.zero in
   let slot =
-    Dal.Operations.Publish_slot_header.
-      {published_level; slot_index; commitment; commitment_proof}
+    Dal.Operations.Publish_commitment.{slot_index; commitment; commitment_proof}
   in
-  Op.dal_publish_slot_header
+  Op.dal_publish_commitment
     ?fee:oinfos.fee
     ?gas_limit:oinfos.gas_limit
     ?counter:oinfos.counter
@@ -942,6 +935,7 @@ let mk_dal_publish_slot_header (oinfos : operation_req) (infos : infos) =
 
 let mk_zk_rollup_origination (oinfos : operation_req) (infos : infos) =
   let open Lwt_result_syntax in
+  let _prover_pp, public_parameters = Lazy.force ZKOperator.lazy_pp in
   let* op, _ =
     Op.zk_rollup_origination
       ?fee:oinfos.fee
@@ -951,9 +945,9 @@ let mk_zk_rollup_origination (oinfos : operation_req) (infos : infos) =
       ?force_reveal:oinfos.force_reveal
       (B infos.ctxt.block)
       (contract_of (get_source infos))
-      ~public_parameters:ZKOperator.public_parameters
+      ~public_parameters
       ~circuits_info:
-        (Zk_rollup.Account.SMap.of_seq @@ Plonk.SMap.to_seq ZKOperator.circuits)
+        (Zk_rollup.Account.SMap.of_seq @@ Kzg.SMap.to_seq ZKOperator.circuits)
       ~init_state:ZKOperator.init_state
       ~nb_ops:1
   in
@@ -983,6 +977,7 @@ let mk_zk_rollup_publish (oinfos : operation_req) (infos : infos) =
 let mk_zk_rollup_update (oinfos : operation_req) (infos : infos) =
   let open Lwt_result_syntax in
   let* zk_rollup = zk_rollup_of infos.ctxt.zk_rollup in
+  let update = Lazy.force ZKOperator.Internal_for_tests.lazy_update_data in
   let* op =
     Op.zk_rollup_update
       ?fee:oinfos.fee
@@ -993,7 +988,7 @@ let mk_zk_rollup_update (oinfos : operation_req) (infos : infos) =
       (B infos.ctxt.block)
       (contract_of (get_source infos))
       ~zk_rollup
-      ~update:ZKOperator.Internal_for_tests.update_data
+      ~update
   in
   return op
 
@@ -1023,42 +1018,59 @@ let select_op (op_req : operation_req) (infos : infos) =
     | K_Sc_rollup_timeout -> mk_sc_rollup_timeout
     | K_Sc_rollup_execute_outbox_message -> mk_sc_rollup_execute_outbox_message
     | K_Sc_rollup_recover_bond -> mk_sc_rollup_return_bond
-    | K_Dal_publish_slot_header -> mk_dal_publish_slot_header
+    | K_Dal_publish_commitment -> mk_dal_publish_commitment
     | K_Zk_rollup_origination -> mk_zk_rollup_origination
     | K_Zk_rollup_publish -> mk_zk_rollup_publish
     | K_Zk_rollup_update -> mk_zk_rollup_update
   in
   mk_op op_req infos
 
-let make_tztest ?(fmt = Format.std_formatter) name test subjects info_builder =
-  let open Lwt_result_syntax in
-  Tztest.tztest name `Quick (fun () ->
+let make_test
+    ~(register_test :
+       title:string ->
+       ?additional_tags:string trace ->
+       ?slow:bool ->
+       (unit -> (unit, tztrace) result Lwt.t) ->
+       unit) name test (subjects : manager_operation_kind list) info_builder =
+  List.iter
+    (fun kind ->
+      let title = sf "%s: %s" name (kind_to_string kind) in
+      register_test ~title @@ fun () ->
+      let open Lwt_syntax in
       let* infos = info_builder () in
-      List.iter_es
-        (fun kind ->
-          Format.fprintf fmt "%s: %s@." name (kind_to_string kind) ;
-          test infos kind)
-        subjects)
+      let infos =
+        match infos with
+        | Error errs ->
+            Tezt.Test.fail "Error: %a" Error_monad.pp_print_trace errs
+        | Ok infos -> infos
+      in
+      test infos kind)
+    subjects
 
-let make_tztest_batched ?(fmt = Format.std_formatter) name test subjects
-    info_builder =
-  let open Lwt_result_syntax in
-  Tztest.tztest name `Quick (fun () ->
-      let* infos = info_builder () in
-      List.iter_es
-        (fun kind1 ->
-          let k1s = kind_to_string kind1 in
-          List.iter_es
-            (fun kind2 ->
-              Format.fprintf
-                fmt
-                "%s: [%s ; %s]@."
-                name
-                k1s
-                (kind_to_string kind2) ;
-              test infos kind1 kind2)
-            subjects)
+let make_test_batched
+    ~(register_test :
+       title:string ->
+       ?additional_tags:string trace ->
+       ?slow:bool ->
+       (unit -> (unit, tztrace) result Lwt.t) ->
+       unit) name test subjects info_builder =
+  List.iter
+    (fun kind1 ->
+      let k1s = kind_to_string kind1 in
+      List.iter
+        (fun kind2 ->
+          let title = sf "%s: [%s ; %s]" name k1s (kind_to_string kind2) in
+          register_test ~title @@ fun () ->
+          let* infos = info_builder () in
+          let infos =
+            match infos with
+            | Error errs ->
+                Tezt.Test.fail "Error: %a" Error_monad.pp_print_trace errs
+            | Ok infos -> infos
+          in
+          test infos kind1 kind2)
         subjects)
+    subjects
 
 (** {2 Diagnostic helpers.} *)
 
@@ -1071,14 +1083,15 @@ let make_tztest_batched ?(fmt = Format.std_formatter) name test subjects
    increment of the counters aka 1 for a single operation, n for a
    batch of n manager operations. *)
 type probes = {
-  source : Signature.Public_key_hash.t;
-  fee : Tez.tez;
+  (* FIXME-PA *)
+  source : Implicit_account_repr.t;
+  fee : Tez.t;
   gas_limit : Gas.Arith.integral;
   nb_counter : int;
 }
 
-let rec contents_infos :
-    type kind. kind Kind.manager contents_list -> probes tzresult Lwt.t =
+let rec contents_infos : type kind.
+    kind Kind.manager contents_list -> probes tzresult Lwt.t =
  fun op ->
   let open Lwt_result_syntax in
   match op with
@@ -1144,7 +1157,7 @@ let expected_witness witness probes ~mode ctxt =
     | Some g_in, Construction ->
         return_some (Gas.Arith.sub g_in (Gas.Arith.fp probes.gas_limit))
     | _, Mempool ->
-        Context.get_constants ctxt >>=? fun c ->
+        let* c = Context.get_constants ctxt in
         return_some
           (Gas.Arith.sub
              (Gas.Arith.fp c.parametric.hard_gas_limit_per_block)
@@ -1184,7 +1197,7 @@ let expected_witness witness probes ~mode ctxt =
     In the [Application] mode, we do not perform any check on the
     available gas. *)
 let observe ~mode ~deallocated ctxt_pre ctxt_post op =
-  let open Lwt_result_syntax in
+  let open Lwt_result_wrap_syntax in
   let check_deallocated ctxt contract =
     let* actxt =
       let+ i =
@@ -1194,12 +1207,13 @@ let observe ~mode ~deallocated ctxt_pre ctxt_post op =
       in
       Incremental.alpha_ctxt i
     in
-    let*! res = Contract.must_be_allocated actxt contract in
-    match Environment.wrap_tzresult res with
+    let*!@ res = Contract.must_be_allocated actxt contract in
+    match res with
     | Ok () ->
         failwith
           "%a should have been deallocated@."
-          Signature.Public_key_hash.pp
+          (* FIXME-PA *)
+          Implicit_account_repr.pp
           (Context.Contract.pkh contract)
     | Error
         [
@@ -1389,7 +1403,7 @@ let subjects =
     K_Sc_rollup_timeout;
     K_Sc_rollup_execute_outbox_message;
     K_Sc_rollup_recover_bond;
-    K_Dal_publish_slot_header;
+    K_Dal_publish_commitment;
     K_Zk_rollup_origination;
     K_Zk_rollup_publish;
     K_Zk_rollup_update;
@@ -1401,7 +1415,7 @@ let is_consumer = function
   | K_Sc_rollup_add_messages | K_Sc_rollup_origination | K_Sc_rollup_refute
   | K_Sc_rollup_timeout | K_Sc_rollup_cement | K_Sc_rollup_publish
   | K_Sc_rollup_execute_outbox_message | K_Sc_rollup_recover_bond
-  | K_Dal_publish_slot_header | K_Zk_rollup_origination | K_Zk_rollup_publish
+  | K_Dal_publish_commitment | K_Zk_rollup_origination | K_Zk_rollup_publish
   | K_Zk_rollup_update ->
       false
   | K_Transaction | K_Origination | K_Register_global_constant
@@ -1423,7 +1437,7 @@ let is_disabled flags = function
   | K_Sc_rollup_origination | K_Sc_rollup_publish | K_Sc_rollup_cement
   | K_Sc_rollup_add_messages | K_Sc_rollup_refute | K_Sc_rollup_timeout
   | K_Sc_rollup_execute_outbox_message | K_Sc_rollup_recover_bond ->
-      flags.scoru = false
-  | K_Dal_publish_slot_header -> flags.dal = false
+      flags.scoru_arith = false
+  | K_Dal_publish_commitment -> flags.dal = false
   | K_Zk_rollup_origination | K_Zk_rollup_publish | K_Zk_rollup_update ->
       flags.zkru = false

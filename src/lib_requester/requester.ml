@@ -24,6 +24,8 @@
 (*                                                                           *)
 (*****************************************************************************)
 
+module Profiler = (val Profiler.wrap Shell_profiling.requester_profiler)
+
 module type REQUESTER = sig
   type t
 
@@ -191,6 +193,18 @@ module Make_request_scheduler
     (Request : REQUEST with type key := Hash.t) : sig
   include SCHEDULER with type key := Hash.t and type param := Request.param
 end = struct
+  module Request = struct
+    include Request
+
+    let send p peer keys =
+      ()
+      [@profiler.overwrite
+        List.iter
+          (fun _ -> Profiler.mark Profiler.Info (["p2p requests sent"], []))
+          keys] ;
+      send p peer keys
+  end
+
   module Events = Requester_event.Make (Hash)
 
   type key = Hash.t
@@ -198,6 +212,8 @@ end = struct
   type t = {
     param : Request.param;
     pending : status Table.t;
+    mutable min_next_request : Time.System.t option;
+    (* The time of the next pending request to timeout. *)
     queue : event Lwt_pipe.Unbounded.t;
     mutable events : event list Lwt.t;
     canceler : Lwt_canceler.t;
@@ -205,7 +221,8 @@ end = struct
   }
 
   and status = {
-    peers : P2p_peer.Set.t;
+    unrequested_peers : P2p_peer.Set.t;
+    requested_peers : P2p_peer.Set.t;
     next_request : Time.System.t;
     delay : Time.System.Span.t;
   }
@@ -224,7 +241,7 @@ end = struct
     let open Lwt_syntax in
     let* () = Events.(emit notify_push) (k, p) in
     Lwt_pipe.Unbounded.push t.queue (Notify (p, k)) ;
-    Lwt.return ()
+    Lwt.return_unit
 
   (* [notify_cancellation] is used within non-Lwt context and needs to
      perform logging without yielding. We use
@@ -238,31 +255,22 @@ end = struct
     let open Lwt_syntax in
     let* () = Events.(emit notify_push_invalid) (k, p) in
     Lwt_pipe.Unbounded.push t.queue (Notify_invalid (p, k)) ;
-    Lwt.return ()
+    Lwt.return_unit
 
   let notify_duplicate t p k =
     let open Lwt_syntax in
     let* () = Events.(emit notify_push_duplicate) (k, p) in
     Lwt_pipe.Unbounded.push t.queue (Notify_duplicate (p, k)) ;
-    Lwt.return ()
+    Lwt.return_unit
 
   let notify_unrequested t p k =
     let open Lwt_syntax in
     let* () = Events.(emit notify_push_unrequested) (k, p) in
     Lwt_pipe.Unbounded.push t.queue (Notify_unrequested (p, k)) ;
-    Lwt.return ()
+    Lwt.return_unit
 
   let compute_timeout state =
-    let next =
-      Table.fold
-        (fun _ {next_request; _} acc ->
-          match acc with
-          | None -> Some next_request
-          | Some x -> Some (Time.System.min x next_request))
-        state.pending
-        None
-    in
-    match next with
+    match state.min_next_request with
     | None -> fst @@ Lwt.task ()
     | Some next ->
         let now = Time.System.now () in
@@ -277,26 +285,35 @@ end = struct
         let* () = Events.(emit registering_request) (key, peer) in
         match Table.find state.pending key with
         | Some data ->
-            let peers =
-              match peer with
-              | None -> data.peers
-              | Some peer -> P2p_peer.Set.add peer data.peers
-            in
-            Table.replace
-              state.pending
-              key
-              {peers; next_request = now; delay = Request.initial_delay} ;
+            (match peer with
+            | None -> ()
+            | Some peer ->
+                let unrequested_peers =
+                  P2p_peer.Set.add peer data.unrequested_peers
+                in
+                let requested_peers =
+                  P2p_peer.Set.remove peer data.requested_peers
+                in
+                Table.replace
+                  state.pending
+                  key
+                  {data with unrequested_peers; requested_peers}) ;
             Events.(emit registering_request_replaced) (key, peer)
         | None ->
-            let peers =
+            let unrequested_peers =
               match peer with
               | None -> P2p_peer.Set.empty
               | Some peer -> P2p_peer.Set.singleton peer
             in
-            Table.add
+            Table.replace
               state.pending
               key
-              {peers; next_request = now; delay = Request.initial_delay} ;
+              {
+                unrequested_peers;
+                requested_peers = P2p_peer.Set.empty;
+                next_request = now;
+                delay = Request.initial_delay;
+              } ;
             Events.(emit registering_request_added) (key, peer))
     | Notify (peer, key) ->
         Table.remove state.pending key ;
@@ -314,10 +331,28 @@ end = struct
         (* TODO: Punish peer *)
         Events.(emit notify_duplicate) (key, peer)
 
+  type update_table_action =
+    | Replace of {key : key; status : status}
+    | Remove of {key : key}
+
   let worker_loop state =
     let open Lwt_syntax in
     let shutdown = Lwt_canceler.when_canceling state.canceler in
     let rec loop state =
+      (* It is possible that numerous pending requests may be canceled
+         sequentially. If this occurs, we will recalculate the
+         subsequent timeout for each cancellation. Calculating the
+         next timeout could be resource-intensive. By allowing for a
+         brief sleep, multiple cancellations can take place
+         simultaneously.
+
+         Note: using `Lwt.pause` or `Lwt.yield` might not be
+         sufficient, e.g., when the scheduler does not timeout
+         cancelers are not given a chance to be executed.
+
+         Note: This constant was selected using the sophisticated
+         "damp digit" method. *)
+      let* () = Lwt_unix.sleep 0.001 in
       let timeout = compute_timeout state in
       let* () =
         Lwt.choose
@@ -334,61 +369,132 @@ end = struct
         let* events = state.events in
         state.events <- Lwt_pipe.Unbounded.pop_all state.queue ;
         let* () = List.iter_s (process_event state now) events in
+        (* Requests are either added or deleted: either way, we need
+           to go through the table to update the timeout. Setting it
+           to now do just that. As a consequence, of that, the next
+           call to `compute_timeout` will always return
+           instantaneously. *)
+        state.min_next_request <- Some now ;
         loop state)
       else
         let* () = Events.(emit timeout) () in
         let now = Time.System.now () in
         let active_peers = Request.active state.param in
-        let requests =
-          Table.fold
-            (fun key {peers; next_request; delay} acc ->
-              if Ptime.is_later next_request ~than:now then acc
-              else
-                let remaining_peers = P2p_peer.Set.inter peers active_peers in
-                if
-                  P2p_peer.Set.is_empty remaining_peers
-                  && not (P2p_peer.Set.is_empty peers)
-                then (
-                  Table.remove state.pending key ;
-                  acc)
+        let compute_new_min_next_request min_next_request next_request =
+          match min_next_request with
+          | None -> Some next_request
+          | Some min_next_request' ->
+              if Ptime.is_earlier min_next_request' ~than:next_request then
+                min_next_request
+              else Some next_request
+        in
+        if
+          P2p_peer.Set.is_empty active_peers
+          && not (Table.length state.pending = 0)
+        then
+          (* When there is no active peer but there is already pending
+             requests, we wait a few seconds. *)
+          let* () = Events.(emit no_active_peers) () in
+          Lwt_unix.sleep 5.
+        else
+          let actions, min_next_request, requests =
+            Table.fold
+              (fun key
+                   {unrequested_peers; requested_peers; next_request; delay}
+                   (actions, min_next_request, acc)
+                 ->
+                if Ptime.is_later next_request ~than:now then
+                  ( actions,
+                    compute_new_min_next_request min_next_request next_request,
+                    acc )
                 else
-                  let requested_peer =
-                    P2p_peer.Id.Set.random_elt
-                      (if P2p_peer.Set.is_empty remaining_peers then
-                       active_peers
-                      else remaining_peers)
+                  (* Removing deactivated peers from sets of peers. *)
+                  let remaining_unrequested_peers =
+                    P2p_peer.Set.inter unrequested_peers active_peers
                   in
-                  let next_request =
-                    Option.value ~default:Ptime.max (Ptime.add_span now delay)
+                  let remaining_requested_peers =
+                    P2p_peer.Set.inter requested_peers active_peers
                   in
-                  let next =
-                    {
-                      peers = remaining_peers;
-                      next_request;
-                      delay = Time.System.Span.multiply_exn 1.5 delay;
-                    }
-                  in
-                  Table.replace state.pending key next ;
-                  let requests =
-                    key
-                    :: Option.value
-                         ~default:[]
-                         (P2p_peer.Map.find requested_peer acc)
-                  in
-                  P2p_peer.Map.add requested_peer requests acc)
-            state.pending
-            P2p_peer.Map.empty
-        in
-        P2p_peer.Map.iter (Request.send state.param) requests ;
-        let* () =
-          P2p_peer.Map.iter_s
-            (fun peer request ->
-              List.iter_s
-                (fun (key : key) -> Events.(emit requested) (key, peer))
-                request)
-            requests
-        in
-        loop state
+                  if
+                    (P2p_peer.Set.is_empty remaining_unrequested_peers
+                    && P2p_peer.Set.is_empty remaining_requested_peers)
+                    && not
+                         (P2p_peer.Set.is_empty unrequested_peers
+                         && P2p_peer.Set.is_empty requested_peers)
+                  then (Remove {key} :: actions, min_next_request, acc)
+                  else
+                    let ( requested_peer,
+                          remaining_unrequested_peers,
+                          remaining_requested_peers ) =
+                      match
+                        ( P2p_peer.Set.is_empty remaining_unrequested_peers,
+                          P2p_peer.Set.is_empty remaining_requested_peers )
+                      with
+                      | true, true ->
+                          (* If there is no specific peer to request, one of the
+                             active peers is randomly selected. *)
+                          ( P2p_peer.Id.Set.random_elt active_peers,
+                            remaining_unrequested_peers,
+                            remaining_requested_peers )
+                      | true, false ->
+                          (* If all requestable peers have already been
+                             requested, one of the already requested peers is
+                             randomly selected. *)
+                          ( P2p_peer.Id.Set.random_elt remaining_requested_peers,
+                            remaining_unrequested_peers,
+                            remaining_requested_peers )
+                      | false, _ ->
+                          (* If there are unrequested peers, one is randomly
+                             selected and moved to the set of requested peers. *)
+                          let peer =
+                            P2p_peer.Id.Set.random_elt
+                              remaining_unrequested_peers
+                          in
+                          ( peer,
+                            P2p_peer.Set.remove peer remaining_unrequested_peers,
+                            P2p_peer.Set.add peer remaining_requested_peers )
+                    in
+                    let next_request =
+                      Option.value ~default:Ptime.max (Ptime.add_span now delay)
+                    in
+                    let next =
+                      {
+                        unrequested_peers = remaining_unrequested_peers;
+                        requested_peers = remaining_requested_peers;
+                        next_request;
+                        delay = Time.System.Span.multiply_exn 1.5 delay;
+                      }
+                    in
+                    let new_acc =
+                      P2p_peer.Map.update
+                        requested_peer
+                        (function
+                          | None -> Some [key] | Some l -> Some (key :: l))
+                        acc
+                    in
+                    ( Replace {key; status = next} :: actions,
+                      compute_new_min_next_request min_next_request next_request,
+                      new_acc ))
+              state.pending
+              ([], None, P2p_peer.Map.empty)
+          in
+          (* Update pending table *)
+          List.iter
+            (function
+              | Remove {key} -> Table.remove state.pending key
+              | Replace {key; status} -> Table.replace state.pending key status)
+            actions ;
+          state.min_next_request <- min_next_request ;
+          P2p_peer.Map.iter (Request.send state.param) requests ;
+          let* () =
+            P2p_peer.Map.iter_s
+              (fun peer request ->
+                List.iter_s
+                  (fun (key : key) -> Events.(emit requested) (key, peer))
+                  request)
+              requests
+          in
+          loop state
     in
     loop state
 
@@ -397,6 +503,7 @@ end = struct
       {
         param;
         queue = Lwt_pipe.Unbounded.create ();
+        min_next_request = None;
         pending = Table.create ~entry_type:"pending_requests" ~random:true 17;
         events = Lwt.return_nil;
         canceler = Lwt_canceler.create ();
@@ -544,34 +651,85 @@ module Make
 
   let fetch s ?peer ?timeout k param =
     let open Lwt_syntax in
-    match Memory_table.find s.memory k with
+    let[@warning "-26"] debug_p2p_message =
+      (match peer with
+      | None -> []
+      | Some peer -> [Format.asprintf "Peer : %a" P2p_peer.Id.pp peer])
+      @ [Format.asprintf "Hash : %a" Hash.pp k]
+    in
+    match[@profiler.span_s {verbosity = Notice} ["fetch"]]
+      Memory_table.find s.memory k
+    with
     | None -> (
-        let* o = Disk_table.read_opt s.disk k in
-        match o with
-        | Some v -> return_ok v
-        | None -> (
-            (* It is necessary to check the memory-table again in case another
-               promise has altered it whilst this one was waiting for the
-               disk-table query. *)
-            match Memory_table.find s.memory k with
-            | None ->
-                let waiter, wakener = Lwt.wait () in
-                Memory_table.add
-                  s.memory
-                  k
-                  (Pending {waiter; wakener; waiters = 1; param}) ;
-                Scheduler.request s.scheduler peer k ;
-                wrap s k ?timeout waiter
-            | Some (Pending data) ->
-                Scheduler.request s.scheduler peer k ;
-                data.waiters <- data.waiters + 1 ;
-                wrap s k ?timeout data.waiter
-            | Some (Found v) -> return_ok v))
-    | Some (Pending data) ->
-        Scheduler.request s.scheduler peer k ;
-        data.waiters <- data.waiters + 1 ;
-        wrap s k ?timeout data.waiter
-    | Some (Found v) -> return_ok v
+        (let* o = Disk_table.read_opt s.disk k in
+         match o with
+         | Some v ->
+             return_ok
+               v
+             [@profiler.span_s
+               {verbosity = Info} ["fetch"; "cache miss"; "disk hit"]]
+         | None -> (
+             let[@warning "-26"] profiling_prefix info =
+               ["fetch"; "cache miss"; "disk miss"] @ info
+             in
+             match(* It is necessary to check the memory-table again in case another
+                     promise has altered it whilst this one was waiting for the
+                     disk-table query. *)
+                  [@profiler.span_s
+                    {verbosity = Info} ["fetch"; "cache miss"; "disk miss"]]
+               Memory_table.find s.memory k
+             with
+             | None ->
+                 (let waiter, wakener = Lwt.wait () in
+                  Memory_table.add
+                    s.memory
+                    k
+                    (Pending {waiter; wakener; waiters = 1; param}) ;
+                  Scheduler.request s.scheduler peer k ;
+                  wrap s k ?timeout waiter)
+                 [@profiler.span_s
+                   {verbosity = Debug}
+                     (profiling_prefix
+                        (["cache miss : request creation"] @ debug_p2p_message))]
+             | Some status -> (
+                 match[@profiler.span_s
+                        {verbosity = Info} (profiling_prefix ["cache hit"])]
+                   status
+                 with
+                 | Pending data ->
+                     (Scheduler.request s.scheduler peer k ;
+                      data.waiters <- data.waiters + 1 ;
+                      wrap s k ?timeout data.waiter)
+                     [@profiler.span_s
+                       {verbosity = Debug}
+                         (profiling_prefix
+                            (["cache hit"; "pending : add peer"]
+                            @ debug_p2p_message))]
+                 | Found v ->
+                     return_ok
+                       v
+                     [@profiler.span_s
+                       {verbosity = Info}
+                         (profiling_prefix ["cache hit"; "found"])])))
+        [@profiler.span_s {verbosity = Notice} ["fetch"; "cache miss"]])
+    | Some status -> (
+        match[@profiler.span_s {verbosity = Notice} ["fetch"; "cache hit"]]
+          status
+        with
+        | Pending data ->
+            (Scheduler.request s.scheduler peer k ;
+             data.waiters <- data.waiters + 1 ;
+             wrap s k ?timeout data.waiter)
+            [@profiler.span_s
+              {verbosity = Debug}
+                (["fetch"; "cache hit"; "pending : add peer"]
+                @ debug_p2p_message)]
+        | Found v ->
+            return_ok
+              v
+            [@profiler.span_s
+              {verbosity = Debug}
+                (["fetch"; "cache hit"; "found"] @ debug_p2p_message)])
 
   let notify_when_pending s p k w param v =
     let open Lwt_syntax in
@@ -626,15 +784,32 @@ module Make
     | Some (Pending _) | Some (Found _) -> Lwt.return_false
 
   let clear_or_cancel s k =
-    match Memory_table.find s.memory k with
-    | None -> ()
+    match[@profiler.span_f {verbosity = Notice} ["clear_or_cancel"]]
+      Memory_table.find s.memory k
+    with
+    | None ->
+        ()
+        [@profiler.span_f {verbosity = Notice} ["clear_or_cancel"; "no data"]]
     | Some (Pending status) ->
-        if status.waiters <= 1 then (
-          Scheduler.notify_cancellation s.scheduler k ;
-          Memory_table.remove s.memory k ;
-          Lwt.wakeup_later status.wakener (Result_syntax.tzfail (Canceled k)))
-        else status.waiters <- status.waiters - 1
-    | Some (Found _) -> Memory_table.remove s.memory k
+        (if status.waiters <= 1 then (
+           (Scheduler.notify_cancellation s.scheduler k ;
+            Memory_table.remove s.memory k ;
+            Lwt.wakeup_later status.wakener (Result_syntax.tzfail (Canceled k)))
+           [@profiler.span_f
+             {verbosity = Info}
+               ["clear_or_cancel"; "pending"; "no more waiters"]])
+         else
+           status.waiters <-
+             (status.waiters - 1)
+             [@profiler.span_f
+               {verbosity = Info}
+                 ["clear_or_cancel"; "pending"; "existing waiters"]])
+        [@profiler.span_f {verbosity = Notice} ["clear_or_cancel"; "pending"]]
+    | Some (Found _) ->
+        Memory_table.remove
+          s.memory
+          k
+        [@profiler.span_f {verbosity = Notice} ["clear_or_cancel"; "completed"]]
 
   let watch s = Lwt_watcher.create_stream s.input
 

@@ -72,6 +72,9 @@ val to_int : t -> int tzresult
    mod committee_size]. *)
 val to_slot : t -> committee_size:int -> Slot_repr.t tzresult
 
+(** Returns the round corresponding to the given slot *)
+val of_slot : Slot_repr.t -> t tzresult
+
 (** Round encoding.
     Be aware that decoding a negative 32 bit integer would lead to an
     exception. *)
@@ -221,7 +224,9 @@ val round_of_timestamp :
   timestamp:Time_repr.t ->
   t tzresult
 
-module Internals_for_test : sig
+module Index : Storage_description.INDEX with type t = round
+
+module Internal_for_tests : sig
   type round_and_offset_raw = {round : round; offset : Period_repr.t}
 
   (** [round_and_offset round_durations ~level_offset], where [level_offset]

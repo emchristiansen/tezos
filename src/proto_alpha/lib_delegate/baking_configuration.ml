@@ -68,13 +68,18 @@ type fees_config = {
 }
 
 type validation_config =
-  | Local of {context_path : string}
+  | Local of {data_dir : string}
   | Node
   | ContextIndex of Abstract_context_index.t
 
 type nonce_config = Deterministic | Random
 
-type state_recorder_config = Filesystem | Disabled
+type state_recorder_config = Filesystem | Memory
+
+type per_block_votes_config = {
+  vote_file : string option;
+  liquidity_baking_vote : Protocol.Alpha_context.Per_block_votes.per_block_vote;
+}
 
 type t = {
   fees : fees_config;
@@ -82,14 +87,14 @@ type t = {
   validation : validation_config;
   retries_on_failure : int;
   user_activated_upgrades : (int32 * Protocol_hash.t) list;
-  liquidity_baking_toggle_vote :
-    Protocol.Alpha_context.Liquidity_baking.liquidity_baking_toggle_vote;
-  per_block_vote_file : string option;
-  force_apply : bool;
+  per_block_votes : per_block_votes_config;
+  force_apply_from_round : Round.t;
   force : bool;
   state_recorder : state_recorder_config;
   extra_operations : Operations_source.t option;
-  dal_node_endpoint : Uri.t option;
+  pre_emptive_forge_time : Time.System.Span.t;
+  remote_calls_timeout : float option;
+  multi_node : bool;
 }
 
 let default_fees_config =
@@ -110,18 +115,26 @@ let default_retries_on_failure_config = 5
 
 let default_user_activated_upgrades = []
 
-let default_liquidity_baking_toggle_vote =
-  Protocol.Alpha_context.Liquidity_baking.LB_pass
+let default_votes_config =
+  {
+    vote_file = None;
+    liquidity_baking_vote =
+      Protocol.Alpha_context.Per_block_votes.Per_block_vote_pass;
+  }
 
 let default_force = false
 
-let default_force_apply = false
+let default_force_apply_from_round = Round.(succ @@ succ @@ succ zero)
 
-let default_state_recorder_config = Filesystem
+let default_state_recorder_config = Memory
 
 let default_extra_operations = None
 
-let default_per_block_vote_file = "per_block_votes.json"
+let default_pre_emptive_forge_time = Time.System.Span.of_seconds_exn 0.
+
+let default_remote_calls_timeout = None
+
+let default_multi_node = false
 
 let default_config =
   {
@@ -130,33 +143,40 @@ let default_config =
     validation = default_validation_config;
     retries_on_failure = default_retries_on_failure_config;
     user_activated_upgrades = default_user_activated_upgrades;
-    liquidity_baking_toggle_vote = default_liquidity_baking_toggle_vote;
-    force_apply = default_force_apply;
+    per_block_votes = default_votes_config;
+    force_apply_from_round = default_force_apply_from_round;
     force = default_force;
     state_recorder = default_state_recorder_config;
     extra_operations = default_extra_operations;
-    per_block_vote_file = None;
-    dal_node_endpoint = None;
+    pre_emptive_forge_time = default_pre_emptive_forge_time;
+    remote_calls_timeout = default_remote_calls_timeout;
+    multi_node = default_multi_node;
   }
 
 let make ?(minimal_fees = default_fees_config.minimal_fees)
     ?(minimal_nanotez_per_gas_unit =
       default_fees_config.minimal_nanotez_per_gas_unit)
     ?(minimal_nanotez_per_byte = default_fees_config.minimal_nanotez_per_byte)
-    ?(nonce = default_nonce_config) ?context_path
+    ?(nonce = default_nonce_config) ?data_dir
     ?(retries_on_failure = default_retries_on_failure_config)
     ?(user_activated_upgrades = default_user_activated_upgrades)
-    ?(liquidity_baking_toggle_vote = default_liquidity_baking_toggle_vote)
-    ?per_block_vote_file ?(force_apply = default_force_apply)
+    ?(votes = default_votes_config) ?force_apply_from_round
     ?(force = default_force) ?(state_recorder = default_state_recorder_config)
-    ?extra_operations ?dal_node_endpoint () =
+    ?extra_operations ?(pre_emptive_forge_time = default_pre_emptive_forge_time)
+    ?remote_calls_timeout ?(multi_node = default_multi_node) () =
   let fees =
     {minimal_fees; minimal_nanotez_per_gas_unit; minimal_nanotez_per_byte}
   in
   let validation =
-    match context_path with
-    | None -> Node
-    | Some context_path -> Local {context_path}
+    match data_dir with None -> Node | Some data_dir -> Local {data_dir}
+  in
+  let force_apply_from_round =
+    match force_apply_from_round with
+    | Some round -> (
+        match Round.of_int round with
+        | Ok round -> round
+        | Error _ -> default_force_apply_from_round)
+    | None -> default_force_apply_from_round
   in
   {
     fees;
@@ -164,13 +184,14 @@ let make ?(minimal_fees = default_fees_config.minimal_fees)
     nonce;
     retries_on_failure;
     user_activated_upgrades;
-    liquidity_baking_toggle_vote;
-    per_block_vote_file;
-    force_apply;
+    per_block_votes = votes;
+    force_apply_from_round;
     force;
     state_recorder;
     extra_operations;
-    dal_node_endpoint;
+    pre_emptive_forge_time;
+    remote_calls_timeout;
+    multi_node;
   }
 
 let fees_config_encoding : fees_config Data_encoding.t =
@@ -179,9 +200,11 @@ let fees_config_encoding : fees_config Data_encoding.t =
     conv (fun q -> Q.to_string q) (fun s -> Q.of_string s) string
   in
   conv
-    (fun {minimal_fees; minimal_nanotez_per_gas_unit; minimal_nanotez_per_byte} ->
+    (fun {minimal_fees; minimal_nanotez_per_gas_unit; minimal_nanotez_per_byte}
+       ->
       (minimal_fees, minimal_nanotez_per_gas_unit, minimal_nanotez_per_byte))
-    (fun (minimal_fees, minimal_nanotez_per_gas_unit, minimal_nanotez_per_byte) ->
+    (fun (minimal_fees, minimal_nanotez_per_gas_unit, minimal_nanotez_per_byte)
+       ->
       {minimal_fees; minimal_nanotez_per_gas_unit; minimal_nanotez_per_byte})
     (obj3
        (req "minimal_fees" Tez.encoding)
@@ -197,8 +220,8 @@ let validation_config_encoding =
         ~title:"Local"
         (Tag 0)
         (obj1 (req "local" string))
-        (function Local {context_path} -> Some context_path | _ -> None)
-        (fun context_path -> Local {context_path});
+        (function Local {data_dir} -> Some data_dir | _ -> None)
+        (fun data_dir -> Local {data_dir});
       case
         ~title:"Node"
         (Tag 1)
@@ -233,11 +256,25 @@ let user_activate_upgrades_config_encoding =
   list (tup2 int32 Protocol_hash.encoding)
 
 let liquidity_baking_toggle_vote_config_encoding =
-  Protocol.Alpha_context.Liquidity_baking.liquidity_baking_toggle_vote_encoding
+  Protocol.Alpha_context.Per_block_votes.liquidity_baking_vote_encoding
+
+let per_block_votes_config_encoding =
+  let open Data_encoding in
+  def (String.concat "." [Protocol.name; "per_block_votes_config"])
+  @@ conv
+       (fun {vote_file; liquidity_baking_vote} ->
+         (vote_file, liquidity_baking_vote))
+       (fun (vote_file, liquidity_baking_vote) ->
+         {vote_file; liquidity_baking_vote})
+       (obj2
+          (opt "per_block_vote_file" string)
+          (req
+             "liquidity_baking_vote"
+             liquidity_baking_toggle_vote_config_encoding))
 
 let force_config_encoding = Data_encoding.bool
 
-let force_apply_config_encoding = Data_encoding.bool
+let force_apply_from_round_config_encoding = Round.encoding
 
 let state_recorder_config_encoding =
   let open Data_encoding in
@@ -251,11 +288,11 @@ let state_recorder_config_encoding =
         (function Filesystem -> Some () | _ -> None)
         (fun () -> Filesystem);
       case
-        ~title:"Disabled"
+        ~title:"Memory"
         (Tag 1)
-        (constant "disabled")
-        (function Disabled -> Some () | _ -> None)
-        (fun () -> Disabled);
+        (constant "memory")
+        (function Memory -> Some () | _ -> None)
+        (fun () -> Memory);
     ]
 
 let encoding : t Data_encoding.t =
@@ -271,49 +308,53 @@ let encoding : t Data_encoding.t =
               nonce;
               retries_on_failure;
               user_activated_upgrades;
-              liquidity_baking_toggle_vote;
-              per_block_vote_file;
-              force_apply;
+              per_block_votes;
+              force_apply_from_round;
               force;
               state_recorder;
               extra_operations;
-              dal_node_endpoint;
-            } ->
+              pre_emptive_forge_time;
+              remote_calls_timeout;
+              multi_node;
+            }
+          ->
          ( ( fees,
              validation,
              nonce,
              retries_on_failure,
              user_activated_upgrades,
-             liquidity_baking_toggle_vote,
-             per_block_vote_file,
-             force_apply,
+             per_block_votes,
+             force_apply_from_round,
              force,
-             state_recorder ),
-           (extra_operations, dal_node_endpoint) ))
+             state_recorder,
+             pre_emptive_forge_time ),
+           (extra_operations, remote_calls_timeout, multi_node) ))
        (fun ( ( fees,
                 validation,
                 nonce,
                 retries_on_failure,
                 user_activated_upgrades,
-                liquidity_baking_toggle_vote,
-                per_block_vote_file,
-                force_apply,
+                per_block_votes,
+                force_apply_from_round,
                 force,
-                state_recorder ),
-              (extra_operations, dal_node_endpoint) ) ->
+                state_recorder,
+                pre_emptive_forge_time ),
+              (extra_operations, remote_calls_timeout, multi_node) )
+          ->
          {
            fees;
            validation;
            nonce;
            retries_on_failure;
            user_activated_upgrades;
-           liquidity_baking_toggle_vote;
-           per_block_vote_file;
-           force_apply;
+           per_block_votes;
+           force_apply_from_round;
            force;
            state_recorder;
            extra_operations;
-           dal_node_endpoint;
+           pre_emptive_forge_time;
+           remote_calls_timeout;
+           multi_node;
          })
        (merge_objs
           (obj10
@@ -324,16 +365,17 @@ let encoding : t Data_encoding.t =
              (req
                 "user_activated_upgrades"
                 user_activate_upgrades_config_encoding)
+             (req "votes" per_block_votes_config_encoding)
              (req
-                "liquidity_baking_toggle_vote"
-                liquidity_baking_toggle_vote_config_encoding)
-             (opt "per_block_vote_file" Data_encoding.string)
-             (req "force_apply" force_apply_config_encoding)
+                "force_apply_from_round"
+                force_apply_from_round_config_encoding)
              (req "force" force_config_encoding)
-             (req "state_recorder" state_recorder_config_encoding))
-          (obj2
+             (req "state_recorder" state_recorder_config_encoding)
+             (req "pre_emptive_forge_time" Time.System.Span.encoding))
+          (obj3
              (opt "extra_operations" Operations_source.encoding)
-             (opt "dal_node_endpoint" Tezos_rpc.Encoding.uri_encoding)))
+             (opt "remote_calls_timeout" float)
+             (dft "multi_node" bool default_multi_node)))
 
 let pp fmt t =
   let json = Data_encoding.Json.construct encoding t in

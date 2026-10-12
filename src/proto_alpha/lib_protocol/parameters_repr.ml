@@ -25,22 +25,32 @@
 (*****************************************************************************)
 
 type bootstrap_account = {
-  public_key_hash : Signature.Public_key_hash.t;
+  public_key_hash : Implicit_account_repr.t;
   public_key : Signature.Public_key.t option;
   amount : Tez_repr.t;
-  delegate_to : Signature.Public_key_hash.t option;
+  delegate_to : Implicit_account_repr.t option;
   consensus_key : Signature.Public_key.t option;
 }
 
 type bootstrap_contract = {
-  delegate : Signature.Public_key_hash.t option;
+  delegate : Implicit_account_repr.t option;
   amount : Tez_repr.t;
   script : Script_repr.t;
+  hash : Contract_hash.t option;
+}
+
+type bootstrap_smart_rollup = {
+  address : Sc_rollup_repr.Address.t;
+  pvm_kind : Sc_rollups.Kind.t;
+  boot_sector : string;
+  parameters_ty : Script_repr.lazy_expr;
+  whitelist : Sc_rollup_whitelist_repr.t option;
 }
 
 type t = {
   bootstrap_accounts : bootstrap_account list;
   bootstrap_contracts : bootstrap_contract list;
+  bootstrap_smart_rollups : bootstrap_smart_rollup list;
   commitments : Commitment_repr.t list;
   constants : Constants_parametric_repr.t;
   security_deposit_ramp_up_cycles : int option;
@@ -64,8 +74,10 @@ let bootstrap_account_encoding =
               consensus_key = None;
             } ->
               assert (
-                Signature.Public_key_hash.equal
-                  (Signature.Public_key.hash public_key)
+                Implicit_account_repr.equal
+                  (* FIXME-PA *)
+                  (Implicit_account_repr.Forbidden.of_pkh
+                     (Signature.Public_key.hash public_key))
                   public_key_hash) ;
               Some (public_key, amount)
           | {public_key = None; _}
@@ -75,7 +87,10 @@ let bootstrap_account_encoding =
         (fun (public_key, amount) ->
           {
             public_key = Some public_key;
-            public_key_hash = Signature.Public_key.hash public_key;
+            (* FIXME-PA *)
+            public_key_hash =
+              Implicit_account_repr.Forbidden.of_pkh
+                (Signature.Public_key.hash public_key);
             amount;
             delegate_to = None;
             consensus_key = None;
@@ -83,7 +98,7 @@ let bootstrap_account_encoding =
       case
         (Tag 1)
         ~title:"Public_key_unknown"
-        (tup2 Signature.Public_key_hash.encoding Tez_repr.encoding)
+        (tup2 Implicit_account_repr.encoding Tez_repr.encoding)
         (function
           | {
               public_key_hash;
@@ -111,7 +126,7 @@ let bootstrap_account_encoding =
         (tup3
            Signature.Public_key.encoding
            Tez_repr.encoding
-           Signature.Public_key_hash.encoding)
+           Implicit_account_repr.encoding)
         (function
           | {
               public_key_hash;
@@ -121,8 +136,10 @@ let bootstrap_account_encoding =
               consensus_key = None;
             } ->
               assert (
-                Signature.Public_key_hash.equal
-                  (Signature.Public_key.hash public_key)
+                Implicit_account_repr.equal
+                  (* FIXME-PA *)
+                  (Implicit_account_repr.Forbidden.of_pkh
+                     (Signature.Public_key.hash public_key))
                   public_key_hash) ;
               Some (public_key, amount, delegate)
           | {public_key = None; _}
@@ -132,7 +149,10 @@ let bootstrap_account_encoding =
         (fun (public_key, amount, delegate) ->
           {
             public_key = Some public_key;
-            public_key_hash = Signature.Public_key.hash public_key;
+            (* FIXME-PA *)
+            public_key_hash =
+              Implicit_account_repr.Forbidden.of_pkh
+                (Signature.Public_key.hash public_key);
             amount;
             delegate_to = Some delegate;
             consensus_key = None;
@@ -141,9 +161,9 @@ let bootstrap_account_encoding =
         (Tag 3)
         ~title:"Public_key_unknown_with_delegate"
         (tup3
-           Signature.Public_key_hash.encoding
+           Implicit_account_repr.encoding
            Tez_repr.encoding
-           Signature.Public_key_hash.encoding)
+           Implicit_account_repr.encoding)
         (function
           | {
               public_key_hash;
@@ -181,8 +201,10 @@ let bootstrap_account_encoding =
               consensus_key = Some consensus_key;
             } ->
               assert (
-                Signature.Public_key_hash.equal
-                  (Signature.Public_key.hash public_key)
+                Implicit_account_repr.equal
+                  (* FIXME-PA *)
+                  (Implicit_account_repr.Forbidden.of_pkh
+                     (Signature.Public_key.hash public_key))
                   public_key_hash) ;
               Some (public_key, amount, consensus_key)
           | {public_key = None; _}
@@ -192,7 +214,10 @@ let bootstrap_account_encoding =
         (fun (public_key, amount, consensus_key) ->
           {
             public_key = Some public_key;
-            public_key_hash = Signature.Public_key.hash public_key;
+            (* FIXME-PA *)
+            public_key_hash =
+              Implicit_account_repr.Forbidden.of_pkh
+                (Signature.Public_key.hash public_key);
             amount;
             delegate_to = None;
             consensus_key = Some consensus_key;
@@ -202,12 +227,27 @@ let bootstrap_account_encoding =
 let bootstrap_contract_encoding =
   let open Data_encoding in
   conv
-    (fun {delegate; amount; script} -> (delegate, amount, script))
-    (fun (delegate, amount, script) -> {delegate; amount; script})
-    (obj3
-       (opt "delegate" Signature.Public_key_hash.encoding)
+    (fun {delegate; amount; script; hash} -> (delegate, amount, script, hash))
+    (fun (delegate, amount, script, hash) -> {delegate; amount; script; hash})
+    (obj4
+       (opt "delegate" Implicit_account_repr.encoding)
        (req "amount" Tez_repr.encoding)
-       (req "script" Script_repr.encoding))
+       (req "script" Script_repr.encoding)
+       (opt "hash" Contract_hash.encoding))
+
+let bootstrap_smart_rollup_encoding =
+  let open Data_encoding in
+  conv
+    (fun {address; pvm_kind; boot_sector; parameters_ty; whitelist} ->
+      (address, pvm_kind, boot_sector, parameters_ty, whitelist))
+    (fun (address, pvm_kind, boot_sector, parameters_ty, whitelist) ->
+      {address; pvm_kind; boot_sector; parameters_ty; whitelist})
+    (obj5
+       (req "address" Sc_rollup_repr.Address.encoding)
+       (req "pvm_kind" Sc_rollups.Kind.encoding)
+       (req "kernel" (string Hex))
+       (req "parameters_ty" Script_repr.lazy_expr_encoding)
+       (opt "whitelist" Sc_rollup_whitelist_repr.encoding))
 
 let encoding =
   let open Data_encoding in
@@ -215,35 +255,45 @@ let encoding =
     (fun {
            bootstrap_accounts;
            bootstrap_contracts;
+           bootstrap_smart_rollups;
            commitments;
            constants;
            security_deposit_ramp_up_cycles;
            no_reward_cycles;
-         } ->
+         }
+       ->
       ( ( bootstrap_accounts,
           bootstrap_contracts,
+          bootstrap_smart_rollups,
           commitments,
           security_deposit_ramp_up_cycles,
           no_reward_cycles ),
         constants ))
     (fun ( ( bootstrap_accounts,
              bootstrap_contracts,
+             bootstrap_smart_rollups,
              commitments,
              security_deposit_ramp_up_cycles,
              no_reward_cycles ),
-           constants ) ->
+           constants )
+       ->
       {
         bootstrap_accounts;
         bootstrap_contracts;
+        bootstrap_smart_rollups;
         commitments;
         constants;
         security_deposit_ramp_up_cycles;
         no_reward_cycles;
       })
     (merge_objs
-       (obj5
+       (obj6
           (req "bootstrap_accounts" (list bootstrap_account_encoding))
           (dft "bootstrap_contracts" (list bootstrap_contract_encoding) [])
+          (dft
+             "bootstrap_smart_rollups"
+             (list bootstrap_smart_rollup_encoding)
+             [])
           (dft "commitments" (list Commitment_repr.encoding) [])
           (opt "security_deposit_ramp_up_cycles" int31)
           (opt "no_reward_cycles" int31))

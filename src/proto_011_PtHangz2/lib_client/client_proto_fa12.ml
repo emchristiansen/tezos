@@ -809,7 +809,8 @@ let token_transfer_encoding =
            fee;
            gas_limit;
            storage_limit;
-         } ->
+         }
+       ->
       ( token_contract,
         destination,
         amount,
@@ -823,7 +824,8 @@ let token_transfer_encoding =
            tez_amount,
            fee,
            gas_limit,
-           storage_limit ) ->
+           storage_limit )
+       ->
       {
         token_contract;
         destination;
@@ -874,13 +876,13 @@ let build_transaction_operation ?(tez_amount = Tez.zero) ?fee ?gas_limit
 
 let prepare_single_token_transfer cctxt ?default_fee ?default_gas_limit
     ?default_storage_limit ~chain ~block src index transfer =
-  Client_proto_contracts.ContractAlias.find_destination
+  Client_proto_contracts.Contract_alias.find_destination
     cctxt
     transfer.token_contract
   >>=? fun (_, token) ->
   contract_has_fa12_interface cctxt ~chain ~block ~contract:token ()
   >>=? fun () ->
-  Client_proto_contracts.ContractAlias.find_destination
+  Client_proto_contracts.Contract_alias.find_destination
     cctxt
     transfer.destination
   >>=? fun (_, dest) ->

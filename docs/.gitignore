@@ -1,16 +1,7 @@
-octez-baker.html
-octez-accuser.html
-octez-endorser.html
-octez-client.html
-/api/octez-snoop.html
-/api/octez-codec.html
-/api/octez-admin-client.html
-/api/octez-signer.html
-/api/octez-node.txt
-
+octez-*.html
+octez-*.txt
 /alpha/rpc.rst
 /shell/rpc.rst
-/lima/rpc.rst
 
 /api/errors.rst
 /shell/p2p_api.rst
@@ -18,5 +9,7 @@ octez-client.html
 /user/node-config.json
 /CHANGES-dev.rst
 /developer/metrics.csv
+/developer/rollup_metrics.csv
 
 /linkcheck
+/odoc.log

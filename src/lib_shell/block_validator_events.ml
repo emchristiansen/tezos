@@ -27,44 +27,70 @@ include Internal_event.Simple
 
 let section = ["validator"; "block"]
 
-let validation_success =
+let validation_and_application_success =
   declare_2
     ~section
-    ~name:"validation_success"
-    ~msg:"block {block} validated in {worker_status}"
+    ~name:"validation_and_application_success"
+    ~msg:"block {block} validated and applied in {worker_status}"
     ~level:Info
-    ~pp1:Block_hash.pp
+    ~pp1:Block_hash.pp_short
     ~pp2:Worker_types.pp_status_completed
     ("block", Block_hash.encoding)
     ("worker_status", Worker_types.request_status_encoding)
 
-let validation_failure =
+let previously_validated_and_applied =
+  declare_1
+    ~section
+    ~name:"previously_validated_and_applied"
+    ~msg:"previously validated and applied block {hash} (after pipe)"
+    ~level:Debug
+    ~pp1:Block_hash.pp
+    ("hash", Block_hash.encoding)
+
+let previously_invalid_block =
+  declare_2
+    ~section
+    ~name:"previously_invalid_block"
+    ~msg:"previously invalid block {hash} with: {errors}"
+    ~level:Debug
+    ~pp1:Block_hash.pp
+    ~pp2:pp_print_top_error_of_trace
+    ("hash", Block_hash.encoding)
+    ("errors", Error_monad.trace_encoding)
+
+let validation_or_application_failure =
   declare_3
     ~section
-    ~name:"validation_failed"
-    ~msg:"validation of block {block} failed ({worker_status}): {errors}"
+    ~name:"validation_or_application_failed"
+    ~msg:
+      "validation or application of block {block} failed ({worker_status}): \
+       {errors}"
     ~level:Notice
-    ~pp1:Block_hash.pp
+    ~pp1:Block_hash.pp_short
     ~pp2:Worker_types.pp_status
     ~pp3:pp_print_top_error_of_trace
     ("block", Block_hash.encoding)
     ("worker_status", Worker_types.request_status_encoding)
     ("errors", Error_monad.trace_encoding)
 
-let previously_validated =
-  declare_1
+let application_failure =
+  declare_3
     ~section
-    ~name:"previously_validated"
-    ~msg:"previously validated block {hash} (after pipe)"
-    ~level:Debug
-    ~pp1:Block_hash.pp
-    ("hash", Block_hash.encoding)
+    ~name:"application_failed"
+    ~msg:"application of block {block} failed, {worker_status}: {errors}"
+    ~level:Notice
+    ~pp1:Block_hash.pp_short
+    ~pp2:Worker_types.pp_status
+    ~pp3:pp_print_top_error_of_trace
+    ("block", Block_hash.encoding)
+    ("worker_status", Worker_types.request_status_encoding)
+    ("errors", Error_monad.trace_encoding)
 
-let validating_block =
+let applying_block =
   declare_1
     ~section
-    ~name:"validating_block"
-    ~msg:"validating block {hash}"
+    ~name:"applying_block"
+    ~msg:"applying block {hash}"
     ~level:Debug
     ~pp1:Block_hash.pp
     ("hash", Block_hash.encoding)
@@ -87,7 +113,7 @@ let preapplication_failure =
     ~msg:
       "pre-application of block at level {level} failed ({worker_status}): \
        {errors}"
-    ~level:Notice
+    ~level:Warning
     ~pp1:(fun fmt -> Format.fprintf fmt "%li")
     ~pp2:Worker_types.pp_status
     ~pp3:pp_print_top_error_of_trace
@@ -95,51 +121,84 @@ let preapplication_failure =
     ("worker_status", Worker_types.request_status_encoding)
     ("errors", Error_monad.trace_encoding)
 
-let validation_failure_after_precheck =
+let application_failure_after_validation =
   declare_3
     ~section
-    ~name:"validation_failure_after_precheck"
-    ~level:Notice
+    ~name:"application_failure_after_validation"
+    ~level:Warning
     ~msg:
-      "validation of block {block} failed but precheck succeeded, \
+      "application of block {block} failed but validation succeeded, \
        {worker_status}: {errors}"
-    ~pp1:Block_hash.pp
+    ~pp1:Block_hash.pp_short
     ~pp2:Worker_types.pp_status
     ~pp3:pp_print_top_error_of_trace
     ("block", Block_hash.encoding)
     ("worker_status", Worker_types.request_status_encoding)
     ("errors", Tezos_rpc.Error.encoding)
 
-let precheck_failure =
+let validation_failure =
   declare_3
     ~section
-    ~name:"precheck_failure"
+    ~name:"validation_failure"
     ~level:Notice
-    ~msg:"precheck of block {block} failed, {worker_status}: {errors}"
-    ~pp1:Block_hash.pp
+    ~msg:"validation of block {block} failed, {worker_status}: {errors}"
+    ~pp1:Block_hash.pp_short
     ~pp2:Worker_types.pp_status
     ~pp3:pp_print_top_error_of_trace
     ("block", Block_hash.encoding)
     ("worker_status", Worker_types.request_status_encoding)
     ("errors", Tezos_rpc.Error.encoding)
 
-let prechecked_block =
+let validation_canceled =
+  declare_2
+    ~section
+    ~name:"validation_canceled"
+    ~level:Info
+    ~msg:"validation of block {block} canceled, {worker_status}"
+    ~pp1:Block_hash.pp_short
+    ~pp2:Worker_types.pp_status
+    ("block", Block_hash.encoding)
+    ("worker_status", Worker_types.request_status_encoding)
+
+let commit_block_failure =
+  declare_3
+    ~section
+    ~name:"commit_block_failure"
+    ~level:Notice
+    ~msg:"commit of block {block} failed, {worker_status}: {errors}"
+    ~pp1:Block_hash.pp_short
+    ~pp2:Worker_types.pp_status
+    ~pp3:pp_print_top_error_of_trace
+    ("block", Block_hash.encoding)
+    ("worker_status", Worker_types.request_status_encoding)
+    ("errors", Tezos_rpc.Error.encoding)
+
+let validated_block =
   declare_1
     ~section
-    ~name:"prechecked_block"
+    ~name:"validated_block"
     ~level:Info
-    ~msg:"prechecked block {hash}"
-    ~pp1:Block_hash.pp
+    ~msg:"validated block {hash}"
+    ~pp1:Block_hash.pp_short
     ("hash", Block_hash.encoding)
 
-let prechecking_block =
-  declare_1
+let validating_block =
+  declare_5
     ~section
-    ~name:"prechecking_block"
-    ~level:Debug
-    ~msg:"prechecking block {hash}"
+    ~name:"validating_block"
+    ~level:Info
+    ~msg:
+      "{hash} with level {level}, parent {parent}, fitness {fitness}, \
+       timestamp {timestamp}"
     ~pp1:Block_hash.pp
     ("hash", Block_hash.encoding)
+    ("level", Data_encoding.int32)
+    ~pp3:Block_hash.pp_short
+    ("parent", Block_hash.encoding)
+    ~pp4:Fitness.pp
+    ("fitness", Fitness.encoding)
+    ~pp5:Time.Protocol.pp_hum
+    ("timestamp", Time.Protocol.encoding)
 
 let could_not_find_context =
   declare_1
@@ -147,5 +206,33 @@ let could_not_find_context =
     ~name:"could_not_find_context"
     ~level:Debug
     ~msg:"could not find context for block {hash}"
-    ~pp1:Block_hash.pp
+    ~pp1:Block_hash.pp_short
     ("hash", Block_hash.encoding)
+
+let context_error_at_block_application =
+  declare_2
+    ~section
+    ~name:"context_error_at_block_application"
+    ~msg:"Application of block {hash} failed on context error: {error}"
+    ~level:Warning
+    ~pp1:Block_hash.pp_short
+    ~pp2:Error_monad.pp_print_trace
+    ("hash", Block_hash.encoding)
+    ("error", Error_monad.trace_encoding)
+
+let retry_block_application =
+  declare_1
+    ~section
+    ~name:"retry_block_application"
+    ~msg:"retry block {hash} application"
+    ~level:Notice
+    ~pp1:Block_hash.pp_short
+    ("hash", Block_hash.encoding)
+
+let stopping_node_missing_context_key =
+  declare_0
+    ~section
+    ~name:"stopping_node_missing_context_key"
+    ~level:Error
+    ~msg:"critical context error: stopping the node gracefully."
+    ()

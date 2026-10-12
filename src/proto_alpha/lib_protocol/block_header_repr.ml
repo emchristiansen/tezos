@@ -30,8 +30,7 @@ type contents = {
   payload_round : Round_repr.t;
   seed_nonce_hash : Nonce_hash.t option;
   proof_of_work_nonce : bytes;
-  liquidity_baking_toggle_vote :
-    Liquidity_baking_repr.liquidity_baking_toggle_vote;
+  per_block_votes : Per_block_votes_repr.per_block_votes;
 }
 
 type protocol_data = {contents : contents; signature : Signature.t}
@@ -70,42 +69,83 @@ let of_watermark = function
 
 let contents_encoding =
   let open Data_encoding in
-  def "block_header.alpha.unsigned_contents"
-  @@ conv
-       (fun {
-              payload_hash;
-              payload_round;
-              seed_nonce_hash;
-              proof_of_work_nonce;
-              liquidity_baking_toggle_vote;
-            } ->
-         ( payload_hash,
-           payload_round,
-           proof_of_work_nonce,
-           seed_nonce_hash,
-           liquidity_baking_toggle_vote ))
-       (fun ( payload_hash,
-              payload_round,
-              proof_of_work_nonce,
-              seed_nonce_hash,
-              liquidity_baking_toggle_vote ) ->
-         {
-           payload_hash;
-           payload_round;
-           seed_nonce_hash;
-           proof_of_work_nonce;
-           liquidity_baking_toggle_vote;
-         })
-       (obj5
-          (req "payload_hash" Block_payload_hash.encoding)
-          (req "payload_round" Round_repr.encoding)
-          (req
-             "proof_of_work_nonce"
-             (Fixed.bytes Hex Constants_repr.proof_of_work_nonce_size))
-          (opt "seed_nonce_hash" Nonce_hash.encoding)
-          (req
-             "liquidity_baking_toggle_vote"
-             Liquidity_baking_repr.liquidity_baking_toggle_vote_encoding))
+  let json =
+    conv
+      (fun {
+             payload_hash;
+             payload_round;
+             seed_nonce_hash;
+             proof_of_work_nonce;
+             per_block_votes = {liquidity_baking_vote};
+           }
+         ->
+        ( payload_hash,
+          payload_round,
+          proof_of_work_nonce,
+          seed_nonce_hash,
+          liquidity_baking_vote ))
+      (fun ( payload_hash,
+             payload_round,
+             proof_of_work_nonce,
+             seed_nonce_hash,
+             liquidity_baking_vote )
+         ->
+        {
+          payload_hash;
+          payload_round;
+          seed_nonce_hash;
+          proof_of_work_nonce;
+          per_block_votes = {liquidity_baking_vote};
+        })
+      (obj5
+         (req "payload_hash" Block_payload_hash.encoding)
+         (req "payload_round" Round_repr.encoding)
+         (req
+            "proof_of_work_nonce"
+            (Fixed.bytes Hex Constants_repr.proof_of_work_nonce_size))
+         (opt "seed_nonce_hash" Nonce_hash.encoding)
+         (req
+            "liquidity_baking_toggle_vote"
+            Per_block_votes_repr.liquidity_baking_vote_encoding))
+  in
+  let binary =
+    conv
+      (fun {
+             payload_hash;
+             payload_round;
+             seed_nonce_hash;
+             proof_of_work_nonce;
+             per_block_votes;
+           }
+         ->
+        ( payload_hash,
+          payload_round,
+          proof_of_work_nonce,
+          seed_nonce_hash,
+          per_block_votes ))
+      (fun ( payload_hash,
+             payload_round,
+             proof_of_work_nonce,
+             seed_nonce_hash,
+             per_block_votes )
+         ->
+        {
+          payload_hash;
+          payload_round;
+          seed_nonce_hash;
+          proof_of_work_nonce;
+          per_block_votes;
+        })
+      (obj5
+         (req "payload_hash" Block_payload_hash.encoding)
+         (req "payload_round" Round_repr.encoding)
+         (req
+            "proof_of_work_nonce"
+            (Fixed.bytes Hex Constants_repr.proof_of_work_nonce_size))
+         (opt "seed_nonce_hash" Nonce_hash.encoding)
+         (req "per_block_votes" Per_block_votes_repr.per_block_votes_encoding))
+  in
+  def "block_header.alpha.unsigned_contents" @@ splitted ~binary ~json
 
 let protocol_data_encoding =
   let open Data_encoding in
@@ -164,7 +204,7 @@ let max_header_length =
       proof_of_work_nonce =
         Bytes.make Constants_repr.proof_of_work_nonce_size '0';
       seed_nonce_hash = Some Nonce_hash.zero;
-      liquidity_baking_toggle_vote = LB_pass;
+      per_block_votes = {liquidity_baking_vote = Per_block_vote_pass};
     }
   in
   Data_encoding.Binary.length
@@ -186,35 +226,15 @@ let hash {shell; protocol_data} =
         Data_encoding.Binary.to_bytes_exn protocol_data_encoding protocol_data;
     }
 
-type locked_round_evidence = {
-  preendorsement_round : Round_repr.t;
-  preendorsement_count : int;
-}
-
 type error +=
   | (* Permanent *)
       Invalid_block_signature of
       Block_hash.t * Signature.Public_key_hash.t
   | (* Permanent *) Invalid_stamp
   | (* Permanent *)
-      Invalid_payload_hash of {
-      expected : Block_payload_hash.t;
-      provided : Block_payload_hash.t;
-    }
-  | (* Permanent *)
-      Locked_round_after_block_round of {
-      locked_round : Round_repr.t;
-      round : Round_repr.t;
-    }
-  | (* Permanent *)
       Invalid_payload_round of {
       payload_round : Round_repr.t;
       round : Round_repr.t;
-    }
-  | (* Permanent *)
-      Insufficient_locked_round_evidence of {
-      voting_power : int;
-      consensus_threshold : int;
     }
   | (* Permanent *) Invalid_commitment of {expected : bool}
   | (* Permanent *) Wrong_timestamp of Time.t * Time.t
@@ -251,52 +271,6 @@ let () =
     (fun () -> Invalid_stamp) ;
   register_error_kind
     `Permanent
-    ~id:"block_header.invalid_payload_hash"
-    ~title:"Invalid payload hash"
-    ~description:"Invalid payload hash."
-    ~pp:(fun ppf (expected, provided) ->
-      Format.fprintf
-        ppf
-        "Invalid payload hash (expected: %a, provided: %a)."
-        Block_payload_hash.pp_short
-        expected
-        Block_payload_hash.pp_short
-        provided)
-    Data_encoding.(
-      obj2
-        (req "expected" Block_payload_hash.encoding)
-        (req "provided" Block_payload_hash.encoding))
-    (function
-      | Invalid_payload_hash {expected; provided} -> Some (expected, provided)
-      | _ -> None)
-    (fun (expected, provided) -> Invalid_payload_hash {expected; provided}) ;
-  () ;
-  register_error_kind
-    `Permanent
-    ~id:"block_header.locked_round_after_block_round"
-    ~title:"Locked round after block round"
-    ~description:"Locked round after block round."
-    ~pp:(fun ppf (locked_round, round) ->
-      Format.fprintf
-        ppf
-        "Locked round (%a) is after the block round (%a)."
-        Round_repr.pp
-        locked_round
-        Round_repr.pp
-        round)
-    Data_encoding.(
-      obj2
-        (req "locked_round" Round_repr.encoding)
-        (req "round" Round_repr.encoding))
-    (function
-      | Locked_round_after_block_round {locked_round; round} ->
-          Some (locked_round, round)
-      | _ -> None)
-    (fun (locked_round, round) ->
-      Locked_round_after_block_round {locked_round; round}) ;
-  () ;
-  register_error_kind
-    `Permanent
     ~id:"block_header.invalid_payload_round"
     ~title:"Invalid payload round"
     ~description:"The given payload round is invalid."
@@ -317,27 +291,6 @@ let () =
           Some (payload_round, round)
       | _ -> None)
     (fun (payload_round, round) -> Invalid_payload_round {payload_round; round}) ;
-  register_error_kind
-    `Permanent
-    ~id:"block_header.insufficient_locked_round_evidence"
-    ~title:"Insufficient locked round evidence"
-    ~description:"Insufficient locked round evidence."
-    ~pp:(fun ppf (voting_power, consensus_threshold) ->
-      Format.fprintf
-        ppf
-        "The provided locked round evidence is not sufficient: provided %d \
-         voting power but was expecting at least %d."
-        voting_power
-        consensus_threshold)
-    Data_encoding.(
-      obj2 (req "voting_power" int31) (req "consensus_threshold" int31))
-    (function
-      | Insufficient_locked_round_evidence {voting_power; consensus_threshold}
-        ->
-          Some (voting_power, consensus_threshold)
-      | _ -> None)
-    (fun (voting_power, consensus_threshold) ->
-      Insufficient_locked_round_evidence {voting_power; consensus_threshold}) ;
   register_error_kind
     `Permanent
     ~id:"block_header.invalid_commitment"
@@ -373,6 +326,7 @@ let () =
 
 let check_signature (block : t) (chain_id : Chain_id.t)
     (key : Signature.Public_key.t) =
+  let open Result_syntax in
   let check_signature key ({shell; protocol_data = {contents; signature}} : t) =
     let unsigned_header =
       Data_encoding.Binary.to_bytes_exn unsigned_encoding (shell, contents)
@@ -383,9 +337,9 @@ let check_signature (block : t) (chain_id : Chain_id.t)
       signature
       unsigned_header
   in
-  if check_signature key block then ok ()
+  if check_signature key block then return_unit
   else
-    error (Invalid_block_signature (hash block, Signature.Public_key.hash key))
+    tzfail (Invalid_block_signature (hash block, Signature.Public_key.hash key))
 
 let check_payload_round ~round ~payload_round =
   error_when
@@ -394,14 +348,16 @@ let check_payload_round ~round ~payload_round =
 
 let check_timestamp round_durations ~timestamp ~round ~predecessor_timestamp
     ~predecessor_round =
-  Round_repr.timestamp_of_round
-    round_durations
-    ~predecessor_timestamp
-    ~predecessor_round
-    ~round
-  >>? fun expected_timestamp ->
-  if Time_repr.(expected_timestamp = timestamp) then Error_monad.ok ()
-  else error (Wrong_timestamp (timestamp, expected_timestamp))
+  let open Result_syntax in
+  let* expected_timestamp =
+    Round_repr.timestamp_of_round
+      round_durations
+      ~predecessor_timestamp
+      ~predecessor_round
+      ~round
+  in
+  if Time_repr.(expected_timestamp = timestamp) then return_unit
+  else tzfail (Wrong_timestamp (timestamp, expected_timestamp))
 
 module Proof_of_work = struct
   let check_hash hash stamp_threshold =
@@ -416,13 +372,14 @@ module Proof_of_work = struct
     check_hash hash stamp_threshold
 
   let check_proof_of_work_stamp ~proof_of_work_threshold block =
+    let open Result_syntax in
     if
       check_header_proof_of_work_stamp
         block.shell
         block.protocol_data.contents
         proof_of_work_threshold
-    then ok ()
-    else error Invalid_stamp
+    then return_unit
+    else tzfail Invalid_stamp
 end
 
 let begin_validate_block_header ~(block_header : t) ~(chain_id : Chain_id.t)
@@ -431,6 +388,7 @@ let begin_validate_block_header ~(block_header : t) ~(chain_id : Chain_id.t)
     ~(delegate_pk : Signature.Public_key.t)
     ~(round_durations : Round_repr.Durations.t)
     ~(proof_of_work_threshold : int64) ~(expected_commitment : bool) =
+  let open Result_syntax in
   (* Level relationship between current node and the predecessor is
      done by the shell. We know that level is predecessor level + 1.
      The predecessor block hash is guaranteed by the shell to be the
@@ -440,67 +398,29 @@ let begin_validate_block_header ~(block_header : t) ~(chain_id : Chain_id.t)
     block_header.protocol_data.contents
   in
   let raw_level = block_header.shell.level in
-  Proof_of_work.check_proof_of_work_stamp ~proof_of_work_threshold block_header
-  >>? fun () ->
-  Raw_level_repr.of_int32 raw_level >>? fun level ->
-  check_signature block_header chain_id delegate_pk >>? fun () ->
+  let* () =
+    Proof_of_work.check_proof_of_work_stamp
+      ~proof_of_work_threshold
+      block_header
+  in
+  let* level = Raw_level_repr.of_int32 raw_level in
+  let* () = check_signature block_header chain_id delegate_pk in
   let round = Fitness_repr.round fitness in
-  check_payload_round ~round ~payload_round >>? fun () ->
-  check_timestamp
-    round_durations
-    ~predecessor_timestamp
-    ~predecessor_round
-    ~timestamp
-    ~round
-  >>? fun () ->
-  Fitness_repr.check_except_locked_round fitness ~level ~predecessor_round
-  >>? fun () ->
+  let* () = check_payload_round ~round ~payload_round in
+  let* () =
+    check_timestamp
+      round_durations
+      ~predecessor_timestamp
+      ~predecessor_round
+      ~timestamp
+      ~round
+  in
+  let* () =
+    Fitness_repr.check_except_locked_round fitness ~level ~predecessor_round
+  in
   let has_commitment =
     match seed_nonce_hash with None -> false | Some _ -> true
   in
   error_unless
     Compare.Bool.(has_commitment = expected_commitment)
     (Invalid_commitment {expected = expected_commitment})
-
-type checkable_payload_hash =
-  | No_check
-  | Expected_payload_hash of Block_payload_hash.t
-
-let finalize_validate_block_header ~(block_header_contents : contents)
-    ~(round : Round_repr.t)
-    ~(* We have to check the round because in the construction case it was
-        deduced from the time *)
-    (fitness_locked_round : Round_repr.t option)
-    ~(checkable_payload_hash : checkable_payload_hash)
-    ~(locked_round_evidence : locked_round_evidence option)
-    ~(consensus_threshold : int) =
-  let {
-    payload_hash = actual_payload_hash;
-    seed_nonce_hash = _;
-    proof_of_work_nonce = _;
-    _;
-  } =
-    block_header_contents
-  in
-  (match checkable_payload_hash with
-  | No_check -> Result.return_unit
-  | Expected_payload_hash bph ->
-      error_unless
-        (Block_payload_hash.equal actual_payload_hash bph)
-        (Invalid_payload_hash {expected = bph; provided = actual_payload_hash}))
-  >>? fun () ->
-  (match locked_round_evidence with
-  | None -> ok None
-  | Some {preendorsement_count; preendorsement_round} ->
-      error_when
-        Round_repr.(preendorsement_round >= round)
-        (Locked_round_after_block_round
-           {locked_round = preendorsement_round; round})
-      >>? fun () ->
-      error_when
-        Compare.Int.(preendorsement_count < consensus_threshold)
-        (Insufficient_locked_round_evidence
-           {voting_power = preendorsement_count; consensus_threshold})
-      >>? fun () -> ok (Some preendorsement_round))
-  >>? fun locked_round ->
-  Fitness_repr.check_locked_round ~fitness_locked_round ~locked_round

@@ -26,7 +26,8 @@
 (** Testing
     -------
     Component:    Peer_validator
-    Invocation:   dune exec src/lib_shell/test/test_peer_validator.exe
+    Invocation:   dune exec src/lib_shell/test/main.exe \
+                  -- --file test_peer_validator.ml
     Subject:      Unit tests for [Peer_validator]
 *)
 
@@ -64,11 +65,6 @@ let wrap
       in
       let genesis = WithExceptions.Option.get ~loc:__LOC__ genesis in
       let genesis_header = Store.Block.header genesis in
-      let internal_validator =
-        (* FIXME: https://gitlab.com/tezos/tezos/-/issues/2833
-           External validator should be used *)
-        Block_validator_process.Internal chain_store
-      in
       let validator_environment =
         {
           Block_validator_process.user_activated_upgrades = [];
@@ -76,8 +72,13 @@ let wrap
           operation_metadata_size_limit = Unlimited;
         }
       in
+      let internal_validator =
+        (* FIXME: https://gitlab.com/tezos/tezos/-/issues/2833
+           External validator should be used *)
+        Block_validator_process.Internal (validator_environment, chain_store)
+      in
       let* block_validator_processs =
-        Block_validator_process.init validator_environment internal_validator
+        Block_validator_process.init internal_validator
       in
       let*! block_validator =
         Block_validator.create
@@ -93,7 +94,16 @@ let wrap
           chain_db
           Tezos_crypto.Crypto_box.Public_key_hash.zero
       in
-      f chain_db genesis_header pv)
+      let* () =
+        Lwt.finalize
+          (fun () -> f chain_db genesis_header pv)
+          (fun () ->
+            let*! () = Peer_validator.shutdown pv in
+            let*! () = Block_validator_process.close block_validator_processs in
+            let*! () = Block_validator.shutdown block_validator in
+            unit)
+      in
+      return_unit)
 
 (* This test ensure that [validate_new_head hash header] remove all
    entries of [hash] in the db if the fitness does not increase. *)
@@ -168,6 +178,7 @@ let test_validate_new_head_on_lower_fitness () =
 
 let () =
   Alcotest_lwt.run
+    ~__FILE__
     "Peer_validator"
     [
       ( "Validate_new_head",

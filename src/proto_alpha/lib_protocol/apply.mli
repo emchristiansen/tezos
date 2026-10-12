@@ -36,12 +36,25 @@
 open Alpha_context
 
 type error +=
+  | Faulty_validation_wrong_slot
+  | Set_deposits_limit_on_unregistered_delegate of Implicit_account_repr.t
+  | Set_deposits_limit_when_automated_staking_off
+  | Error_while_taking_fees
+  | Update_consensus_key_on_unregistered_delegate of
+      (Implicit_account_repr.t * Operation_repr.consensus_key_kind)
+  | Empty_transaction of Contract.t
+  | Non_empty_transaction_from of Destination.t
   | Internal_operation_replay of
       Apply_internal_results.packed_internal_operation
-  | Tx_rollup_feature_disabled
-  | Tx_rollup_invalid_transaction_ticket_amount
-  | Sc_rollup_feature_disabled
-  | Empty_transaction of Contract.t
+  | Multiple_revelation
+  | Invalid_transfer_to_sc_rollup
+  | Invalid_sender of Destination.t
+  | Invalid_self_transaction_destination
+  | Staking_to_delegate_that_refuses_external_staking
+  | Stake_modification_with_no_delegate_set
+  | Invalid_nonzero_transaction_amount of Tez.t
+  | Invalid_staking_parameters_sender
+  | Missing_shell_header
 
 type mode =
   | Application of {
@@ -61,10 +74,8 @@ type mode =
       predecessor_level : Level.t;
       predecessor_round : Round.t;
     }
-  | Partial_construction of {
-      predecessor_level : Raw_level.t;
-      predecessor_fitness : Fitness.raw;
-    }  (** This mode is mainly intended to be used by a mempool. *)
+  | Partial_construction of {predecessor_fitness : Fitness.raw}
+      (** This mode is mainly intended to be used by a mempool. *)
 
 type application_state = {
   ctxt : context;
@@ -72,7 +83,7 @@ type application_state = {
   mode : mode;
   op_count : int;
   migration_balance_updates : Receipt.balance_updates;
-  liquidity_baking_toggle_ema : Liquidity_baking.Toggle_EMA.t;
+  liquidity_baking_toggle_ema : Per_block_votes.Liquidity_baking_toggle_EMA.t;
   implicit_operations_results :
     Apply_results.packed_successful_manager_operation_result list;
 }
@@ -111,7 +122,6 @@ val begin_partial_construction :
   Chain_id.t ->
   migration_balance_updates:Receipt.balance_updates ->
   migration_operation_results:Migration.origination_result list ->
-  predecessor_level:Raw_level.t ->
   predecessor_hash:Block_hash.t ->
   predecessor_fitness:Fitness.raw ->
   application_state tzresult Lwt.t

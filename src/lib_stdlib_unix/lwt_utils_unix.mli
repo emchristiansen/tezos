@@ -79,6 +79,12 @@ val write_bytes :
     kind is [S_DIR]). *)
 val is_directory : string -> bool Lwt.t
 
+(** [dir_exists] tests if the given [path] (or the target of the
+    symbolic link located at [path]) is an existing directory. [false]
+    is returned either if the target does not exist or if it is not a
+    directory. *)
+val dir_exists : string -> bool Lwt.t
+
 val remove_dir : string -> unit Lwt.t
 
 (** [create_dir ?perm dir] creates the directory at the path [dir] and
@@ -92,14 +98,41 @@ val create_dir : ?perm:int -> string -> unit Lwt.t
     directory. *)
 val copy_dir : ?perm:int -> string -> string -> unit Lwt.t
 
+(** [hardlink_dir ?perm src dst] creates hardlinks for the content of directory
+    [src] in a fresh directory [dst] with the same structure
+
+    @raise Unix_error(ENOTDIR,_,_) if the given file is not a
+    directory. *)
+val hardlink_dir : ?perm:int -> string -> string -> unit Lwt.t
+
 val read_file : string -> string Lwt.t
 
-val copy_file : src:string -> dst:string -> unit Lwt.t
+(** [copy_file ?buffer_size ~src ~dst ()] copies the file from [src]
+    to [dst]. The permissions of the [dst] file are inherited from
+    `Lwt_io.with_file`. The [buffer_size] parameter, which defaults to
+    4096, can be adjusted to improve performance. *)
+val copy_file :
+  ?buffer_size:int -> src:string -> dst:string -> unit -> unit Lwt.t
+
+(** [copy_file_raw ?buffer_size ?dst_perm ~src ~dst ()] is very
+    similar to [copy_file] but it uses an alternate implementation
+    using raw file descriptors, enabling better performances. It
+    copies the file from [src] to [dst]. The permissions of the [dst]
+    file is 0o666 by default. The [buffer_size] parameter, which
+    defaults to 4096*1024, can be adjusted to improve performance. *)
+val copy_file_raw :
+  ?buffer_size:int ->
+  ?dst_perm:int ->
+  src:string ->
+  dst:string ->
+  unit ->
+  unit Lwt.t
 
 val create_file :
   ?close_on_exec:bool -> ?perm:int -> string -> string -> unit Lwt.t
 
-val with_tempdir : string -> (string -> 'a Lwt.t) -> 'a Lwt.t
+val with_tempdir :
+  ?temp_dir:string -> string -> (string -> 'a Lwt.t) -> 'a Lwt.t
 
 val safe_close : Lwt_unix.file_descr -> unit tzresult Lwt.t
 
@@ -138,15 +171,16 @@ type 'action io_error = {
   arg : string;  (** Argument given to the unix function: generally a path. *)
 }
 
-type error += Io_error of [`Close | `Open | `Rename] io_error
+type error += Io_error of [`Close | `Open | `Rename | `Unlink | `Lock] io_error
 
-val tzfail_of_io_error : [`Close | `Open | `Rename] io_error -> 'b tzresult
+val tzfail_of_io_error :
+  [`Close | `Open | `Rename | `Unlink | `Lock] io_error -> 'b tzresult
 
 (** [with_open_file ~flags ~perm filename f] opens the given file
    using {!Lwt_unix.open_file} and passes the resulting file-descriptor
    to [f]. [with_open_file] ensures that the file-descriptor is closed
-   when the promise returned by [f] resolves, or if [f] raises an
-   exception.
+   when the promise returned by [f] resolves, and also when [f] raises
+   an exception or is cancelled.
 
    See {!Lwt_unix.openfile} for a description of the arguments,
    warnings, and other notes. Default values for [perm] is [0o640].
@@ -163,7 +197,7 @@ val with_open_file :
   ?perm:Unix.file_perm ->
   string ->
   (Lwt_unix.file_descr -> 'a Lwt.t) ->
-  ('a, [`Open | `Close] io_error) result Lwt.t
+  ('a, [> `Open | `Close] io_error) result Lwt.t
 
 (** [with_open_out ?overwrite filename f] uses [with_open_file] with
    the flags [O_WRONLY; O_CREAT; O_CLOEXEC] and the default
@@ -173,7 +207,7 @@ val with_open_out :
   ?overwrite:bool ->
   string ->
   (Lwt_unix.file_descr -> 'a Lwt.t) ->
-  ('a, [`Open | `Close] io_error) result Lwt.t
+  ('a, [> `Open | `Close] io_error) result Lwt.t
 
 (** [with_atomic_open_out ?(overwrite=true) filename ?temp_dir f] is a
    wrapper around [with_open_out] that ensures that the data are
@@ -189,14 +223,18 @@ val with_open_out :
    {!with_open_file} for a description of the other errors. In that
    case, no write have been done on [filename].
 
-   The default value of [temp_dir] is the same as
-   [Filename.temp_file]. *)
+   The default value of [temp_dir] is the directory of [filename], so
+   that the temporary file sits on the same partition as its
+   destination.
+
+   The temporary file is removed on every path that does not rename it
+   onto [filename], including when [f] raises or is cancelled. *)
 val with_atomic_open_out :
   ?overwrite:bool ->
   string ->
   ?temp_dir:string ->
   (Lwt_unix.file_descr -> 'a Lwt.t) ->
-  ('a, [`Open | `Close | `Rename] io_error) result Lwt.t
+  ('a, [> `Open | `Close | `Rename] io_error) result Lwt.t
 
 (** [with_open_in filename f] uses [with_open_file] with the flags
    [O_RDONLY; O_CLOEXEC] and the default permissions. *)
@@ -204,3 +242,5 @@ val with_open_in :
   string ->
   (Lwt_unix.file_descr -> 'a Lwt.t) ->
   ('a, [> `Open | `Close] io_error) result Lwt.t
+
+val safe_cancel_on_exit : (unit -> 'a Lwt.t) -> 'a Lwt.t

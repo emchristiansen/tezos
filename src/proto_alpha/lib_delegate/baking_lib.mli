@@ -29,29 +29,33 @@ open Protocol.Alpha_context
 
 val bake :
   Protocol_client_context.full ->
+  ?dal_node_rpc_ctxt:Tezos_rpc.Context.generic ->
   ?minimal_fees:Tez.t ->
   ?minimal_nanotez_per_gas_unit:Q.t ->
   ?minimal_nanotez_per_byte:Q.t ->
-  ?force_apply:bool ->
+  ?force_apply_from_round:int ->
   ?force:bool ->
   ?minimal_timestamp:bool ->
   ?extra_operations:Baking_configuration.Operations_source.t ->
   ?monitor_node_mempool:bool ->
-  ?context_path:string ->
-  ?dal_node_endpoint:Uri.t ->
-  Baking_state.consensus_key list ->
+  ?data_dir:string ->
+  (* Number of baked blocks. Defaults to 1. *)
+  ?count:int ->
+  ?votes:Baking_configuration.per_block_votes_config ->
+  ?state_recorder:Baking_configuration.state_recorder_config ->
+  Baking_state_types.Key.t list ->
   unit tzresult Lwt.t
 
-val preendorse :
+val preattest :
   Protocol_client_context.full ->
   ?force:bool ->
-  Baking_state.consensus_key list ->
+  Baking_state_types.Key.t list ->
   unit tzresult Lwt.t
 
-val endorse :
+val attest :
   Protocol_client_context.full ->
   ?force:bool ->
-  Baking_state.consensus_key list ->
+  Baking_state_types.Key.t list ->
   unit tzresult Lwt.t
 
 val propose :
@@ -59,10 +63,24 @@ val propose :
   ?minimal_fees:Tez.t ->
   ?minimal_nanotez_per_gas_unit:Q.t ->
   ?minimal_nanotez_per_byte:Q.t ->
-  ?force_apply:bool ->
+  ?force_apply_from_round:int ->
   ?force:bool ->
   ?minimal_timestamp:bool ->
   ?extra_operations:Baking_configuration.Operations_source.t ->
-  ?context_path:string ->
-  Baking_state.consensus_key list ->
+  ?data_dir:string ->
+  ?state_recorder:Baking_configuration.state_recorder_config ->
+  Baking_state_types.Key.t list ->
+  unit tzresult Lwt.t
+
+(** [repropose] tries to bake a new block proposal on the same level
+    as the current head. If provided, the proposal will use the
+    [force_round] argument as its reproposal round, otherwise the
+    current tenderbake round will be used. *)
+val repropose :
+  Protocol_client_context.full ->
+  ?force:bool ->
+  ?force_round:Round.t ->
+  ?minimal_timestamp:bool ->
+  ?force_reproposal:bool ->
+  Baking_state_types.Key.t list ->
   unit tzresult Lwt.t

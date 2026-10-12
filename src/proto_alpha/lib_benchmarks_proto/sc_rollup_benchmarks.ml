@@ -2,6 +2,7 @@
 (*                                                                           *)
 (* Open Source License                                                       *)
 (* Copyright (c) 2022 Trili Tech, <contact@trili.com>                        *)
+(* Copyright (c) 2023  Marigold <contact@marigold.dev>                       *)
 (*                                                                           *)
 (* Permission is hereby granted, free of charge, to any person obtaining a   *)
 (* copy of this software and associated documentation files (the "Software"),*)
@@ -35,7 +36,7 @@ module Pvm_state_generator = struct
   module Context = Tezos_context_memory.Context_binary
 
   module Wasm_context = struct
-    type Tezos_lazy_containers.Lazy_map.tree += Tree of Context.tree
+    type Tezos_tree_encoding.tree_instance += Tree of Context.tree
 
     module Tree = struct
       include Context.Tree
@@ -70,8 +71,8 @@ module Pvm_state_generator = struct
       match Context.Tree.kinded_key tree with
       | Some k ->
           let* p = Context.produce_tree_proof index k step in
-          return (Some p)
-      | None -> return None
+          return_some p
+      | None -> return_none
 
     let kinded_hash_to_state_hash = function
       | `Value hash | `Node hash ->
@@ -81,6 +82,8 @@ module Pvm_state_generator = struct
       kinded_hash_to_state_hash proof.Context.Proof.before
 
     let proof_after proof = kinded_hash_to_state_hash proof.Context.Proof.after
+
+    let cast_read_only proof = Context.Proof.{proof with after = proof.before}
 
     let proof_encoding =
       let module Proof_encoding =
@@ -229,7 +232,7 @@ module Pvm_state_generator = struct
     in
     (* Encode the buffers and update the state of the pvm. *)
     let buffers = Eval.{input; output} in
-    let buffers_encoding = Wasm_pvm.durable_buffers_encoding in
+    let buffers_encoding = Tree_state.durable_buffers_encoding in
     let module Tree_encoding_runner =
       Tezos_tree_encoding.Runner.Make (Wasm_context.Tree) in
     let*! tree =
@@ -271,7 +274,8 @@ module Pvm_state_generator = struct
     in
     (* Produce an output proof for the picked message, and return the proof
        and its length. *)
-    return Sc_rollup_PVM_sig.{outbox_level; message_index; message}
+    return
+      Sc_rollup_PVM_sig.{output_info = {outbox_level; message_index}; message}
 end
 
 (** This benchmark estimates the cost of verifying an output proof for the
@@ -279,14 +283,27 @@ end
     The inferred cost model is [c1 + c2 * proof_length]. *)
 module Sc_rollup_verify_output_proof_benchmark = struct
   open Pvm_state_generator
-  module Full_Wasm =
-    Sc_rollup_wasm.V2_0_0.Make (Environment.Wasm_2_0_0.Make) (Wasm_context)
+
+  module Full_Wasm = Sc_rollup_wasm.V2_0_0.Make_pvm (struct
+    include
+      (val Tezos_smart_rollup_wasm_in_memory.wasm_pvm_machine
+             ~config:Tezos_scoru_wasm.Wasm_pvm_config.empty)
+
+    let compute_step =
+      compute_step ~wasm_entrypoint:Tezos_scoru_wasm.Constants.wasm_entrypoint
+  end)
 
   (* Benchmark starts here. *)
 
   let name = ns "Sc_rollup_verify_output_proof_benchmark"
 
   let info = "Estimating the cost of verifying an output proof"
+
+  let module_filename = __FILE__
+
+  let purpose = Benchmark.Generate_code "sc_rollup"
+
+  let group = Benchmarks_proto.Benchmark.Group "sc_rollup"
 
   let tags = ["sc_rollup"]
 
@@ -311,7 +328,8 @@ module Sc_rollup_verify_output_proof_benchmark = struct
              nb_transactions;
              tree_depth;
              tree_branching_factor;
-           } ->
+           }
+         ->
         ( nb_inbox_messages,
           input_payload_size,
           nb_output_buffer_levels,
@@ -325,7 +343,8 @@ module Sc_rollup_verify_output_proof_benchmark = struct
              output_buffer_size,
              nb_transactions,
              tree_depth,
-             tree_branching_factor ) ->
+             tree_branching_factor )
+         ->
         {
           nb_inbox_messages : int;
           input_payload_size : int;
@@ -416,20 +435,13 @@ module Sc_rollup_verify_output_proof_benchmark = struct
   let workload_to_vector {proof_length} =
     Sparse_vec.String.of_list [("proof_length", float_of_int proof_length)]
 
-  let verify_output_proof_model =
-    Model.make
-      ~conv:(fun {proof_length} -> (proof_length, ()))
-      ~model:
-        (Model.affine
-           ~name
-           ~intercept:(fv "verify_const")
-           ~coeff:(fv "verify_proof_length"))
-
-  let models = [("verify_output_proof", verify_output_proof_model)]
+  let model =
+    let open Benchmarks_proto in
+    Model.make ~conv:(fun {proof_length} -> (proof_length, ())) Model.affine
 
   let pvm_state = ref None
 
-  let benchmark rng_state conf () =
+  let create_benchmark ~rng_state conf =
     let nb_output_buffer_levels = conf.nb_output_buffer_levels in
     let output_buffer_size = conf.output_buffer_size in
     let prepare_benchmark_scenario () =
@@ -484,9 +496,6 @@ module Sc_rollup_verify_output_proof_benchmark = struct
       ignore (Lwt_main.run @@ Full_Wasm.verify_output_proof output_proof)
     in
     Generator.Plain {workload; closure}
-
-  let create_benchmarks ~rng_state ~bench_num config =
-    List.repeat bench_num (benchmark rng_state config)
 end
 
 (** This benchmark estimates the cost of verifying an output proof for the
@@ -494,14 +503,28 @@ end
     The inferred cost model is [c1 + c2 * proof_length]. *)
 module Sc_rollup_deserialize_output_proof_benchmark = struct
   open Pvm_state_generator
-  module Full_Wasm =
-    Sc_rollup_wasm.V2_0_0.Make (Environment.Wasm_2_0_0.Make) (Wasm_context)
+  open Benchmarks_proto
+
+  module Full_Wasm = Sc_rollup_wasm.V2_0_0.Make_pvm (struct
+    include
+      (val Tezos_smart_rollup_wasm_in_memory.wasm_pvm_machine
+             ~config:Tezos_scoru_wasm.Wasm_pvm_config.empty)
+
+    let compute_step =
+      compute_step ~wasm_entrypoint:Tezos_scoru_wasm.Constants.wasm_entrypoint
+  end)
 
   (* Benchmark starts here. *)
 
   let name = ns "Sc_rollup_deserialize_output_proof_benchmark"
 
   let info = "Estimating the cost of deserializing an output proof"
+
+  let module_filename = __FILE__
+
+  let purpose = Benchmark.Generate_code "sc_rollup"
+
+  let group = Benchmarks_proto.Benchmark.Group "sc_rollup"
 
   let tags = ["sc_rollup"]
 
@@ -520,7 +543,8 @@ module Sc_rollup_deserialize_output_proof_benchmark = struct
              output_buffer_size;
              nb_transactions;
              tree_depth;
-           } ->
+           }
+         ->
         ( nb_output_buffer_levels,
           output_buffer_size,
           nb_transactions,
@@ -528,7 +552,8 @@ module Sc_rollup_deserialize_output_proof_benchmark = struct
       (fun ( nb_output_buffer_levels,
              output_buffer_size,
              nb_transactions,
-             tree_depth ) ->
+             tree_depth )
+         ->
         {
           nb_output_buffer_levels;
           output_buffer_size;
@@ -561,20 +586,13 @@ module Sc_rollup_deserialize_output_proof_benchmark = struct
   let workload_to_vector {proof_length} =
     Sparse_vec.String.of_list [("proof_length", float_of_int proof_length)]
 
-  let verify_output_proof_model =
-    Model.make
-      ~conv:(fun {proof_length} -> (proof_length, ()))
-      ~model:
-        (Model.affine
-           ~name
-           ~intercept:(fv "deserialize_const")
-           ~coeff:(fv "deserialize_proof_length"))
-
-  let models = [("deserialize_output_proof", verify_output_proof_model)]
+  let model =
+    let open Benchmarks_proto in
+    Model.make ~conv:(fun {proof_length} -> (proof_length, ())) Model.affine
 
   let pvm_state = ref None
 
-  let benchmark rng_state conf () =
+  let create_benchmark ~rng_state conf =
     let prepared_benchmark_scenario =
       let nb_output_buffer_levels = conf.nb_output_buffer_levels in
       let output_buffer_size = conf.output_buffer_size in
@@ -636,14 +654,78 @@ module Sc_rollup_deserialize_output_proof_benchmark = struct
            encoded_proof)
     in
     Generator.Plain {workload; closure}
+end
 
-  let create_benchmarks ~rng_state ~bench_num config =
-    List.repeat bench_num (benchmark rng_state config)
+(** This benchmark estimates the cost of installing a boot sector. *)
+module Sc_rollup_install_boot_sector_benchmark = struct
+  open Pvm_state_generator
+
+  (* Benchmark starts here. *)
+
+  let name = ns "Sc_rollup_install_boot_sector_benchmark"
+
+  let group = Benchmarks_proto.Benchmark.Group "sc_rollup"
+
+  let info = "Estimating the cost of installing a boot sector."
+
+  let module_filename = __FILE__
+
+  let purpose = Benchmark.Generate_code "sc_rollup"
+
+  let tags = ["sc_rollup"]
+
+  type config = unit
+
+  let config_encoding = Data_encoding.unit
+
+  let default_config = ()
+
+  type workload = {boot_sector_length : int}
+
+  let workload_encoding =
+    let open Data_encoding in
+    conv
+      (fun {boot_sector_length} -> boot_sector_length)
+      (fun boot_sector_length -> {boot_sector_length})
+      (obj1 (req "boot_sector_length" int31))
+
+  let workload_to_vector {boot_sector_length} =
+    Sparse_vec.String.of_list
+      [("boot_sector_length", float_of_int boot_sector_length)]
+
+  let model =
+    let open Benchmarks_proto in
+    Model.make
+      ~conv:(fun {boot_sector_length} -> (boot_sector_length, ()))
+      Model.affine
+
+  let create_benchmark ~rng_state _conf =
+    let open Base_samplers in
+    let max_boot_sector_size = 32 * 1024 in
+    let boot_sector_length =
+      sample_in_interval ~range:(0 -- (max_boot_sector_size - 1)) rng_state
+    in
+    let workload = {boot_sector_length} in
+    let boot_sector = uniform_string ~nbytes:boot_sector_length rng_state in
+    let state = empty_tree in
+
+    let closure () =
+      let (module Full_Wasm) =
+        Sc_rollup_wasm.V2_0_0.protocol_implementation ~config:[]
+      in
+      ignore (Full_Wasm.install_boot_sector state boot_sector)
+    in
+    Generator.Plain {workload; closure}
 end
 
 let () =
-  Registration_helpers.register (module Sc_rollup_verify_output_proof_benchmark)
+  Benchmarks_proto.Registration.register
+    (module Sc_rollup_verify_output_proof_benchmark)
 
 let () =
-  Registration_helpers.register
+  Benchmarks_proto.Registration.register
     (module Sc_rollup_deserialize_output_proof_benchmark)
+
+let () =
+  Benchmarks_proto.Registration.register
+    (module Sc_rollup_install_boot_sector_benchmark)

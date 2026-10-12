@@ -1,0 +1,159 @@
+(*****************************************************************************)
+(*                                                                           *)
+(* Open Source License                                                       *)
+(* Copyright (c) 2023 Nomadic Labs <contact@nomadic-labs.com>                *)
+(* Copyright (c) 2023 Functori <contact@functori.com>                        *)
+(* Copyright (c) 2024 Trilitech <contact@trili.tech>                         *)
+(*                                                                           *)
+(* Permission is hereby granted, free of charge, to any person obtaining a   *)
+(* copy of this software and associated documentation files (the "Software"),*)
+(* to deal in the Software without restriction, including without limitation *)
+(* the rights to use, copy, modify, merge, publish, distribute, sublicense,  *)
+(* and/or sell copies of the Software, and to permit persons to whom the     *)
+(* Software is furnished to do so, subject to the following conditions:      *)
+(*                                                                           *)
+(* The above copyright notice and this permission notice shall be included   *)
+(* in all copies or substantial portions of the Software.                    *)
+(*                                                                           *)
+(* THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR*)
+(* IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,  *)
+(* FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL   *)
+(* THE AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER*)
+(* LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING   *)
+(* FROM, OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER       *)
+(* DEALINGS IN THE SOFTWARE.                                                 *)
+(*                                                                           *)
+(*****************************************************************************)
+
+(** [no_0x s] removes the prefix [0x] of [s] if it exists. *)
+val no_0x : string -> string
+
+(** [normalize s] calls {!no_0x} and {!String.lowercase_ascii} on [s]. *)
+val normalize : string -> string
+
+(** Path in the Wasm PVM durable storage. *)
+type path = string
+
+val delayed_inbox : Kernel.t -> path
+
+(** [kernel_root_hash] is the path to the current kernel root hash. *)
+val kernel_root_hash : Kernel.t -> path
+
+(** [kernel_version] is the path to the current kernel version. *)
+val kernel_version : Kernel.t -> path
+
+(** [indexes] is the directory with all indexes category. *)
+val indexes : path
+
+(** [eth_accounts kernel] is the path to ethereum accounts. *)
+val eth_accounts : Kernel.t -> path
+
+(** [eth_account kernel addr] is the path to the [addr] account. The address
+    is "normalized", i.e. lowered and removed the prefix [0x] if it exists. *)
+val eth_account : Kernel.t -> string -> path
+
+(** [account_info kernel addr] is the path to the [addr] account's RLP-encoded info
+    (balance, nonce, code_hash). *)
+val account_info : Kernel.t -> string -> path
+
+(** [balance kernel addr] is the path to the [addr] account's balance. *)
+val balance : Kernel.t -> string -> path
+
+(** [nonce kernel addr] is the path to the [addr] account's nonce. *)
+val nonce : Kernel.t -> string -> path
+
+(** [code kernel addr] is the path to the [addr] account's code. *)
+val code : Kernel.t -> string -> path
+
+(** [storage kernel addr ?key ()] is the path to the [addr] storage's code. [key]
+    can be provided to get the path of a sub-element in the storage. *)
+val storage : Kernel.t -> string -> ?key:string -> unit -> path
+
+(** [admin] is the path to the administrator contract. *)
+val admin : Kernel.t -> path
+
+(** [kernel_governance] is the path to the kernel governance contract. *)
+val kernel_governance : Kernel.t -> path
+
+(** [kernel_security_governance] is the path to the security governance contract. *)
+val kernel_security_governance : Kernel.t -> path
+
+(** [sequencer_governance] is the path to the governance contract
+    administrating the sequencer. *)
+val sequencer_governance : path
+
+(** [ticketer] is the path to the ticketer contract. *)
+val ticketer : path
+
+(** [sequencer kernel] is the path to the sequencer key. It lives in the
+    world state for every kernel in the table: the move happened in V51
+    ([Storage_version.sequencer_key_storage_migrated_to_world_state]). *)
+val sequencer : Kernel.t -> path
+
+(** [sequencer_pool_address] is the path to the L2 address credited with DA fees. *)
+val sequencer_pool_address : path
+
+(** [dal_publishers_whitelist] is the path to the whitelist of authorized DAL publishers. *)
+val dal_publishers_whitelist : Kernel.t -> path
+
+(** [kernel_boot_wasm] is the path to the kernel `boot.wasm`. *)
+val kernel_boot_wasm : path
+
+(** [delayed_bridge_path] is the path to the delayed transaction bridge contract. *)
+val delayed_bridge_path : Kernel.t -> path
+
+(** [da_fee_per_byte_path] is the path to the da fee per byte, charged on every transaction. *)
+val da_fee_per_byte_path : path
+
+(** [minimum_base_fee_per_gas] is the path to the minimum base fee per gas the kernel will charge. *)
+val minimum_base_fee_per_gas : path
+
+(** [delayed_inbox_timeout] is the path to the timeout for
+    delayed transactions. *)
+val delayed_inbox_timeout : Kernel.t -> path
+
+(** [delayed_inbox_min_levels] is the path to the minimum number of L1 levels
+    needed to have passed to consider a timeout. *)
+val delayed_inbox_min_levels : Kernel.t -> path
+
+(** [reveal_config] is the path to the storage configuration. *)
+val reveal_config : Kernel.t -> path
+
+(** [enable_fa_bridge] is the path to the feature flag to activate the FA bridge. *)
+val enable_fa_bridge : Kernel.t -> path
+
+(** [enable_fast_withdrawal] is the path to the feature flag to activate fast withdrawals. *)
+val enable_fast_withdrawal : Kernel.t -> path
+
+(** [storage_version] is the path to the version of the storage used
+    by the kernel to detect if a storage migration is required. *)
+val storage_version : Kernel.t -> path
+
+(** [evm_node_flag kernel] is the path to the flag telling the kernel
+    it runs inside an EVM node rather than a rollup node. *)
+val evm_node_flag : Kernel.t -> path
+
+module Ticket_table : sig
+  (** [ticket_table kernel] returns the path to the ticket table. *)
+  val ticket_table : Kernel.t -> path
+
+  (** [balance kernel ~ticket_hash ~account] returns the path where the balance of
+      [account] of ticket [ticket_hash] is. *)
+  val balance : Kernel.t -> ticket_hash:path -> account:path -> path
+end
+
+module Ghostnet : sig
+  val eth_accounts : path
+
+  val eth_account : path -> path
+
+  val balance : path -> path
+
+  val code : path -> path
+
+  val storage : path -> ?key:path -> unit -> path
+
+  val da_fee_per_byte_path : path
+
+  val minimum_base_fee_per_gas : path
+end

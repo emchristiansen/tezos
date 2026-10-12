@@ -26,8 +26,6 @@
 open Protocol
 open Alpha_context
 
-type rollup_entity = {rollup : Tx_rollup.t; origination_level : int32 option}
-
 module EpoxyEntity = struct
   include Zk_rollup.Address
 
@@ -40,9 +38,11 @@ module EpoxyEntity = struct
     in
     return rollup
 
-  let to_source rollup = return (Zk_rollup.Address.to_b58check rollup)
+  let to_source rollup =
+    let open Lwt_result_syntax in
+    return (Zk_rollup.Address.to_b58check rollup)
 
   let name = "epoxy"
 end
 
-module EpoxyAlias = Client_aliases.Alias (EpoxyEntity)
+module Epoxy_alias = Client_aliases.Alias (EpoxyEntity)

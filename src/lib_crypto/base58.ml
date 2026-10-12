@@ -384,6 +384,10 @@ module Prefix = struct
 
   let bls12_381_public_key_hash = "\006\161\166" (* tz4(36) *)
 
+  let mldsa44_public_key_hash = "\006\161\169" (* tz5(36) *)
+
+  let smart_rollup_address = "\006\124\117" (* sr1(36) *)
+
   (* 16 *)
   let cryptobox_public_key_hash = "\153\103" (* id(30) *)
 
@@ -395,6 +399,14 @@ module Prefix = struct
   let secp256k1_secret_key = "\017\162\224\201" (* spsk(54) *)
 
   let p256_secret_key = "\016\081\238\189" (* p2sk(54) *)
+
+  let smart_rollup_commitment = "\017\165\134\138" (* src1(54) *)
+
+  let smart_rollup_state = "\017\165\235\240" (* srs1(54) *)
+
+  let smart_rollup_inbox = "\003\255\138\145\110" (* srib1(55) *)
+
+  let smart_rollup_merkelized_payload = "\003\255\138\145\140" (* srib2(55) *)
 
   (* 56 *)
   let ed25519_encrypted_seed = "\007\090\060\179\041" (* edesk(88) *)
@@ -452,4 +464,16 @@ module Prefix = struct
 
   (* 48 *)
   let slot_header = "\002\116\180" (* sh(74) *)
+
+  (* 1312 *)
+  let mldsa44_public_key = "\013\007\237\067" (* mdpk(1802) *)
+
+  (* 3872 *)
+  let mldsa44_secret_key = "\009\057\116\057" (* mdsk(5298) *)
+
+  (* 3896 *)
+  let mldsa44_encrypted_secret_key = "\005\049\133\039\172" (* mdesk(5332) *)
+
+  (* 2420 *)
+  let mldsa44_signature = "\001\156\045\210\003" (* mdsig(3316) *)
 end

@@ -73,7 +73,7 @@ let validation_passes =
   let open Alpha_context.Constants in
   Updater.
     [
-      (* 2048 endorsements *)
+      (* 2048 attestations *)
       {max_size = 2048 * 2048; max_op = Some 2048};
       (* 32k of voting operations *)
       {max_size = 32 * 1024; max_op = None};
@@ -86,42 +86,11 @@ let validation_passes =
       {max_size = 512 * 1024; max_op = None};
     ]
 
-let rpc_services =
-  Alpha_services.register () ;
-  Services_registration.get_rpc_services ()
+let rpc_services = RPC_directory.empty
 
 type validation_state = Validate.validation_state
 
 type application_state = Apply.application_state
-
-let init_allowed_consensus_operations ctxt ~endorsement_level
-    ~preendorsement_level =
-  let open Lwt_result_syntax in
-  let open Alpha_context in
-  let* ctxt = Delegate.prepare_stake_distribution ctxt in
-  let* ctxt, allowed_endorsements, allowed_preendorsements =
-    if Level.(endorsement_level = preendorsement_level) then
-      let* ctxt, slots =
-        Baking.endorsing_rights_by_first_slot ctxt endorsement_level
-      in
-      let consensus_operations = slots in
-      return (ctxt, consensus_operations, consensus_operations)
-    else
-      let* ctxt, endorsements =
-        Baking.endorsing_rights_by_first_slot ctxt endorsement_level
-      in
-      let* ctxt, preendorsements =
-        Baking.endorsing_rights_by_first_slot ctxt preendorsement_level
-      in
-      return (ctxt, endorsements, preendorsements)
-  in
-  let ctxt =
-    Consensus.initialize_consensus_operation
-      ctxt
-      ~allowed_endorsements
-      ~allowed_preendorsements
-  in
-  return ctxt
 
 (** Circumstances and relevant information for [begin_validation] and
     [begin_application] below. *)
@@ -138,6 +107,137 @@ type mode =
       timestamp : Time.t;
     }
 
+let can_contain_preattestations mode =
+  let open Result_syntax in
+  match mode with
+  | Construction _ | Partial_construction _ -> return_true
+  | Application block_header | Partial_validation block_header ->
+      (* A preexisting block, which has a complete and correct block
+         header, can only contain preattestations when the locked
+         round in the fitness has an actual value. *)
+      let* locked_round =
+        Alpha_context.Fitness.locked_round_from_raw block_header.shell.fitness
+      in
+      return (Option.is_some locked_round)
+
+let delegate_to_shard_count ctxt ~attested_levels =
+  let open Lwt_result_syntax in
+  let open Alpha_context in
+  let lags = Constants.dal_attestation_lags ctxt in
+  (* We are using a set here to de-duplicate the committee levels across
+     different attested levels and attestation lags. Indeed, repetition may
+     occur; for instance, if [attested_level] contains levels 10 and 11, and
+     [attestation_lags = [2;3;5]], then committee level 12 can be obtained as
+     both [10-2 + 5-1] and [11-3 + 5-1]. *)
+  let committee_levels =
+    List.fold_left
+      (fun acc attested_level ->
+        let attested_level = attested_level.Level.level in
+        let new_levels =
+          List.filter_map
+            (fun lag ->
+              let raw_level_opt =
+                Dal.committee_level_of ctxt ~attested_level ~lag
+              in
+              Option.map (Level.from_raw ctxt) raw_level_opt)
+            lags
+        in
+        Level.Set.union acc (Level.Set.of_list new_levels))
+      Level.Set.empty
+      attested_levels
+  in
+  Level.Set.fold_es
+    (fun committee_level (ctxt, dal_map) ->
+      let* ctxt, counts = Baking.delegate_to_shard_count ctxt committee_level in
+      return (ctxt, Raw_level.Map.add committee_level.level counts dal_map))
+    committee_levels
+    (ctxt, Raw_level.Map.empty)
+
+(** Initialize the consensus rights by first slot for modes that are
+    about the validation/application of a block: application, partial
+    validation, and full construction.
+
+    In these modes, attestations must point to the predecessor's level
+    and preattestations, if any, to the block's level. *)
+let init_consensus_rights_for_block ctxt mode ~predecessor_level =
+  let open Lwt_result_syntax in
+  let open Alpha_context in
+  let* ctxt, attestations_map =
+    Baking.attesting_rights_by_first_slot ctxt ~attested_level:predecessor_level
+  in
+  let*? can_contain_preattestations = can_contain_preattestations mode in
+  let current_level = Level.current ctxt in
+  (* Always compute preattestation rights for current_level, even when the block
+     cannot contain preattestations. This ensures the cache domain (specifically
+     `stake_info` for current_cycle) is populated deterministically regardless
+     of the application mode (Construction vs Application). Without this,
+     Construction mode always computes these rights while Application mode may
+     skip them when there is no locked round, causing divergent cache domains
+     and context hashes. *)
+  let* ctxt, preattestations_map =
+    Baking.attesting_rights_by_first_slot ctxt ~attested_level:current_level
+  in
+  let allowed_preattestations =
+    if can_contain_preattestations then Some preattestations_map else None
+  in
+  let* ctxt, delegate_to_shard_count =
+    delegate_to_shard_count ctxt ~attested_levels:[current_level]
+  in
+  let ctxt =
+    Consensus.initialize_consensus_operation
+      ctxt
+      ~allowed_attestations:(Some attestations_map)
+      ~allowed_preattestations
+      ~allowed_consensus:None
+      ~delegate_to_shard_count
+  in
+  return ctxt
+
+(** Initialize the consensus rights for a mempool (partial
+    construction mode).
+
+    In the mempool, there are three allowed levels for both
+    attestations and preattestations: [predecessor_level - 1] (aka the
+    grandparent's level), [predecessor_level] (that is, the level of
+    the mempool's head), and [predecessor_level + 1] (aka the current
+    level in ctxt). *)
+let init_consensus_rights_for_mempool ctxt ~predecessor_level =
+  let open Lwt_result_syntax in
+  let open Alpha_context in
+  (* For each allowed level, compute a map associating slots to their owners.
+     Only the lowest slot assigned to each delegate is included. *)
+  let allowed_levels =
+    let levels = [predecessor_level; Level.(succ ctxt predecessor_level)] in
+    match Level.pred ctxt predecessor_level with
+    | Some grandparent_level -> grandparent_level :: levels
+    | None -> levels
+  in
+  let* ctxt, minimal_slots =
+    List.fold_left_es
+      (fun (ctxt, minimal_slots) level ->
+        let* ctxt, level_minimal_slot =
+          Baking.attesting_rights_by_first_slot ctxt ~attested_level:level
+        in
+        return (ctxt, Level.Map.add level level_minimal_slot minimal_slots))
+      (ctxt, Level.Map.empty)
+      allowed_levels
+  in
+  let* ctxt, delegate_to_shard_count =
+    delegate_to_shard_count
+      ctxt
+      ~attested_levels:(List.map (Level.succ ctxt) allowed_levels)
+  in
+  let ctxt =
+    (* Store the resulting map in the context as [allowed_consensus]. *)
+    Consensus.initialize_consensus_operation
+      ctxt
+      ~allowed_attestations:None
+      ~allowed_preattestations:None
+      ~allowed_consensus:(Some minimal_slots)
+      ~delegate_to_shard_count
+  in
+  return ctxt
+
 let prepare_ctxt ctxt mode ~(predecessor : Block_header.shell_header) =
   let open Lwt_result_syntax in
   let open Alpha_context in
@@ -153,31 +253,19 @@ let prepare_ctxt ctxt mode ~(predecessor : Block_header.shell_header) =
   in
   let*? predecessor_raw_level = Raw_level.of_int32 predecessor.level in
   let predecessor_level = Level.from_raw ctxt predecessor_raw_level in
-  (* During block (full or partial) application or full construction,
-     endorsements must be for [predecessor_level] and preendorsements,
-     if any, for the block's level. In the mempool (partial
-     construction), only consensus operations for [predecessor_level]
-     (that is, head's level) are allowed (except for grandparent
-     endorsements, which are handled differently). *)
-  let preendorsement_level =
+  let* ctxt = Delegate.prepare_stake_distribution ctxt in
+  let* ctxt =
     match mode with
     | Application _ | Partial_validation _ | Construction _ ->
-        Level.current ctxt
-    | Partial_construction _ -> predecessor_level
+        init_consensus_rights_for_block ctxt mode ~predecessor_level
+    | Partial_construction _ ->
+        init_consensus_rights_for_mempool ctxt ~predecessor_level
   in
-  let* ctxt =
-    init_allowed_consensus_operations
-      ctxt
-      ~endorsement_level:predecessor_level
-      ~preendorsement_level
-  in
-  Dal_apply.initialisation ~level:predecessor_level ctxt >>=? fun ctxt ->
   return
     ( ctxt,
       migration_balance_updates,
       migration_operation_results,
-      predecessor_level,
-      predecessor_raw_level )
+      predecessor_level )
 
 let begin_validation ctxt chain_id mode ~predecessor =
   let open Lwt_result_syntax in
@@ -185,8 +273,7 @@ let begin_validation ctxt chain_id mode ~predecessor =
   let* ( ctxt,
          _migration_balance_updates,
          _migration_operation_results,
-         predecessor_level,
-         _predecessor_raw_level ) =
+         predecessor_level ) =
     prepare_ctxt ctxt ~predecessor mode
   in
   let predecessor_timestamp = predecessor.timestamp in
@@ -230,16 +317,12 @@ let begin_validation ctxt chain_id mode ~predecessor =
         block_header_data.contents
   | Partial_construction _ ->
       let*? predecessor_round = Fitness.round_from_raw predecessor_fitness in
-      let*? grandparent_round =
-        Fitness.predecessor_round_from_raw predecessor_fitness
-      in
       return
         (Validate.begin_partial_construction
            ctxt
            chain_id
            ~predecessor_level
-           ~predecessor_round
-           ~grandparent_round)
+           ~predecessor_round)
 
 let validate_operation = Validate.validate_operation
 
@@ -270,8 +353,7 @@ let begin_application ctxt chain_id mode ~predecessor =
   let* ( ctxt,
          migration_balance_updates,
          migration_operation_results,
-         predecessor_level,
-         predecessor_raw_level ) =
+         predecessor_level ) =
     prepare_ctxt ctxt ~predecessor mode
   in
   let predecessor_timestamp = predecessor.timestamp in
@@ -305,7 +387,6 @@ let begin_application ctxt chain_id mode ~predecessor =
         chain_id
         ~migration_balance_updates
         ~migration_operation_results
-        ~predecessor_level:predecessor_raw_level
         ~predecessor_hash
         ~predecessor_fitness
 
@@ -317,80 +398,97 @@ let compare_operations (oph1, op1) (oph2, op2) =
   Alpha_context.Operation.compare (oph1, op1) (oph2, op2)
 
 let init chain_id ctxt block_header =
+  let open Lwt_result_syntax in
   let level = block_header.Block_header.level in
   let timestamp = block_header.timestamp in
   let predecessor = block_header.predecessor in
-  let typecheck (ctxt : Alpha_context.context) (script : Alpha_context.Script.t)
-      =
-    let allow_forged_in_storage =
-      false
+  let typecheck_smart_contract (ctxt : Alpha_context.context)
+      (script : Alpha_context.Script.michelson_with_storage) =
+    let allow_forged_tickets_in_storage, allow_forged_lazy_storage_id_in_storage
+        =
+      (false, false)
       (* There should be no forged value in bootstrap contracts. *)
     in
-    Script_ir_translator.parse_script
-      ctxt
-      ~elab_conf:Script_ir_translator_config.(make ~legacy:true ())
-      ~allow_forged_in_storage
-      script
-    >>=? fun (Ex_script (Script parsed_script), ctxt) ->
-    Script_ir_translator.extract_lazy_storage_diff
-      ctxt
-      Optimized
-      parsed_script.storage_type
-      parsed_script.storage
-      ~to_duplicate:Script_ir_translator.no_lazy_storage_id
-      ~to_update:Script_ir_translator.no_lazy_storage_id
-      ~temporary:false
-    >>=? fun (storage, lazy_storage_diff, ctxt) ->
-    Script_ir_translator.unparse_data
-      ctxt
-      Optimized
-      parsed_script.storage_type
-      storage
-    >|=? fun (storage, ctxt) ->
+    let* Ex_script (Script parsed_script), ctxt =
+      Script_ir_translator.parse_script
+        ctxt
+        ~elab_conf:Script_ir_translator_config.(make ~legacy:true ())
+        ~allow_forged_tickets_in_storage
+        ~allow_forged_lazy_storage_id_in_storage
+        (Alpha_context.Script.Script script)
+    in
+    let* storage, lazy_storage_diff, ctxt =
+      Script_ir_translator.extract_lazy_storage_diff
+        ctxt
+        Optimized
+        parsed_script.storage_type
+        parsed_script.storage
+        ~to_duplicate:Script_ir_translator.no_lazy_storage_id
+        ~to_update:Script_ir_translator.no_lazy_storage_id
+        ~temporary:false
+    in
+    let+ storage, ctxt =
+      Script_ir_translator.unparse_data
+        ctxt
+        Optimized
+        parsed_script.storage_type
+        storage
+    in
     let storage = Alpha_context.Script.lazy_expr storage in
     (({script with storage}, lazy_storage_diff), ctxt)
   in
   (* The cache must be synced at the end of block validation, so we do
      so here for the first block in a protocol where `finalize_block`
      is not called. *)
-  Alpha_context.Raw_level.of_int32 level >>?= fun raw_level ->
+  let*? raw_level = Alpha_context.Raw_level.of_int32 level in
   let init_fitness =
     Alpha_context.Fitness.create_without_locked_round
       ~level:raw_level
       ~round:Alpha_context.Round.zero
       ~predecessor_round:Alpha_context.Round.zero
   in
-  Alpha_context.prepare_first_block
-    chain_id
-    ~typecheck
-    ~level
-    ~timestamp
-    ~predecessor
-    ctxt
-  >>=? fun ctxt ->
+  let* ctxt =
+    Alpha_context.prepare_first_block
+      chain_id
+      ~typecheck_smart_contract
+      ~typecheck_smart_rollup:
+        Sc_rollup_operations.validate_untyped_parameters_ty
+      ~level
+      ~timestamp
+      ~predecessor
+      ctxt
+  in
   let cache_nonce =
     Alpha_context.Cache.cache_nonce_from_block_header
+      ~round:Alpha_context.Round.zero
       block_header
       ({
          payload_hash = Block_payload_hash.zero;
          payload_round = Alpha_context.Round.zero;
-         liquidity_baking_toggle_vote = Alpha_context.Liquidity_baking.LB_pass;
+         per_block_votes =
+           {
+             liquidity_baking_vote =
+               Alpha_context.Per_block_votes.Per_block_vote_pass;
+           };
          seed_nonce_hash = None;
          proof_of_work_nonce =
            Bytes.make Constants_repr.proof_of_work_nonce_size '0';
        }
         : Alpha_context.Block_header.contents)
   in
-  Alpha_context.Cache.Admin.sync ctxt cache_nonce >>= fun ctxt ->
+  let*! ctxt = Alpha_context.Cache.Admin.sync ctxt cache_nonce in
   return
     (Alpha_context.finalize ctxt (Alpha_context.Fitness.to_raw init_fitness))
 
 let value_of_key ~chain_id:_ ~predecessor_context:ctxt ~predecessor_timestamp
     ~predecessor_level:pred_level ~predecessor_fitness:_ ~predecessor:_
     ~timestamp =
+  let open Lwt_result_syntax in
   let level = Int32.succ pred_level in
-  Alpha_context.prepare ctxt ~level ~predecessor_timestamp ~timestamp
-  >>=? fun (ctxt, _, _) -> return (Apply.value_of_key ctxt)
+  let* ctxt, _, _ =
+    Alpha_context.prepare ctxt ~level ~predecessor_timestamp ~timestamp
+  in
+  return (Apply.value_of_key ctxt)
 
 module Mempool = struct
   include Mempool_validation
@@ -401,8 +499,7 @@ module Mempool = struct
     let* ( ctxt,
            _migration_balance_updates,
            _migration_operation_results,
-           head_level,
-           _head_raw_level ) =
+           head_level ) =
       (* We use Partial_construction to factorize the [prepare_ctxt]. *)
       prepare_ctxt
         ctxt
@@ -411,15 +508,13 @@ module Mempool = struct
         ~predecessor:head
     in
     let*? predecessor_round = Fitness.round_from_raw head.fitness in
-    let*? grandparent_round = Fitness.predecessor_round_from_raw head.fitness in
     return
       (init
          ctxt
          chain_id
          ~predecessor_level:head_level
          ~predecessor_round
-         ~predecessor_hash:head_hash
-         ~grandparent_round)
+         ~predecessor_hash:head_hash)
 end
 
 (* Vanity nonce: TBD *)

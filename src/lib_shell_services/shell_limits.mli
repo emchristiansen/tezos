@@ -55,10 +55,6 @@ type prevalidator_limits = {
   operations_batch_size : int;
       (** Maximum number of pending operations processed (or classified) at the
           end of each request to the prevalidator worker. Default is [50] *)
-  disable_precheck : bool;
-      (** If [disable_precheck] is [true] (default is [false]) operations are
-          executed by the protocol before being propagated. This flag is
-          intended to be used for testing and debugging. *)
 }
 
 (** Sane default values for {!limits} *)
@@ -97,12 +93,18 @@ val default_chain_validator_limits : chain_validator_limits
 
 val chain_validator_limits_encoding : chain_validator_limits Data_encoding.t
 
+val default_disable_context_pruning : bool
+
+val default_storage_maintenance_delay : Storage_maintenance.delay
+
 type limits = {
   block_validator_limits : block_validator_limits;
   prevalidator_limits : prevalidator_limits;
   peer_validator_limits : peer_validator_limits;
   chain_validator_limits : chain_validator_limits;
   history_mode : History_mode.t option;
+  disable_context_pruning : bool option;
+  storage_maintenance_delay : Storage_maintenance.delay option;
 }
 
 val default_limits : limits

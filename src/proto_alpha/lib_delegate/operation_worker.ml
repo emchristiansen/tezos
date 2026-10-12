@@ -26,6 +26,7 @@
 open Protocol_client_context
 open Protocol
 open Alpha_context
+module Profiler = Baking_profiler.Operation_worker_profiler
 
 module Events = struct
   include Internal_event.Simple
@@ -34,14 +35,37 @@ module Events = struct
 
   let pp_int = Format.pp_print_int
 
-  let loop_failed =
+  let pp_int_64 fmt = Format.fprintf fmt "%Ld"
+
+  let node_unreachable_crash =
+    declare_0
+      ~section
+      ~name:"node_unreachable_crash"
+      ~level:Error
+      ~msg:
+        "Node unreachable via the monitor_operations RPC. Unable to monitor \
+         quorum. Shutting down baker..."
+      ()
+
+  let monitor_operations_retry =
     declare_1
       ~section
-      ~name:"loop_failed"
-      ~level:Error
-      ~msg:"loop failed with {trace}"
-      ~pp1:Error_monad.pp_print_trace
-      ("trace", Error_monad.trace_encoding)
+      ~name:"monitor_operations_retry"
+      ~level:Warning
+      ~msg:"{msg}"
+      ~pp1:Format.pp_print_string
+      ("msg", Data_encoding.string)
+
+  let monitor_operations_stream_timeout =
+    declare_1
+      ~section
+      ~name:"monitor_operations_stream_timeout"
+      ~level:Warning
+      ~msg:
+        "No data received from monitor_operations RPC for {timeout} seconds. \
+         Assuming the stream is stalled and refreshing it."
+      ~pp1:Format.pp_print_float
+      ("timeout", Data_encoding.float)
 
   let ended =
     declare_1
@@ -55,61 +79,95 @@ module Events = struct
     declare_2
       ~section
       ~name:"pqc_reached"
-      ~level:Debug
+      ~level:Info
       ~msg:
-        "prequorum reached (voting power: {voting_power}, {preendorsements} \
-         preendorsements)"
-      ~pp1:pp_int
-      ("voting_power", Data_encoding.int31)
+        "prequorum reached (voting power: {voting_power}, {preattestations} \
+         preattestations)"
+      ~pp1:pp_int_64
+      ("voting_power", Data_encoding.int64)
       ~pp2:pp_int
-      ("preendorsements", Data_encoding.int31)
+      ("preattestations", Data_encoding.int31)
 
-  let preendorsements_received =
+  let non_relevant_operation_received =
+    declare_0
+      ~section
+      ~name:"non_relevant_operation_received"
+      ~level:Debug
+      ~msg:"received a non relevant operation"
+      ()
+
+  let preattestations_received =
     declare_4
       ~section
-      ~name:"preendorsements_received"
+      ~name:"preattestations_received"
       ~level:Debug
       ~msg:
-        "received {count} preendorsements (power: {delta_power}) (total voting \
-         power: {voting_power}, {preendorsements} preendorsements)"
+        "received {count} preattestations (power: {delta_power}) (total voting \
+         power: {voting_power}, {preattestations} preattestations)"
       ~pp1:pp_int
       ("count", Data_encoding.int31)
-      ~pp2:pp_int
-      ("delta_power", Data_encoding.int31)
-      ~pp3:pp_int
-      ("voting_power", Data_encoding.int31)
+      ~pp2:pp_int_64
+      ("delta_power", Data_encoding.int64)
+      ~pp3:pp_int_64
+      ("voting_power", Data_encoding.int64)
       ~pp4:pp_int
-      ("preendorsements", Data_encoding.int31)
+      ("preattestations", Data_encoding.int31)
+
+  let pqc_progression =
+    declare_2
+      ~section
+      ~name:"pqc_progression"
+      ~level:Info
+      ~msg:
+        "preattesting voting power at {quorum_progression}% of the stake with \
+         {preattestations} preattestations"
+      ~pp1:pp_int
+      ("quorum_progression", Data_encoding.int31)
+      ~pp2:pp_int
+      ("preattestations", Data_encoding.int31)
 
   let qc_reached =
     declare_2
       ~section
       ~name:"qc_reached"
-      ~level:Debug
+      ~level:Info
       ~msg:
-        "quorum reached (voting power: {voting_power}, {endorsements} \
-         endorsements)"
-      ~pp1:pp_int
-      ("voting_power", Data_encoding.int31)
+        "quorum reached (voting power: {voting_power}, {attestations} \
+         attestations)"
+      ~pp1:pp_int_64
+      ("voting_power", Data_encoding.int64)
       ~pp2:pp_int
-      ("endorsements", Data_encoding.int31)
+      ("attestations", Data_encoding.int31)
 
-  let endorsements_received =
+  let attestations_received =
     declare_4
       ~section
-      ~name:"endorsements_received"
+      ~name:"attestations_received"
       ~level:Debug
       ~msg:
-        "received {count} endorsements (power: {delta_power}) (total voting \
-         power: {voting_power}, {endorsements} endorsements)"
+        "received {count} attestations (power: {delta_power}) (total voting \
+         power: {voting_power}, {attestations} attestations)"
       ~pp1:pp_int
       ("count", Data_encoding.int31)
-      ~pp2:pp_int
-      ("delta_power", Data_encoding.int31)
-      ~pp3:pp_int
-      ("voting_power", Data_encoding.int31)
+      ~pp2:pp_int_64
+      ("delta_power", Data_encoding.int64)
+      ~pp3:pp_int_64
+      ("voting_power", Data_encoding.int64)
       ~pp4:pp_int
-      ("endorsements", Data_encoding.int31)
+      ("attestations", Data_encoding.int31)
+
+  let qc_progression =
+    declare_2
+      ~section
+      ~name:"qc_progression"
+      ~level:Info
+      ~msg:
+        "attesting voting power at {quorum_progression}% of the stake with \
+         {attestations} attestations"
+      ~pp1:pp_int
+      ("quorum_progression", Data_encoding.int31)
+      ~pp2:pp_int
+      ("attestations", Data_encoding.int31)
 
   let starting_new_monitoring =
     declare_0
@@ -117,6 +175,14 @@ module Events = struct
       ~name:"starting_new_monitoring"
       ~level:Debug
       ~msg:"starting new monitoring"
+      ()
+
+  let resetting_monitoring =
+    declare_0
+      ~section
+      ~name:"resetting_monitoring"
+      ~level:Debug
+      ~msg:"resetting monitoring after a mempool flush"
       ()
 
   let end_of_stream =
@@ -139,43 +205,118 @@ end
 
 type candidate = {
   hash : Block_hash.t;
+  level_watched : Int32.t;
   round_watched : Round.t;
   payload_hash_watched : Block_payload_hash.t;
+  branch_watched : Block_hash.t option;
 }
 
 let candidate_encoding =
   let open Data_encoding in
   conv
-    (fun {hash; round_watched; payload_hash_watched} ->
-      (hash, round_watched, payload_hash_watched))
-    (fun (hash, round_watched, payload_hash_watched) ->
-      {hash; round_watched; payload_hash_watched})
-    (obj3
+    (fun {
+           hash;
+           level_watched;
+           round_watched;
+           payload_hash_watched;
+           branch_watched;
+         }
+       ->
+      (hash, level_watched, round_watched, payload_hash_watched, branch_watched))
+    (fun ( hash,
+           level_watched,
+           round_watched,
+           payload_hash_watched,
+           branch_watched )
+       ->
+      {hash; level_watched; round_watched; payload_hash_watched; branch_watched})
+    (obj5
        (req "hash" Block_hash.encoding)
+       (req "level_watched" int32)
        (req "round_watched" Round.encoding)
-       (req "payload_hash_watched" Block_payload_hash.encoding))
+       (req "payload_hash_watched" Block_payload_hash.encoding)
+       (req "branch_watched" (option Block_hash.encoding)))
 
 type event =
-  | Prequorum_reached of candidate * Kind.preendorsement operation list
-  | Quorum_reached of candidate * Kind.endorsement operation list
+  | Prequorum_reached of candidate * Kind.preattestation operation list
+  | Quorum_reached of candidate * Kind.attestation operation list
+  | Shutdown
+
+let compare_consensus_contents (op1 : consensus_content)
+    (op2 : consensus_content) =
+  Compare.or_else (Raw_level.compare op1.level op2.level) @@ fun () ->
+  Compare.or_else (Round.compare op1.round op2.round) @@ fun () ->
+  Compare.or_else (Slot.compare op1.slot op2.slot) @@ fun () ->
+  Block_payload_hash.compare op1.block_payload_hash op2.block_payload_hash
+
+module Preattestation_set = Set.Make (struct
+  type t = Kind.preattestation operation
+
+  let compare
+      ({protocol_data = {contents = Single (Preattestation op1); _}; shell = _} :
+        t)
+      ({protocol_data = {contents = Single (Preattestation op2); _}; shell = _} :
+        t) =
+    compare_consensus_contents op1 op2
+end)
+
+module Attestation_set = Set.Make (struct
+  type t = Kind.attestation operation
+
+  let compare
+      ({
+         protocol_data =
+           {
+             contents =
+               Single (Attestation {consensus_content = op1; dal_content = _});
+             _;
+           };
+         shell = _;
+       } :
+        t)
+      ({
+         protocol_data =
+           {
+             contents =
+               Single (Attestation {consensus_content = op2; dal_content = _});
+             _;
+           };
+         shell = _;
+       } :
+        t) =
+    (* We do not consider the DAL content (therefore two attestations with the
+       same consensus content but different DAL content are considered equal),
+       in order to correctly count the voting power. Note however that there
+       should be no such operations in the mempool in the first place. *)
+    compare_consensus_contents op1 op2
+end)
 
 type pqc_watched = {
   candidate_watched : candidate;
-  get_preendorsement_voting_power : slot:Slot.t -> int;
-  consensus_threshold : int;
-  mutable current_voting_power : int;
-  mutable preendorsements_received : Kind.preendorsement operation list;
-  mutable preendorsements_count : int;
+  get_slot_voting_power : slot:Slot.t -> int64 option;
+  consensus_threshold : int64;
+  consensus_committee : int64;
+  mutable current_voting_power : int64;
+  mutable preattestations_received : Preattestation_set.t;
+  mutable preattestations_count : int;
+  mutable previous_prequorum_progression : int;
 }
 
 type qc_watched = {
   candidate_watched : candidate;
-  get_endorsement_voting_power : slot:Slot.t -> int;
-  consensus_threshold : int;
-  mutable current_voting_power : int;
-  mutable endorsements_received : Kind.endorsement operation list;
-  mutable endorsements_count : int;
+  get_slot_voting_power : slot:Slot.t -> int64 option;
+  consensus_threshold : int64;
+  consensus_committee : int64;
+  mutable current_voting_power : int64;
+  mutable attestations_received : Attestation_set.t;
+  mutable attestations_count : int;
+  mutable previous_quorum_progression : int;
 }
+
+(* [quorum_progression_increment] is a constant used to output an event only if
+   the quorum progression has progressed of at least
+   [quorum_progression_increment] since the last output *)
+let quorum_progression_increment = 10
 
 type watch_kind = Pqc_watch of pqc_watched | Qc_watch of qc_watched
 
@@ -194,26 +335,29 @@ type t = {
 }
 
 let monitor_operations (cctxt : #Protocol_client_context.full) =
-  Alpha_block_services.Mempool.monitor_operations
-    cctxt
-    ~chain:cctxt#chain
-    ~applied:true
-    ~branch_delayed:true
-    ~branch_refused:false
-    ~refused:false
-    ()
-  >>=? fun (operation_stream, stream_stopper) ->
+  let open Lwt_result_syntax in
+  let* operation_stream, stream_stopper =
+    (Alpha_block_services.Mempool.monitor_operations
+       cctxt
+       ~chain:cctxt#chain
+       ~validated:true
+       ~branch_delayed:true
+       ~branch_refused:false
+       ~refused:false
+       () [@profiler.record_s {verbosity = Info} "monitor_operations RPC"])
+  in
   let operation_stream =
     Lwt_stream.map
       (fun ops -> List.map (fun ((_, op), _) -> op) ops)
       operation_stream
   in
-  Shell_services.Blocks.Header.shell_header
-    cctxt
-    ~chain:cctxt#chain
-    ~block:(`Head 0)
-    ()
-  >>=? fun shell_header ->
+  let* shell_header =
+    (Node_rpc.shell_header
+       cctxt
+       ~chain:cctxt#chain
+       ~block:(`Head 0)
+       () [@profiler.record_s {verbosity = Info} "shell_header RPC"])
+  in
   let round =
     match Fitness.(round_from_raw shell_header.fitness) with
     | Ok r -> r
@@ -238,154 +382,273 @@ let make_initial_state ?(monitor_node_operations = true) () =
     monitor_node_operations;
   }
 
-let is_valid_consensus_content (candidate : candidate) consensus_content =
-  let {hash = _; round_watched; payload_hash_watched} = candidate in
-  Round.equal consensus_content.round round_watched
+let is_eligible (candidate : candidate) branch consensus_content =
+  let {
+    hash = _;
+    level_watched;
+    round_watched;
+    payload_hash_watched;
+    branch_watched;
+  } =
+    candidate
+  in
+  Int32.equal (Raw_level.to_int32 consensus_content.level) level_watched
+  && Round.equal consensus_content.round round_watched
   && Block_payload_hash.equal
        consensus_content.block_payload_hash
        payload_hash_watched
+  && Option.fold
+       ~none:true
+       ~some:(fun branch' -> Block_hash.(branch = branch'))
+       branch_watched
 
 let cancel_monitoring state = state.proposal_watched <- None
 
 let reset_monitoring state =
+  let open Lwt_syntax in
   Lwt_mutex.with_lock state.lock @@ fun () ->
+  let* () = Events.(emit resetting_monitoring ()) in
   match state.proposal_watched with
-  | None -> Lwt.return_unit
+  | None -> return_unit
   | Some (Pqc_watch pqc_watched) ->
-      pqc_watched.current_voting_power <- 0 ;
-      pqc_watched.preendorsements_count <- 0 ;
-      pqc_watched.preendorsements_received <- [] ;
-      Lwt.return_unit
+      pqc_watched.current_voting_power <- 0L ;
+      pqc_watched.preattestations_count <- 0 ;
+      pqc_watched.preattestations_received <- Preattestation_set.empty ;
+      pqc_watched.previous_prequorum_progression <- 0 ;
+      return_unit
   | Some (Qc_watch qc_watched) ->
-      qc_watched.current_voting_power <- 0 ;
-      qc_watched.endorsements_count <- 0 ;
-      qc_watched.endorsements_received <- [] ;
-      Lwt.return_unit
+      qc_watched.current_voting_power <- 0L ;
+      qc_watched.attestations_count <- 0 ;
+      qc_watched.attestations_received <- Attestation_set.empty ;
+      qc_watched.previous_quorum_progression <- 0 ;
+      return_unit
 
+(** [update_pqc_monitoring ~pqc_watched ops] incorporates fresh preattestation
+    found in [ops] into [pqc_watched].
+
+    @return [(voting_power, count)], where [count] is the number of new
+    preattestations added, and [voting_power] is the amount of additional voting
+    power contributed by these.
+*)
+let update_pqc_monitoring ~pqc_watched ops =
+  let {
+    candidate_watched;
+    get_slot_voting_power;
+    current_voting_power;
+    preattestations_received;
+    preattestations_count;
+    _;
+  } =
+    pqc_watched
+  in
+  let preattestations = Operation_pool.filter_preattestations ops in
+  let fresh_preattestations =
+    List.filter
+      (fun op -> not (Preattestation_set.mem op preattestations_received))
+      preattestations
+  in
+  List.iter
+    (function
+      | ({
+           protocol_data =
+             {contents = Single (Preattestation consensus_content); _};
+           shell = {branch};
+         } as op :
+          Kind.preattestation Operation.t) -> (
+          if is_eligible candidate_watched branch consensus_content then
+            match get_slot_voting_power ~slot:consensus_content.slot with
+            | Some op_power ->
+                pqc_watched.preattestations_received <-
+                  Preattestation_set.add op pqc_watched.preattestations_received ;
+                pqc_watched.preattestations_count <-
+                  succ pqc_watched.preattestations_count ;
+                pqc_watched.current_voting_power <-
+                  Int64.add pqc_watched.current_voting_power op_power
+            | None ->
+                (* preattestations that do not use the first slot of a
+                   delegate are not added to the quorum *)
+                ()))
+    fresh_preattestations ;
+  let additional_voting_power =
+    Int64.sub pqc_watched.current_voting_power current_voting_power
+  in
+  let additional_preattestations_count =
+    pqc_watched.preattestations_count - preattestations_count
+  in
+  (additional_voting_power, additional_preattestations_count)
+
+(** [update_qc_monitoring ~qc_watched ops] incorporates fresh attestation
+    found in [ops] into [qc_watched].
+
+    @return [(voting_power, count)], where [count] is the number of new
+    attestations added, and [voting_power] is the amount of additional voting
+    power contributed by these.
+*)
+let update_qc_monitoring ~qc_watched ops =
+  let {
+    candidate_watched;
+    get_slot_voting_power;
+    current_voting_power;
+    attestations_received;
+    attestations_count;
+    _;
+  } =
+    qc_watched
+  in
+  let attestations = Operation_pool.filter_attestations ops in
+  let fresh_attestations =
+    List.filter
+      (fun op -> not (Attestation_set.mem op attestations_received))
+      attestations
+  in
+  List.iter
+    (function
+      | ({
+           protocol_data =
+             {contents = Single (Attestation {consensus_content; _}); _};
+           shell = {branch};
+         } as op :
+          Kind.attestation Operation.t) -> (
+          if is_eligible candidate_watched branch consensus_content then
+            match get_slot_voting_power ~slot:consensus_content.slot with
+            | Some op_power ->
+                qc_watched.attestations_received <-
+                  Attestation_set.add op qc_watched.attestations_received ;
+                qc_watched.attestations_count <-
+                  succ qc_watched.attestations_count ;
+                qc_watched.current_voting_power <-
+                  Int64.add qc_watched.current_voting_power op_power
+            | None ->
+                (* attestations that do not use the first slot of a delegate
+                   are not added to the quorum *)
+                ()))
+    fresh_attestations ;
+  let additional_voting_power =
+    Int64.sub qc_watched.current_voting_power current_voting_power
+  in
+  let additional_attestations_count =
+    qc_watched.attestations_count - attestations_count
+  in
+  (additional_voting_power, additional_attestations_count)
+
+(** [update_monitoring ?should_lock state ops] incorporates fresh
+    (pre)attestations operations found in [ops] into [state.proposal_watched].
+    If a (pre)quorum is reached, a new event is emitted through
+    [state.quorum_event_stream].
+    Does nothing if [state.proposal_watched] is None.
+*)
 let update_monitoring ?(should_lock = true) state ops =
+  let open Lwt_syntax in
   (if should_lock then Lwt_mutex.with_lock state.lock else fun f -> f ())
   @@ fun () ->
   (* If no block is watched, don't do anything *)
   match state.proposal_watched with
-  | None -> Lwt.return_unit
-  | Some
-      (Pqc_watch
-        ({
-           candidate_watched;
-           get_preendorsement_voting_power;
-           consensus_threshold;
-           _;
-         } as proposal_watched)) ->
-      let preendorsements = Operation_pool.filter_preendorsements ops in
-      let preendorsements_count, voting_power =
-        List.fold_left
-          (fun (count, power) (op : Kind.preendorsement Operation.t) ->
-            let {
-              shell = _;
-              protocol_data =
-                {contents = Single (Preendorsement consensus_content); _};
-              _;
-            } =
-              op
-            in
-            if is_valid_consensus_content candidate_watched consensus_content
-            then (
-              let op_power =
-                get_preendorsement_voting_power ~slot:consensus_content.slot
-              in
-              proposal_watched.current_voting_power <-
-                proposal_watched.current_voting_power + op_power ;
-              proposal_watched.preendorsements_received <-
-                op :: proposal_watched.preendorsements_received ;
-              proposal_watched.preendorsements_count <-
-                proposal_watched.preendorsements_count + 1 ;
-              (count + 1, power + op_power))
-            else (count, power))
-          (0, 0)
-          preendorsements
+  | None -> return_unit
+  | Some (Pqc_watch pqc_watched) ->
+      let additional_voting_power, additional_preattestations_count =
+        update_pqc_monitoring ~pqc_watched ops
       in
-      if proposal_watched.current_voting_power >= consensus_threshold then (
-        Events.(
-          emit
-            pqc_reached
-            ( proposal_watched.current_voting_power,
-              proposal_watched.preendorsements_count ))
-        >>= fun () ->
+      if pqc_watched.current_voting_power >= pqc_watched.consensus_threshold
+      then (
+        let* () =
+          Events.(
+            emit
+              pqc_reached
+              ( pqc_watched.current_voting_power,
+                pqc_watched.preattestations_count ))
+        in
         state.qc_event_stream.push
           (Some
              (Prequorum_reached
-                ( candidate_watched,
-                  List.rev proposal_watched.preendorsements_received ))) ;
+                ( pqc_watched.candidate_watched,
+                  Preattestation_set.elements
+                    pqc_watched.preattestations_received ))) ;
         (* Once the event has been emitted, we cancel the monitoring *)
         cancel_monitoring state ;
-        Lwt.return_unit)
+        return_unit)
       else
-        Events.(
-          emit
-            preendorsements_received
-            ( preendorsements_count,
-              voting_power,
-              proposal_watched.current_voting_power,
-              proposal_watched.preendorsements_count ))
-  | Some
-      (Qc_watch
-        ({
-           candidate_watched;
-           get_endorsement_voting_power;
-           consensus_threshold;
-           _;
-         } as proposal_watched)) ->
-      let endorsements = Operation_pool.filter_endorsements ops in
-      let endorsements_count, voting_power =
-        List.fold_left
-          (fun (count, power) (op : Kind.endorsement Operation.t) ->
-            let {
-              shell = _;
-              protocol_data =
-                {contents = Single (Endorsement consensus_content); _};
-              _;
-            } =
-              op
-            in
-            if is_valid_consensus_content candidate_watched consensus_content
-            then (
-              let op_power =
-                get_endorsement_voting_power ~slot:consensus_content.slot
-              in
-              proposal_watched.current_voting_power <-
-                proposal_watched.current_voting_power + op_power ;
-              proposal_watched.endorsements_received <-
-                op :: proposal_watched.endorsements_received ;
-              proposal_watched.endorsements_count <-
-                proposal_watched.endorsements_count + 1 ;
-              (count + 1, power + op_power))
-            else (count, power))
-          (0, 0)
-          endorsements
+        let* () =
+          let current_ratio =
+            Int64.(
+              div
+                (mul pqc_watched.current_voting_power 100L)
+                pqc_watched.consensus_committee
+              |> to_int)
+          in
+          (* We only want to output an event if the quorum progression has
+             progressed of at least [quorum_progression_increment] *)
+          if
+            current_ratio
+            > pqc_watched.previous_prequorum_progression
+              + quorum_progression_increment
+          then (
+            pqc_watched.previous_prequorum_progression <- current_ratio ;
+            Events.(
+              emit
+                pqc_progression
+                (current_ratio, pqc_watched.preattestations_count)))
+          else return_unit
+        in
+        if additional_preattestations_count = 0 then
+          Events.(emit non_relevant_operation_received ())
+        else
+          Events.(
+            emit
+              preattestations_received
+              ( additional_preattestations_count,
+                additional_voting_power,
+                pqc_watched.current_voting_power,
+                pqc_watched.preattestations_count ))
+  | Some (Qc_watch qc_watched) ->
+      let additional_voting_power, additional_attestations_count =
+        update_qc_monitoring ~qc_watched ops
       in
-      if proposal_watched.current_voting_power >= consensus_threshold then (
-        Events.(
-          emit
-            qc_reached
-            ( proposal_watched.current_voting_power,
-              proposal_watched.endorsements_count ))
-        >>= fun () ->
+      if qc_watched.current_voting_power >= qc_watched.consensus_threshold then (
+        let* () =
+          Events.(
+            emit
+              qc_reached
+              (qc_watched.current_voting_power, qc_watched.attestations_count))
+        in
         state.qc_event_stream.push
           (Some
              (Quorum_reached
-                ( candidate_watched,
-                  List.rev proposal_watched.endorsements_received ))) ;
+                ( qc_watched.candidate_watched,
+                  Attestation_set.elements qc_watched.attestations_received ))) ;
         (* Once the event has been emitted, we cancel the monitoring *)
         cancel_monitoring state ;
-        Lwt.return_unit)
+        return_unit)
       else
-        Events.(
-          emit
-            endorsements_received
-            ( endorsements_count,
-              voting_power,
-              proposal_watched.current_voting_power,
-              proposal_watched.endorsements_count ))
+        let* () =
+          let current_ratio =
+            Int64.(
+              div
+                (mul qc_watched.current_voting_power 100L)
+                qc_watched.consensus_committee
+              |> to_int)
+          in
+          (* We only want to output an event if the quorum progression has
+             progressed of at least [quorum_progression_increment] *)
+          if
+            current_ratio
+            > qc_watched.previous_quorum_progression
+              + quorum_progression_increment
+          then (
+            qc_watched.previous_quorum_progression <- current_ratio ;
+            Events.(
+              emit qc_progression (current_ratio, qc_watched.attestations_count)))
+          else return_unit
+        in
+        if additional_attestations_count = 0 then
+          Events.(emit non_relevant_operation_received ())
+        else
+          Events.(
+            emit
+              attestations_received
+              ( additional_attestations_count,
+                additional_voting_power,
+                qc_watched.current_voting_power,
+                qc_watched.attestations_count ))
 
 let monitor_quorum state new_proposal_watched =
   Lwt_mutex.with_lock state.lock @@ fun () ->
@@ -398,61 +661,66 @@ let monitor_quorum state new_proposal_watched =
   (* initialize with the currently present consensus operations *)
   update_monitoring ~should_lock:false state current_consensus_operations
 
-let monitor_preendorsement_quorum state ~consensus_threshold
-    ~get_preendorsement_voting_power candidate_watched =
+let monitor_preattestation_quorum state ~consensus_threshold
+    ~consensus_committee ~get_slot_voting_power candidate_watched =
   let new_proposal =
     Some
       (Pqc_watch
          {
            candidate_watched;
-           get_preendorsement_voting_power;
+           get_slot_voting_power;
            consensus_threshold;
-           current_voting_power = 0;
-           preendorsements_received = [];
-           preendorsements_count = 0;
+           consensus_committee;
+           current_voting_power = 0L;
+           preattestations_received = Preattestation_set.empty;
+           preattestations_count = 0;
+           previous_prequorum_progression = 0;
          })
   in
   monitor_quorum state new_proposal
 
-let monitor_endorsement_quorum state ~consensus_threshold
-    ~get_endorsement_voting_power candidate_watched =
+let monitor_attestation_quorum state ~consensus_threshold ~consensus_committee
+    ~get_slot_voting_power candidate_watched =
   let new_proposal =
     Some
       (Qc_watch
          {
            candidate_watched;
-           get_endorsement_voting_power;
+           get_slot_voting_power;
            consensus_threshold;
-           current_voting_power = 0;
-           endorsements_received = [];
-           endorsements_count = 0;
+           consensus_committee;
+           current_voting_power = 0L;
+           attestations_received = Attestation_set.empty;
+           attestations_count = 0;
+           previous_quorum_progression = 0;
          })
   in
   monitor_quorum state new_proposal
 
 let shutdown_worker state =
-  Events.(emit shutting_down ()) >>= fun () ->
+  let open Lwt_result_syntax in
+  let*! () = Events.(emit shutting_down ()) in
   Lwt_canceler.cancel state.canceler
 
 (* Each time a new head is received, the operation_pool field of the state is
    cleaned/reset by this function. Instead of emptying it completely, we keep
-   the endorsements of at most 5 rounds and 1 level in the past, to be able to
-   include as much endorsements as possible in the next block if this baker is
+   the attestations of at most 5 rounds and 1 level in the past, to be able to
+   include as much attestations as possible in the next block if this baker is
    the proposer. This allows to handle the following situations:
 
    - The baker observes an EQC for (L, R), but a proposal arrived for (L, R+1).
-   After the flush, extra endorsements on top of (L, R) are 'Branch_refused',
+   After the flush, extra attestations on top of (L, R) are 'Branch_refused',
    and are not re-sent by the node. If the baker proposes at (L+1, 1), he should
-   be able to include these extra endorsements. Hence the cache for old rounds.
+   be able to include these extra attestations. Hence the cache for old rounds.
 
    - The baker receives a head at (L+1, 0) on top of (L, 0), but this head
    didn't reach consensus. If the baker who proposes at (L+1, 1) observed some
-   extra endorsements for (L, 0) that are not included in (L+1, 0), he may want
-   to add them. But these endorsements become 'Outdated' in the mempool once
+   extra attestations for (L, 0) that are not included in (L+1, 0), he may want
+   to add them. But these attestations become 'Outdated' in the mempool once
    (L+1, 0) is received. Hence the cache for previous level.
 *)
-let update_operations_pool state (head_level, head_round) =
-  let endorsements =
+let flush_operation_pool state (head_level, head_round) =
+  let attestations =
     let head_round_i32 = Round.to_int32 head_round in
     let head_level_i32 = head_level in
     Operation_pool.Operation_set.filter
@@ -460,82 +728,177 @@ let update_operations_pool state (head_level, head_round) =
         | {
             protocol_data =
               Operation_data
-                {contents = Single (Endorsement {round; level; _}); _};
+                {
+                  contents =
+                    Single
+                      (Attestation {consensus_content = {round; level; _}; _});
+                  _;
+                };
             _;
           } ->
             let round_i32 = Round.to_int32 round in
             let level_i32 = Raw_level.to_int32 level in
             let delta_round = Int32.sub head_round_i32 round_i32 in
             let delta_level = Int32.sub head_level_i32 level_i32 in
-            (* Only retain endorsements that are maximum 5 rounds old and
+            (* Only retain attestations that are maximum 5 rounds old and
                1 level in the last *)
             Compare.Int32.(delta_round <= 5l && delta_level <= 1l)
         | _ -> false)
       state.operation_pool.consensus
   in
-  let operation_pool = {Operation_pool.empty with consensus = endorsements} in
+  let operation_pool = {Operation_pool.empty with consensus = attestations} in
   state.operation_pool <- operation_pool
 
-let create ?(monitor_node_operations = true)
+let run ?(monitor_node_operations = true) ~multi_node ~round_durations
     (cctxt : #Protocol_client_context.full) =
-  let state = make_initial_state ~monitor_node_operations () in
-  (* TODO should we continue forever ? *)
+  let open Lwt_syntax in
+  let state =
+    (make_initial_state
+       ~monitor_node_operations
+       () [@profiler.record_f {verbosity = Notice} "make initial state"])
+  in
   let rec worker_loop () =
-    monitor_operations cctxt >>= function
-    | Error err -> Events.(emit loop_failed err)
-    | Ok (head, operation_stream, op_stream_stopper) ->
-        (* request distant mempools (note: the node might not have
-           received the full mempools, but just the deltas with respect
-           to the last time the mempools where sent) *)
-        Alpha_block_services.Mempool.request_operations cctxt () >>= fun _ ->
-        Events.(emit starting_new_monitoring ()) >>= fun () ->
+    let* result =
+      (* If the call to [monitor_operations] RPC fails, retry 5 times during 25
+         seconds before crashing the worker . *)
+      Utils.retry
+        ~emit:Events.(emit monitor_operations_retry)
+        ~max_delay:10.
+        ~delay:1.
+        ~factor:2.
+        ~tries:10
+        ~is_error:(function _ -> true)
+        ~msg:(fun errs ->
+          Format.asprintf
+            "Failed to reach the node via the monitor_operations RPC@,%a"
+            pp_print_trace
+            errs)
+        (fun () ->
+          (monitor_operations
+             cctxt
+           [@profiler.record_s {verbosity = Notice} "monitor operations"]))
+        ()
+    in
+    match result with
+    | Error _ ->
+        (* The baker failed to reach the node via the monitor_operations
+           RPC after multiple retries. In multi-node setups, the supervisor
+           will handle this failure by restarting this automaton while other
+           nodes continue operating. In single-node setups, we exit the entire
+           baker process immediately. *)
+        let* () = Events.(emit node_unreachable_crash ()) in
+        if multi_node then (
+          (* Multi-node: close stream to signal automaton, cancel worker *)
+          state.qc_event_stream.push (Some Shutdown) ;
+          let* _ = shutdown_worker state in
+          return_unit)
+        else
+          (* Single-node: exit entire baker process *)
+          Lwt_exit.exit_and_raise (*ECONNREFUSED*) 111
+    | Ok (((_, round) as head), operation_stream, op_stream_stopper) ->
+        () [@profiler.stop] ;
+        ()
+        [@profiler.record
+          {verbosity = Notice}
+            (Format.sprintf
+               "level : %ld, round : %s"
+               (fst head)
+               (Int32.to_string @@ Round.to_int32 @@ snd head))] ;
+        let* () = Events.(emit starting_new_monitoring ()) in
         state.canceler <- Lwt_canceler.create () ;
         Lwt_canceler.on_cancel state.canceler (fun () ->
-            op_stream_stopper () ;
-            cancel_monitoring state ;
-            Lwt.return_unit) ;
-        update_operations_pool state head ;
+            op_stream_stopper
+              () [@profiler.record_f {verbosity = Notice} "stream stopped"] ;
+            cancel_monitoring
+              state
+            [@profiler.record_f {verbosity = Notice} "cancel monitoring state"] ;
+            () [@profiler.stop] ;
+            return_unit) ;
+        flush_operation_pool
+          state
+          head
+        [@profiler.record_f {verbosity = Notice} "update operations pool"] ;
+        let stream_timeout =
+          Round.round_duration round_durations (Round.succ round)
+          |> Period.to_seconds |> Int64.to_float
+        in
         let rec loop () =
-          Lwt_stream.get operation_stream >>= function
-          | None ->
+          let* result =
+            Lwt.pick
+              [
+                (let* ops = Lwt_stream.get operation_stream in
+                 return (`Stream ops));
+                (let* () = Lwt_unix.sleep stream_timeout in
+                 return `Timeout);
+              ]
+          in
+          match result with
+          | `Timeout ->
+              (* The monitor_operations RPC has neither produced new data nor
+                 closed the stream for some time. This can occur naturally, but
+                 may also indicate a stalled stream. Restarting it is
+                 inexpensive and can prevent the baker from hanging
+                 indefinitely. *)
+              let* () =
+                Events.(emit monitor_operations_stream_timeout stream_timeout)
+              in
+              op_stream_stopper () ;
+              let* () = reset_monitoring state in
+              worker_loop ()
+          | `Stream None ->
               (* When the stream closes, it means a new head has been set,
                  we reset the monitoring and flush current operations *)
-              Events.(emit end_of_stream ()) >>= fun () ->
-              op_stream_stopper () ;
-              reset_monitoring state >>= fun () -> worker_loop ()
-          | Some ops ->
-              state.operation_pool <-
-                Operation_pool.add_operations state.operation_pool ops ;
-              update_monitoring state ops >>= fun () -> loop ()
+              let* () = Events.(emit end_of_stream ()) in
+              op_stream_stopper
+                () [@profiler.record_f {verbosity = Info} "stream stopped"] ;
+              let* () =
+                (reset_monitoring
+                   state
+                 [@profiler.record_s
+                   {verbosity = Info} "reset monitoring state"])
+              in
+              () [@profiler.stop] ;
+              worker_loop ()
+          | `Stream (Some ops) ->
+              (state.operation_pool <-
+                Operation_pool.add_operations state.operation_pool ops)
+              [@profiler.aggregate_f {verbosity = Info} "add operations"] ;
+              let* () =
+                (update_monitoring
+                   state
+                   ops
+                 [@profiler.aggregate_f
+                   {verbosity = Info} "update monitoring state"])
+              in
+              loop ()
         in
-        loop ()
+        (loop
+           () [@profiler.record_s {verbosity = Notice} "operations processing"])
   in
-  Lwt.dont_wait
-    (fun () ->
-      Lwt.finalize
-        (fun () ->
-          if state.monitor_node_operations then worker_loop ()
-          else Lwt.return_unit)
-        (fun () -> shutdown_worker state >>= fun _ -> Lwt.return_unit))
-    (fun exn ->
-      Events.(emit__dont_wait__use_with_care ended (Printexc.to_string exn))) ;
-  Lwt.return state
+  if state.monitor_node_operations then
+    Lwt.dont_wait
+      (fun () -> worker_loop ())
+      (fun exn ->
+        Events.(emit__dont_wait__use_with_care ended (Printexc.to_string exn))) ;
+  return state
 
 let retrieve_pending_operations cctxt state =
+  let open Lwt_result_syntax in
   let open Protocol_client_context in
-  Alpha_block_services.Mempool.pending_operations
-    cctxt
-    ~chain:cctxt#chain
-    ~applied:true
-    ~branch_delayed:true
-    ~branch_refused:false
-    ~refused:false
-    ~outdated:false
-    ()
-  >>=? fun pending_mempool ->
+  let* pending_mempool =
+    Alpha_block_services.Mempool.pending_operations
+      cctxt
+      ~chain:cctxt#chain
+      ~validated:true
+      ~branch_delayed:true
+      ~branch_refused:false
+      ~refused:false
+      ~outdated:false
+      ()
+  in
   state.operation_pool <-
     Operation_pool.add_operations state.operation_pool
-    @@ List.rev_map snd pending_mempool.applied ;
+    @@ List.rev_map snd pending_mempool.validated ;
   state.operation_pool <-
     Operation_pool.add_operations
       state.operation_pool
@@ -547,3 +910,8 @@ let retrieve_pending_operations cctxt state =
 let get_current_operations state = state.operation_pool
 
 let get_quorum_event_stream state = state.qc_event_stream.stream
+
+module Internal_for_tests = struct
+  (* State creation *)
+  let make_initial_state = make_initial_state
+end

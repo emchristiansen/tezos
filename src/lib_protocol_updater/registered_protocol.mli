@@ -52,7 +52,8 @@ val get_embedded_sources : Protocol_hash.t -> Protocol.t option
 
 module Register_embedded_V0
     (Env : Tezos_protocol_environment.V0.T)
-    (Proto : Env.Updater.PROTOCOL) (Source : sig
+    (Proto : Env.Updater.PROTOCOL)
+    (Source : sig
       val hash : Protocol_hash.t option
 
       val sources : Protocol.t
@@ -65,7 +66,8 @@ module Register_embedded_V0
 
 module Register_embedded_V1
     (Env : Tezos_protocol_environment.V1.T)
-    (Proto : Env.Updater.PROTOCOL) (Source : sig
+    (Proto : Env.Updater.PROTOCOL)
+    (Source : sig
       val hash : Protocol_hash.t option
 
       val sources : Protocol.t
@@ -78,7 +80,8 @@ module Register_embedded_V1
 
 module Register_embedded_V2
     (Env : Tezos_protocol_environment.V2.T)
-    (Proto : Env.Updater.PROTOCOL) (Source : sig
+    (Proto : Env.Updater.PROTOCOL)
+    (Source : sig
       val hash : Protocol_hash.t option
 
       val sources : Protocol.t
@@ -92,7 +95,8 @@ module Register_embedded_V2
 
 module Register_embedded_V3
     (Env : Tezos_protocol_environment.V3.T)
-    (Proto : Env.Updater.PROTOCOL) (Source : sig
+    (Proto : Env.Updater.PROTOCOL)
+    (Source : sig
       val hash : Protocol_hash.t option
 
       val sources : Protocol.t
@@ -106,7 +110,8 @@ module Register_embedded_V3
 
 module Register_embedded_V4
     (Env : Tezos_protocol_environment.V4.T)
-    (Proto : Env.Updater.PROTOCOL) (Source : sig
+    (Proto : Env.Updater.PROTOCOL)
+    (Source : sig
       val hash : Protocol_hash.t option
 
       val sources : Protocol.t
@@ -120,7 +125,8 @@ module Register_embedded_V4
 
 module Register_embedded_V5
     (Env : Tezos_protocol_environment.V5.T)
-    (Proto : Env.Updater.PROTOCOL) (Source : sig
+    (Proto : Env.Updater.PROTOCOL)
+    (Source : sig
       val hash : Protocol_hash.t option
 
       val sources : Protocol.t
@@ -134,7 +140,8 @@ module Register_embedded_V5
 
 module Register_embedded_V6
     (Env : Tezos_protocol_environment.V6.T)
-    (Proto : Env.Updater.PROTOCOL) (Source : sig
+    (Proto : Env.Updater.PROTOCOL)
+    (Source : sig
       val hash : Protocol_hash.t option
 
       val sources : Protocol.t
@@ -148,7 +155,8 @@ module Register_embedded_V6
 
 module Register_embedded_V7
     (Env : Tezos_protocol_environment.V7.T)
-    (Proto : Env.Updater.PROTOCOL) (Source : sig
+    (Proto : Env.Updater.PROTOCOL)
+    (Source : sig
       val hash : Protocol_hash.t option
 
       val sources : Protocol.t
@@ -162,7 +170,8 @@ module Register_embedded_V7
 
 module Register_embedded_V8
     (Env : Tezos_protocol_environment.V8.T)
-    (Proto : Env.Updater.PROTOCOL) (Source : sig
+    (Proto : Env.Updater.PROTOCOL)
+    (Source : sig
       val hash : Protocol_hash.t option
 
       val sources : Protocol.t
@@ -176,7 +185,129 @@ module Register_embedded_V8
 
 module Register_embedded_V9
     (Env : Tezos_protocol_environment.V9.T)
-    (Proto : Env.Updater.PROTOCOL) (Source : sig
+    (Proto : Env.Updater.PROTOCOL)
+    (Source : sig
+      val hash : Protocol_hash.t option
+
+      val sources : Protocol.t
+    end) :
+  T
+    with type block_header_data = Proto.block_header_data
+     and type operation_data = Proto.operation_data
+     and type operation = Proto.operation
+     and type operation_receipt = Proto.operation_receipt
+     and type validation_state = Proto.validation_state
+
+module Register_embedded_V10
+    (Env : Tezos_protocol_environment.V10.T)
+    (Proto : Env.Updater.PROTOCOL)
+    (Source : sig
+      val hash : Protocol_hash.t option
+
+      val sources : Protocol.t
+    end) :
+  T
+    with type block_header_data = Proto.block_header_data
+     and type operation_data = Proto.operation_data
+     and type operation = Proto.operation
+     and type operation_receipt = Proto.operation_receipt
+     and type validation_state = Proto.validation_state
+
+module Register_embedded_V11
+    (Env : Tezos_protocol_environment.V11.T)
+    (Proto : Env.Updater.PROTOCOL)
+    (Source : sig
+      val hash : Protocol_hash.t option
+
+      val sources : Protocol.t
+    end) :
+  T
+    with type block_header_data = Proto.block_header_data
+     and type operation_data = Proto.operation_data
+     and type operation = Proto.operation
+     and type operation_receipt = Proto.operation_receipt
+     and type validation_state = Proto.validation_state
+
+module Register_embedded_V12
+    (Env : Tezos_protocol_environment.V12.T)
+    (Proto : Env.Updater.PROTOCOL)
+    (Source : sig
+      val hash : Protocol_hash.t option
+
+      val sources : Protocol.t
+    end) :
+  T
+    with type block_header_data = Proto.block_header_data
+     and type operation_data = Proto.operation_data
+     and type operation = Proto.operation
+     and type operation_receipt = Proto.operation_receipt
+     and type validation_state = Proto.validation_state
+
+module Register_embedded_V13
+    (Env : Tezos_protocol_environment.V13.T)
+    (Proto : Env.Updater.PROTOCOL)
+    (Source : sig
+      val hash : Protocol_hash.t option
+
+      val sources : Protocol.t
+    end) :
+  T
+    with type block_header_data = Proto.block_header_data
+     and type operation_data = Proto.operation_data
+     and type operation = Proto.operation
+     and type operation_receipt = Proto.operation_receipt
+     and type validation_state = Proto.validation_state
+     and type application_state = Proto.application_state
+
+module Register_embedded_V14
+    (Env : Tezos_protocol_environment.V14.T)
+    (Proto : Env.Updater.PROTOCOL)
+    (Source : sig
+      val hash : Protocol_hash.t option
+
+      val sources : Protocol.t
+    end) :
+  T
+    with type block_header_data = Proto.block_header_data
+     and type operation_data = Proto.operation_data
+     and type operation = Proto.operation
+     and type operation_receipt = Proto.operation_receipt
+     and type validation_state = Proto.validation_state
+
+module Register_embedded_V15
+    (Env : Tezos_protocol_environment.V15.T)
+    (Proto : Env.Updater.PROTOCOL)
+    (Source : sig
+      val hash : Protocol_hash.t option
+
+      val sources : Protocol.t
+    end) :
+  T
+    with type block_header_data = Proto.block_header_data
+     and type operation_data = Proto.operation_data
+     and type operation = Proto.operation
+     and type operation_receipt = Proto.operation_receipt
+     and type validation_state = Proto.validation_state
+
+module Register_embedded_V16
+    (Env : Tezos_protocol_environment.V16.T)
+    (Proto : Env.Updater.PROTOCOL)
+    (Source : sig
+      val hash : Protocol_hash.t option
+
+      val sources : Protocol.t
+    end) :
+  T
+    with type block_header_data = Proto.block_header_data
+     and type operation_data = Proto.operation_data
+     and type operation = Proto.operation
+     and type operation_receipt = Proto.operation_receipt
+     and type validation_state = Proto.validation_state
+
+module Register_embedded_V17
+    (Env : Tezos_protocol_environment.V17.T)
+    (Proto : Env.Updater.PROTOCOL)
+    (Source : sig
       val hash : Protocol_hash.t option
 
       val sources : Protocol.t

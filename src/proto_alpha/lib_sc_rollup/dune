@@ -3,12 +3,17 @@
 
 (library
  (name tezos_smart_rollup_alpha)
- (public_name tezos-smart-rollup-alpha)
+ (public_name octez-protocol-alpha-libs.smart-rollup)
  (instrumentation (backend bisect_ppx))
  (libraries
-  tezos-base
-  tezos-protocol-alpha)
- (inline_tests (flags -verbose) (modes native))
+  octez-libs.base
+  tezos-protocol-alpha.protocol
+  octez-libs.smart-rollup-wasm-in-memory)
+ (inline_tests
+  (flags -verbose)
+  (modes native)
+  (executable (link_flags -linkall -cclib -lblst -cclib -loctez_rust_deps))
+  (libraries bls12-381.archive octez-rust-deps))
  (preprocess (pps ppx_expect))
  (library_flags (:standard -linkall))
  (flags

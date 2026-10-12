@@ -150,7 +150,30 @@ module Schema = struct
                   |> List.map (fun p -> string p.name));
                 field_opt "additionalProperties" additional_properties to_json;
               ]
-          | One_of schemas -> [field "oneOf" (array (List.map to_json schemas))]
+          | One_of schemas ->
+              let schemas =
+                let rec deduplicate known acc = function
+                  | [] -> List.rev acc
+                  | schema :: tail -> (
+                      match schema with
+                      | Ref title | Other {title = Some title; _} ->
+                          if String_set.mem title known then (
+                            Printf.eprintf
+                              "Warning: Schema %s appears twice in the same \
+                               object; ignored duplicate occurrence\n\
+                               %!"
+                              title ;
+                            deduplicate known acc tail)
+                          else
+                            deduplicate
+                              (String_set.add title known)
+                              (schema :: acc)
+                              tail
+                      | _ -> deduplicate known (schema :: acc) tail)
+                in
+                deduplicate String_set.empty [] schemas
+              in
+              [field "oneOf" (array (List.map to_json schemas))]
           | Any -> []))
 
   let rec of_json json =
@@ -505,10 +528,33 @@ module Endpoint = struct
       in
       obj (List.map method_ Method.list)
     in
-    let parameters =
-      Path.get_dynamics endpoint.path |> List.map (Parameter.to_json "path")
+    let path = Path.to_string endpoint.path in
+    let rec deduplicate known acc = function
+      | [] -> List.rev acc
+      | (parameter : Parameter.t) :: tail -> (
+          match Hashtbl.find_opt known parameter.name with
+          | Some p ->
+              if
+                Parameter.(p.description) = parameter.description
+                && Parameter.(p.schema) = parameter.schema
+              then deduplicate known acc tail
+              else
+                failwith
+                  (Format.sprintf
+                     "Parameter named %s from %s is found more than once but \
+                      with different desription or schema"
+                     p.name
+                     path)
+          | _ ->
+              Hashtbl.add known parameter.name parameter ;
+              deduplicate known (parameter :: acc) tail)
     in
-    (Path.to_string endpoint.path, encode_parameters endpoint.methods parameters)
+    let parameters =
+      Path.get_dynamics endpoint.path
+      |> deduplicate (Hashtbl.create 0) []
+      |> List.map (Parameter.to_json "path")
+    in
+    (path, encode_parameters endpoint.methods parameters)
 
   let of_json (path, json) =
     let methods, p =

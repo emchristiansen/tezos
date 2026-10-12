@@ -496,8 +496,7 @@ module Scripts = struct
     let unparse_stack ctxt (stack, stack_ty) =
       (* We drop the gas limit as this function is only used for debugging/errors. *)
       let ctxt = Gas.set_unlimited ctxt in
-      let rec unparse_stack :
-          type a s.
+      let rec unparse_stack : type a s.
           (a, s) Script_typed_ir.stack_ty * (a * s) ->
           Script.expr list tzresult Lwt.t = function
         | Bot_t, (EmptyCell, EmptyCell) -> return_nil
@@ -599,8 +598,7 @@ module Scripts = struct
       let z = Alpha_context.Sapling.Memo_size.unparse_to_z memo_size in
       Int (loc, z)
 
-    let rec unparse_ty :
-        type a ac loc.
+    let rec unparse_ty : type a ac loc.
         loc:loc -> (a, ac) ty -> (loc, Script.prim) Micheline.node =
      fun ~loc ty ->
       let return (name, args, annot) = Prim (loc, name, args, annot) in
@@ -675,8 +673,7 @@ module Scripts = struct
       | Chest_key_t -> return (T_chest_key, [], [])
   end
 
-  let rec pp_instr_name :
-      type a b c d.
+  let rec pp_instr_name : type a b c d.
       Format.formatter -> (a, b, c, d) Script_typed_ir.kinstr -> unit =
     let open Script_typed_ir in
     let open Format in
@@ -940,7 +937,7 @@ module Scripts = struct
   type run_code_config = {
     balance : Tez.t;
     self : Contract_hash.t;
-    payer : Tezos_crypto.Signature.public_key_hash;
+    payer : Signature.public_key_hash;
     source : Contract.t;
   }
 
@@ -970,9 +967,8 @@ module Scripts = struct
     let source_and_payer ~src_opt ~pay_opt ~default_src =
       match (src_opt, pay_opt) with
       | None, None ->
-          ( Contract.Originated default_src,
-            Tezos_crypto.Signature.Public_key_hash.zero )
-      | Some c, None -> (c, Tezos_crypto.Signature.Public_key_hash.zero)
+          (Contract.Originated default_src, Signature.Public_key_hash.zero)
+      | Some c, None -> (c, Signature.Public_key_hash.zero)
       | None, Some c -> (Contract.Implicit c, c)
       | Some src, Some pay -> (src, pay)
     in
@@ -1083,16 +1079,18 @@ module Scripts = struct
           ~entrypoint
           ~parameter
           ~internal:true
-        >|=? fun ( {
-                     script = _;
-                     code_size = _;
-                     Script_interpreter.storage;
-                     operations;
-                     lazy_storage_diff;
-                     ticket_diffs = _;
-                     ticket_receipt = _;
-                   },
-                   _ ) ->
+        >|=?
+        fun ( {
+                script = _;
+                code_size = _;
+                Script_interpreter.storage;
+                operations;
+                lazy_storage_diff;
+                ticket_diffs = _;
+                ticket_receipt = _;
+              },
+              _ )
+          ->
         ( storage,
           Apply_internal_results.packed_internal_operations operations,
           lazy_storage_diff )) ;
@@ -1156,17 +1154,19 @@ module Scripts = struct
           ~script:{storage; code}
           ~entrypoint
           ~parameter
-        >|=? fun ( ( {
-                       script = _;
-                       code_size = _;
-                       Script_interpreter.storage;
-                       operations;
-                       lazy_storage_diff;
-                       ticket_diffs = _;
-                       ticket_receipt = _;
-                     },
-                     _ctxt ),
-                   trace ) ->
+        >|=?
+        fun ( ( {
+                  script = _;
+                  code_size = _;
+                  Script_interpreter.storage;
+                  operations;
+                  lazy_storage_diff;
+                  ticket_diffs = _;
+                  ticket_receipt = _;
+                },
+                _ctxt ),
+              trace )
+          ->
         ( storage,
           Apply_internal_results.packed_internal_operations operations,
           trace,
@@ -1253,16 +1253,18 @@ module Scripts = struct
           ~entrypoint
           ~parameter
           ~internal:true
-        >>=? fun ( {
-                     Script_interpreter.operations;
-                     script = _;
-                     code_size = _;
-                     storage = _;
-                     lazy_storage_diff = _;
-                     ticket_diffs = _;
-                     ticket_receipt = _;
-                   },
-                   _ctxt ) ->
+        >>=?
+        fun ( {
+                Script_interpreter.operations;
+                script = _;
+                code_size = _;
+                storage = _;
+                lazy_storage_diff = _;
+                ticket_diffs = _;
+                ticket_receipt = _;
+              },
+              _ctxt )
+          ->
         Lwt.return
           (View_helpers.extract_parameter_from_operations
              entrypoint
@@ -1358,16 +1360,18 @@ module Scripts = struct
           ~entrypoint:Entrypoint.default
           ~parameter
           ~internal:true
-        >>=? fun ( {
-                     Script_interpreter.operations = _;
-                     script = _;
-                     code_size = _;
-                     storage;
-                     lazy_storage_diff = _;
-                     ticket_diffs = _;
-                     ticket_receipt = _;
-                   },
-                   _ctxt ) ->
+        >>=?
+        fun ( {
+                Script_interpreter.operations = _;
+                script = _;
+                code_size = _;
+                storage;
+                lazy_storage_diff = _;
+                ticket_diffs = _;
+                ticket_receipt = _;
+              },
+              _ctxt )
+          ->
         View_helpers.extract_value_from_storage storage >>?= fun value ->
         return (Micheline.strip_locations value)) ;
     Registration.register0
@@ -1396,17 +1400,12 @@ module Scripts = struct
         let elab_conf = elab_conf ~legacy () in
         let code = Script.lazy_expr expr in
         Script_ir_translator.parse_code ~elab_conf ctxt ~code
-        >>=? fun ( Ex_code
-                     (Code
-                       {
-                         code;
-                         arg_type;
-                         storage_type;
-                         views;
-                         entrypoints;
-                         code_size;
-                       }),
-                   ctxt ) ->
+        >>=?
+        fun ( Ex_code
+                (Code
+                   {code; arg_type; storage_type; views; entrypoints; code_size}),
+              ctxt )
+          ->
         Script_ir_translator.parse_data
           ~elab_conf
           ~allow_forged:true
@@ -1528,8 +1527,8 @@ module Scripts = struct
         parse_toplevel ~legacy ctxt expr >>=? fun ({arg_type; _}, ctxt) ->
         Lwt.return
           ( parse_parameter_ty_and_entrypoints ctxt ~legacy arg_type
-          >|? fun (Ex_parameter_ty_and_entrypoints {arg_type; entrypoints}, _)
-            ->
+          >|?
+          fun (Ex_parameter_ty_and_entrypoints {arg_type; entrypoints}, _) ->
             let unreachable_entrypoint, map =
               Script_ir_translator.list_entrypoints_uncarbonated
                 arg_type
@@ -2182,6 +2181,17 @@ module Sc_rollup = struct
         ~query:RPC_query.empty
         ~output:Sc_rollup.Inbox.encoding
         RPC_path.(path_sc_rollups / "inbox")
+
+    let ticket_balance =
+      let open Data_encoding in
+      RPC_service.post_service
+        ~description:
+          "Access the smart rollup's balance of ticket with specified \
+           ticketer, content type, and content."
+        ~query:RPC_query.empty
+        ~input:Ticket_token.unparsed_token_encoding
+        ~output:n
+        RPC_path.(path_sc_rollup / "ticket_balance")
   end
 
   let kind ctxt block sc_rollup_address =
@@ -2370,6 +2380,23 @@ module Sc_rollup = struct
         in
         match res with Ok _context -> return_true | Error _ -> return_false)
 
+  let register_ticket_balance () =
+    Registration.register1
+      ~chunked:false
+      S.ticket_balance
+      (fun ctxt sc_rollup () Ticket_token.{ticketer; contents_type; contents} ->
+        let open Lwt_result_syntax in
+        let* ticket_hash, ctxt =
+          Ticket_balance_key.make
+            ctxt
+            ~owner:(Sc_rollup sc_rollup)
+            ~ticketer
+            ~contents_type:(Micheline.root contents_type)
+            ~contents:(Micheline.root contents)
+        in
+        let* amount, _ctxt = Ticket_balance.get_balance ctxt ticket_hash in
+        return @@ Option.value amount ~default:Z.zero)
+
   let register () =
     register_kind () ;
     register_inbox () ;
@@ -2388,7 +2415,8 @@ module Sc_rollup = struct
     register_timeout () ;
     register_timeout_reached () ;
     register_can_be_cemented () ;
-    register_initial_pvm_state_hash ()
+    register_initial_pvm_state_hash () ;
+    register_ticket_balance ()
 
   let list ctxt block = RPC_context.make_call0 S.root ctxt block () ()
 
@@ -2482,6 +2510,9 @@ module Sc_rollup = struct
       commitment_hash
       ()
       ()
+
+  let get_ticket_balance ctxt block sc_rollup key =
+    RPC_context.make_call1 S.ticket_balance ctxt block sc_rollup () key
 end
 
 module Dal = struct
@@ -3041,10 +3072,10 @@ module Baking_rights = struct
         {level; delegate; consensus_key; round; timestamp})
       (obj5
          (req "level" Raw_level.encoding)
-         (req "delegate" Tezos_crypto.Signature.Public_key_hash.encoding)
+         (req "delegate" Signature.Public_key_hash.encoding)
          (req "round" Round.encoding)
          (opt "estimated_time" Timestamp.encoding)
-         (req "consensus_key" Tezos_crypto.Signature.Public_key_hash.encoding))
+         (req "consensus_key" Signature.Public_key_hash.encoding))
 
   let default_max_round = 64
 
@@ -3056,8 +3087,8 @@ module Baking_rights = struct
     type baking_rights_query = {
       levels : Raw_level.t list;
       cycle : Cycle.t option;
-      delegates : Tezos_crypto.Signature.Public_key_hash.t list;
-      consensus_keys : Tezos_crypto.Signature.Public_key_hash.t list;
+      delegates : Signature.Public_key_hash.t list;
+      consensus_keys : Signature.Public_key_hash.t list;
       max_round : int option;
       all : bool;
     }
@@ -3116,9 +3147,10 @@ module Baking_rights = struct
         return (ctxt, List.rev acc)
       else
         Stake_distribution.baking_rights_owner ctxt level ~round
-        >>=? fun ( ctxt,
-                   _slot,
-                   {Consensus_key.consensus_pkh; delegate; consensus_pk = _} )
+        >>=?
+        fun ( ctxt,
+              _slot,
+              {Consensus_key.consensus_pkh; delegate; consensus_pk = _} )
           ->
         estimated_time
           round_durations
@@ -3147,16 +3179,12 @@ module Baking_rights = struct
     @@ List.fold_left
          (fun (acc, previous) r ->
            if
-             Tezos_crypto.Signature.Public_key_hash.Set.exists
-               (Tezos_crypto.Signature.Public_key_hash.equal r.delegate)
+             Signature.Public_key_hash.Set.exists
+               (Signature.Public_key_hash.equal r.delegate)
                previous
            then (acc, previous)
-           else
-             ( r :: acc,
-               Tezos_crypto.Signature.Public_key_hash.Set.add
-                 r.delegate
-                 previous ))
-         ([], Tezos_crypto.Signature.Public_key_hash.Set.empty)
+           else (r :: acc, Signature.Public_key_hash.Set.add r.delegate previous))
+         ([], Signature.Public_key_hash.Set.empty)
          rights
 
   let register () =
@@ -3192,7 +3220,7 @@ module Baking_rights = struct
           | _ :: _ as delegates ->
               let is_requested p =
                 List.exists
-                  (Tezos_crypto.Signature.Public_key_hash.equal p.delegate)
+                  (Signature.Public_key_hash.equal p.delegate)
                   delegates
               in
               List.filter is_requested rights
@@ -3203,7 +3231,7 @@ module Baking_rights = struct
           | _ :: _ as delegates ->
               let is_requested p =
                 List.exists
-                  (Tezos_crypto.Signature.Public_key_hash.equal p.consensus_key)
+                  (Signature.Public_key_hash.equal p.consensus_key)
                   delegates
               in
               List.filter is_requested rights
@@ -3222,8 +3250,8 @@ end
 
 module Endorsing_rights = struct
   type delegate_rights = {
-    delegate : Tezos_crypto.Signature.Public_key_hash.t;
-    consensus_key : Tezos_crypto.Signature.Public_key_hash.t;
+    delegate : Signature.Public_key_hash.t;
+    consensus_key : Signature.Public_key_hash.t;
     first_slot : Slot.t;
     endorsing_power : int;
   }
@@ -3242,10 +3270,10 @@ module Endorsing_rights = struct
       (fun (delegate, first_slot, endorsing_power, consensus_key) ->
         {delegate; first_slot; endorsing_power; consensus_key})
       (obj4
-         (req "delegate" Tezos_crypto.Signature.Public_key_hash.encoding)
+         (req "delegate" Signature.Public_key_hash.encoding)
          (req "first_slot" Slot.encoding)
          (req "endorsing_power" uint16)
-         (req "consensus_key" Tezos_crypto.Signature.Public_key_hash.encoding))
+         (req "consensus_key" Signature.Public_key_hash.encoding))
 
   let encoding =
     let open Data_encoding in
@@ -3267,8 +3295,8 @@ module Endorsing_rights = struct
     type endorsing_rights_query = {
       levels : Raw_level.t list;
       cycle : Cycle.t option;
-      delegates : Tezos_crypto.Signature.Public_key_hash.t list;
-      consensus_keys : Tezos_crypto.Signature.Public_key_hash.t list;
+      delegates : Signature.Public_key_hash.t list;
+      consensus_keys : Signature.Public_key_hash.t list;
     }
 
     let endorsing_rights_query =
@@ -3329,8 +3357,8 @@ module Endorsing_rights = struct
                  consensus_pkh = consensus_key;
                },
                endorsing_power )
-             acc ->
-          {delegate; consensus_key; first_slot; endorsing_power} :: acc)
+             acc
+           -> {delegate; consensus_key; first_slot; endorsing_power} :: acc)
         rights
         []
     in
@@ -3356,10 +3384,10 @@ module Endorsing_rights = struct
           | _, _ ->
               let is_requested p =
                 List.exists
-                  (Tezos_crypto.Signature.Public_key_hash.equal p.consensus_key)
+                  (Signature.Public_key_hash.equal p.consensus_key)
                   q.consensus_keys
                 || List.exists
-                     (Tezos_crypto.Signature.Public_key_hash.equal p.delegate)
+                     (Signature.Public_key_hash.equal p.delegate)
                      q.delegates
               in
               List.filter_map
@@ -3387,8 +3415,8 @@ end
 module Validators = struct
   type t = {
     level : Raw_level.t;
-    delegate : Tezos_crypto.Signature.Public_key_hash.t;
-    consensus_key : Tezos_crypto.Signature.public_key_hash;
+    delegate : Signature.Public_key_hash.t;
+    consensus_key : Signature.public_key_hash;
     slots : Slot.t list;
   }
 
@@ -3401,9 +3429,9 @@ module Validators = struct
         {level; delegate; consensus_key; slots})
       (obj4
          (req "level" Raw_level.encoding)
-         (req "delegate" Tezos_crypto.Signature.Public_key_hash.encoding)
+         (req "delegate" Signature.Public_key_hash.encoding)
          (req "slots" (list Slot.encoding))
-         (req "consensus_key" Tezos_crypto.Signature.Public_key_hash.encoding))
+         (req "consensus_key" Signature.Public_key_hash.encoding))
 
   module S = struct
     open Data_encoding
@@ -3412,8 +3440,8 @@ module Validators = struct
 
     type validators_query = {
       levels : Raw_level.t list;
-      delegates : Tezos_crypto.Signature.Public_key_hash.t list;
-      consensus_keys : Tezos_crypto.Signature.Public_key_hash.t list;
+      delegates : Signature.Public_key_hash.t list;
+      consensus_keys : Signature.Public_key_hash.t list;
     }
 
     let validators_query =
@@ -3468,7 +3496,7 @@ module Validators = struct
           | _ :: _ as delegates ->
               let is_requested p =
                 List.exists
-                  (Tezos_crypto.Signature.Public_key_hash.equal p.delegate)
+                  (Signature.Public_key_hash.equal p.delegate)
                   delegates
               in
               List.filter is_requested rights
@@ -3479,7 +3507,7 @@ module Validators = struct
           | _ :: _ as delegates ->
               let is_requested p =
                 List.exists
-                  (Tezos_crypto.Signature.Public_key_hash.equal p.consensus_key)
+                  (Signature.Public_key_hash.equal p.consensus_key)
                   delegates
               in
               List.filter is_requested rights
@@ -3593,3 +3621,5 @@ let levels_in_current_cycle ctxt ?(offset = 0l) block =
 let rpc_services =
   register () ;
   RPC_directory.merge rpc_services !Registration.patched_services
+
+let get_blocks_preservation_cycles ~get_context:_ = Lwt.return_none

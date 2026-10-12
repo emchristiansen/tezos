@@ -28,37 +28,54 @@ open Alpha_context
 
 type error +=
   | (* `Permanent *)
-      Insufficient_endorsing_power of {
-      endorsing_power : int;
-      consensus_threshold : int;
+      Insufficient_attesting_power of {
+      attesting_power : int64;
+      consensus_threshold : int64;
     }
 
 type ordered_slots = private {
-  delegate : Signature.public_key_hash;
+  delegate : Implicit_account_repr.t;
   consensus_key : Signature.public_key_hash;
-  slots : Slot.t list;
+  companion_key : Bls.Public_key_hash.t option;
+  rounds : Round.t list;
+  attesting_power : int64;
+  attestation_slot : Slot.t;
 }
 
-(** For a given level computes who has the right to include an endorsement in
+(** For a given level computes who has the right to include an attestation in
    the next block.
 
-   @return map from delegates with such rights to their endorsing slots, in
+   @return map from delegates with such rights to their attesting slots, in
    increasing order.
 
    This function is only used by the 'validators' RPC.  *)
-val endorsing_rights :
+val attesting_rights :
+  context ->
+  attested_level:Level.t ->
+  (context * ordered_slots Implicit_account_repr.Map.t) tzresult Lwt.t
+
+(** For a given level computes the number of DAL shards assigned to delegates. *)
+val delegate_to_shard_count :
   context ->
   Level.t ->
-  (context * ordered_slots Signature.Public_key_hash.Map.t) tzresult Lwt.t
+  (context * int Implicit_account_repr.Map.t) tzresult Lwt.t
 
-(** Computes endorsing rights for a given level.
+(** Computes attesting rights for a given level.
 
-   @return  map from allocated first slots to their owner's public key, public key
-   hash, and endorsing power. *)
-val endorsing_rights_by_first_slot :
+   @return map from allocated first slots to their owner's public key, consensus
+     attesting power, and DAL attesting power. *)
+val attesting_rights_by_first_slot :
   context ->
-  Level.t ->
-  (context * (Consensus_key.pk * int) Slot.Map.t) tzresult Lwt.t
+  attested_level:Level.t ->
+  (context * Consensus_key.power Slot.Map.t) tzresult Lwt.t
 
-(** Computes the bonus baking reward depending on the endorsing power. *)
-val bonus_baking_reward : context -> endorsing_power:int -> Tez.t tzresult
+(** Computes the bonus baking reward depending on the attestation power.
+
+    [attested_level] is the level written in the attestations whose
+    total [attesting_power] is provided, not the level of the block
+    being baked. *)
+val bonus_baking_reward :
+  context ->
+  attested_level:Level.t ->
+  attesting_power:Attesting_power.t ->
+  (context * Tez.t) tzresult Lwt.t

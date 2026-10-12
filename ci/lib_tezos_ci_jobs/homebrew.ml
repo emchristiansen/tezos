@@ -1,0 +1,102 @@
+(*****************************************************************************)
+(*                                                                           *)
+(* SPDX-License-Identifier: MIT                                              *)
+(* Copyright (c) 2024 Nomadic Labs. <contact@nomadic-labs.com>               *)
+(*                                                                           *)
+(*****************************************************************************)
+
+let only_if_changed =
+  [
+    "scripts/packaging/test_homebrew_install.sh";
+    "scripts/packaging/homebrew_release.sh";
+    "images/scripts/install-gcloud.sh";
+    "scripts/packaging/homebrew_install.sh";
+    "scripts/packaging/octez/homebrew/Formula/*";
+    "scripts/version.sh";
+  ]
+
+open Tezos_ci
+module CI = Cacio.Shared
+
+let image = Images.Base_images.debian_homebrew_trixie
+
+let job_create_homebrew_formula =
+  CI.job
+    "oc.create-homebrew-formula"
+    ~__POS__
+    ~stage:Build
+    ~description:
+      "Create a Homebrew formula from a template using the homebrew_release.sh \
+       script"
+    ~arch:Amd64
+    ~image
+    ~artifacts:
+      (Gitlab_ci.Util.artifacts
+         ~expire_in:(Duration (Days 1))
+         ["public/homebrew/*"])
+    ~only_if_changed
+    ~script:["./scripts/packaging/homebrew_release.sh"]
+
+let job_build_homebrew_formula =
+  CI.job
+    "oc.build-homebrew-formula"
+    ~__POS__
+    ~stage:Test
+    ~description:
+      "Tests if the formula created by oc.create-homebrew-formula can be \
+       compiled and installed"
+    ~arch:Amd64
+    ~cpu:Very_high
+    ~allow_failure:No
+    ~image
+    ~needs:[(Job, job_create_homebrew_formula)]
+    ~only_if_changed
+    ~variables:
+      [
+        ("DUNE_BUILD_JOBS", "-j 12");
+        ("HOMEBREW_KISSCACHE", "http://kisscache.kisscache.svc.cluster.local");
+        ("HOMEBREW_OPAMFETCH", "scripts/kiss-fetch.sh");
+        ("CARGO_NET_OFFLINE", "false");
+      ]
+    ~script:
+      [
+        "cp images/ci/.cargo/config.toml .cargo/";
+        "./scripts/packaging/test_homebrew_install.sh";
+      ]
+
+let job_build_homebrew_formula_macosx =
+  CI.job
+    "oc.build-homebrew-formula-macosx"
+    ~__POS__
+    ~stage:Test
+    ~description:"Run the homebrew installation on MacOSX"
+    ~image:(Image.mk_external ~image_path:"$MACOS_IMAGE")
+    ~allow_failure:Yes
+    ~needs:[(Job, job_create_homebrew_formula)]
+    ~only_if_changed
+    ~parallel:
+      (Matrix [[("MACOS_IMAGE", ["macos-15-xcode-16"; "macos-26-xcode-26"])]])
+      (* Would be better to define a MacOS runner in Tezos_ci.Runner,
+         instead of using Dynamic + the TAGS variable.
+         But it's unclear if homebrew will stay anyway. *)
+    ~tag:Dynamic
+    ~variables:[("TAGS", "saas-macos-large-m2pro")]
+    ~script:
+      [
+        "./scripts/packaging/homebrew_install.sh";
+        "eval $(/opt/homebrew/bin/brew shellenv)";
+        "./scripts/packaging/test_homebrew_install.sh";
+      ]
+
+let () =
+  Tezos_ci_pipelines.register_merge_request_jobs
+    [
+      (Auto, job_build_homebrew_formula);
+      (Auto, job_build_homebrew_formula_macosx);
+    ] ;
+  Cacio.register_jobs
+    Tezos_ci_pipelines.homebrew_daily
+    [
+      (Auto, job_build_homebrew_formula);
+      (Auto, job_build_homebrew_formula_macosx);
+    ]

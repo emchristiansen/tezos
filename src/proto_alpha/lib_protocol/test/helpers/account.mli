@@ -57,14 +57,41 @@ val find : Signature.Public_key_hash.t -> t tzresult Lwt.t
 
 val find_alternate : Signature.Public_key_hash.t -> t
 
-(** 4.000.000.000 tez *)
-val default_initial_balance : Tez.t
+(** Default full balance of bootstrap accounts: 4_000_000 tez *)
+val default_initial_full_balance : Tez.t
 
-(** [generate_accounts ?rng_state n] first frees the global account state then
+(** Default staked balance of bootstrap accounts: 200_000 tez *)
+val default_initial_staked_balance : Tez.t
+
+(** Default spendable balance of bootstrap accounts: 3_800_000 tez *)
+val default_initial_spendable_balance : Tez.t
+
+(** Initial staked balance of a newly created bootstrap account with a
+    given initial full balance. *)
+val bootstrap_initial_staked_balance :
+  constants:Constants.Parametric.t -> initial_full_balance:Tez.t -> Tez.t
+
+(** Initial baking power of a newly created bootstrap account, in
+    weighted tez (that is, staked tez count with weight 1 and
+    delegated tez with weight 1/edge_of_staking_over_delegation). *)
+val bootstrap_initial_baking_power :
+  constants:Constants.Parametric.t -> initial_full_balance:Tez.t -> Tez.t
+
+(** [generate_accounts ?algo ?rng_state n] first frees the global account state then
     generates [n] random accounts with [rng_state] to generate the seed and adds
-    them to the global account state.
+    them to the global account state. When provided, all accounts key generation
+    will use [algo]. Otherwise uses a random algo.
 *)
-val generate_accounts : ?rng_state:Random.State.t -> int -> t list tzresult
+val generate_accounts :
+  ?algo:Signature.algo -> ?rng_state:Random.State.t -> int -> t list tzresult
+
+(** [generate_accounts_with_algo_list ?rng_state algo_list] does the same thing as
+    [generate_accounts], but each account can be given a different algorithm. The number
+    of accounts is the length of the given list, and if an algo is given as None,
+    one is chosen at random.
+*)
+val generate_accounts_with_algo_list :
+  ?rng_state:Random.State.t -> Signature.algo option list -> t list
 
 val commitment_secret : Blinded_public_key_hash.activation_code
 
@@ -72,11 +99,11 @@ val new_commitment :
   ?seed:Bytes.t -> unit -> (account * Commitment.t) tzresult Lwt.t
 
 (** Fails if the contract is not an implicit one  *)
-val pkh_of_contract_exn : Contract.t -> Signature.Public_key_hash.t
+val pkh_of_contract_exn : Contract.t -> Implicit_account_repr.t
 
-(** [make_bootstrap_account ~initial_balance ~delegate_to account] creates a
+(** [make_bootstrap_account ~balance ~delegate_to account] creates a
     {!Parameters.bootstrap_account} from an account with the default or set
-    values. default [initial_balance] is [default_initial_balance],
+    values. default [balance] is {!default_initial_full_balance},
     [delegate_to] is [None] and [consensus_key] is [None].
 *)
 val make_bootstrap_account :
@@ -91,10 +118,25 @@ val make_bootstrap_account :
     [bootstrap_balances], [bootstrap_delegations] and [bootstrap_consensus_keys]
     to create a list of {!Parameters.bootstrap_account} using
     [make_bootstrap_account].
+    The balances, delegations and consensus keys are given in the same order as the
+    [accounts], and if they get exhausted, the following bootstrap accounts will be
+    initialized with default values: {!default_initial_full_balance} for the balance,
+    and [None] for the delegate and consensus key.
 *)
 val make_bootstrap_accounts :
   ?bootstrap_balances:int64 list ->
   ?bootstrap_delegations:Signature.public_key_hash option list ->
   ?bootstrap_consensus_keys:Signature.public_key option list ->
   t list ->
+  Parameters.bootstrap_account list
+
+(** [make_bootstrap_accounts_packed accounts_packed] creates bootstrap accounts
+    from each element [(account, balance, delegate_to, consensus_key)] of the given list,
+    by calling [make_bootstrap_account ~balance ~delegate_to ~consensus_key account]. *)
+val make_bootstrap_accounts_packed :
+  (t
+  * int64 option
+  * Signature.public_key_hash option
+  * Signature.public_key option)
+  list ->
   Parameters.bootstrap_account list

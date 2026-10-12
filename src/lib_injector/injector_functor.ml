@@ -1,7 +1,8 @@
 (*****************************************************************************)
 (*                                                                           *)
 (* Open Source License                                                       *)
-(* Copyright (c) 2022 Nomadic Labs, <contact@nomadic-labs.com>               *)
+(* Copyright (c) 2023 Nomadic Labs, <contact@nomadic-labs.com>               *)
+(* Copyright (c) 2023 Functori, <contact@functori.com>                       *)
 (*                                                                           *)
 (* Permission is hereby granted, free of charge, to any person obtaining a   *)
 (* copy of this software and associated documentation files (the "Software"),*)
@@ -31,12 +32,20 @@ module Block_cache =
   Aches_lwt.Lache.Make_result
     (Aches.Rache.Transfer (Aches.Rache.LRU) (Block_hash))
 
+module Int_cache =
+  Aches_lwt.Lache.Make_result
+    (Aches.Rache.Transfer
+       (Aches.Rache.LRU)
+       (struct
+         include Int
+
+         let hash x = x
+       end))
+
 (* This is the Tenderbake finality for blocks. *)
 (* TODO: https://gitlab.com/tezos/tezos/-/issues/2815
    Centralize this and maybe make it configurable. *)
 let confirmations = 2
-
-type injection_strategy = [`Each_block | `Delay_block of float]
 
 (** Builds a client context from another client context but uses logging instead
     of printing on stdout directly. This client context cannot make the injector
@@ -52,17 +61,30 @@ let injector_context (cctxt : #Client_context.full) : Client_context.full =
       Format.ksprintf Stdlib.failwith "Injector client wants to exit %d" code
   end
 
-module Make
-    (Parameters : PARAMETERS)
-    (Proto_client : PROTOCOL_CLIENT
-                      with type state := Parameters.state
-                       and type operation := Parameters.Operation.t) =
-struct
+(** Service name for Opentelemetry traces. *)
+let service_name = "Injector"
+
+module Make (Parameters : PARAMETERS) = struct
   module Tags = Injector_tags.Make (Parameters.Tag)
   module Tags_table = Hashtbl.Make (Parameters.Tag)
   module POperation = Parameters.Operation
   module Inj_operation = Injector_operation.Make (POperation)
-  module Request = Request (Inj_operation)
+  module Request = Request (Parameters.Tag) (Inj_operation)
+  module Inj_proto = Injector_protocol.Make (Parameters)
+
+  module type PROTOCOL_CLIENT =
+    PROTOCOL_CLIENT
+      with type state = Parameters.state
+       and type operation = Parameters.Operation.t
+
+  type proto_client = (module PROTOCOL_CLIENT)
+
+  (** Wrapper for unsigned operation with the protocol code to sign it. *)
+  module type Proto_unsigned_op = sig
+    module Proto_client : PROTOCOL_CLIENT
+
+    val value : Proto_client.unsigned_operation
+  end
 
   type injected_info = {
     op : Inj_operation.t;
@@ -78,140 +100,75 @@ struct
     l1_level : int32;
   }
 
+  type injected_l1_op_content = {
+    level : int32;
+    inj_ops : Id.t list;
+    signer_pkh : Signature.public_key_hash;
+  }
+
+  type included_l1_op_content = {level : int32; inj_ops : Id.t list}
+
   type status =
     | Pending of POperation.t
     | Injected of injected_info
     | Included of included_info
 
-  let injected_info_encoding =
-    let open Data_encoding in
-    conv
-      (fun ({op; oph; op_index} : injected_info) -> (op, (oph, op_index)))
-      (fun (op, (oph, op_index)) -> {op; oph; op_index})
-    @@ merge_objs
-         Inj_operation.encoding
-         (obj1
-            (req
-               "layer1"
-               (obj2
-                  (req "operation_hash" Operation_hash.encoding)
-                  (req "operation_index" int31))))
-
-  let included_info_encoding =
-    let open Data_encoding in
-    conv
-      (fun {op; oph; op_index; l1_block; l1_level} ->
-        (op, (oph, op_index, l1_block, l1_level)))
-      (fun (op, (oph, op_index, l1_block, l1_level)) ->
-        {op; oph; op_index; l1_block; l1_level})
-    @@ merge_objs
-         Inj_operation.encoding
-         (obj1
-            (req
-               "layer1"
-               (obj4
-                  (req "operation_hash" Operation_hash.encoding)
-                  (req "operation_index" int31)
-                  (req "block_hash" Block_hash.encoding)
-                  (req "level" int32))))
-
-  module Op_queue =
-    Disk_persistence.Make_queue
+  module Op_heap =
+    Disk_persistence.Make_heap
       (struct
-        let name = "operations_queue"
+        let name = "operations_heap"
       end)
-      (Inj_operation.Hash)
-      (Inj_operation)
+      (Id)
+      (struct
+        include Inj_operation
 
-  module Injected_operations = Disk_persistence.Make_table (struct
-    include Inj_operation.Hash.Table
+        let persist o = Parameters.persist_operation o.operation
+      end)
 
-    type value = injected_info
-
-    let name = "injected_operations"
-
-    let string_of_key = Inj_operation.Hash.to_b58check
-
-    let key_of_string = Inj_operation.Hash.of_b58check_opt
-
-    let value_encoding = injected_info_encoding
-  end)
-
-  module Injected_ophs = Disk_persistence.Make_table (struct
-    include Operation_hash.Table
-
-    type value = Inj_operation.Hash.t list
-
-    let name = "injected_ophs"
-
-    let string_of_key = Operation_hash.to_b58check
-
-    let key_of_string = Operation_hash.of_b58check_opt
-
-    let value_encoding = Data_encoding.list Inj_operation.Hash.encoding
-  end)
+  module Injected_operations = Id.Table
+  module Injected_ophs = Operation_hash.Table
 
   (** The part of the state which gathers information about injected
     operations (but not included). *)
   type injected_state = {
-    injected_operations : Injected_operations.t;
-        (** A table mapping L1 manager operation hashes to the injection info for that
-          operation.  *)
-    injected_ophs : Injected_ophs.t;
-        (** A mapping of all L1 manager operations contained in a L1 batch (i.e. an L1
-          operation). *)
+    injected_operations : injected_info Injected_operations.t;
+        (** A table mapping L1 operation ids to the injection info for that
+            operation.  *)
+    injected_ophs : injected_l1_op_content Injected_ophs.t;
+        (** A mapping of all L1 manager operations contained in a L1 batch
+            (i.e. an L1 operation). *)
   }
 
-  module Included_operations = Disk_persistence.Make_table (struct
-    include Inj_operation.Hash.Table
-
-    type value = included_info
-
-    let name = "included_operations"
-
-    let string_of_key = Inj_operation.Hash.to_b58check
-
-    let key_of_string = Inj_operation.Hash.of_b58check_opt
-
-    let value_encoding = included_info_encoding
-  end)
-
-  module Included_in_blocks = Disk_persistence.Make_table (struct
-    include Block_hash.Table
-
-    type value = int32 * Inj_operation.Hash.t list
-
-    let name = "included_in_blocks"
-
-    let string_of_key = Block_hash.to_b58check
-
-    let key_of_string = Block_hash.of_b58check_opt
-
-    let value_encoding =
-      let open Data_encoding in
-      obj2 (req "level" int32) (req "l1_ops" (list Inj_operation.Hash.encoding))
-  end)
+  module Included_operations = Id.Table
+  module Included_in_blocks = Block_hash.Table
 
   (** The part of the state which gathers information about
     operations which are included in the L1 chain (but not confirmed). *)
   type included_state = {
-    included_operations : Included_operations.t;
-    included_in_blocks : Included_in_blocks.t;
+    included_operations : included_info Included_operations.t;
+    included_in_blocks : included_l1_op_content Included_in_blocks.t;
   }
+
+  type protocols = Tezos_shell_services.Chain_services.Blocks.protocols = {
+    current_protocol : Protocol_hash.t;
+    next_protocol : Protocol_hash.t;
+  }
+
+  type last_seen_head = {block_hash : Block_hash.t; level : int32}
 
   (** The internal state of each injector worker.  *)
   type state = {
     cctxt : Client_context.full;
         (** The client context which is used to perform the injections. *)
-    signer : signer;  (** The signer for this worker. *)
+    l1_ctxt : Layer_1.t;  (** Monitoring of L1 heads.  *)
+    mutable signers : signer list;  (** The signers for this worker. *)
     tags : Tags.t;
         (** The tags of this worker, for both informative and identification
           purposes. *)
     strategy : injection_strategy;
         (** The strategy of this worker for injecting the pending operations. *)
     save_dir : string;  (** Path to where save persistent state *)
-    queue : Op_queue.t;
-        (** The queue of pending operations for this injector. *)
+    heap : Op_heap.t;  (** The heap of pending operations for this injector. *)
     injected : injected_state;
         (** The information about injected operations. *)
     included : included_state;
@@ -222,6 +179,21 @@ struct
     retention_period : int;
         (** Number of blocks for which the injector keeps the included
             information. *)
+    allowed_attempts : int;
+        (** The number of attempts that will be made to inject an operation. *)
+    injection_ttl : int;
+        (** The number of blocks after which an operation is retried when
+            injected but never included. *)
+    mutable last_seen_head : last_seen_head option;
+        (** Last L1 head that the injector has seen (used to compute
+            reorganizations). *)
+    mutable protocols : protocols;
+        (** The protocols of the head of the L1 chain. This information is used
+            to know with which protocol one should perform the
+            simulation/injection. NOTE: this value is updated before
+            [last_seen_head]. *)
+    mutable proto_client : proto_client;
+        (** The protocol client that should be used to simulate operations. *)
   }
 
   module Event = struct
@@ -229,195 +201,244 @@ struct
       Injector_events.Make (Parameters) (Tags) (POperation) (Inj_operation)
         (Request)
 
-    let emit1 e state x = emit e (state.signer.pkh, state.tags, x)
+    let signers_alias signers = List.map (fun s -> s.alias) signers
 
-    let emit2 e state x y = emit e (state.signer.pkh, state.tags, x, y)
+    let emit1 e state ?(signers = state.signers) x =
+      emit e (signers_alias signers, state.tags, x)
 
-    let emit3 e state x y z = emit e (state.signer.pkh, state.tags, x, y, z)
+    let emit2 e state ?(signers = state.signers) x y =
+      emit e (signers_alias signers, state.tags, x, y)
+
+    let emit3 e state ?(signers = state.signers) x y z =
+      emit e (signers_alias signers, state.tags, x, y, z)
   end
 
-  let init_injector cctxt ~data_dir state ~retention_period ~signer strategy
-      tags =
+  module Metrics = Injector_metrics.Make (struct
+    module Tag = Parameters.Tag
+
+    let registry = Parameters.metrics_registry
+  end)
+
+  let last_head_encoding =
+    let open Data_encoding in
+    conv
+      (fun {block_hash; level} -> (block_hash, level))
+      (fun (block_hash, level) -> {block_hash; level})
+    @@ obj2 (req "block_hash" Block_hash.encoding) (req "level" int32)
+
+  let read_last_head ~data_dir ~warn =
+    Disk_persistence.maybe_read_value
+      ~warn
+      (Filename.concat data_dir "last_seen_head")
+      last_head_encoding
+
+  let set_last_head state head =
     let open Lwt_result_syntax in
-    let* signer = get_signer cctxt signer in
+    let+ () =
+      Disk_persistence.write_value
+        (Filename.concat state.save_dir "last_seen_head")
+        last_head_encoding
+        head
+    in
+    state.last_seen_head <- Some head
+
+  let tags_attribute tags =
+    ("injector.tags", `String (Format.asprintf "%a" Tags.pp tags))
+
+  let signer_attribute signer = ("injector.signer", `String signer.alias)
+
+  let init_injector cctxt l1_ctxt ~head_protocols ~data_dir state
+      ~retention_period ~allowed_attempts ~injection_ttl ~signers strategy tags
+      =
+    let open Lwt_result_syntax in
+    let* signers = List.map_ep (get_signer cctxt) signers in
+    let* () =
+      Tezos_signer_backends.Encrypted.decrypt_list
+        cctxt
+        (List.map (fun k -> k.alias) signers)
+    in
+    let* () =
+      List.iter_es
+        (fun s ->
+          let* pk_uri = Client_keys.neuterize s.sk in
+          (* Fetch public key for remote signer to make sure it is reachable. *)
+          trace_eval
+            (fun () ->
+              error_of_fmt
+                "Cannot get public key for signer %s. Most likely, the remote \
+                 signer cannot be reached."
+                s.alias)
+            (let* (_ : Signature.public_key) = Client_keys.public_key pk_uri in
+             return_unit))
+        signers
+    in
     let data_dir = Filename.concat data_dir "injector" in
     let*! () = Lwt_utils_unix.create_dir data_dir in
     let filter op_proj op =
       Tags.mem (Parameters.operation_tag (op_proj op)) tags
     in
-    let warn_unreadable =
-      (* Warn of corrupted files but don't fail *)
-      Some
-        (fun file error ->
-          Event.(emit corrupted_operation_on_disk)
-            (signer.pkh, tags, file, error))
+    (* Warn of corrupted files but don't fail *)
+    let warn file error =
+      Event.(emit corrupted_operation_on_disk)
+        (List.map (fun s -> s.alias) signers, tags, file, error)
     in
+    let warn_unreadable = Some warn in
     let emit_event_loaded kind nb =
-      Event.(emit loaded_from_disk) (signer.pkh, tags, nb, kind)
+      Event.(emit loaded_from_disk)
+        (List.map (fun s -> s.alias) signers, tags, nb, kind)
     in
-    let* queue =
-      Op_queue.load_from_disk
+    let* heap =
+      Op_heap.load_from_disk
         ~warn_unreadable
         ~capacity:50_000
         ~data_dir
         ~filter:(filter (fun op -> op.Inj_operation.operation))
     in
-    let*! () = emit_event_loaded "operations_queue" @@ Op_queue.length queue in
+    let*! () = emit_event_loaded "operations_queue" @@ Op_heap.length heap in
     (* Very coarse approximation for the number of operation we expect for each
        block *)
     let n =
       Tags.fold (fun t acc -> acc + Parameters.table_estimated_size t) tags 0
     in
-    let* injected_operations =
-      Injected_operations.load_from_disk
-        ~warn_unreadable
-        ~initial_size:n
-        ~data_dir
-        ~filter:(filter (fun (i : injected_info) -> i.op.operation))
-    in
+    let injected_operations = Injected_operations.create n in
     let*! () =
       emit_event_loaded "injected_operations"
       @@ Injected_operations.length injected_operations
     in
-
-    let* included_operations =
-      Included_operations.load_from_disk
-        ~warn_unreadable
-        ~initial_size:((confirmations + retention_period) * n)
-        ~data_dir
-        ~filter:(filter (fun (i : included_info) -> i.op.operation))
+    let included_operations =
+      Included_operations.create ((confirmations + retention_period) * n)
     in
     let*! () =
       emit_event_loaded "included_operations"
       @@ Included_operations.length included_operations
     in
-    let* injected_ophs =
-      Injected_ophs.load_from_disk
-        ~warn_unreadable
-        ~initial_size:n
-        ~data_dir
-        ~filter:(List.exists (Injected_operations.mem injected_operations))
-    in
+    let injected_ophs = Injected_ophs.create n in
     let*! () =
       emit_event_loaded "injected_ophs" @@ Injected_ophs.length injected_ophs
     in
-    let* included_in_blocks =
-      Included_in_blocks.load_from_disk
-        ~warn_unreadable
-        ~initial_size:((confirmations + retention_period) * n)
-        ~data_dir
-        ~filter:(fun (_, ops) ->
-          List.exists (Included_operations.mem included_operations) ops)
+    let included_in_blocks =
+      Included_in_blocks.create ((confirmations + retention_period) * n)
     in
     let*! () =
       emit_event_loaded "included_in_blocks"
       @@ Included_in_blocks.length included_in_blocks
     in
-
+    let*! last_seen_head = read_last_head ~data_dir ~warn in
+    let proto_client =
+      Inj_proto.proto_client_for_protocol head_protocols.next_protocol
+    in
     return
       {
         cctxt = injector_context (cctxt :> #Client_context.full);
-        signer;
+        l1_ctxt;
+        signers;
         tags;
         strategy;
         save_dir = data_dir;
-        queue;
+        heap;
         injected = {injected_operations; injected_ophs};
         included = {included_operations; included_in_blocks};
         state;
         retention_period;
+        allowed_attempts;
+        injection_ttl;
+        last_seen_head;
+        protocols = head_protocols;
+        proto_client;
       }
 
-  (** Add an operation to the pending queue corresponding to the signer for this
-    operation.  *)
-  let add_pending_operation ?(retry = false) state op =
+  (** We consider an operation to already exist in the injector if either:
+      - It is already in the heap
+      - It is injected but not included
+      - It is included but not confirmed. *)
+  let already_exists state op_hash =
+    Op_heap.find_opt state.heap op_hash <> None
+    || Injected_operations.mem state.injected.injected_operations op_hash
+    ||
+    match
+      Included_operations.find state.included.included_operations op_hash
+    with
+    | None -> false
+    | Some {l1_level; _} -> (
+        match state.last_seen_head with
+        | None -> false
+        | Some {level = head_level; _} ->
+            Int32.sub head_level l1_level < Int32.of_int confirmations)
+
+  (** Add an operation to the pending heap corresponding to the signer for this
+    operation. *)
+  let add_pending_operation ?(retry = false) state (op : Inj_operation.t) =
     let open Lwt_result_syntax in
-    let*! () =
-      Event.(emit1 (if retry then retry_operation else add_pending))
-        state
-        op.Inj_operation.operation
-    in
-    let* () = Op_queue.replace state.queue op.hash op in
-    let*! () =
-      Event.(emit1 number_of_operations_in_queue)
-        state
-        (Op_queue.length state.queue)
-    in
-    return_unit
+    if already_exists state op.id then
+      (* Ignore operations which already exist in the injector *)
+      return_unit
+    else
+      let*! () =
+        Event.(emit1 (if retry then retry_operation else add_pending))
+          state
+          op.operation
+      in
+      Op_heap.insert state.heap op.id op
 
   (** Mark operations as injected (in [oph]). *)
-  let add_injected_operations state oph operations =
-    let open Lwt_result_syntax in
+  let add_injected_operations state {pkh = signer_pkh; _} oph ~injection_level
+      operations =
     let infos =
       List.map
-        (fun (op_index, op) -> (op.Inj_operation.hash, {op; oph; op_index}))
+        (fun (op_index, op) -> (op.Inj_operation.id, {op; oph; op_index}))
         operations
     in
-    let* () =
-      Injected_operations.replace_seq
-        state.injected.injected_operations
-        (List.to_seq infos)
-    in
-    Injected_ophs.replace state.injected.injected_ophs oph (List.map fst infos)
+    Injected_operations.replace_seq
+      state.injected.injected_operations
+      (List.to_seq infos) ;
+    Injected_ophs.replace
+      state.injected.injected_ophs
+      oph
+      {level = injection_level; inj_ops = List.map fst infos; signer_pkh}
 
   (** [add_included_operations state oph l1_block l1_level operations] marks the
     [operations] as included (in the L1 batch [oph]) in the Tezos block
     [l1_block] of level [l1_level]. *)
   let add_included_operations state l1_block l1_level
       (operations : injected_info list) =
-    let open Lwt_result_syntax in
-    let*! () =
-      Event.(emit3 included)
-        state
-        l1_block
-        l1_level
-        (List.map
-           (fun (o : injected_info) -> o.op.Inj_operation.hash)
-           operations)
-    in
     let infos =
       List.map
         (fun ({op; oph; op_index} : injected_info) ->
-          (op.Inj_operation.hash, {op; oph; op_index; l1_block; l1_level}))
+          (op.Inj_operation.id, {op; oph; op_index; l1_block; l1_level}))
         operations
     in
-    let* () =
-      Included_operations.replace_seq
-        state.included.included_operations
-        (List.to_seq infos)
-    in
+    Included_operations.replace_seq
+      state.included.included_operations
+      (List.to_seq infos) ;
     Included_in_blocks.replace
       state.included.included_in_blocks
       l1_block
-      (l1_level, List.map fst infos)
+      {level = l1_level; inj_ops = List.map fst infos}
 
   (** [remove state oph] removes the operations that correspond to the L1 batch
     [oph] from the injected operations in the injector state. This function is
     used to move operations from injected to included. *)
   let remove_injected_operation state oph =
-    let open Lwt_result_syntax in
     match Injected_ophs.find state.injected.injected_ophs oph with
     | None ->
         (* Nothing removed *)
-        return []
-    | Some mophs ->
-        let* () = Injected_ophs.remove state.injected.injected_ophs oph in
-        let+ removed =
-          List.fold_left_es
+        []
+    | Some {inj_ops; _} ->
+        Injected_ophs.remove state.injected.injected_ophs oph ;
+        let removed =
+          List.fold_left
             (fun removed moph ->
               match
                 Injected_operations.find state.injected.injected_operations moph
               with
-              | None -> return removed
+              | None -> removed
               | Some info ->
-                  let+ () =
-                    Injected_operations.remove
-                      state.injected.injected_operations
-                      moph
-                  in
+                  Injected_operations.remove
+                    state.injected.injected_operations
+                    moph ;
                   info :: removed)
             []
-            mophs
+            inj_ops
         in
         List.rev removed
 
@@ -426,30 +447,27 @@ struct
       e.g. when [block] is on an alternative chain in the case of a
       reorganization. *)
   let forget_block state block =
-    let open Lwt_result_syntax in
     match Included_in_blocks.find state.included.included_in_blocks block with
     | None ->
         (* Nothing removed *)
-        return []
-    | Some (_level, mophs) ->
-        let* () =
+        []
+    | Some {inj_ops; _} ->
+        let () =
           Included_in_blocks.remove state.included.included_in_blocks block
         in
-        List.fold_left_es
+        List.fold_left
           (fun removed moph ->
             match
               Included_operations.find state.included.included_operations moph
             with
-            | None -> return removed
+            | None -> removed
             | Some info ->
-                let+ () =
-                  Included_operations.remove
-                    state.included.included_operations
-                    moph
-                in
+                Included_operations.remove
+                  state.included.included_operations
+                  moph ;
                 info :: removed)
           []
-          mophs
+          inj_ops
 
   let fee_parameter_of_operations state ops =
     List.fold_left
@@ -478,20 +496,52 @@ struct
       }
       ops
 
+  (** The safety guard parameter is global to the simulation function, so in the
+      case of a batch of L1 operations, we set this safety guard as the maximum
+      of safety guards decided by the injector instance for each operation. *)
+  let safety_guard_of_operations ops =
+    List.fold_left
+      (fun acc {Inj_operation.operation; _} ->
+        let op_safety = Parameters.safety_guard operation in
+        match (acc, op_safety) with
+        | None, _ -> op_safety
+        | Some _, None -> acc
+        | Some safety, Some op_safety -> Some (max safety op_safety))
+      None
+      ops
+
   (** Returns the first half of the list [ops] if there is more than two
       elements, or [None] otherwise.  *)
   let keep_half ops =
     let total = List.length ops in
     if total <= 1 then None else Some (List.take_n (total / 2) ops)
 
-  (** [simulate_operations ~must_succeed state operations] simulates the
+  let available_signers state =
+    let used_signers =
+      Injected_ophs.fold
+        (fun _ {signer_pkh; _} signers_pkh ->
+          Signature.Public_key_hash.Set.add signer_pkh signers_pkh)
+        state.injected.injected_ophs
+        Signature.Public_key_hash.Set.empty
+    in
+    List.filter
+      (fun s -> not @@ Signature.Public_key_hash.Set.mem s.pkh used_signers)
+      state.signers
+
+  let rotate_signers state ~used_signers =
+    let used_signers, unused_signers =
+      List.partition
+        (fun s -> Signature.Public_key_hash.Set.mem s.pkh used_signers)
+        state.signers
+    in
+    state.signers <- unused_signers @ used_signers
+
+  (** [simulate_operations state operations] simulates the
       injection of [operations] and returns a triple [(op, ops, results)] where
       [op] is the packed operation with the adjusted limits, [ops] is the prefix
       of [operations] which was considered (because it did not exceed the
-      quotas) and [results] are the results of the simulation. See
-      {!inject_operations} for the specification of [must_succeed]. *)
-  let rec simulate_operations ~must_succeed state
-      (operations : Inj_operation.t list) =
+      quotas) and [results] are the results of the simulation. *)
+  let rec simulate_operations state signer (operations : Inj_operation.t list) =
     let open Lwt_result_syntax in
     let force =
       match operations with
@@ -499,26 +549,37 @@ struct
       | [_] ->
           (* If there is only one operation, fail when simulation fails *)
           false
-      | _ -> (
-          (* We want to see which operation failed in the batch if not all must
-             succeed *)
-          match must_succeed with `All -> false | `At_least_one -> true)
+      | _ ->
+          (* We want to see which operation failed in the batch *)
+          true
     in
     let op_operations =
       List.map (fun o -> o.Inj_operation.operation) operations
     in
+    let*! () =
+      Event.(emit1 simulating_batch_length) state (List.length operations)
+    in
     let*! () = Event.(emit2 simulating_operations) state op_operations force in
     let fee_parameter = fee_parameter_of_operations state.state operations in
+    let safety_guard = safety_guard_of_operations operations in
+    let module Proto_client = (val state.proto_client) in
     let*! simulation_result =
+      Octez_telemetry.Trace.with_result
+        ~service_name
+        "Proto_client.simulate_operations"
+        ~message_on_error:(function `TzError trace | `Exceeds_quotas trace ->
+          Format.asprintf "%a" Error_monad.pp_print_trace trace)
+      @@ fun _ ->
       Proto_client.simulate_operations
         state.cctxt
         ~force
-        ~source:state.signer.pkh
-        ~src_pk:state.signer.pk
+        ~source:signer.pkh
+        ~src_pk:signer.pk
         ~successor_level:true
           (* Operations are simulated in the next block, which is important for
              rollups and ok for other applications. *)
         ~fee_parameter
+        ?safety_guard
         op_operations
     in
     match simulation_result with
@@ -527,20 +588,47 @@ struct
         let*! () =
           Event.(emit1 number_of_operations_in_queue)
             state
-            (Op_queue.length state.queue)
+            (Op_heap.length state.heap)
         in
-        (* We perform a dichotomy by injecting the first half of the
-           operations (we are not looking to maximize the number of operations
-           injected because of the cost of simulation). Only the operations
-           which are actually injected will be removed from the queue so the
-           other half will be reconsidered later. *)
+        (* We perform a dichotomy by simulating (and ultimately injecting)
+           only the first half of the operations (we are not looking to
+           maximize the number of operations injected because of the cost of
+           simulation). The operations have already been removed from the heap
+           by [get_n_ops_batch_from_queue], so the dropped second half is
+           re-queued here to be reconsidered in a subsequent injection round
+           instead of being lost. *)
         match keep_half operations with
         | None ->
             fail
             @@ TzTrace.cons
                  (Exn (Failure "Quotas exceeded when simulating one operation"))
                  trace
-        | Some operations -> simulate_operations ~must_succeed state operations)
+        | Some new_operations ->
+            let dropped_operations =
+              let kept = List.length new_operations in
+              List.filteri (fun i _ -> i >= kept) operations
+            in
+            let*! () =
+              Event.(emit2 batch_too_large_splitting)
+                state
+                (List.length operations)
+                (List.length new_operations)
+            in
+            (* Re-queue best-effort: if the heap is full the dropped
+               operations are simply not re-queued this round (they are
+               reconsidered once the queue drains), which must not turn into
+               a failed injection. *)
+            let*! () =
+              List.iter_s
+                (fun op ->
+                  let open Lwt_syntax in
+                  let* (_ : unit tzresult) =
+                    add_pending_operation ~retry:true state op
+                  in
+                  return_unit)
+                dropped_operations
+            in
+            simulate_operations state signer new_operations)
     | Ok {operations_statuses; unsigned_operation} ->
         let*? results =
           List.combine
@@ -554,166 +642,260 @@ struct
             operations
             operations_statuses
         in
-        return (results, unsigned_operation)
+        let module Unsigned_op = struct
+          module Proto_client = Proto_client
 
-  let inject_on_node state ~nb unsigned_op =
+          let value = unsigned_operation
+        end in
+        return (results, (module Unsigned_op : Proto_unsigned_op))
+
+  let register_error state ?signers (op : Inj_operation.t) error =
+    let open Lwt_result_syntax in
+    Inj_operation.register_error op error ;
+    if op.errors.count > state.allowed_attempts then
+      let*! () =
+        Event.(emit3 ?signers discard_error_operation)
+          state
+          op.operation
+          op.errors.count
+          op.errors.last_error
+      in
+      Op_heap.remove state.heap op.id
+    else
+      let*! () =
+        Event.(emit3 ?signers error_simulation_operation)
+          state
+          op.operation
+          op.errors.count
+          error
+      in
+      return_unit
+
+  (* An operation that is back in the pending heap has been set aside by a
+     batch split and re-queued for a later injection round. It must not be
+     penalized or dropped because of the failure of another operation in the
+     same batch. *)
+  let is_requeued state (op : Inj_operation.t) =
+    Op_heap.find_opt state.heap op.id <> None
+
+  let inject_on_node state ~nb signer (module Unsigned_op : Proto_unsigned_op) =
     let open Lwt_result_syntax in
     let* signed_op_bytes =
-      Proto_client.sign_operation state.cctxt state.signer.sk unsigned_op
+      Unsigned_op.Proto_client.sign_operation
+        state.cctxt
+        signer.sk
+        Unsigned_op.value
     in
-    Tezos_shell_services.Shell_services.Injection.operation
-      state.cctxt
-      ~chain:state.cctxt#chain
-      signed_op_bytes
-    >>=? fun oph ->
-    let*! () = Event.(emit2 injected) state nb oph in
+    let* oph =
+      Tezos_shell_services.Shell_services.Injection.operation
+        state.cctxt
+        ~chain:state.cctxt#chain
+        signed_op_bytes
+    in
+    let*! () = Event.(emit2 ~signers:[signer] injected) state nb oph in
     return oph
 
-  (** Inject the given [operations] in an L1 batch. If [must_succeed] is [`All]
-    then all the operations must succeed in the simulation of injection. If
-    [must_succeed] is [`At_least_one] at least one operation in the list
-    [operations] must be successful in the simulation. In any case, only
-    operations which are known as successful will be included in the injected L1
-    batch. {b Note}: [must_succeed = `At_least_one] allows to incrementally build
-    "or-batches" by iteratively removing operations that fail from the desired
-    batch. *)
-  let rec inject_operations ~must_succeed state
+  (** Inject the given [operations] in an L1 batch. Only operations which are
+      known as successful will be included in the injected L1 batch. {b Note}:
+      This function incrementally builds "or-batches" by iteratively removing
+      operations that fail from the desired batch. *)
+  let rec inject_operations_for_signer state signer
       (operations : Inj_operation.t list) =
     let open Lwt_result_syntax in
-    let* operations_results, raw_op =
+    let*! simulation_result =
+      Octez_telemetry.Trace.with_tzresult ~service_name "simulate" @@ fun _ ->
       trace (Step_failed "simulation")
-      @@ simulate_operations ~must_succeed state operations
+      @@ simulate_operations state signer operations
     in
-    let failure = ref false in
-    let*! rev_non_failing_operations =
-      List.fold_left_s
+    let* () =
+      match simulation_result with
+      | Ok _ -> return_unit
+      | Error error ->
+          List.iter_es
+            (fun op ->
+              if is_requeued state op then return_unit
+              else register_error state ~signers:[signer] op error)
+            operations
+    in
+    let*? operations_results, raw_op = simulation_result in
+    let failure = ref None in
+    let* rev_non_failing_operations =
+      List.fold_left_es
         (fun acc (op, {status; _}) ->
-          let open Lwt_syntax in
           match status with
           | Unsuccessful (Failed error) ->
-              let+ () =
-                Event.(emit2 dropping_operation)
-                  state
-                  op.Inj_operation.operation
-                  error
-              in
-              failure := true ;
+              failure := Some (op.Inj_operation.operation, error) ;
+              let+ () = register_error state ~signers:[signer] op error in
               acc
-          | Successful | Unsuccessful (Backtracked | Skipped | Other_branch) ->
+          | Successful -> return (op :: acc)
+          | Unsuccessful
+              ((Backtracked | Skipped | Other_branch | Never_included) as
+               err_status) -> (
               (* Not known to be failing *)
-              return (op :: acc))
-        []
-        operations_results
-    in
-    if !failure then
-      (* Invariant: must_succeed = `At_least_one, otherwise the simulation would
-         have returned an error. We try to inject without the failing
-         operation. *)
-      let operations = List.rev rev_non_failing_operations in
-      inject_operations ~must_succeed state operations
-    else
-      (* Inject on node for real *)
-      let+ oph =
-        trace (Step_failed "injection")
-        @@ inject_on_node ~nb:(List.length operations) state raw_op
-      in
-      let operations =
-        List.map
-          (fun (op, {index_in_batch; _}) -> (index_in_batch, op))
-          operations_results
-      in
-      (oph, operations)
-
-  (** Returns the (upper bound on) the size of an L1 batch of operations composed
-    of the manager operations [ops]. *)
-  let size_l1_batch ops =
-    let size_shell_header =
-      (* Size of branch field *)
-      Block_hash.size
-    in
-    let signature_size = Signature.size Signature.zero in
-    let contents_size =
-      List.fold_left
-        (fun acc o ->
-          acc
-          + Proto_client.operation_size o.Inj_operation.operation
-          + Proto_client.operation_size_overhead)
-        0
-        ops
-    in
-    size_shell_header + contents_size + signature_size
-
-  (** Retrieve as many operations from the queue while remaining below the size
-    limit. *)
-  let get_operations_from_queue ~size_limit state =
-    let exception Reached_limit of Inj_operation.t list in
-    let rev_ops =
-      try
-        Op_queue.fold
-          (fun _oph op ops ->
-            let new_ops = op :: ops in
-            let new_size = size_l1_batch new_ops in
-            if new_size > size_limit then raise (Reached_limit ops) ;
-            new_ops)
-          state.queue
-          []
-      with Reached_limit ops -> ops
-    in
-    List.rev rev_ops
-
-  (* Ignore operations that are allowed to fail. *)
-  let ignore_ignorable_failing_operations state operations = function
-    | Ok res -> return (`Injected res)
-    | Error err ->
-        let open Lwt_result_syntax in
-        let+ operations_to_drop =
-          List.fold_left_es
-            (fun to_drop op ->
               let*! retry =
                 Parameters.retry_unsuccessful_operation
                   state.state
-                  op.Inj_operation.operation
-                  (Failed err)
+                  op.operation
+                  err_status
+                  ?reason:!failure
               in
               match retry with
-              | Abort err -> fail err
-              | Retry -> return to_drop
-              | Forget -> return (op :: to_drop))
+              | Retry -> return (op :: acc)
+              | Abort _ | Forget -> return acc))
+        []
+        operations_results
+    in
+    match !failure with
+    | Some (_, err) ->
+        (* We try to inject without the failing operation. *)
+        let operations = List.rev rev_non_failing_operations in
+        if operations = [] then fail err
+        else inject_operations_for_signer state signer operations
+    | None ->
+        (* Inject on node for real *)
+        let+ oph =
+          trace (Step_failed "injection")
+          @@ inject_on_node ~nb:(List.length operations) state signer raw_op
+        in
+        let operations =
+          List.map
+            (fun (op, {index_in_batch; _}) -> (index_in_batch, op))
+            operations_results
+        in
+        (oph, operations)
+
+  (** Retrieve as many batch of operations from the heap while batch
+          size remains below the size limit and count remains below max_batch_count. *)
+  let get_n_ops_batch_from_queue ~size_limit ?max_batch_count state nb_signers =
+    let open Lwt_result_syntax in
+    let module Proto_client = (val state.proto_client) in
+    let min_size = Block_hash.size + Signature.size Signature.zero in
+    let op_size op =
+      Proto_client.operation_size op.Inj_operation.operation
+      + Proto_client.operation_size_overhead
+    in
+    let add_batch rev_batch rev_batches =
+      if List.is_empty rev_batch then rev_batches
+      else
+        let batch = List.rev rev_batch in
+        batch :: rev_batches
+    in
+    let rec get_until_enough (batch_size, batch_count, rev_ops)
+        (nb_batches, rev_batches) =
+      let op_opt = Op_heap.peek_min state.heap in
+      let batch_limit_reached =
+        match max_batch_count with
+        | Some limit -> batch_count >= limit
+        | None -> false
+      in
+      match op_opt with
+      | None ->
+          (* Heap is empty, finalize current batch *)
+          return @@ add_batch rev_ops rev_batches
+      | Some _ when batch_limit_reached ->
+          (* Batch count limit reached, finalize current batch *)
+          continue_or_stop (nb_batches + 1, add_batch rev_ops rev_batches)
+      | Some op ->
+          let new_size = batch_size + op_size op in
+          if new_size <= size_limit then
+            (* pop the message as we only peeked it. *)
+            let* _op = Op_heap.pop state.heap in
+            get_until_enough
+              (new_size, batch_count + 1, op :: rev_ops)
+              (nb_batches, rev_batches)
+          else
+            (* we haven't pop the message, so we can safely call
+               continue_or_stop. *)
+            continue_or_stop (nb_batches + 1, add_batch rev_ops rev_batches)
+    and continue_or_stop (nb_batches, rev_batches) =
+      if nb_batches = nb_signers then return rev_batches
+      else get_until_enough (min_size, 0, []) (nb_batches, rev_batches)
+    in
+    let* rev_batches = continue_or_stop (0, []) in
+    return @@ List.rev rev_batches
+
+  (* Ignore operations that are allowed to fail. *)
+  let ignore_ignorable_failing_operations state operations =
+    let open Lwt_result_syntax in
+    function
+    | Ok res -> return (`Injected res)
+    | Error err ->
+        let+ operations_to_drop =
+          List.fold_left_es
+            (fun to_drop op ->
+              if is_requeued state op then return to_drop
+              else
+                let*! retry =
+                  Parameters.retry_unsuccessful_operation
+                    state.state
+                    op.Inj_operation.operation
+                    (Failed err)
+                in
+                match retry with
+                | Abort err -> fail err
+                | Retry -> return to_drop
+                | Forget -> return (op :: to_drop))
             []
             operations
         in
         `Ignored operations_to_drop
 
-  (** [inject_pending_operations_for ~size_limit state pending] injects
-    operations from the pending queue [pending], whose total size does
-    not exceed [size_limit]. Upon successful injection, the
-    operations are removed from the queue and marked as injected. *)
-  let inject_pending_operations
-      ?(size_limit = Proto_client.max_operation_data_length) state =
+  let link_batches_scope scope batches =
+    Opentelemetry.Scope.add_links scope @@ fun () ->
+    let scope_link = Opentelemetry.Scope.to_span_link scope in
+    List.fold_left
+      (List.fold_left (fun acc op ->
+           match op.Inj_operation.scope with
+           | None -> acc
+           | Some op_scope ->
+               Opentelemetry.Scope.add_links op_scope (fun () -> [scope_link]) ;
+               Opentelemetry.Scope.to_span_link op_scope :: acc))
+      []
+      batches
+    |> List.rev
+
+  (** [inject_pending_operations_round state ?size_limit signer]
+      injects operations from the pending heap [state.pending], whose
+      total size does not exceed [size_limit] using [signer]. Upon
+      successful injection, the operations are removed from the heap
+      and marked as injected. *)
+  let inject_pending_operations_round state signer operations_to_inject =
     let open Lwt_result_syntax in
+    Octez_telemetry.Trace.with_tzresult ~service_name "inject_round"
+    @@ fun scope ->
+    Opentelemetry.Scope.add_attrs scope (fun () ->
+        [tags_attribute state.tags; signer_attribute signer]) ;
+    link_batches_scope scope [operations_to_inject] ;
     (* Retrieve and remove operations from pending *)
-    let operations_to_inject = get_operations_from_queue ~size_limit state in
     let*! () =
-      Event.(emit1 considered_operations_info)
+      Event.(emit1 ~signers:[signer] considered_operations_info)
         state
         (List.map (fun o -> o.Inj_operation.operation) operations_to_inject)
     in
+    let* injection_level =
+      match state.last_seen_head with
+      | None ->
+          (* Should not happen as head monitoring fills in values *)
+          let+ header =
+            Tezos_shell_services.Shell_services.Blocks.Header.shell_header
+              state.cctxt
+              ~chain:`Main
+              ~block:(`Head 0)
+              ()
+          in
+          header.level
+      | Some {level; _} -> return level
+    in
     match operations_to_inject with
-    | [] -> return_unit
+    | [] -> return `Stop
     | _ -> (
         let*! () =
-          Event.(emit1 injecting_pending)
+          Event.(emit1 ~signers:[signer] injecting_pending)
             state
             (List.length operations_to_inject)
         in
-        let must_succeed =
-          Parameters.batch_must_succeed
-          @@ List.map
-               (fun op -> op.Inj_operation.operation)
-               operations_to_inject
-        in
         let*! res =
-          inject_operations ~must_succeed state operations_to_inject
+          inject_operations_for_signer state signer operations_to_inject
         in
         let* res =
           ignore_ignorable_failing_operations state operations_to_inject res
@@ -724,25 +906,104 @@ struct
             let* () =
               List.iter_es
                 (fun (_index, op) ->
-                  Op_queue.remove state.queue op.Inj_operation.hash)
+                  Op_heap.remove state.heap op.Inj_operation.id)
                 injected_operations
             in
-            add_injected_operations state oph injected_operations
+            let*! () =
+              Event.(emit2 injected_ops)
+                state
+                ~signers:[signer]
+                oph
+                (List.map
+                   (fun (_, o) -> o.Inj_operation.operation)
+                   injected_operations)
+            in
+            let () =
+              add_injected_operations
+                state
+                signer
+                oph
+                ~injection_level
+                injected_operations
+            in
+            let nb_operations = List.length injected_operations in
+            return (`Continue nb_operations)
         | `Ignored operations_to_drop ->
             (* Injection failed but we ignore the failure. *)
             let*! () =
-              Event.(emit1 dropped_operations)
-                state
-                (List.map
-                   (fun o -> o.Inj_operation.operation)
-                   operations_to_drop)
+              List.iter_s
+                (fun Inj_operation.{operation; errors; _} ->
+                  Event.(emit2 ~signers:[signer] dropped_operation)
+                    state
+                    operation
+                    errors.last_error)
+                operations_to_drop
             in
             let* () =
               List.iter_es
-                (fun op -> Op_queue.remove state.queue op.Inj_operation.hash)
+                (fun op -> Op_heap.remove state.heap op.Inj_operation.id)
                 operations_to_drop
             in
-            return_unit)
+            return (`Continue 0))
+
+  let inject_pending_operation_with_all_keys_or_no_op_left state
+      ?(size_limit =
+        let module Proto_client = (val state.proto_client) in
+        Proto_client.max_operation_data_length) () =
+    let open Lwt_result_syntax in
+    Octez_telemetry.Trace.with_tzresult ~service_name "inject" @@ fun scope ->
+    let signers = available_signers state in
+    let max_batch_count = Parameters.max_batch_length state.state in
+    let* ops_batch =
+      get_n_ops_batch_from_queue
+        ~size_limit
+        ?max_batch_count
+        state
+        (List.length signers)
+    in
+    Opentelemetry.Scope.add_attrs scope (fun () -> [tags_attribute state.tags]) ;
+    link_batches_scope scope ops_batch ;
+    let signers_and_ops = List.combine_drop signers ops_batch in
+    let*! res_list =
+      List.map_p
+        (fun (signer, operations_to_inject) ->
+          inject_pending_operations_round state signer operations_to_inject)
+        signers_and_ops
+    in
+    let used_signers =
+      List.fold_left
+        (fun acc (s, _) -> Signature.Public_key_hash.Set.add s.pkh acc)
+        Signature.Public_key_hash.Set.empty
+        signers_and_ops
+    in
+    rotate_signers state ~used_signers ;
+    let*? total_np_op =
+      List.fold_left
+        (fun res injected_res ->
+          match (res, injected_res) with
+          | Ok n, Ok (`Continue n') -> Ok (n + n')
+          | Ok n, Ok `Stop -> Ok n
+          | Error err, _ | Ok _, Error err ->
+              (* only keep the first found error *) Error err)
+        (Ok 0)
+        res_list
+    in
+    return total_np_op
+
+  (** Retrieve protocols of a block with a small cache. *)
+  let protocols_of_block =
+    let protos_cache = Block_cache.create 32 in
+    fun state block_hash ->
+      Block_cache.bind_or_put
+        protos_cache
+        block_hash
+        (fun block_hash ->
+          Tezos_shell_services.Shell_services.Blocks.protocols
+            state.cctxt
+            ~chain:state.cctxt#chain
+            ~block:(`Hash (block_hash, 0))
+            ())
+        Lwt.return
 
   (** [register_included_operation state block level op] marks the manager
       operations contained in the L1 batch [op] as being included in the [block]
@@ -751,12 +1012,17 @@ struct
       retried.  *)
   let register_included_operation state block level oph =
     let open Lwt_result_syntax in
-    let* injected_infos = remove_injected_operation state oph in
+    let injected_infos = remove_injected_operation state oph in
     match injected_infos with
     | [] ->
         (* No operations injected by us *)
         return_unit
     | _ ->
+        let* block_proto = protocols_of_block state block in
+        (* Protocol client for the block in which the operation is included. *)
+        let module Proto_client =
+          (val Inj_proto.proto_client_for_protocol block_proto.current_protocol)
+        in
         let* included, to_retry =
           List.fold_left_es
             (fun (included, to_retry) (info : injected_info) ->
@@ -780,6 +1046,12 @@ struct
                       info.op.operation
                       status
                   in
+                  let* () =
+                    match status with
+                    | Failed error -> register_error state info.op error
+                    | Other_branch | Backtracked | Skipped | Never_included ->
+                        return_unit
+                  in
                   match retry with
                   | Retry -> return (included, info.op :: to_retry)
                   | Forget -> return (included, to_retry)
@@ -787,9 +1059,16 @@ struct
             ([], [])
             injected_infos
         in
-        let* () =
-          add_included_operations state block level (List.rev included)
+        let*! () =
+          Event.(emit3 included)
+            state
+            block
+            level
+            (List.map
+               (fun (o : injected_info) -> o.op.Inj_operation.id)
+               included)
         in
+        add_included_operations state block level (List.rev included) ;
         List.iter_es
           (add_pending_operation ~retry:true state)
           (List.rev to_retry)
@@ -798,6 +1077,7 @@ struct
   let manager_operations_hashes_of_block =
     let blocks_ops_cache = Block_cache.create 32 in
     fun state block_hash ->
+      let module Proto_client = (val state.proto_client) in
       Block_cache.bind_or_put
         blocks_ops_cache
         block_hash
@@ -810,10 +1090,15 @@ struct
             Proto_client.manager_pass)
         Lwt.return
 
+  let has_injected_operations state =
+    Injected_operations.length state.injected.injected_operations <> 0
+    || Injected_ophs.length state.injected.injected_ophs <> 0
+
   (** [register_included_operations state (block, level)] marks the known (by
       this injector) manager operations contained in [block] as being included. *)
   let register_included_operations state (block_hash, level) =
     let open Lwt_result_syntax in
+    when_ (has_injected_operations state) @@ fun () ->
     let* operation_hashes =
       manager_operations_hashes_of_block state block_hash
     in
@@ -821,20 +1106,25 @@ struct
       (fun oph -> register_included_operation state block_hash level oph)
       operation_hashes
 
+  let has_included_operations state =
+    Included_in_blocks.length state.included.included_in_blocks <> 0
+    || Included_operations.length state.included.included_operations <> 0
+
   (** [revert_included_operations state block] marks the known (by this injector)
     manager operations contained in [block] as not being included any more,
     typically in the case of a reorganization where [block] is on an alternative
-    chain. The operations are put back in the pending queue. *)
+    chain. The operations are put back in the pending heap. *)
   let revert_included_operations state block =
     let open Lwt_result_syntax in
-    let* revert_infos = forget_block state block in
+    when_ (has_included_operations state) @@ fun () ->
+    let revert_infos = forget_block state block in
     let*! () =
       Event.(emit1 revert_operations)
         state
-        (List.map (fun o -> o.op.hash) revert_infos)
+        (List.map (fun o -> o.op.id) revert_infos)
     in
     (* TODO: https://gitlab.com/tezos/tezos/-/issues/2814
-       maybe put at the front of the queue for re-injection. *)
+       maybe put at the front of the heap for re-injection. *)
     List.iter_es
       (fun {op; _} ->
         let*! requeue =
@@ -855,30 +1145,148 @@ struct
     reorganization so there will be no need to re-inject them anymore. *)
   let register_confirmed_level state confirmed_level =
     let open Lwt_result_syntax in
-    let*! () =
-      Event.(emit confirmed_level)
-        (state.signer.pkh, state.tags, confirmed_level)
-    in
+    let*! () = Event.(emit1 confirmed_level) state confirmed_level in
     Included_in_blocks.iter_es
-      (fun block (level, _operations) ->
+      (fun block ({level = inclusion_level; _} : included_l1_op_content) ->
         if
-          level
+          inclusion_level
           <= Int32.sub confirmed_level (Int32.of_int state.retention_period)
         then
-          let* _removed_ops = forget_block state block in
+          let _removed_ops = forget_block state block in
           return_unit
         else return_unit)
       state.included.included_in_blocks
 
-  (** [on_new_tezos_head state head reorg] is called when there is a new Tezos
-    head (with a potential reorganization [reorg]). It first reverts any blocks
-    that are in the alternative branch of the reorganization and then registers
-    the effect of the new branch (the newly included operation and confirmed
-    operations).  *)
-  let on_new_tezos_head state (head_hash, head_level)
-      (reorg : (Block_hash.t * int32) reorg) =
+  (** Retry operations that are injected but never included after
+      [state.injection_ttl].  *)
+  let retry_expired_injected_operations state head_level =
     let open Lwt_result_syntax in
+    let expired =
+      Injected_ophs.fold
+        (fun oph ({level = injection_level; _} : injected_l1_op_content) acc ->
+          if
+            head_level
+            > Int32.add injection_level (Int32.of_int state.injection_ttl)
+          then oph :: acc
+          else acc)
+        state.injected.injected_ophs
+        []
+    in
+    let expired_infos =
+      List.fold_left
+        (fun acc oph ->
+          let injected_infos = remove_injected_operation state oph in
+          List.rev_append injected_infos acc)
+        []
+        expired
+    in
+    List.iter_es
+      (fun (info : injected_info) ->
+        let*! () =
+          Event.(emit2 never_included)
+            state
+            info.op.operation
+            state.injection_ttl
+        in
+        let*! retry =
+          Parameters.retry_unsuccessful_operation
+            state.state
+            info.op.operation
+            Never_included
+        in
+        match retry with
+        | Abort err -> fail err
+        | Retry -> add_pending_operation ~retry:true state info.op
+        | Forget -> return_unit)
+      (List.rev expired_infos)
+
+  let metrics_get_signers_balance state level =
+    dont_wait
+      (fun () ->
+        (* It isn't necessary to fetch the balance of signers at each level, to
+           avoid overloading the server with RPCs, we only do it every 5 levels *)
+        let open Lwt_result_syntax in
+        if Int32.rem level 5l = 0l then
+          let module Proto_client = (val state.proto_client) in
+          let tags = Tags.to_seq state.tags |> List.of_seq in
+          let* () =
+            List.iter_ep
+              (fun signer ->
+                let pkh = signer.pkh in
+                let key = Signature.Public_key_hash.to_b58check pkh in
+                let* balance = Proto_client.get_balance_mutez state.cctxt pkh in
+                Metrics.set_gauge_signer_balance tags key balance ;
+                return_unit)
+              state.signers
+          in
+          return_unit
+        else return_unit)
+      (fun trace ->
+        Event.metrics_error (Format.asprintf "%a" pp_print_trace trace))
+      (fun exn -> Event.metrics_error (Printexc.to_string exn))
+
+  let set_metrics state =
+    Metrics.wrap @@ fun () ->
+    let tags = Tags.to_seq state.tags |> List.of_seq in
+    Metrics.set_queue_size tags (Op_heap.length state.heap) ;
+    Metrics.set_injected_operations_size
+      tags
+      (Injected_operations.length state.injected.injected_operations) ;
+    Metrics.set_included_operations_size
+      tags
+      (Included_operations.length state.included.included_operations)
+
+  (** [on_new_tezos_head state head] is called when there is a new Tezos
+      head. It first reverts any blocks that are in the alternative branch of
+      the reorganization and then registers the effect of the new branch (the
+      newly included operation and confirmed operations).  *)
+  let on_new_tezos_head state
+      ({block_hash = head_hash; level = head_level} as head) =
+    let open Lwt_result_syntax in
+    Octez_telemetry.Trace.with_tzresult ~service_name "on_new_tezos_head"
+    @@ fun scope ->
+    Opentelemetry.Scope.add_attrs scope (fun () ->
+        [
+          tags_attribute state.tags;
+          ("rollup_node.block_hash", `String (Block_hash.to_b58check head_hash));
+          ("rollup_node.block_level", `Int (Int32.to_int head_level));
+        ]) ;
     let*! () = Event.(emit1 new_tezos_head) state head_hash in
+    let () = metrics_get_signers_balance state head.level in
+    set_metrics state ;
+    let*! reorg =
+      match state.last_seen_head with
+      | None ->
+          return {Reorg.no_reorg with new_chain = [(head_hash, head_level)]}
+      | Some {level; _} when Int32.sub head_level level > 120l ->
+          (* Don't analyze reorgs which are too long (more than 120 blocks) as
+             this would be too expensive in the injector. *)
+          return {Reorg.no_reorg with new_chain = [(head_hash, head_level)]}
+      | Some last_head ->
+          Layer_1.get_tezos_reorg_for_new_head
+            state.l1_ctxt
+            (`Head (last_head.block_hash, last_head.level))
+            (head_hash, head_level)
+    in
+    let* reorg =
+      match reorg with
+      | Error trace
+        when TzTrace.fold
+               (fun yes error ->
+                 yes
+                 ||
+                 match error with
+                 | Layer_1.Cannot_find_predecessor _ -> true
+                 | _ -> false)
+               false
+               trace ->
+          (* The reorganization could not be computed entirely because of
+             missing info on the Layer 1. We may miss on some backtracking but
+             it is better than to fail. *)
+          let*! () = Event.(emit1 cannot_compute_reorg) state head_hash in
+          return {Reorg.no_reorg with new_chain = [(head_hash, head_level)]}
+      | _ -> Lwt.return reorg
+    in
     let* () =
       List.iter_es
         (fun (removed_block, _) ->
@@ -890,94 +1298,167 @@ struct
         (fun added_block -> register_included_operations state added_block)
         reorg.new_chain
     in
+    let* () = retry_expired_injected_operations state head_level in
     (* Head is already included in the reorganization, so no need to process it
        separately. *)
     let confirmed_level = Int32.sub head_level (Int32.of_int confirmations) in
-    if confirmed_level >= 0l then register_confirmed_level state confirmed_level
-    else return_unit
+    let* () =
+      if confirmed_level >= 0l then
+        register_confirmed_level state confirmed_level
+      else return_unit
+    in
+    set_last_head state head
 
   (* The request {Request.Inject} triggers an injection of the operations
-     the pending queue. *)
-  let on_inject state = inject_pending_operations state
+     the pending heap. *)
+  let on_inject state =
+    let open Lwt_result_syntax in
+    let* total_nb_injected_op =
+      inject_pending_operation_with_all_keys_or_no_op_left state ()
+    in
+    let*! () = Event.(emit1 total_injected_ops) state total_nb_injected_op in
+    let*! () =
+      Event.(emit1 number_of_operations_in_queue)
+        state
+        (Op_heap.length state.heap)
+    in
+    return ()
+
+  let clear state =
+    Injected_operations.clear state.injected.injected_operations ;
+    Injected_ophs.clear state.injected.injected_ophs ;
+    Included_operations.clear state.included.included_operations ;
+    Included_in_blocks.clear state.included.included_in_blocks ;
+    Op_heap.clear state.heap
+
+  let remove_operations removal_criteria {heap; _} =
+    let predicate_f (op : Inj_operation.t) =
+      let is_op_tag tag =
+        Parameters.Tag.equal (Parameters.operation_tag op.operation) tag
+      in
+      let is_order_below ~drop_no_order order_below =
+        Option.map (fun op_order -> Z.lt op_order order_below) op.order
+        |> Option.value ~default:drop_no_order
+      in
+      match removal_criteria with
+      | Request.Operation_tag tag -> is_op_tag tag
+      | Order_below (order_below, drop_no_order) ->
+          is_order_below ~drop_no_order order_below
+      | Tag_and_order_below (tag, order_below, drop_no_order) ->
+          is_op_tag tag && is_order_below ~drop_no_order order_below
+    in
+    Op_heap.remove_predicate predicate_f heap
 
   module Types = struct
     type nonrec state = state
 
     type parameters = {
+      signers : Signature.public_key_hash list;
       cctxt : Client_context.full;
+      l1_ctxt : Layer_1.t;
+      head_protocols : protocols;
       data_dir : string;
       state : Parameters.state;
       retention_period : int;
+      allowed_attempts : int;
+      injection_ttl : int;
       strategy : injection_strategy;
-      tags : Tags.t;
     }
   end
 
+  module Name = struct
+    type t = Tags.t
+
+    let encoding = Tags.encoding
+
+    let base = Parameters.events_section @ ["injector"]
+
+    let pp = Tags.pp
+
+    let equal = Tags.equal
+  end
+
   (* The worker for the injector. *)
-  module Worker = Worker.MakeSingle (Name) (Request) (Types)
+  module Worker = Octez_telemetry.Worker.MakeSingle (Name) (Request) (Types)
 
-  (* The queue for the requests to the injector worker is infinite. *)
-  type worker = Worker.infinite Worker.queue Worker.t
+  (* The injector worker can have a single pending injection request at a
+     time. *)
+  type worker = Worker.dropbox Worker.t
 
-  let table = Worker.create_table Queue
+  let table =
+    Worker.create_table (Dropbox {merge = (fun _w new_r _old_r -> Some new_r)})
 
   let tags_table = Tags_table.create 7
 
   module Handlers = struct
     type self = worker
 
-    let on_request :
-        type r request_error.
+    let on_request : type r request_error.
         worker ->
         (r, request_error) Request.t ->
         (r, request_error) result Lwt.t =
      fun w request ->
+      let open Lwt_result_syntax in
       let state = Worker.state w in
       match request with
-      | Request.Add_pending op ->
-          (* The execution of the request handler is protected to avoid stopping the
-             worker in case of an exception. *)
-          protect @@ fun () -> add_pending_operation state op
-      | Request.New_tezos_head (head, reorg) ->
-          protect @@ fun () -> on_new_tezos_head state head reorg
+      (* The execution of the request handler is protected to avoid stopping the
+         worker in case of an exception. *)
       | Request.Inject -> protect @@ fun () -> on_inject state
+      | Request.Clear removal_criteria -> (
+          protect @@ fun () ->
+          match removal_criteria with
+          | Some removal_criteria -> remove_operations removal_criteria state
+          | None ->
+              let*! () = clear state in
+              return_unit)
 
     type launch_error = error trace
 
-    let on_launch _w signer
-        Types.{cctxt; data_dir; state; retention_period; strategy; tags} =
+    let on_launch _w tags
+        Types.
+          {
+            signers;
+            cctxt;
+            l1_ctxt;
+            head_protocols;
+            data_dir;
+            state;
+            retention_period;
+            allowed_attempts;
+            injection_ttl;
+            strategy;
+          } =
       trace (Step_failed "initialization")
       @@ init_injector
            cctxt
+           l1_ctxt
+           ~head_protocols
            ~data_dir
            state
            ~retention_period
-           ~signer
+           ~allowed_attempts
+           ~injection_ttl
+           ~signers
            strategy
            tags
 
     let on_error (type a b) w st (r : (a, b) Request.t) (errs : b) :
-        unit tzresult Lwt.t =
+        [`Continue | `Shutdown] tzresult Lwt.t =
       let open Lwt_result_syntax in
       let state = Worker.state w in
       let request_view = Request.view r in
       let emit_and_return_errors errs =
         (* Errors do not stop the worker but emit an entry in the log. *)
         let*! () = Event.(emit3 request_failed) state request_view st errs in
-        return_unit
+        return `Continue
       in
       match r with
-      | Request.Add_pending _ -> emit_and_return_errors errs
-      | Request.New_tezos_head _ -> emit_and_return_errors errs
       | Request.Inject -> emit_and_return_errors errs
+      | Request.Clear _ -> emit_and_return_errors errs
 
     let on_completion w r _ st =
       let state = Worker.state w in
-      match Request.view r with
-      | Request.View (Add_pending _ | New_tezos_head _) ->
-          Event.(emit2 request_completed_debug) state (Request.view r) st
-      | View Inject ->
-          Event.(emit2 request_completed_notice) state (Request.view r) st
+      Event.(emit2 request_completed_debug) state (Request.view r) st
 
     let on_no_request _ = Lwt.return_unit
 
@@ -987,96 +1468,6 @@ struct
       Lwt.return_unit
   end
 
-  (* TODO: https://gitlab.com/tezos/tezos/-/issues/2754
-     Injector worker in a separate process *)
-  let init (cctxt : #Client_context.full) ~data_dir ?(retention_period = 0)
-      state ~signers =
-    let open Lwt_result_syntax in
-    assert (retention_period >= 0) ;
-    let signers_map =
-      List.fold_left
-        (fun acc (signer, strategy, tags) ->
-          let tags = Tags.of_list tags in
-          let strategy, tags =
-            match Signature.Public_key_hash.Map.find_opt signer acc with
-            | None -> (strategy, tags)
-            | Some (other_strategy, other_tags) ->
-                let strategy =
-                  match (strategy, other_strategy) with
-                  | `Each_block, `Each_block -> `Each_block
-                  | `Delay_block f, _ | _, `Delay_block f ->
-                      (* Delay_block strategy takes over because we can always wait a
-                         little bit more to inject operation which are to be injected
-                         "each block". *)
-                      `Delay_block f
-                in
-                (strategy, Tags.union other_tags tags)
-          in
-          Signature.Public_key_hash.Map.add signer (strategy, tags) acc)
-        Signature.Public_key_hash.Map.empty
-        signers
-    in
-    Signature.Public_key_hash.Map.iter_es
-      (fun signer (strategy, tags) ->
-        let+ worker =
-          Worker.launch
-            table
-            signer
-            {
-              cctxt = (cctxt :> Client_context.full);
-              data_dir;
-              state;
-              retention_period;
-              strategy;
-              tags;
-            }
-            (module Handlers)
-        in
-        ignore worker)
-      signers_map
-
-  let worker_of_signer signer_pkh =
-    match Worker.find_opt table signer_pkh with
-    | None ->
-        (* TODO: https://gitlab.com/tezos/tezos/-/issues/2818
-           maybe lazily start worker here *)
-        error (No_worker_for_source signer_pkh)
-    | Some worker -> ok worker
-
-  let worker_of_tag tag =
-    match Tags_table.find_opt tags_table tag with
-    | None ->
-        Format.kasprintf
-          (fun s -> error (No_worker_for_tag s))
-          "%a"
-          Parameters.Tag.pp
-          tag
-    | Some worker -> ok worker
-
-  let add_pending_operation ?source op =
-    let open Lwt_result_syntax in
-    let operation = Inj_operation.make op in
-    let*? w =
-      match source with
-      | Some source -> worker_of_signer source
-      | None -> worker_of_tag (Parameters.operation_tag op)
-    in
-    let*! (_pushed : bool) =
-      Worker.Queue.push_request w (Request.Add_pending operation)
-    in
-    return operation.hash
-
-  let new_tezos_head h reorg =
-    let open Lwt_syntax in
-    let workers = Worker.list table in
-    List.iter_p
-      (fun (_signer, w) ->
-        let* (_pushed : bool) =
-          Worker.Queue.push_request w (Request.New_tezos_head (h, reorg))
-        in
-        return_unit)
-      workers
-
   let has_tag_in ~tags state =
     match tags with
     | None ->
@@ -1084,11 +1475,12 @@ struct
         true
     | Some tags -> not (Tags.disjoint state.tags tags)
 
-  let delay_stategy state header f =
+  let delay_strategy state header f =
     let open Lwt_syntax in
     match state.strategy with
     | `Each_block -> f ()
     | `Delay_block delay_factor ->
+        let module Proto_client = (val state.proto_client) in
         let time_until_next_block =
           Proto_client.time_until_next_block state.state header
           |> Ptime.Span.to_float_s
@@ -1111,19 +1503,237 @@ struct
       (fun (_signer, w) ->
         let open Lwt_syntax in
         let worker_state = Worker.state w in
-        if has_tag_in ~tags worker_state then
-          delay_stategy worker_state header @@ fun () ->
-          let* _pushed = Worker.Queue.push_request w Request.Inject in
-          return_unit
+        if has_tag_in ~tags worker_state then (
+          delay_strategy worker_state header @@ fun () ->
+          Worker.Dropbox.put_request w Request.Inject ;
+          return_unit)
         else Lwt.return_unit)
       workers
 
+  let notify_new_tezos_head h =
+    let workers = Worker.list table in
+    List.iter_ep
+      (fun (_signer, w) -> on_new_tezos_head (Worker.state w) h)
+      workers
+
+  let protocols_of_head cctxt =
+    Tezos_shell_services.Shell_services.Blocks.protocols
+      cctxt
+      ~chain:cctxt#chain
+      ~block:(`Head 0)
+      ()
+
+  let update_protocol ~next_protocol =
+    let workers = Worker.list table in
+    List.iter
+      (fun (_signer, w) ->
+        let state = Worker.state w in
+        let protocols =
+          {current_protocol = state.protocols.next_protocol; next_protocol}
+        in
+        state.proto_client <- Inj_proto.proto_client_for_protocol next_protocol ;
+        state.protocols <- protocols)
+      workers
+
+  (** Retrieve next protocol of a block with a small cache from protocol levels
+      to protocol hashes. *)
+  let next_protocol_of_block =
+    let proto_levels_cache = Int_cache.create 7 in
+    fun (cctxt : Client_context.full)
+        (block_hash, (block_header : Block_header.t))
+      ->
+      let open Lwt_result_syntax in
+      let proto_level = block_header.shell.proto_level in
+      Int_cache.bind_or_put
+        proto_levels_cache
+        proto_level
+        (fun _proto_level ->
+          let+ protos =
+            Tezos_shell_services.Shell_services.Blocks.protocols
+              cctxt
+              ~chain:cctxt#chain
+              ~block:(`Hash (block_hash, 0))
+              ()
+          in
+          protos.next_protocol)
+        Lwt.return
+
+  let rec monitor_l1_chain (cctxt : #Client_context.full) l1_ctxt =
+    let open Lwt_result_syntax in
+    let*! res =
+      Layer_1.iter_heads ~name:"injector" l1_ctxt @@ fun (head_hash, header) ->
+      let head = {block_hash = head_hash; level = header.shell.level} in
+      let* next_protocol =
+        next_protocol_of_block (cctxt :> Client_context.full) (head_hash, header)
+      in
+      update_protocol ~next_protocol ;
+      (* Notify all workers of a new Tezos head *)
+      notify_new_tezos_head head
+    in
+    (* Ignore errors *)
+    let*! () =
+      match res with
+      | Error error -> Internal_event.Simple.emit Event.monitoring_error error
+      | Ok () -> Lwt.return_unit
+    in
+    monitor_l1_chain cctxt l1_ctxt
+
+  let rec async_monitor_l1_chain (cctxt : #Client_context.full) l1_ctxt =
+    Lwt.dont_wait
+      (fun () -> monitor_l1_chain cctxt l1_ctxt)
+      (fun exn ->
+        Format.eprintf
+          "Warning: Error in async monitoring (%s), restarting"
+          (Printexc.to_string exn) ;
+        async_monitor_l1_chain cctxt l1_ctxt)
+
+  let check_signer_is_not_already_registered registered_signers signers =
+    List.iter_ep
+      (fun pkh ->
+        fail_when (Signature.Public_key_hash.Set.mem pkh registered_signers)
+        @@ error_of_fmt
+             "key %a is already registered"
+             Signature.Public_key_hash.pp
+             pkh)
+      signers
+
+  let check_tag_is_not_already_registered registered_tags tags =
+    error_unless (Tags.disjoint tags registered_tags)
+    @@ error_of_fmt "tags %a is already registered" Tags.pp tags
+
+  let register_worker cctxt l1_ctxt head_protocols ~data_dir state
+      retention_period allowed_attempts injection_ttl signers strategy tags =
+    let open Lwt_result_syntax in
+    let* worker =
+      Worker.launch
+        table
+        tags
+        {
+          signers;
+          cctxt :> Client_context.full;
+          l1_ctxt;
+          head_protocols;
+          data_dir;
+          state;
+          retention_period;
+          allowed_attempts;
+          injection_ttl;
+          strategy;
+        }
+        (module Handlers)
+    in
+    let () = Tags.iter (fun tag -> Tags_table.add tags_table tag worker) tags in
+    return_unit
+
+  let register_metrics_gauges tags =
+    Metrics.wrap @@ fun () -> List.iteri Metrics.add_gauge tags
+
+  let register_disjoint_signers (cctxt : #Client_context.full) l1_ctxt ~data_dir
+      retention_period ~allowed_attempts ~injection_ttl state
+      (signers :
+        (Signature.public_key_hash list
+        * injection_strategy
+        * Parameters.Tag.t list)
+        list) =
+    let open Lwt_result_syntax in
+    let rec aux registered_signers registered_tags tags_list = function
+      | [] -> return tags_list
+      | (signers, strategy, tags_l) :: rest ->
+          let* () =
+            check_signer_is_not_already_registered registered_signers signers
+          in
+          let tags = Tags.of_list tags_l in
+          let*? () = check_tag_is_not_already_registered registered_tags tags in
+          let*? () = Inj_proto.check_registered_proto_clients state in
+          let* head_protocols = protocols_of_head cctxt in
+          let* _ =
+            register_worker
+              cctxt
+              l1_ctxt
+              head_protocols
+              ~data_dir
+              state
+              retention_period
+              allowed_attempts
+              injection_ttl
+              signers
+              strategy
+              tags
+          in
+          let registered_signers =
+            Signature.Public_key_hash.Set.add_seq
+              (List.to_seq signers)
+              registered_signers
+          in
+          let registered_tags = Tags.union tags registered_tags in
+          aux registered_signers registered_tags (tags_l :: tags_list) rest
+    in
+    let+ tags = aux Signature.Public_key_hash.Set.empty Tags.empty [] signers in
+    register_metrics_gauges tags
+
+  (* TODO: https://gitlab.com/tezos/tezos/-/issues/2754
+     Injector worker in a separate process *)
+  let init (cctxt : #Client_context.full) ~data_dir ?(retention_period = 0)
+      ?(allowed_attempts = 10) ?(injection_ttl = 120) ?(collect_metrics = false)
+      l1_ctxt state ~signers =
+    let open Lwt_result_syntax in
+    assert (retention_period >= 0) ;
+    assert (allowed_attempts >= 0) ;
+    assert (injection_ttl > 0) ;
+    Metrics.produce_metrics collect_metrics ;
+    let* () =
+      register_disjoint_signers
+        (cctxt : #Client_context.full)
+        l1_ctxt
+        ~data_dir
+        retention_period
+        ~allowed_attempts
+        ~injection_ttl
+        state
+        signers
+    in
+    async_monitor_l1_chain cctxt l1_ctxt ;
+    return_unit
+
+  let worker_of_tag tag =
+    let open Result_syntax in
+    match Tags_table.find_opt tags_table tag with
+    | None ->
+        Format.kasprintf
+          (fun s -> tzfail (No_worker_for_tag s))
+          "%a"
+          Parameters.Tag.pp
+          tag
+    | Some worker -> return worker
+
+  let add_pending_operation ?order op =
+    let open Lwt_result_syntax in
+    Octez_telemetry.Trace.with_tzresult ~service_name "add_pending_operation"
+    @@ fun scope ->
+    let operation = Inj_operation.make ?order ~scope op in
+    let*? w = worker_of_tag (Parameters.operation_tag op) in
+    let state = Worker.state w in
+    Opentelemetry.Scope.add_attrs scope (fun () ->
+        let op_str = Format.asprintf "%a" POperation.pp op in
+        [
+          tags_attribute state.tags;
+          ("injector.operation.id", `String (Id.to_b58check operation.id));
+          ("injector.operation", `String op_str);
+        ]) ;
+    let* () = add_pending_operation state operation in
+    return operation.id
+
   let shutdown () =
     let workers = Worker.list table in
+    (* Don't shutdown L1 monitoring otherwise worker shutdown hangs *)
     List.iter_p (fun (_signer, w) -> Worker.shutdown w) workers
 
+  let running_worker_tags () =
+    Worker.list table
+    |> List.map (fun (tags, _w) -> Tags.to_seq tags |> List.of_seq)
+
   let op_status_in_worker state l1_hash =
-    match Op_queue.find_opt state.queue l1_hash with
+    match Op_heap.find_opt state.heap l1_hash with
     | Some op -> Some (Pending op.operation)
     | None -> (
         match
@@ -1144,4 +1754,71 @@ struct
     List.find_map
       (fun (_signer, w) -> op_status_in_worker (Worker.state w) l1_hash)
       workers
+
+  let total_queued_operations () =
+    let workers = Worker.list table in
+    List.fold_left
+      (fun (acc, total) (tags, w) ->
+        let state = Worker.state w in
+        let len = Op_heap.length state.heap in
+        let tag_list = Tags.to_seq tags |> List.of_seq in
+        ((tag_list, len) :: acc, total + len))
+      ([], 0)
+      workers
+
+  let get_queues ?tag () =
+    let workers = Worker.list table in
+    List.fold_left
+      (fun acc (tags, w) ->
+        let to_count =
+          match tag with None -> true | Some tag -> Tags.mem tag tags
+        in
+        if not to_count then acc
+        else
+          let state = Worker.state w in
+          let heap = Op_heap.elements state.heap in
+          let tag_list = Tags.to_seq tags |> List.of_seq in
+          (tag_list, heap) :: acc)
+      []
+      workers
+
+  let handle_request_error worker_res =
+    let open Lwt_syntax in
+    let* worker_res in
+    match worker_res with
+    | Ok res -> return_ok res
+    | Error (Worker.Request_error errs) -> Lwt.return_error errs
+    | Error (Closed None) -> Lwt.return_error [Worker_types.Terminated]
+    | Error (Closed (Some errs)) -> Lwt.return_error errs
+    | Error (Any exn) -> Lwt.return_error [Exn exn]
+
+  let put_request_and_wait w req =
+    Worker.Dropbox.put_request_and_wait w req |> handle_request_error
+
+  let clear_queues ?(drop_no_order = false) ?order_below ?tag () =
+    let open Lwt_result_syntax in
+    let removal_criteria : Request.removal_criteria option =
+      match (tag, order_below) with
+      | Some tag, None -> Some (Operation_tag tag)
+      | None, Some order_below ->
+          Some (Order_below (order_below, drop_no_order))
+      | Some tag, Some order_below ->
+          Some (Tag_and_order_below (tag, order_below, drop_no_order))
+      | None, None -> None
+    in
+    let clear_worker_queue (tags, w) =
+      match removal_criteria with
+      | Some (Operation_tag tag) | Some (Tag_and_order_below (tag, _, _)) ->
+          (*If a tag is specified in the removal_criteria only clear
+            the worker that inject such operation tag *)
+          if Tags.mem tag tags then
+            put_request_and_wait w (Request.Clear removal_criteria)
+          else return_unit
+      | Some (Order_below _) | None ->
+          put_request_and_wait w (Request.Clear removal_criteria)
+    in
+    let workers = Worker.list table in
+    List.iter_ep clear_worker_queue workers
+
+  let register_proto_client = Inj_proto.register
 end

@@ -58,13 +58,14 @@
 
    - Full <offset>: maintains every block that is part of the chain
      but prune the metadata for blocks that are below the following
-     threshold level: [last_allowed_fork_level] of the current head -
-     [offset] cycles.
+     threshold level: [last_preserved_block_level] of the current head
+     - [offset] cycles.
 
    - Rolling <offset>: maintains rolling windows which contain recent
      blocks that are part of the chain, along with their metadata. It
      prunes everything that is below the following threshold level:
-     [last_allowed_fork_level] of the current head - [offset] cycles.
+     [last_preserved_block_level] of the current head - [offset]
+     cycles.
 
    {2 Protocol store}
 
@@ -109,17 +110,17 @@
    - A check is made if this head is consistent (i.e. if it's not
      below the checkpoint);
 
-   - If the [last_allowed_fork_level] of the head is different from
+   - If the [last_preserved_block_level] of the head is different from
      the previous head's one, then we can establish that a cycle has
      been completed and we can start cementing this cycle by
      "triggering a merge".
 
    A merge phase consists of establishing the interval of blocks to
-   cement, which is trivially [last_allowed_fork_level(new_head)] to
-   [last_allowed_fork_level(prev_head)], but also, for Full and
+   cement, which is trivially [last_preserved_block_level(new_head)]
+   to [last_preserved_block_level(prev_head)], but also, for Full and
    Rolling history modes, keep some extra blocks so that we make sure
    to keep blocks above
-   max_operation_ttl(last_allowed_fork_level(checkpoint)). This is
+   max_operation_ttl(last_preserved_block_level(checkpoint)). This is
    done to make sure that we can export snapshots at the checkpoint
    level later on. This merging operation is asynchronous, the changes
    will be committed on disk only when the merge succeeds. Before
@@ -153,7 +154,8 @@
 
    - [chain_store_dir]/<stored_data>* files containing encoded simple
      data structures such as: genesis block, checkpoint, savepoint,
-     caboose, protocol levels, forked chains, invalid blocks, etc.
+     caboose, protocol levels, forked chains, alternate heads, invalid
+     blocks, etc.
 
    - [chain_store_dir]/testchains/<testchain_id_b58>/ contains the
      [chains_store_dir]'s test chain, based on a similar hierarchy.
@@ -173,17 +175,16 @@ type chain_store
 
 (** {3 Initialization} *)
 
-(** [init ?patch_context ?commit_genesis ?history_mode
-    ?block_cache_limit ~store_dir ~context_dir ~allow_testchains
-    genesis] initializes the store and a main chain store. If
-    [store_dir] (resp. [context_dir]) does not exist, a fresh store
-    (resp. context) is created. Otherwise, it loads the store
-    (resp. context) from reading the adequate directory. If
-    [allow_testchains] is passed, the store will be able to fork
-    chains and instantiate testchain's sub chain stores, for all
-    chains contained in the store. The chain store created is based on
-    the [genesis] provided. Its chain identifier will be computed
-    using the {!Chain_id.of_block_hash} function.
+(** [init ?patch_context ?commit_genesis ?history_mode ?readonly
+    ?block_cache_limit ?disable_context_pruning ?maintenance_delay ~store_dir
+    ~data_dir ~allow_testchains genesis] initializes the store and a main chain
+    store. If [store_dir] (resp. [data_dir]) does not exist, a fresh store
+    (resp. context) is created. Otherwise, it loads the store (resp. context)
+    from reading the adequate directory. If [allow_testchains] is passed, the
+    store will be able to fork chains and instantiate testchain's sub chain
+    stores, for all chains contained in the store. The chain store created is
+    based on the [genesis] provided. Its chain identifier will be computed using
+    the {!Chain_id.of_block_hash} function.
 
     @param patch_context the handle called when initializing the
     context. It usually is passed when creating a sandboxed chain.
@@ -198,15 +199,25 @@ type chain_store
     @param history_mode the history mode used throughout the store. If
     a directory already exists and the given [history_mode] is
     different, the initialization will fail.
-      Default: {!History_mode.default} (which should correspond to full
-    with 5 extra preserved cycles.)
+      Default: {!History_mode.default} (which should correspond to
+    full with 5 extra preserved cycles.)
+
+    @param readonly a flag that, if set to true, opens the storage,
+      that is stored on disk, in read-only mode preventing to write in
+      the corresponding store {b and} context.
+      Default: false
 
     @param block_cache_limit allows to override the size of the block
     cache to use. The minimal value is 1.
 
-    @param readonly a flag that, if set to true, prevent writing
-    throughout the store {b and} context.
+    @param disable_context_pruning a flag that, if set to true,
+      prevent the store to trigger the context pruning. Note that the
+      storage maintenance, aka merge, won't be impacted by this flag.
       Default: false
+
+    @param maintenance_delay a flag that, if set, will disable the
+    storage maintenance by a certain delay.
+      Default: Disabled
 *)
 val init :
   ?patch_context:
@@ -216,11 +227,24 @@ val init :
   ?history_mode:History_mode.t ->
   ?readonly:bool ->
   ?block_cache_limit:int ->
+  ?disable_context_pruning:bool ->
+  ?maintenance_delay:Storage_maintenance.delay ->
   store_dir:string ->
-  context_dir:string ->
+  data_dir:string ->
   allow_testchains:bool ->
   Genesis.t ->
   store tzresult Lwt.t
+
+(** [sync ?last_status ~trigger_hash store] performs a store
+    synchronization to update all the data and file descriptors. This
+    is useful to keep track of a store opened in readonly mode that is
+    updated by another read/write instance.
+    [?last_status] gives a hint regarding the previous synchronization
+    to speed up the process. *)
+val sync :
+  ?last_status:Block_store_status.t ->
+  t ->
+  (t * Block_store_status.t * (unit -> unit Lwt.t)) tzresult Lwt.t
 
 (** [main_chain_store global_store] returns the main chain store. *)
 val main_chain_store : store -> chain_store
@@ -231,12 +255,12 @@ val main_chain_store : store -> chain_store
     already closed, this function is idempotent. *)
 val close_store : store -> unit Lwt.t
 
-(** [may_switch_history_mode ?patch_context ~store_dir ~context_dir
-    genesis ~new_history_mode] tries switching the store located at
-    [store_dir] (if present) to [new_history_mode] when possible. *)
+(** [may_switch_history_mode ?patch_context ~store_dir ~data_dir genesis
+    ~new_history_mode] tries switching the store located at [store_dir] (if
+    present) to [new_history_mode] when possible. *)
 val may_switch_history_mode :
   store_dir:string ->
-  context_dir:string ->
+  data_dir:string ->
   Genesis.t ->
   new_history_mode:History_mode.t ->
   unit tzresult Lwt.t
@@ -288,12 +312,10 @@ module Block : sig
   type metadata = Block_repr.metadata = {
     message : string option;
     max_operations_ttl : int;
-    last_allowed_fork_level : Int32.t;
+    last_preserved_block_level : Int32.t;
     block_metadata : Bytes.t;
     operations_metadata : Block_validation.operation_metadata list list;
   }
-
-  (* FIXME: could be misleading. *)
 
   (** [equal b1 b2] tests the equality between [b1] and [b2]. {b
       Warning} only block hashes are compared. *)
@@ -426,8 +448,11 @@ module Block : sig
      the block was already stored. If the block is correctly stored,
      the newly created block is returned.
 
-      If the block was successfully stored, then the block is removed
-     from the validated block cache. *)
+     If the block was successfully stored, then the block is removed
+     from the validated block cache.
+
+     {b Warning} The store will refuse to store blocks with no
+     associated context's commit. *)
   val store_block :
     chain_store ->
     block_header:Block_header.t ->
@@ -561,7 +586,7 @@ module Block : sig
 
   val max_operations_ttl : metadata -> int
 
-  val last_allowed_fork_level : metadata -> int32
+  val last_preserved_block_level : metadata -> int32
 
   val block_metadata : metadata -> Bytes.t
 
@@ -642,15 +667,14 @@ module Chain : sig
         checkpoint's level.
 
       - The checkpoint is updated periodically such that the following
-        invariant holds:
-        [checkpoint.level >= all_head.last_allowed_fork_level]
+      invariant holds:
+      [checkpoint.level >= all_head.last_preserved_block_level]
 
-      The checkpoint will tend to designate the highest block among
-      all chain head's [last_allowed_fork_level] in a normal mode. This
-      is not always true. i.e. after a snapshot import where the
-      checkpoint will be set as the imported block and when the
-      [target] block is reached, the checkpoint will be set at this
-      point. *)
+      The checkpoint will tend to designate the highest block among all chain
+      head's [last_preserved_block_level] in a normal mode. This is not always
+      true. i.e. after a snapshot import where the checkpoint will be set as the
+      predecessor of the imported block and when the [target] block is reached,
+      the checkpoint will be set at this point. *)
   val checkpoint : chain_store -> block_descriptor Lwt.t
 
   (** [target chain_store] returns the target block associated to the
@@ -681,7 +705,8 @@ module Chain : sig
       For Full and Rolling history modes, the savepoint will be
       periodically updated at each store merge which happens when:
 
-      [pred(head).last_allowed_fork_level < head.last_allowed_fork_level]
+      [pred(head).last_preserved_block_level <
+      head.last_preserved_block_level]
 
       On Archive history mode: [savepoint = genesis]. *)
   val savepoint : chain_store -> block_descriptor Lwt.t
@@ -747,19 +772,18 @@ module Chain : sig
 
       After a merge:
 
-      - The checkpoint is updated to [lafl(new_head)] if it was below
+      - The checkpoint is updated to [lpbl(new_head)] if it was below
         this level or unchanged otherwise;
 
       - The savepoint will be updated to :
-        min(max_op_ttl(lafl(new_head)), lafl(new_head) -
-        <cycle_length> * <history_mode_offset>) or will remain 0 in
-        Archive mode;
+        min(max_op_ttl(lpbl(new_head)), lpbl(new_head) - <cycle_length>
+        * <history_mode_offset>) or will remain 0 in Archive mode;
 
       - The caboose will be updated to the same value as the savepoint
         in Rolling mode.
 
-      Note: lafl(new_head) is the last allowed fork level of the new
-      head.
+      Note: lpbl(new_head) is the last preserved block level of the
+      new head.
 
       {b Warnings:}
 
@@ -852,6 +876,11 @@ module Chain : sig
 
   (** {2 Chain's protocols} *)
 
+  (** [protol_levels chain_store] return all protocols with their activation
+      levels. *)
+  val protocol_levels :
+    t -> Protocol_levels.protocol_info Protocol_levels.t Lwt.t
+
   (** [find_protocol_info chain_store ~protocol_level] returns the
      protocol info associated to the given [protocol_level]. *)
   val find_protocol_info :
@@ -897,20 +926,18 @@ module Chain : sig
     Block.block * Protocol_hash.t ->
     unit tzresult Lwt.t
 
-  (** [may_update_ancestor_protocol_level chain_store ~head] tries to
-      find the activation block of the [head]'s protocol, checks that
-      its an ancestor and tries to update it if that's not the
-      case. If the registered activation block is not reachable
-      (already pruned), this function does nothing. *)
+  (** [may_update_ancestor_protocol_level chain_store ~head
+      ~expect_predecessor_context] tries to find the activation block
+      of the [head]'s protocol, checks that its an ancestor and tries
+      to update it if that's not the case. If the registered
+      activation block is not reachable (already pruned), this
+      function does nothing. The [expect_predecessor_context] argument
+      specifies which context hash semantics should be used. *)
   val may_update_ancestor_protocol_level :
     chain_store -> head:Block.block -> unit tzresult Lwt.t
 
-  (** [watcher chain_store] instantiates a new block watcher for
-      [chain_store]. *)
-  val watcher : chain_store -> Block.t Lwt_stream.t * Lwt_watcher.stopper
-
-  (** [validated_watcher chain_store] instantiates a new validated block
-       watcher for [chain_store]. *)
+  (** [validated_watcher chain_store] instantiates a new validated
+      block watcher for [chain_store]. *)
   val validated_watcher :
     chain_store -> Block.t Lwt_stream.t * Lwt_watcher.stopper
 
@@ -1015,11 +1042,20 @@ module Chain_traversal : sig
     (Block.t * Block.t list) Lwt.t
 end
 
-(** Upgrade a v_2 to v_3 store by rewriting the block store and the
-    protocol level's table.
+(** Utilities brings some utility functions that aims to help
+    extracting values, data or statistics from the store. *)
+module Utilities : sig
+  (** Store utility function that aims to give an overview of the shape
+    of the store's metadata. *)
+  val stat_metadata_cycles :
+    t -> (string * metadata_stat list) list tzresult Lwt.t
+end
 
-    {b Warning} Not backward-compatible. *)
-val v_3_0_upgrade : store_dir:string -> Genesis.t -> unit tzresult Lwt.t
+(** Upgrade module gathering all available upgrades. *)
+module Upgrade : sig
+  (** Upgrade the offset format for cemented files in v_3_2. *)
+  val v_3_2_upgrade : store_dir:string -> Genesis.t -> unit tzresult Lwt.t
+end
 
 (**/**)
 
@@ -1034,7 +1070,10 @@ module Unsafe : sig
   val get_block_store : chain_store -> Block_store.block_store
 
   val load_testchain :
-    chain_store -> chain_id:Chain_id.t -> Chain.testchain option tzresult Lwt.t
+    chain_store ->
+    chain_id:Chain_id.t ->
+    maintenance_delay:Storage_maintenance.delay ->
+    Chain.testchain option tzresult Lwt.t
 
   (** [set_head chain_store block] sets the block as the current head
       of [chain_store] without checks. *)
@@ -1074,29 +1113,28 @@ module Unsafe : sig
 
   (** Snapshots utility functions *)
 
-  (** [open_for_snapshot_export ~store_dir ~context_dir genesis
-      ~locked_f] opens the store (resp. context) located in [store_dir]
-      (resp. [context_dir]) and gives the [chain_store] whose
-      [chain_id] is computed using [genesis] and gives it to
-      [locked_f]. [locked_f] starts by taking a lock (using a lockfile) on
-      the store to prevent merge from happening during this function.
+  (** [open_for_snapshot_export ~store_dir ~data_dir genesis ~locked_f] opens
+      the store (resp. context) located in [store_dir] (resp. [data_dir]) and
+      gives the [chain_store] whose [chain_id] is computed using [genesis] and
+      gives it to [locked_f]. [locked_f] starts by taking a lock (using a
+      lockfile) on the store to prevent merge from happening during this
+      function.
 
       {b Warning} [locked_f] must not perform long computations or
       costly I/Os: if the store needs to perform a merge, it will be
       locked while [locked_f] is running. *)
   val open_for_snapshot_export :
     store_dir:string ->
-    context_dir:string ->
+    data_dir:string ->
     Genesis.t ->
     locked_f:(chain_store -> 'a tzresult Lwt.t) ->
     'a tzresult Lwt.t
 
-  (** [restore_from_snapshot ?notify ~store_dir ~context_index
-      ~genesis ~genesis_context_hash ~floating_blocks_stream
-      ~new_head_with_metadata ~new_head_resulting_context_hash
-      ~predecessor_header ~protocol_levels ~history_mode] initialises
-      a coherent store in [store_dir] with all the given info
-      retrieved from a snapshot. *)
+  (** [restore_from_snapshot ?notify ~store_dir ~context_index ~genesis
+      ~genesis_context_hash ~floating_blocks_stream ~new_head_with_metadata
+      ~new_head_resulting_context_hash ~predecessor_header ~protocol_levels
+      ~history_mode ~is_legacy_import] initialises a coherent store in
+      [store_dir] with all the given info retrieved from a snapshot. *)
   val restore_from_snapshot :
     ?notify:(unit -> unit Lwt.t) ->
     [`Store_dir] Naming.directory ->

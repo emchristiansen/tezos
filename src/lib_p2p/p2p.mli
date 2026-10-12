@@ -107,12 +107,20 @@ type config = {
       (** If [true], peers discovered on the local network will be trusted. *)
   reconnection_config : Point_reconnection_config.t;
       (** The reconnection delat configuration. *)
+  disable_peer_discovery : bool;
+      (** If set to [true], the p2p layer will not participate to the peer
+          discovery mechanism. The p2p layer will not be able to find new peers
+          to connect with. For more details, refers to field
+          [disable_peer_discovery] of {!type:P2p_connect_handler.config}.  *)
 }
 
 (** Type of a P2P layer instance *)
 type ('msg, 'peer_meta, 'conn_meta) t
 
 type ('msg, 'peer_meta, 'conn_meta) net = ('msg, 'peer_meta, 'conn_meta) t
+
+(** A connection to a peer *)
+type ('msg, 'peer_meta, 'conn_meta) connection
 
 val announced_version : ('msg, 'peer_meta, 'conn_meta) net -> Network_version.t
 
@@ -132,10 +140,27 @@ val faked_network :
   'conn_meta ->
   ('msg, 'peer_meta, 'conn_meta) net
 
-(** Main network initialization function *)
+(** Main network initialization function
+
+    [received_msg_hook] is a function that is called every time a message
+    ['msg] is received.
+    [sent_msg_hook] is a function that is called every time a message
+    ['msg] is sent.
+    [broadcasted_msg_hook] is a function that is called every time a message
+    ['msg] is broadcasted.
+    *)
 val create :
+  ?fd_pool:P2p_fd.fd_pool ->
   config:config ->
   limits:Tezos_p2p_services.P2p_limits.t ->
+  ?received_msg_hook:(('msg, 'peer_meta, 'conn_meta) connection -> 'msg -> unit) ->
+  ?sent_msg_hook:(('msg, 'peer_meta, 'conn_meta) connection -> 'msg -> unit) ->
+  ?broadcasted_msg_hook:
+    (('msg, 'peer_meta, 'conn_meta) connection P2p_peer.Table.t ->
+    ?except:(('msg, 'peer_meta, 'conn_meta) connection -> bool) ->
+    ?alt:(('msg, 'peer_meta, 'conn_meta) connection -> bool) * 'msg ->
+    'msg ->
+    unit) ->
   'peer_meta P2p_params.peer_meta_config ->
   'conn_meta P2p_params.conn_meta_config ->
   'msg P2p_params.message_config ->
@@ -154,9 +179,6 @@ val roll : ('msg, 'peer_meta, 'conn_meta) net -> unit Lwt.t
 
 (** Close all connections properly *)
 val shutdown : ('msg, 'peer_meta, 'conn_meta) net -> unit Lwt.t
-
-(** A connection to a peer *)
-type ('msg, 'peer_meta, 'conn_meta) connection
 
 (** Access the domain of active peers *)
 val connections :
@@ -208,6 +230,7 @@ val negotiated_version :
 val disconnect :
   ('msg, 'peer_meta, 'conn_meta) net ->
   ?wait:bool ->
+  reason:string ->
   ('msg, 'peer_meta, 'conn_meta) connection ->
   unit Lwt.t
 
@@ -220,13 +243,26 @@ val get_peer_metadata :
 val set_peer_metadata :
   ('msg, 'peer_meta, 'conn_meta) net -> P2p_peer.Id.t -> 'peer_meta -> unit
 
-(** [connect net ?timeout point] attempts to establish a connection to [point]
-   within an optional duration [timeout]. *)
+(** [connect net ?trusted ?expected_peer_id ?timeout point] attempts to
+    establish a connection to [point] within an optional duration [timeout]. The
+    optional arguments [trusted] and [expected_peer_id] can be used to specify
+    whether the connection should be trusted and to provide the expected remote
+    peer's id, respectively. *)
 val connect :
   ('msg, 'peer_meta, 'conn_meta) net ->
+  ?trusted:bool ->
+  ?expected_peer_id:P2p_peer.Id.t ->
   ?timeout:Ptime.span ->
   P2p_point.Id.t ->
   ('msg, 'peer_meta, 'conn_meta) connection tzresult Lwt.t
+
+(** [wait_reader_closed conn] is a promise that resolves when the TCP
+    read side of [conn] fails. *)
+val wait_reader_closed : ('msg, 'peer_meta, 'conn_meta) connection -> unit Lwt.t
+
+(** [wait_writer_closed conn] is a promise that resolves when the TCP
+    write side of [conn] fails. *)
+val wait_writer_closed : ('msg, 'peer_meta, 'conn_meta) connection -> unit Lwt.t
 
 (** Wait for a message from a given connection. *)
 val recv :
@@ -255,7 +291,7 @@ val try_send :
   'msg ->
   bool
 
-(** [broadcast connections ~except ~(alt:if_conn,then_msg) msg] will
+(** [broadcast net connections ~except ~(alt:if_conn,then_msg) msg] will
     send messages to all [connections] that do not satisfy the
     predicate [except]. [alt] can be used to send an alternative
     message [then_msg] to connections that do satisfy the [if_conn]
@@ -266,6 +302,7 @@ val try_send :
     actually received (https://gitlab.com/tezos/tezos/-/issues/4205).
 *)
 val broadcast :
+  ('msg, 'peer_meta, 'conn_meta) net ->
   ('msg, 'peer_meta, 'conn_meta) connection P2p_peer.Table.t ->
   ?except:(('msg, 'peer_meta, 'conn_meta) connection -> bool) ->
   ?alt:(('msg, 'peer_meta, 'conn_meta) connection -> bool) * 'msg ->
@@ -283,10 +320,34 @@ val iter_connections :
   (P2p_peer.Id.t -> ('msg, 'peer_meta, 'conn_meta) connection -> unit) ->
   unit
 
+(** [on_new_connection p2p f] registers a function [f] that is called
+    everytime we were successfully connected to a peer (after having
+    initialised a secured channel).
+
+    This function will not be called if we started to connect to a
+    peer and the connection was rejected during the initialisation of
+    the connection. For example, if the peer is using a different
+    network version. *)
 val on_new_connection :
   ('msg, 'peer_meta, 'conn_meta) net ->
   (P2p_peer.Id.t -> ('msg, 'peer_meta, 'conn_meta) connection -> unit) ->
   unit
+
+(** [on_disconnection p2p f] registers a function [f] that is called
+    everytime we disconnect from a peer after we were successfully
+    connected to a peer (this call may happen at any moment during the
+    disconnection). The library ensures that anytime [f peer] is
+    called, then for any callback registered with [on_new_connection],
+    those callbacks would have been called with [peer] in the first
+    place (if the callbacks were registered at that time).
+
+    A direct implication of this is that any callback registered with
+    this function will not be called if we started to connect to a
+    peer and we disconnect from it because the connection was rejected
+    somehow.
+*)
+val on_disconnection :
+  ('msg, 'peer_meta, 'conn_meta) net -> (P2p_peer.Id.t -> unit) -> unit
 
 val greylist_addr : ('msg, 'peer_meta, 'conn_meta) net -> P2p_addr.t -> unit
 
@@ -299,11 +360,13 @@ val watcher :
 (**/**)
 
 module Internal_for_tests : sig
-  (** [broadcast_conns connections ~except ~(alt:if_conn,then_msg)
-      msg] is similarly to broadcast.
-      But it exposes the internal `connection = P2p_conn.t` type for
-      testing purposes *)
-  val broadcast_conns :
+  (** [raw_broadcast connections ~except ~(alt:if_conn,then_msg)
+      msg] is similarly to broadcast, but for testing purposes:
+      - it exposes the internal `connection = P2p_conn.t` type,
+      - it does not notify broadcasted hooks,
+      - it does not require an argument of type net.
+  *)
+  val raw_broadcast :
     ('msg, 'peer_meta, 'conn_meta) P2p_conn.t P2p_peer.Table.t ->
     ?except:(('msg, 'peer_meta, 'conn_meta) P2p_conn.t -> bool) ->
     ?alt:(('msg, 'peer_meta, 'conn_meta) connection -> bool) * 'msg ->

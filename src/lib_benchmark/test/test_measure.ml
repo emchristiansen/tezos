@@ -29,7 +29,7 @@ open Tezos_benchmark_examples
 let bench_opts =
   let open Measure in
   {
-    seed = Some 1337;
+    seed = 1337;
     nsamples = 3000;
     (* Percentile 50 = Median *)
     bench_number = 100;
@@ -52,4 +52,6 @@ let tests =
       test_parse_config;
   ]
 
-let () = Alcotest_lwt.run "tezos-benchmark" [("measure", tests)] |> Lwt_main.run
+let () =
+  Alcotest_lwt.run ~__FILE__ "tezos-benchmark" [("measure", tests)]
+  |> Lwt_main.run

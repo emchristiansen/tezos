@@ -145,7 +145,7 @@ module Make (Encoding : module type of Tezos_context_encoding.Context) = struct
         List.iter_s
           (fun (s, k) ->
             match Store.Tree.destruct k with
-            | `Contents _ -> Lwt.return ()
+            | `Contents _ -> Lwt.return_unit
             | `Node _ ->
                 let* tree = Store.Tree.get_tree context.tree [s] in
                 let+ _ =
@@ -571,7 +571,9 @@ module Make (Encoding : module type of Tezos_context_encoding.Context) = struct
         let tree =
           (* This is safe as store.Tree will never call any blocking
              functions. *)
-          match Lwt.state tree with Return t -> t | _ -> assert false
+          match Lwt.state tree with
+          | Return t -> t
+          | _ -> assert false
         in
         tree)
       (fun t ->
