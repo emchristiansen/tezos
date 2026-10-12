@@ -37,6 +37,14 @@ module Hashed = struct
   module Operation_metadata_list_hash = Operation_metadata_list_hash
   module Operation_metadata_list_list_hash = Operation_metadata_list_list_hash
   module Protocol_hash = Protocol_hash
+  module Smart_rollup_address = Smart_rollup_address
+  module Smart_rollup_commitment_hash = Smart_rollup_commitment_hash
+  module Smart_rollup_state_hash = Smart_rollup_state_hash
+  module Smart_rollup_inbox_hash = Smart_rollup_inbox_hash
+  module Smart_rollup_merkelized_payload_hashes_hash =
+    Smart_rollup_merkelized_payload_hashes_hash
+  module Injector_operations_hash = Injector_operations_hash
+  module Account_hash = Account_hash
 end
 
 module Signature = struct
@@ -44,6 +52,7 @@ module Signature = struct
   module Ed25519 = Ed25519
   module P256 = P256
   module Secp256k1 = Secp256k1
+  module Mldsa44 = Mldsa44
   include Signature
 end
 
@@ -54,4 +63,5 @@ module Crypto_box = Crypto_box
 module Hacl = Hacl
 module Helpers = Helpers
 module Rand = Rand
+module Timelock_legacy = Timelock_legacy
 module Timelock = Timelock

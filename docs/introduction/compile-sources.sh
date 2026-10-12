@@ -6,19 +6,17 @@
 # shellcheck disable=SC2086
 # for omitting quotes in: source $HOME/.cargo/env
 
-usage () {
-    cat >&2 <<!EOF
+usage() {
+  cat >&2 << !EOF
 usage:
   $0 [<repo> <branch>]
 !EOF
 }
 
-if [ $# -eq 2 ]
-then
+if [ $# -eq 2 ]; then
   REPO=$1
   BRANCH=$2
-elif [ $# -eq 0 ]  # don't remove this branch used for an example in the doc!
-then
+elif [ $# -eq 0 ]; then # don't remove this branch used for an example in the doc!
   # [select branch]
   REPO="tezos/tezos"
   BRANCH="latest-release"
@@ -30,31 +28,31 @@ fi
 
 set -e
 set -x
-cd
-# [install prerequisites]
-sudo apt-get update
-sudo apt-get install -y sudo
-export OPAMYES=true
-# [install packages]
-# [Temporary fix: removes tezos folder from PATH if added with Octez <= v13 instructions]
-PATH=${PATH##"$HOME"/tezos/:}
-sudo apt-get install -y rsync git m4 build-essential patch unzip wget opam jq bc
-# [install rust]
-wget https://sh.rustup.rs/rustup-init.sh
-chmod +x rustup-init.sh
-./rustup-init.sh --profile minimal --default-toolchain 1.60.0 -y
+
+# we clean the directory in the CI before cloning to avoid
+# dune getting confused
+if [ "$CI" = "true" ]; then rm -Rf ./*; fi
+
 # [source cargo]
 . $HOME/.cargo/env
 # [get sources]
 git clone https://gitlab.com/"$REPO".git tezos
 cd tezos
 git checkout $BRANCH
-# [install Octez dependencies]
+# [init opam]
 opam init --bare
+# [end init opam]
+
+# this script uses a docker image with pre-compiled dependencies.
+# we hide this detail here from the script that is copied verbatim in
+# the documentation
+ln -s /root/tezos/_opam .
+
+# [make build-deps]
 make build-deps
 # [compile sources]
 eval $(opam env)
-make
+make release
 # [optional setup]
 # puts Octez binaries in PATH:
 # export PATH=$PWD/_build/install/default/bin/:$PATH
@@ -65,5 +63,3 @@ make
 # [test executables]
 ./octez-client --version
 ./octez-node --version
-./octez-baker-alpha --version
-./octez-accuser-alpha --version

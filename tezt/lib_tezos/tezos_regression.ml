@@ -23,42 +23,42 @@
 (*                                                                           *)
 (*****************************************************************************)
 
+let replacements =
+  [
+    (* Normalize DAL debug print store schemas command for regression (dal-node vs baker). *)
+    ( "\\./octez-baker dal debug print store schemas\\b",
+      "./[octez-dal-executable] debug print store schemas" );
+    ( "\\./octez-dal-node debug print store schemas\\b",
+      "./[octez-dal-executable] debug print store schemas" );
+    ("sh\\w{72}\\b", "[DAL_SLOT_HEADER]");
+    (* TODO: https://gitlab.com/tezos/tezos/-/issues/3752
+       Remove this regexp as soon as the WASM PVM stabilizes. *)
+    ("srs\\w{51}\\b", "[SC_ROLLUP_PVM_STATE_HASH]");
+    ("\\bB\\w{50}\\b", "[BLOCK_HASH]");
+    ("SRCo\\w{50}\\b", "[SC_ROLLUP_CONTEXT_HASH]");
+    ("Co\\w{50}\\b", "[CONTEXT_HASH]");
+    ("src1\\w{50}\\b", "[SC_ROLLUP_COMMITMENT_HASH]");
+    ("srib1\\w{50}\\b", "[SC_ROLLUP_INBOX_HASH]");
+    ("srib2\\w{50}\\b", "[SC_ROLLUP_INBOX_MERKELIZED_PAYLOAD_HASHES_HASH]");
+    ("srib3\\w{50}\\b", "[SC_ROLLUP_INBOX_MESSAGE_HASH]");
+    ("edpk\\w{50}\\b", "[PUBLIC_KEY]");
+    ("\\bo\\w{50}\\b", "[OPERATION_HASH]");
+    ("tz[1234]\\w{33}\\b", "[PUBLIC_KEY_HASH]");
+    ("sr1\\w{33}\\b", "[SMART_ROLLUP_HASH]");
+    ("KT1\\w{33}\\b", "[CONTRACT_HASH]");
+    ("\\d{4}-\\d{2}-\\d{2}T\\d{2}:\\d{2}:\\d{2}Z", "[TIMESTAMP]");
+    ("parent_hash: 0x\\w{64}\\b", "parent_hash: [EVM_BLOCK_PARENT_HASH]");
+    (* Ports are non-deterministic when using -j. *)
+    ("/localhost:\\d{4,5}/", "/[HOST]:[PORT]/");
+    ("/127.0.0.1:\\d{4,5}/", "/[HOST]:[PORT]/");
+    ("/\\[::1\\]:\\d{4,5}/", "/[HOST]:[PORT]/");
+  ]
+
 (* Replace variables that may change between different runs by constants.
 
    Order them by length.
 *)
-let replace_variables string =
-  let replacements =
-    [
-      ("sh\\w{72}\\b", "[DAL_SLOT_HEADER]");
-      (* TODO: https://gitlab.com/tezos/tezos/-/issues/3752
-         Remove this regexp as soon as the WASM PVM stabilizes. *)
-      ("srs\\w{51}\\b", "[SC_ROLLUP_PVM_STATE_HASH]");
-      ("\\bB\\w{50}\\b", "[BLOCK_HASH]");
-      ("SRCo\\w{50}\\b", "[SC_ROLLUP_CONTEXT_HASH]");
-      ("Co\\w{50}\\b", "[CONTEXT_HASH]");
-      ("txi\\w{50}\\b", "[TX_ROLLUP_INBOX_HASH]");
-      ("txmr\\w{50}\\b", "[TX_ROLLUP_MESSAGE_RESULT_HASH]");
-      ("txm\\w{50}\\b", "[TX_ROLLUP_MESSAGE_HASH]");
-      ("txmr\\w{50}\\b", "[TX_ROLLUP_MESSAGE_RESULT_HASH]");
-      ("txM\\w{50}\\b", "[TX_ROLLUP_MESSAGE_RESULT_LIST_HASH]");
-      ("txc\\w{50}\\b", "[TX_ROLLUP_COMMITMENT_HASH]");
-      ("src1\\w{50}\\b", "[SC_ROLLUP_COMMITMENT_HASH]");
-      ("srib1\\w{50}\\b", "[SC_ROLLUP_INBOX_HASH]");
-      ("srib2\\w{50}\\b", "[SC_ROLLUP_INBOX_MERKELIZED_PAYLOAD_HASHES_HASH]");
-      ("srib3\\w{50}\\b", "[SC_ROLLUP_INBOX_MESSAGE_HASH]");
-      ("edpk\\w{50}\\b", "[PUBLIC_KEY]");
-      ("\\bo\\w{50}\\b", "[OPERATION_HASH]");
-      ("tz[123]\\w{33}\\b", "[PUBLIC_KEY_HASH]");
-      ("txr1\\w{33}\\b", "[TX_ROLLUP_HASH]");
-      ("tz4\\w{33}\\b", "[TX_ROLLUP_PUBLIC_KEY_HASH]");
-      ("sr1\\w{33}\\b", "[SMART_ROLLUP_HASH]");
-      ("KT1\\w{33}\\b", "[CONTRACT_HASH]");
-      ("\\d{4}-\\d{2}-\\d{2}T\\d{2}:\\d{2}:\\d{2}Z", "[TIMESTAMP]");
-      (* Ports are non-deterministic when using -j. *)
-      ("/localhost:\\d{4,5}/", "/localhost:[PORT]/");
-    ]
-  in
+let replace_variables ?(replacements = replacements) string =
   List.fold_left
     (fun string (replace, by) ->
       replace_string ~all:true (rex replace) ~by string)
@@ -69,7 +69,7 @@ let scrubbed_global_options =
   ["--base-dir"; "-d"; "--endpoint"; "-E"; "--sources"]
 
 let hooks_custom ?(scrubbed_global_options = scrubbed_global_options)
-    ?(replace_variables = replace_variables) () =
+    ?(replace_variables = replace_variables ~replacements) () =
   let on_spawn command arguments =
     (* Remove arguments that shouldn't be captured in regression output. *)
     let arguments, _ =
@@ -85,9 +85,28 @@ let hooks_custom ?(scrubbed_global_options = scrubbed_global_options)
         arguments
     in
     let message = Log.quote_shell_command command arguments in
-    Regression.capture ("\n" ^ message)
+    Regression.capture ("\n" ^ replace_variables message)
   in
   let on_log output = replace_variables output |> Regression.capture in
   {Process.on_spawn; on_log}
 
 let hooks = hooks_custom ~scrubbed_global_options ~replace_variables ()
+
+let rpc_hooks : RPC_core.rpc_hooks =
+  let open RPC_core in
+  let on_request verb ~uri data =
+    Regression.capture (sf "%s %s" (show_verb verb) (replace_variables uri)) ;
+    match data with
+    | None -> ()
+    | Some (Data data) ->
+        Regression.capture "Content-type: application/json" ;
+        Regression.capture (JSON.encode_u data)
+    | Some (File f) ->
+        Regression.capture
+        @@ sf "Content-type: application/json (file %s)" (Filename.basename f)
+  in
+  let on_response status ~body =
+    Regression.capture (Cohttp.Code.string_of_status status) ;
+    Regression.capture (replace_variables body)
+  in
+  {on_request; on_response}

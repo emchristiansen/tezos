@@ -51,8 +51,14 @@ let root = 0l
 let succ = Int32.succ
 
 let add l i =
+  let x = Int32.add l (Int32.of_int i) in
+  assert (Compare.Int32.(x >= 0l)) ;
+  x
+
+let add_opt l i =
   assert (Compare.Int.(i >= 0)) ;
-  Int32.add l (Int32.of_int i)
+  let res = Int32.add l (Int32.of_int i) in
+  if Compare.Int32.(res >= 0l) then Some res else None
 
 let sub l i =
   assert (Compare.Int.(i >= 0)) ;
@@ -60,6 +66,8 @@ let sub l i =
   if Compare.Int32.(res >= 0l) then Some res else None
 
 let pred l = if l = 0l then None else Some (Int32.pred l)
+
+let pred_dontreturnzero l = if l <= 1l then None else Some (Int32.pred l)
 
 let diff = Int32.sub
 
@@ -88,7 +96,8 @@ let () =
     (fun l -> Unexpected_level l)
 
 let of_int32 l =
-  if Compare.Int32.(l >= 0l) then ok l else error (Unexpected_level l)
+  let open Result_syntax in
+  if Compare.Int32.(l >= 0l) then return l else tzfail (Unexpected_level l)
 
 let of_int32_exn l =
   match of_int32 l with
@@ -102,6 +111,7 @@ let of_int32_non_negative l =
 
 let encoding =
   Data_encoding.conv_with_guard
+    ~schema:Data_encoding.positive_int32_schema
     to_int32
     (fun l ->
       match of_int32 l with

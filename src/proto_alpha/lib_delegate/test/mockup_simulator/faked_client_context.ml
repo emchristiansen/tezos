@@ -58,25 +58,25 @@ class faked_ctxt (hooks : Faked_services.hooks) (chain_id : Chain_id.t) :
     method generic_media_type_call meth ?body uri =
       local_ctxt#generic_media_type_call meth ?body uri
 
-    method call_service
-        : 'm 'p 'q 'i 'o.
-          (([< Resto.meth] as 'm), unit, 'p, 'q, 'i, 'o) Tezos_rpc.Service.t ->
-          'p ->
-          'q ->
-          'i ->
-          'o tzresult Lwt.t =
+    method call_service :
+        'm 'p 'q 'i 'o.
+        (([< Resto.meth] as 'm), unit, 'p, 'q, 'i, 'o) Tezos_rpc.Service.t ->
+        'p ->
+        'q ->
+        'i ->
+        'o tzresult Lwt.t =
       fun service params query body ->
         local_ctxt#call_service service params query body
 
-    method call_streamed_service
-        : 'm 'p 'q 'i 'o.
-          (([< Resto.meth] as 'm), unit, 'p, 'q, 'i, 'o) Tezos_rpc.Service.t ->
-          on_chunk:('o -> unit) ->
-          on_close:(unit -> unit) ->
-          'p ->
-          'q ->
-          'i ->
-          (unit -> unit) tzresult Lwt.t =
+    method call_streamed_service :
+        'm 'p 'q 'i 'o.
+        (([< Resto.meth] as 'm), unit, 'p, 'q, 'i, 'o) Tezos_rpc.Service.t ->
+        on_chunk:('o -> unit) ->
+        on_close:(unit -> unit) ->
+        'p ->
+        'q ->
+        'i ->
+        (unit -> unit) tzresult Lwt.t =
       fun service ~on_chunk ~on_close params query body ->
         local_ctxt#call_streamed_service
           service
@@ -92,6 +92,7 @@ class faked_wallet ~base_dir ~filesystem : Client_context.wallet =
     method load_passwords = None
 
     method read_file fname =
+      let open Lwt_result_syntax in
       match String.Hashtbl.find filesystem fname with
       | None -> failwith "faked_wallet: cannot read file (%s)" fname
       | Some (content, _mtime) -> return content
@@ -110,11 +111,12 @@ class faked_wallet ~base_dir ~filesystem : Client_context.wallet =
 
     method load : type a.
         string -> default:a -> a Data_encoding.encoding -> a tzresult Lwt.t =
+      let open Lwt_result_syntax in
       fun alias_name ~default encoding ->
         let filename = self#filename alias_name in
         if not (String.Hashtbl.mem filesystem filename) then return default
         else
-          self#read_file filename >>=? fun content ->
+          let* content = self#read_file filename in
           let json = (Ezjsonm.from_string content :> Data_encoding.json) in
           match Data_encoding.Json.destruct encoding json with
           | exception e ->
@@ -127,6 +129,7 @@ class faked_wallet ~base_dir ~filesystem : Client_context.wallet =
 
     method write : type a.
         string -> a -> a Data_encoding.encoding -> unit tzresult Lwt.t =
+      let open Lwt_result_syntax in
       fun alias_name list encoding ->
         let filename = self#filename alias_name in
         let json = Data_encoding.Json.construct encoding list in

@@ -23,6 +23,14 @@
 (*                                                                           *)
 (*****************************************************************************)
 
+(* Testing
+   -------
+   Component:    Stdlib
+   Invocation:   dune exec src/lib_lwt_result_stdlib/test/main.exe \
+                  -- --file test_fuzzing_set_against_stdlib.ml
+   Subject:      Test fuzzing set against stdlib
+*)
+
 open Test_fuzzing_lib
 
 (* The testing framework [Test_fuzzing_lib] uses [char] as the type of values
@@ -69,7 +77,7 @@ let iter =
           (fun x ->
             let* y = f x in
             acc := y ;
-            return ())
+            return_unit)
           (Set.of_list xs)
       in
       return !acc)
@@ -81,7 +89,7 @@ let iter =
           (fun x ->
             let* y = f x in
             acc := y ;
-            return ())
+            return_unit)
           (Set.of_list xs)
       in
       return !acc)
@@ -93,7 +101,7 @@ let iter =
           (fun x ->
             let* y = f x in
             acc := y ;
-            return ())
+            return_unit)
           (Set.of_list xs)
       in
       return !acc)
@@ -105,7 +113,7 @@ let iter =
           (fun x ->
             let* y = f x in
             acc := y ;
-            return ())
+            return_unit)
           (Set.of_list xs)
       in
       return !acc)
@@ -117,7 +125,7 @@ let iter =
           (fun x ->
             let* y = f x in
             acc := y ;
-            return ())
+            return_unit)
           (Set.of_list xs)
       in
       return !acc)
@@ -134,4 +142,4 @@ let fold =
 
 let all_set : unit Alcotest.test_case list = [iter; fold]
 
-let () = Alcotest.run "FuzzRef" [("Set", all_set)]
+let () = Alcotest.run ~__FILE__ "FuzzRef" [("Set", all_set)]

@@ -30,11 +30,13 @@
    Subject:      Tests handling oversized contract call arguments
 *)
 
+let team = Tag.layer1
+
 let test_operation_size =
   Protocol.register_test
     ~__FILE__
     ~title:"operation size munch and bytes contract"
-    ~tags:["operation"; "script"; "size"; "munch"; "bytes"]
+    ~tags:[team; "operation"; "script"; "size"; "munch"; "bytes"]
   @@ fun protocol ->
   let repeat_s n s =
     let buf = Buffer.create (n * String.length s) in
@@ -90,11 +92,17 @@ let test_operation_size =
     test
     [
       (* Operations that fit *)
-      (bytes, None, (* 6 KB of data. *)
-                    "0x" ^ repeat_s (6 * 1024) "00", None);
+      ( bytes,
+        None,
+        (* 6 KB of data. *)
+        "0x" ^ repeat_s (6 * 1024) "00",
+        None );
       (* Test that operations between 16KB and 32KB can be injected in the node. *)
-      (bytes, None, (* 24 KB of data. *)
-                    "0x" ^ repeat_s (24 * 1024) "00", None);
+      ( bytes,
+        None,
+        (* 24 KB of data. *)
+        "0x" ^ repeat_s (24 * 1024) "00",
+        None );
       (* Test that an operation of exactly 32KB can be injected in the node. *)
       ( bytes,
         None,

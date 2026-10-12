@@ -1,0 +1,25 @@
+[
+  {
+    "file": "tezt/tests/dal.ml",
+    "title": "S023-: Testing DAL rollup and node with L1 (Refutation where the honest node makes final move)",
+    "tags": [
+      "admin_client",
+      "client",
+      "dal",
+      "dal_echo_kernel",
+      "dal_node",
+      "memory_hungry",
+      "node",
+      "s023",
+      "slow",
+      "smart_rollup_installer",
+      "smart_rollup_node",
+      "tezos2"
+    ],
+    "successful_runs": {
+      "total_time": "659923529",
+      "count": "1"
+    },
+    "peak_memory_usage": 4361418000
+  }
+]

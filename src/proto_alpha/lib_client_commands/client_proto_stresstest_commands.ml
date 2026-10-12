@@ -26,6 +26,7 @@
 open Protocol
 open Alpha_context
 module Smart_contracts = Client_proto_stresstest_contracts
+module Alpha_services = Plugin.Alpha_services
 
 type transfer_strategy =
   | Fixed_amount of {mutez : Tez.t}  (** Amount to transfer *)
@@ -62,13 +63,13 @@ type parameters = {
 type origin = Explicit | Wallet_pkh | Wallet_alias of string
 
 type source = {
-  pkh : public_key_hash;
+  pkh : Implicit_account_repr.t;
   pk : public_key;
   sk : Signature.secret_key;
 }
 
 type source_with_uri = {
-  pkh : public_key_hash;
+  pkh : Implicit_account_repr.t;
   pk : public_key;
   pk_uri : Client_keys.pk_uri;
   sk : Signature.secret_key;
@@ -78,7 +79,7 @@ type source_with_uri = {
 type input_source =
   | Explicit of source
   | Wallet_alias of string
-  | Wallet_pkh of public_key_hash
+  | Wallet_pkh of Implicit_account_repr.t
 
 type source_origin = {source : source; origin : origin}
 
@@ -139,7 +140,7 @@ let default_parameters =
     tps = 5.0;
     strategy = Fixed_amount {mutez = Tez.one};
     regular_transfer_fee = Tez.of_mutez_exn 2_000L;
-    regular_transfer_gas_limit = Gas.Arith.integral_of_int_exn 1_600;
+    regular_transfer_gas_limit = Gas.Arith.integral_of_int_exn 2_200;
     (* [gas_limit] corresponds to a slight overapproximation of the
        gas needed to inject an operation. It was obtained by simulating
        the operation using the client. *)
@@ -161,7 +162,7 @@ let input_source_encoding =
         ~title:"explicit"
         (Tag 0)
         (obj3
-           (req "pkh" Signature.Public_key_hash.encoding)
+           (req "pkh" Implicit_account_repr.encoding)
            (req "pk" Signature.Public_key.encoding)
            (req "sk" Signature.Secret_key.encoding))
         (function Explicit {pkh; pk; sk} -> Some (pkh, pk, sk) | _ -> None)
@@ -175,7 +176,7 @@ let input_source_encoding =
       case
         ~title:"pkh"
         (Tag 2)
-        (obj1 (req "pkh" Signature.Public_key_hash.encoding))
+        (obj1 (req "pkh" Implicit_account_repr.encoding))
         (function Wallet_pkh pkh -> Some pkh | _ -> None)
         (fun pkh -> Wallet_pkh pkh);
     ]
@@ -198,7 +199,8 @@ let transaction_costs_encoding =
 
 let destination_to_contract dst =
   match dst with
-  | Implicit x -> Contract.Implicit x
+  (* FIXME-PA *)
+  | Implicit x -> Contract.Implicit (Implicit_account_repr.Forbidden.of_pkh x)
   | Originated x -> x.destination
 
 let parse_strategy s =
@@ -272,6 +274,8 @@ let normalize_source cctxt =
                  wallet"
                 alias
           | Some sk ->
+              (* FIXME-PA *)
+              let pkh = Implicit_account_repr.Forbidden.of_pkh pkh in
               Lwt.return_some
                 {source = {pkh; pk; sk}; origin = Wallet_alias alias})
     in
@@ -280,14 +284,16 @@ let normalize_source cctxt =
     | key -> Lwt.return key
   in
   let key_from_wallet pkh =
+    (* FIXME-PA *)
+    let pkh_sig = Implicit_account_repr.Forbidden.to_pkh pkh in
     let warning msg pkh =
       let* () = cctxt#warning msg Signature.Public_key_hash.pp pkh in
       return_none
     in
     let* key =
-      let* r = Client_keys.get_key cctxt pkh in
+      let* r = Client_keys.get_key cctxt pkh_sig in
       match r with
-      | Error _ -> warning "Pkh \"%a\" not found in the wallet" pkh
+      | Error _ -> warning "Pkh \"%a\" not found in the wallet" pkh_sig
       | Ok (alias, pk, sk_uri) -> (
           let* o = sk_of_sk_uri sk_uri in
           match o with
@@ -297,7 +303,7 @@ let normalize_source cctxt =
                   "Cannot extract the secret key form the pkh \"%a\" (alias: \
                    \"%s\") of the wallet"
                   Signature.Public_key_hash.pp
-                  pkh
+                  pkh_sig
                   alias
               in
               Lwt.return_none
@@ -305,7 +311,7 @@ let normalize_source cctxt =
               Lwt.return_some {source = {pkh; pk; sk}; origin = Wallet_pkh})
     in
     match key with
-    | None -> warning "Source given as pkh \"%a\" ignored" pkh
+    | None -> warning "Source given as pkh \"%a\" ignored" pkh_sig
     | key -> Lwt.return key
   in
   function
@@ -361,7 +367,9 @@ let random_seed rng =
 
 let generate_fresh_source state =
   let seed = random_seed state.rng_state in
-  let pkh, pk, sk = Signature.generate_key ~seed () in
+  let pkh_sig, pk, sk = Signature.generate_key ~seed () in
+  (* FIXME-PA *)
+  let pkh = Implicit_account_repr.Forbidden.of_pkh pkh_sig in
   let fresh = {source = {pkh; pk; sk}; origin = Explicit} in
   state.pool <- fresh :: state.pool ;
   state.pool_size <- state.pool_size + 1 ;
@@ -452,7 +460,7 @@ let rec sample_transfer (cctxt : Protocol_client_context.full) chain block
       log Debug (fun () ->
           cctxt#message
             "sample_transfer: invalid balance %a"
-            Signature.Public_key_hash.pp
+            Protocol.Implicit_account_repr.pp
             src.pkh)
     in
     (* Sampled source has zero balance: the transfer that created that
@@ -472,7 +480,9 @@ let rec sample_transfer (cctxt : Protocol_client_context.full) chain block
             else sample_any_source_from_pool state
           in
           return
-            ( Implicit dest.pkh,
+            ( (* FIXME-PA *)
+              Implicit
+                (Protocol.Implicit_account_repr.Forbidden.to_pkh dest.pkh),
               parameters.regular_transfer_fee,
               parameters.regular_transfer_gas_limit )
       | Some v -> return v
@@ -541,7 +551,7 @@ let manager_op_of_transfer parameters
       Manager_operation
         {source; fee; counter; operation; gas_limit; storage_limit}
 
-let cost_of_manager_operation = Gas.Arith.integral_of_int_exn 1_000
+let cost_of_manager_operation = Gas.Arith.integral_of_int_exn 2_200
 
 let inject_transfer (cctxt : Protocol_client_context.full) parameters state
     transfer =
@@ -551,14 +561,21 @@ let inject_transfer (cctxt : Protocol_client_context.full) parameters state
     Alpha_services.Contract.counter cctxt (`Main, `Head 0) transfer.src.pkh
   in
   let* already_revealed =
-    if Signature.Public_key_hash.Set.mem transfer.src.pkh state.revealed then
-      return true
+    if
+      (* FIXME-PA *)
+      Signature.Public_key_hash.Set.mem
+        (Implicit_account_repr.Forbidden.to_pkh transfer.src.pkh)
+        state.revealed
+    then return true
     else (
       (* Either the [manager_key] RPC tells us the key is already
          revealed, or we immediately inject a reveal operation: in any
          case the key is revealed in the end. *)
       state.revealed <-
-        Signature.Public_key_hash.Set.add transfer.src.pkh state.revealed ;
+        (* FIXME-PA *)
+        Signature.Public_key_hash.Set.add
+          (Implicit_account_repr.Forbidden.to_pkh transfer.src.pkh)
+          state.revealed ;
       let* pk_opt =
         Alpha_services.Contract.manager_key
           cctxt
@@ -571,6 +588,11 @@ let inject_transfer (cctxt : Protocol_client_context.full) parameters state
     if not already_revealed then
       let reveal_counter = Manager_counter.succ current_counter in
       let transf_counter = Manager_counter.succ reveal_counter in
+      let proof =
+        match transfer.src.sk with
+        | Bls sk -> Signature.Bls.of_bytes_opt (Signature.Bls.pop_prove sk)
+        | _ -> None
+      in
       let reveal =
         Manager_operation
           {
@@ -579,7 +601,7 @@ let inject_transfer (cctxt : Protocol_client_context.full) parameters state
             counter = reveal_counter;
             gas_limit = cost_of_manager_operation;
             storage_limit = Z.zero;
-            operation = Reveal transfer.src.pk;
+            operation = Reveal {public_key = transfer.src.pk; proof};
           }
       in
       let manager_op =
@@ -592,7 +614,7 @@ let inject_transfer (cctxt : Protocol_client_context.full) parameters state
         log Info (fun () ->
             cctxt#message
               "injecting reveal+transfer from %a (counters=%a,%a) to %a"
-              Signature.Public_key_hash.pp
+              Implicit_account_repr.pp
               transfer.src.pkh
               Manager_counter.pp
               reveal_counter
@@ -618,7 +640,7 @@ let inject_transfer (cctxt : Protocol_client_context.full) parameters state
         log Info (fun () ->
             cctxt#message
               "injecting transfer from %a (counter=%a) to %a"
-              Signature.Public_key_hash.pp
+              Implicit_account_repr.pp
               transfer.src.pkh
               Manager_counter.pp
               transf_counter
@@ -743,8 +765,8 @@ let stat_on_exit (cctxt : Protocol_client_context.full) state =
          included). Note that the operations injected during the last block \
          are ignored because they should not be currently included."
         (if Int.equal injected_ops_count 0 then "N/A"
-        else
-          Format.sprintf "%d%%" (included_ops_count * 100 / injected_ops_count))
+         else
+           Format.sprintf "%d%%" (included_ops_count * 100 / injected_ops_count))
         injected_ops_count
         included_ops_count
     in
@@ -800,7 +822,7 @@ let launch (cctxt : Protocol_client_context.full) (parameters : parameters)
       let*! () = save_injected_operations cctxt state in
       stat_on_exit cctxt state
     else
-      let start = Mtime_clock.elapsed () in
+      let start = Mtime_clock.counter () in
       let*! () =
         log Debug (fun () ->
             cctxt#message "launch.loop: invoke sample_transfer")
@@ -814,8 +836,7 @@ let launch (cctxt : Protocol_client_context.full) (parameters : parameters)
       in
       let* () = inject_transfer cctxt parameters state transfer in
       incr injected ;
-      let stop = Mtime_clock.elapsed () in
-      let elapsed = Mtime.Span.(to_s stop -. to_s start) in
+      let elapsed = Time.Monotonic.Span.to_float_s (Mtime_clock.count start) in
       let remaining = dt -. elapsed in
       let*! () =
         if remaining <= 0.0 then
@@ -1103,7 +1124,8 @@ let generate_random_transactions =
            verbose_flag,
            debug_flag )
          pool_source
-         (cctxt : Protocol_client_context.full) ->
+         (cctxt : Protocol_client_context.full)
+       ->
       let open Lwt_result_syntax in
       (verbosity :=
          match (debug_flag, verbose_flag) with
@@ -1237,7 +1259,8 @@ let estimate_transaction_cost ?smart_contracts
     Option.value
       selected_smart_contract
       ~default:
-        ( Implicit dst.source.pkh,
+        (* FIXME-PA *)
+        ( Implicit (Implicit_account_repr.Forbidden.to_pkh dst.source.pkh),
           default_parameters.regular_transfer_fee,
           default_parameters.regular_transfer_gas_limit )
   in
@@ -1272,8 +1295,8 @@ let estimate_transaction_cost ?smart_contracts
   | Single_result (Manager_operation_result {operation_result; _}) -> (
       match operation_result with
       | Applied
-          (Transaction_result
-            (Transaction_to_contract_result {consumed_gas; _})) ->
+          (Transaction_result (Transaction_to_contract_result {consumed_gas; _}))
+        ->
           return (Gas.Arith.ceil consumed_gas)
       | _ ->
           (match operation_result with
@@ -1333,14 +1356,17 @@ let generate_transfers ~sources ~amount ~parameters ~entrypoint ~fee ~gas_limit
     sources
 
 (* Returns a list of reveals from each element of [sources]. *)
-let generate_reveals ~sources ~fee ~gas_limit ~storage_limit =
-  List.map
+let generate_reveals cctxt ~sources ~fee ~gas_limit ~storage_limit =
+  let open Lwt_result_syntax in
+  List.map_es
     (fun dst ->
-      let reveal =
+      let+ reveal =
         Client_proto_context.build_reveal_operation
+          cctxt
           ~fee
           ~gas_limit
           ~storage_limit
+          ~src_sk:dst.sk_uri
           dst.pk
       in
       (dst, Annotated_manager_operation.Annotated_manager_operation reveal))
@@ -1354,9 +1380,10 @@ let generate_reveals ~sources ~fee ~gas_limit ~storage_limit =
     [sources] is the list of "starter" accounts, used to fund all
     accounts in a exponential way.
 *)
-let generate_starter_ops ~sources ~amount ~batch_size =
+let generate_starter_ops cctxt ~sources ~amount ~batch_size =
+  let open Lwt_result_syntax in
   let fee = Tez.of_mutez_exn 1_000L in
-  let gas_limit = Gas.Arith.integral_of_int_exn 1_040 in
+  let gas_limit = Gas.Arith.integral_of_int_exn 4000 in
   let storage_limit = Z.of_int 257 in
   let parameters =
     let open Tezos_micheline in
@@ -1375,7 +1402,9 @@ let generate_starter_ops ~sources ~amount ~batch_size =
       ~gas_limit
       ~storage_limit
   in
-  let reveal_ops = generate_reveals ~sources ~fee ~gas_limit ~storage_limit in
+  let+ reveal_ops =
+    generate_reveals cctxt ~sources ~fee ~gas_limit ~storage_limit
+  in
   let rec split n acc = function
     | [] -> acc
     | l ->
@@ -1397,7 +1426,10 @@ let generate_account_funding_batches (starter_sources : source_with_uri list)
   let open Lwt_result_syntax in
   let nb_sources = List.length starter_sources in
   let fee = Tez.of_mutez_exn 1_000L in
-  let gas_limit = Gas.Arith.integral_of_int_exn 1_040 in
+  let gas_limit =
+    (* We need a bit more gas than usual batch here *)
+    Gas.Arith.integral_of_int_exn 2_500
+  in
   let storage_limit = Z.of_int 257 in
   let parameters =
     let open Tezos_micheline in
@@ -1472,6 +1504,8 @@ let load_wallet cctxt ~source_pkh =
           Uri.path (sk_uri : Tezos_signer_backends.Unencrypted.sk_uri :> Uri.t)
         in
         let sk = Signature.Secret_key.of_b58check_exn payload in
+        (* FIXME-PA *)
+        let pkh = Implicit_account_repr.Forbidden.of_pkh pkh in
         aux ({pkh; pk; pk_uri; sk; sk_uri} :: acc) tl
   in
   aux [] keys
@@ -1757,7 +1791,8 @@ let fund_accounts_from_source : Protocol_client_context.full Tezos_clic.command
            storage_limit,
            fee_parameter )
          source_pkh
-         (cctxt : Protocol_client_context.full) ->
+         (cctxt : Protocol_client_context.full)
+       ->
       let open Lwt_result_syntax in
       let* source_pk, source_sk =
         let* _, src_pk, src_sk = Client_keys.get_key cctxt source_pkh in
@@ -1824,7 +1859,8 @@ let fund_accounts_from_source : Protocol_client_context.full Tezos_clic.command
         Alpha_services.Contract.balance
           cctxt
           (cctxt#chain, cctxt#block)
-          (Contract.Implicit source_pkh)
+          (* FIXME-PA *)
+          (Contract.Implicit (Implicit_account_repr.Forbidden.of_pkh source_pkh))
       in
       let* () =
         let req_balance = Tez.mul_exn starter_initial_amount nb_starters in
@@ -1856,8 +1892,9 @@ let fund_accounts_from_source : Protocol_client_context.full Tezos_clic.command
         log Notice (fun () ->
             cctxt#message "Generating starter transactions and reveals@.")
       in
-      let starter_batch, starter_reveals =
+      let* starter_batch, starter_reveals =
         generate_starter_ops
+          cctxt
           ~sources:starter_sources
           ~amount:starter_initial_amount
           ~batch_size
@@ -1870,7 +1907,10 @@ let fund_accounts_from_source : Protocol_client_context.full Tezos_clic.command
       let* () =
         inject_batched_txs
           cctxt
-          (source_pkh, source_pk, source_sk)
+          (* FIXME-PA *)
+          ( Implicit_account_repr.Forbidden.of_pkh source_pkh,
+            source_pk,
+            source_sk )
           ~starter_batch
           ~fee
           ~gas_limit
@@ -1927,4 +1967,12 @@ let commands =
   ]
 
 let commands network () =
-  match network with Some `Mainnet -> [] | Some `Testnet | None -> commands
+  (* Stresstest should not be used on mainnet. If the client is running with
+     the yes-crypto activated, operations won't be considered valid and should
+     not endanger the network nor the users funds. *)
+  match Sys.getenv_opt Tezos_crypto.Helpers.yes_crypto_environment_variable with
+  | Some _ -> commands
+  | None -> (
+      match network with
+      | Some `Mainnet -> []
+      | Some `Testnet | None -> commands)

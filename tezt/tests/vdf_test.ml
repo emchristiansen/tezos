@@ -33,6 +33,8 @@
                  status as expected throughout the cycle.
 *)
 
+let team = Tag.layer1
+
 (* Stripped down version of [Seed_storage.seed_computation_status] *)
 type seed_computation_status =
   | Nonce_revelation_stage
@@ -41,7 +43,10 @@ type seed_computation_status =
 
 let get_seed_computation_status ?(info = false) client level =
   let* seed_status =
-    RPC.Seed.get_seed_status ~block:(string_of_int level) client
+    Client.RPC.call client
+    @@ RPC.get_chain_block_context_seed_computation
+         ~block:(string_of_int level)
+         ()
   in
   let status =
     match List.map fst (JSON.as_object seed_status) with
@@ -58,70 +63,113 @@ let get_seed_computation_status ?(info = false) client level =
   if info then Log.info "At level %d we are in %s" level (pp_status status) ;
   return status
 
-let assert_computation_status ?(info = false) client level status =
-  let* current_status = get_seed_computation_status ~info client level in
-  return @@ assert (current_status = status)
+let assert_computation_status ?(info = false) ?(assert_is_not = false)
+    nonce_revelation_threshold client status =
+  let comp = if assert_is_not then ( <> ) else ( = ) in
+  let* level =
+    Client.RPC.call client @@ RPC.get_chain_block_helper_current_level ()
+  in
+  let* current_status = get_seed_computation_status ~info client level.level in
+  (if current_status = Nonce_revelation_stage then
+     (* For levels in the nonce revelation stage, we also check the consistency
+      * of [Vdf.Helpers.is_in_nonce_revelation_stage] with
+      * the [Seed_computation] RPC. *)
+     let nonce_revelation_threshold = Int32.of_int nonce_revelation_threshold in
+     if
+       not
+         (Vdf.Helpers.is_in_nonce_revelation_stage
+            ~nonce_revelation_threshold
+            ~level)
+     then
+       failwith
+         (Printf.sprintf
+            "Vdf.Helpers.is_in_nonce_revelation_stage is inconsistent with the \
+             Seed_computation RPC: returned false on level %d"
+            level.level)) ;
+  return @@ assert (comp current_status status)
 
-let assert_level actual expected =
-  if actual <> expected then (
+let assert_not_computation_status =
+  assert_computation_status ~assert_is_not:true
+
+let assert_level client actual expected =
+  let* level =
+    Client.RPC.call client @@ RPC.get_chain_block_helper_current_level ()
+  in
+  if actual <> expected || level.level <> expected then (
     Log.info "Expected to be at level %d, actually at level %d" expected actual ;
-    assert false)
-  else ()
+    return @@ assert false)
+  else Lwt.return_unit
 
 let init_vdf_event_listener vdf_baker injected =
   Vdf.on_event vdf_baker (fun Vdf.{name; _} ->
       if name = "vdf_revelation_injected.v0" then injected := true)
 
-(* Bakes at most `max_level - min_starting_level + 1` blocks, starting from
- * a level not lower than `min_starting_level` and finishing exactly
- * at `max_level`.
- * Optionally checks that the computation status is never `Computation_finished`
+(* Bakes at most [max_level - min_starting_level + 1] blocks, starting from
+ * a level not lower than [min_starting_level] and finishing exactly
+ * at [max_level].
+ * Optionally checks that the computation status is never [Computation_finished]
  * (used when checking a cycle with no VDF daemon running) *)
-let bake_until min_starting_level max_level client node status_check =
-  let check_status level =
-    if status_check then
-      let* current_status = get_seed_computation_status client level in
-      return @@ assert (current_status <> Computation_finished)
-    else Lwt.return_unit
-  in
+let bake_until min_starting_level max_level client node status_check
+    nonce_revelation_threshold =
   let rec loop level =
     if level < max_level then
-      let* () = Client.bake_for client in
-      let* level = Node.wait_for_level node (level + 1) in
-      let* () = check_status level in
+      let* level = Client.bake_for_and_wait_level ~level_before:level client in
+      let* () =
+        if status_check then
+          assert_not_computation_status
+            nonce_revelation_threshold
+            client
+            Computation_finished
+        else Lwt.return_unit
+      in
       loop level
     else return level
   in
   let* level = Node.wait_for_level node min_starting_level in
   let* level = loop level in
   let* level = Node.wait_for_level node level in
-  assert_level level max_level ;
+  let* () = assert_level client level max_level in
   return level
 
-(* Checks that we are in the last block of the nonce revelation period,
+(* Checks that we are in the last block of the nonce revelation stage,
  * sets an event handler for the VDF revelation operation, then bakes
- * the whole of the VDF revelation period. Checks that (at least one)
+ * the whole of the VDF revelation stage. Checks that (at least one)
  * VDF revelation operation has been injected *)
-let bake_vdf_revelation_period level max_level client node injected =
+let bake_vdf_revelation_stage nonce_revelation_threshold level max_level client
+    node injected =
   injected := false ;
-
-  let* () = assert_computation_status client level Nonce_revelation_stage in
-  let* () = Client.bake_for client in
-  let* level = Node.wait_for_level node (level + 1) in
-  let* () = assert_computation_status client level Vdf_revelation_stage in
-
-  let* _level = bake_until level max_level client node false in
+  let* () =
+    assert_computation_status
+      nonce_revelation_threshold
+      client
+      Nonce_revelation_stage
+  in
+  let* level = Client.bake_for_and_wait_level ~level_before:level client in
+  let* () =
+    assert_computation_status
+      nonce_revelation_threshold
+      client
+      Vdf_revelation_stage
+  in
+  let* _level =
+    bake_until level max_level client node false nonce_revelation_threshold
+  in
   return @@ assert !injected
 
 let check_cycle (blocks_per_cycle, nonce_revelation_threshold) starting_level
     client node injected =
   (* Check that at the beginning of the cycle we are in the nonce
-     revelation period *)
+     revelation stage *)
   let* level = Node.wait_for_level node starting_level in
-  assert_level level starting_level ;
-  let* () = assert_computation_status client level Nonce_revelation_stage in
+  let* () = assert_level client level starting_level in
+  let* () =
+    assert_computation_status
+      nonce_revelation_threshold
+      client
+      Nonce_revelation_stage
+  in
 
-  (* Bake until the end of the nonce revelation period *)
+  (* Bake until the end of the nonce revelation stage *)
   let* level =
     bake_until
       level
@@ -129,13 +177,15 @@ let check_cycle (blocks_per_cycle, nonce_revelation_threshold) starting_level
       client
       node
       false
+      nonce_revelation_threshold
   in
 
-  (* Bake throughout the VDF revelation period, checking that a VDF revelation
+  (* Bake throughout the VDF revelation stage, checking that a VDF revelation
    * operation is injected at some point. Check that the seed computation
-   * status is set to [Computation_finished] at the end of the period. *)
+   * status is set to [Computation_finished] at the end of the stage. *)
   let* () =
-    bake_vdf_revelation_period
+    bake_vdf_revelation_stage
+      nonce_revelation_threshold
       level
       (starting_level + blocks_per_cycle - 1)
       client
@@ -145,14 +195,18 @@ let check_cycle (blocks_per_cycle, nonce_revelation_threshold) starting_level
   let* level =
     Node.wait_for_level node (starting_level + blocks_per_cycle - 1)
   in
-  assert_level level (starting_level + blocks_per_cycle - 1) ;
-  let* () = assert_computation_status client level Computation_finished in
+  let* () = assert_level client level (starting_level + blocks_per_cycle - 1) in
+  let* () =
+    assert_computation_status
+      nonce_revelation_threshold
+      client
+      Computation_finished
+  in
 
   (* Bake one more block, and check that it is the first block of
    * the following cycle *)
-  let* () = Client.bake_for client in
-  let* level = Node.wait_for_level node (starting_level + blocks_per_cycle) in
-  assert_level level (starting_level + blocks_per_cycle) ;
+  let* level = Client.bake_for_and_wait_level ~level_before:level client in
+  let* () = assert_level client level (starting_level + blocks_per_cycle) in
   return level
 
 let check_n_cycles n constants starting_level client node injected =
@@ -164,29 +218,13 @@ let check_n_cycles n constants starting_level client node injected =
   in
   loop n starting_level
 
-(* In total, [test_vdf] bakes `2 * (n_cycles + 1)` cycles *)
-let n_cycles = 3
-
-let test_vdf : Protocol.t list -> unit =
-  (* [check_n_cycles] requires that the starting_level is the beginning of
-   * a new cycle. Since that's not the case when the VDF daemon is launched,
-   * the first cycle is checked here directly and the following cycles are
-   * checked using [check_n_cycles] *)
-  Protocol.register_test ~__FILE__ ~title:"VDF daemon" ~tags:["vdf"]
-  @@ fun protocol ->
-  let* node = Node.init [Synchronisation_threshold 0; Private_mode] in
-  let* client = Client.init ~endpoint:(Node node) () in
-  let* () = Client.activate_protocol ~protocol client
-  and* vdf_baker = Vdf.init ~protocol node in
-
-  (* Track whether a VDF revelation has been injected during the correct period.
-   * It is set to `false` at the beginning of [bake_vdf_revelation_period] and
-   * to `true` by a listener for `vdf_revelation_injected` events. *)
-  let injected = ref false in
-  init_vdf_event_listener vdf_baker injected ;
+let init_test ?parameter_file protocol =
+  let* node, client =
+    Client.init_with_protocol ?parameter_file ~protocol `Client ()
+  in
 
   let* constants =
-    RPC.Client.call client @@ RPC.get_chain_block_context_constants ()
+    Client.RPC.call client @@ RPC.get_chain_block_context_constants ()
   in
   let* blocks_per_cycle =
     return JSON.(constants |-> "blocks_per_cycle" |> as_int)
@@ -194,30 +232,81 @@ let test_vdf : Protocol.t list -> unit =
   let* nonce_revelation_threshold =
     return JSON.(constants |-> "nonce_revelation_threshold" |> as_int)
   in
+  return (node, client, blocks_per_cycle, nonce_revelation_threshold)
 
-  (* Bake and check that we are in the nonce revelation period *)
-  let* () = Client.bake_for client in
-  let* level = Node.wait_for_level node 1 in
-  let* () = assert_computation_status client level Nonce_revelation_stage in
+(* This test runs through a number of cycles [n_cycles], checking correct
+ * injection of a VDF revelation for each one. It then runs through a cycle
+ * with no VDF daemon in order to check that RANDAO randomness is computed
+ * on chain in the absence of a VDF revelation. *)
+let vdf_cycles : Protocol.t list -> unit =
+  Protocol.register_test
+    ~__FILE__
+    ~title:"VDF daemon"
+    ~tags:[team; "vdf"]
+    ~uses:(fun _protocol -> [Constant.octez_agnostic_baker])
+  @@ fun protocol ->
+  let n_cycles = 2 in
+  let* node, client, blocks_per_cycle, nonce_revelation_threshold =
+    init_test protocol
+  in
+  let* vdf_baker = Vdf.init ~protocol node in
 
-  (* Bake until the end of the nonce revelation period *)
-  let* level = bake_until level nonce_revelation_threshold client node false in
+  (* Track whether a VDF revelation has been injected during the correct stage.
+   * It is set to [false] at the beginning of [bake_vdf_revelation_stage] and
+   * to [true] by a listener for [vdf_revelation_injected] events. *)
+  let injected = ref false in
+  init_vdf_event_listener vdf_baker injected ;
+
+  (* [check_n_cycles] requires that the starting_level is the beginning of
+   * a new cycle. Since that's not the case when the VDF daemon is launched,
+   * the first cycle is checked here directly and the following cycles are
+   * checked using [check_n_cycles] *)
+
+  (* Bake and check that we are in the nonce revelation stage *)
+  let* level = Client.bake_for_and_wait_level client in
+  let* () =
+    assert_computation_status
+      nonce_revelation_threshold
+      client
+      Nonce_revelation_stage
+  in
+
+  (* Bake until the end of the nonce revelation stage *)
+  let* level =
+    bake_until
+      level
+      nonce_revelation_threshold
+      client
+      node
+      false
+      nonce_revelation_threshold
+  in
 
   (* Bake until the end of the cycle, checking that a VDF revelation
-     operation was injected during the VDF revelation period and that
+     operation was injected during the VDF revelation stage and that
      the computation status is set to finished at the end of the cycle *)
   let* () =
-    bake_vdf_revelation_period level blocks_per_cycle client node injected
+    bake_vdf_revelation_stage
+      nonce_revelation_threshold
+      level
+      blocks_per_cycle
+      client
+      node
+      injected
   in
   let* level = Node.wait_for_level node blocks_per_cycle in
-  let* () = assert_computation_status client level Computation_finished in
+  let* () =
+    assert_computation_status
+      nonce_revelation_threshold
+      client
+      Computation_finished
+  in
 
   (* Bake, check that we are in the first block of the following cycle *)
-  let* () = Client.bake_for client in
-  let* level = Node.wait_for_level node (blocks_per_cycle + 1) in
-  assert_level level (blocks_per_cycle + 1) ;
+  let* level = Client.bake_for_and_wait_level ~level_before:level client in
+  let* () = assert_level client level (blocks_per_cycle + 1) in
 
-  (* Check correct behaviour for the following cycles *)
+  (* Check correct behaviour for the following [n_cycles] cycles *)
   let* level =
     check_n_cycles
       n_cycles
@@ -232,36 +321,83 @@ let test_vdf : Protocol.t list -> unit =
      Check that since no VDF daemon is running the computation status is
      never "finished" in this cycle. *)
   let* () = Vdf.terminate vdf_baker in
-  assert_level level ((blocks_per_cycle * (n_cycles + 1)) + 1) ;
-  let* level =
-    bake_until level ((blocks_per_cycle * (n_cycles + 2)) + 1) client node true
+  let* () =
+    assert_level client level ((blocks_per_cycle * (n_cycles + 1)) + 1)
+  in
+  let* _ =
+    bake_until
+      level
+      ((blocks_per_cycle * (n_cycles + 2)) + 1)
+      client
+      node
+      true
+      nonce_revelation_threshold
+  in
+  Lwt.return_unit
+
+(* This test runs through 1 cycle, launching the VDF daemons late in order
+ *  to test that the VDF computation is cancelled if not finished by the end
+ *  of the cycle *)
+let vdf_cancel : Protocol.t list -> unit =
+  Protocol.register_test
+    ~__FILE__
+    ~title:"Cancelling VDF computation"
+    ~tags:[team; "vdf"]
+    ~uses:(fun _protocol -> [Constant.octez_agnostic_baker])
+  @@ fun protocol ->
+  (* Override the `vdf_difficulty` constant in order ensure that
+   * a VDF computation started in the last block of a cycle will not be finished
+   * by the end of the cycle *)
+  let parameters = [(["vdf_difficulty"], `String "100000")] in
+  let* parameter_file =
+    Protocol.write_parameter_file ~base:(Right (protocol, None)) parameters
+  in
+  let* node, client, blocks_per_cycle, nonce_revelation_threshold =
+    init_test ~parameter_file protocol
+  in
+  let injected = ref false in
+
+  (* Bake and check that we are in the nonce revelation stage *)
+  let* level = Client.bake_for_and_wait_level client in
+  let* () =
+    assert_computation_status
+      nonce_revelation_threshold
+      client
+      Nonce_revelation_stage
   in
 
-  (* Bake through most of a new cycle and restart the VDF daemon right before
+  (* Bake through most of a new cycle and start the VDF daemon right before
    * the end of the cycle so that the VDF is computed too late for injection. *)
   let* level =
-    bake_until level ((blocks_per_cycle * (n_cycles + 3)) - 1) client node true
+    bake_until
+      level
+      (blocks_per_cycle - 1)
+      client
+      node
+      true
+      nonce_revelation_threshold
   in
   let* vdf_baker = Vdf.init ~protocol node in
   init_vdf_event_listener vdf_baker injected ;
+  let* vdf_baker2 = Vdf.init ~protocol node in
+  init_vdf_event_listener vdf_baker2 injected ;
 
   (* Bake to the end of the cycle and check that the VDF was not injected. *)
-  let* level =
-    bake_until level ((blocks_per_cycle * (n_cycles + 3)) + 1) client node true
-  in
-
-  (* Check correct behaviour for another `n_cycles` after the RANDAO cycle and
-   * the failed injection cycle. *)
-  let* _level =
-    check_n_cycles
-      n_cycles
-      (blocks_per_cycle, nonce_revelation_threshold)
+  let* _ =
+    bake_until
       level
+      (blocks_per_cycle + 1)
       client
       node
-      injected
+      true
+      nonce_revelation_threshold
   in
+  assert (not !injected) ;
 
-  Vdf.terminate vdf_baker
+  let* () = Vdf.terminate vdf_baker in
+  let* () = Vdf.terminate vdf_baker2 in
+  Lwt.return_unit
 
-let register ~protocols = test_vdf protocols
+let register ~protocols =
+  vdf_cycles protocols ;
+  vdf_cancel protocols

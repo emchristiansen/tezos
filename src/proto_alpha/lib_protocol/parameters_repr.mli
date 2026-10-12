@@ -29,18 +29,29 @@
 
 (** An implict contract (account) initially existing on a chain since genesis. *)
 type bootstrap_account = {
-  public_key_hash : Signature.Public_key_hash.t;
+  public_key_hash : Implicit_account_repr.t;
   public_key : Signature.Public_key.t option;
   amount : Tez_repr.t;
-  delegate_to : Signature.Public_key_hash.t option;
+  delegate_to : Implicit_account_repr.t option;
   consensus_key : Signature.Public_key.t option;
 }
 
 (** An originated contract initially existing on a chain since genesis. *)
 type bootstrap_contract = {
-  delegate : Signature.Public_key_hash.t option;
+  delegate : Implicit_account_repr.t option;
   amount : Tez_repr.t;
   script : Script_repr.t;
+  hash : Contract_hash.t option;
+      (** If the contract hash is not provided, generate a fresh hash. *)
+}
+
+(** An originated smart rollup initially existing on a chain since genesis. *)
+type bootstrap_smart_rollup = {
+  address : Sc_rollup_repr.Address.t;
+  pvm_kind : Sc_rollups.Kind.t;
+  boot_sector : string;
+  parameters_ty : Script_repr.lazy_expr;
+  whitelist : Sc_rollup_whitelist_repr.t option;
 }
 
 (** Protocol parameters define some constants regulating behaviour of the
@@ -48,6 +59,7 @@ type bootstrap_contract = {
 type t = {
   bootstrap_accounts : bootstrap_account list;
   bootstrap_contracts : bootstrap_contract list;
+  bootstrap_smart_rollups : bootstrap_smart_rollup list;
   commitments : Commitment_repr.t list;
   constants : Constants_parametric_repr.t;
   security_deposit_ramp_up_cycles : int option;

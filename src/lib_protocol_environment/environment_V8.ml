@@ -95,9 +95,10 @@ module type T = sig
         ('m, 'pr, 'p, 'q, 'i, 'o) Tezos_rpc.Service.t
        and type Error_monad.shell_tztrace = Error_monad.tztrace
        and type 'a Error_monad.shell_tzresult = ('a, Error_monad.tztrace) result
-       and type Timelock.chest = Tezos_crypto.Timelock.chest
-       and type Timelock.chest_key = Tezos_crypto.Timelock.chest_key
-       and type Timelock.opening_result = Tezos_crypto.Timelock.opening_result
+       and type Timelock.chest = Tezos_crypto.Timelock_legacy.chest
+       and type Timelock.chest_key = Tezos_crypto.Timelock_legacy.chest_key
+       and type Timelock.opening_result =
+        Tezos_crypto.Timelock_legacy.opening_result
        and module Sapling = Tezos_sapling.Core.Validator
        and type ('a, 'b) Either.t = ('a, 'b) Stdlib.Either.t
        and type Bls.Primitive.Fr.t = Bls12_381.Fr.t
@@ -111,14 +112,12 @@ module type T = sig
        and type Dal.page_proof = Tezos_crypto_dal.Cryptobox.Verifier.page_proof
        and type Bounded.Non_negative_int32.t =
         Tezos_base.Bounded.Non_negative_int32.t
+       and type Wasm_2_0_0.reveal =
+        Tezos_scoru_wasm.Wasm_pvm_state.Compatibility.reveal
        and type Wasm_2_0_0.input = Tezos_scoru_wasm.Wasm_pvm_state.input_info
        and type Wasm_2_0_0.output = Tezos_scoru_wasm.Wasm_pvm_state.output_info
        and type Wasm_2_0_0.reveal_hash =
-        Tezos_scoru_wasm.Wasm_pvm_state.reveal_hash
-       and type Wasm_2_0_0.reveal = Tezos_scoru_wasm.Wasm_pvm_state.reveal
-       and type Wasm_2_0_0.input_request =
-        Tezos_scoru_wasm.Wasm_pvm_state.input_request
-       and type Wasm_2_0_0.info = Tezos_scoru_wasm.Wasm_pvm_state.info
+        Tezos_scoru_wasm.Wasm_pvm_state.Compatibility.reveal_hash
 
   type error += Ecoproto_error of Error_monad.error
 
@@ -140,20 +139,21 @@ module type T = sig
        and type application_state = P.application_state
 
   class ['chain, 'block] proto_rpc_context :
-    Tezos_rpc.Context.t
-    -> (unit, (unit * 'chain) * 'block) RPC_path.t
-    -> ['chain * 'block] RPC_context.simple
+    Tezos_rpc.Context.t ->
+    (unit, (unit * 'chain) * 'block) RPC_path.t ->
+    ['chain * 'block] RPC_context.simple
 
   class ['block] proto_rpc_context_of_directory :
-    ('block -> RPC_context.t)
-    -> RPC_context.t RPC_directory.t
-    -> ['block] RPC_context.simple
+    ('block -> RPC_context.t) ->
+    RPC_context.t RPC_directory.t ->
+    ['block] RPC_context.simple
 end
 
-module Make (Param : sig
-  val name : string
-end)
-() =
+module Make
+    (Param : sig
+      val name : string
+    end)
+    () =
 struct
   (* The protocol V8 only supports 64-bits architectures. We ensure this the
      hard way with a dynamic check. *)
@@ -203,7 +203,13 @@ struct
   module Compare = Compare
   module Either = Either
   module Seq = Tezos_protocol_environment_structs.V8.Seq
-  module List = Tezos_error_monad.TzLwtreslib.List
+
+  module List = struct
+    include Tezos_error_monad.TzLwtreslib.List
+
+    let fold_right_es f l x = fold_left_es (fun acc x -> f x acc) x (rev l)
+  end
+
   module Array = Tezos_protocol_environment_structs.V8.Array
   module Char = Char
   module Bytes = Tezos_base.TzPervasives.Bytes
@@ -302,9 +308,15 @@ struct
   module Ed25519 = Signature.Ed25519
   module Secp256k1 = Signature.Secp256k1
   module P256 = Signature.P256
-  module Bls = Signature.Bls
+
+  module Bls = struct
+    include Tezos_crypto.Signature.Bls
+
+    let aggregate_signature_opt = aggregate_signature_opt ~subgroup_check:true
+  end
+
   module Signature = Signature.V1
-  module Timelock = Tezos_crypto.Timelock
+  module Timelock = Tezos_crypto.Timelock_legacy
   module Vdf = Class_group_vdf.Vdf_self_contained
 
   module S = struct
@@ -908,70 +920,69 @@ struct
   module RPC_context = struct
     type t = rpc_context
 
-    class type ['pr] simple =
-      object
-        method call_proto_service0 :
-          'm 'q 'i 'o.
-          ( ([< Tezos_rpc.Service.meth] as 'm),
-            t,
-            t,
-            'q,
-            'i,
-            'o )
-          Tezos_rpc.Service.t ->
-          'pr ->
-          'q ->
-          'i ->
-          'o Error_monad.shell_tzresult Lwt.t
+    class type ['pr] simple = object
+      method call_proto_service0 :
+        'm 'q 'i 'o.
+        ( ([< Tezos_rpc.Service.meth] as 'm),
+          t,
+          t,
+          'q,
+          'i,
+          'o )
+        Tezos_rpc.Service.t ->
+        'pr ->
+        'q ->
+        'i ->
+        'o Error_monad.shell_tzresult Lwt.t
 
-        method call_proto_service1 :
-          'm 'a 'q 'i 'o.
-          ( ([< Tezos_rpc.Service.meth] as 'm),
-            t,
-            t * 'a,
-            'q,
-            'i,
-            'o )
-          Tezos_rpc.Service.t ->
-          'pr ->
-          'a ->
-          'q ->
-          'i ->
-          'o Error_monad.shell_tzresult Lwt.t
+      method call_proto_service1 :
+        'm 'a 'q 'i 'o.
+        ( ([< Tezos_rpc.Service.meth] as 'm),
+          t,
+          t * 'a,
+          'q,
+          'i,
+          'o )
+        Tezos_rpc.Service.t ->
+        'pr ->
+        'a ->
+        'q ->
+        'i ->
+        'o Error_monad.shell_tzresult Lwt.t
 
-        method call_proto_service2 :
-          'm 'a 'b 'q 'i 'o.
-          ( ([< Tezos_rpc.Service.meth] as 'm),
-            t,
-            (t * 'a) * 'b,
-            'q,
-            'i,
-            'o )
-          Tezos_rpc.Service.t ->
-          'pr ->
-          'a ->
-          'b ->
-          'q ->
-          'i ->
-          'o Error_monad.shell_tzresult Lwt.t
+      method call_proto_service2 :
+        'm 'a 'b 'q 'i 'o.
+        ( ([< Tezos_rpc.Service.meth] as 'm),
+          t,
+          (t * 'a) * 'b,
+          'q,
+          'i,
+          'o )
+        Tezos_rpc.Service.t ->
+        'pr ->
+        'a ->
+        'b ->
+        'q ->
+        'i ->
+        'o Error_monad.shell_tzresult Lwt.t
 
-        method call_proto_service3 :
-          'm 'a 'b 'c 'q 'i 'o.
-          ( ([< RPC_service.meth] as 'm),
-            t,
-            ((t * 'a) * 'b) * 'c,
-            'q,
-            'i,
-            'o )
-          RPC_service.t ->
-          'pr ->
-          'a ->
-          'b ->
-          'c ->
-          'q ->
-          'i ->
-          'o Error_monad.shell_tzresult Lwt.t
-      end
+      method call_proto_service3 :
+        'm 'a 'b 'c 'q 'i 'o.
+        ( ([< RPC_service.meth] as 'm),
+          t,
+          ((t * 'a) * 'b) * 'c,
+          'q,
+          'i,
+          'o )
+        RPC_service.t ->
+        'pr ->
+        'a ->
+        'b ->
+        'c ->
+        'q ->
+        'i ->
+        'o Error_monad.shell_tzresult Lwt.t
+    end
 
     let make_call0 s (ctxt : _ simple) = ctxt#call_proto_service0 s
 
@@ -1039,7 +1050,7 @@ struct
   end
 
   module Updater = struct
-    type nonrec validation_result = validation_result = {
+    type nonrec validation_result = legacy_validation_result = {
       context : Context.t;
       fitness : Fitness.t;
       message : string option;
@@ -1063,7 +1074,7 @@ struct
          and type cache_value := Environment_context.Context.cache_value
          and type cache_key := Environment_context.Context.cache_key
          and type quota := quota
-         and type validation_result := validation_result
+         and type validation_result := legacy_validation_result
          and type rpc_context := rpc_context
          and type tztrace := Error_monad.tztrace
          and type 'a tzresult := 'a Error_monad.tzresult
@@ -1106,18 +1117,18 @@ struct
       message_index : Z.t;
     }
 
-    type reveal_hash = Tezos_scoru_wasm.Wasm_pvm_state.reveal_hash
+    type reveal_hash = Tezos_scoru_wasm.Wasm_pvm_state.Compatibility.reveal_hash
 
-    type reveal = Tezos_scoru_wasm.Wasm_pvm_state.reveal =
+    type reveal = Tezos_scoru_wasm.Wasm_pvm_state.Compatibility.reveal =
       | Reveal_raw_data of reveal_hash
       | Reveal_metadata
 
-    type input_request = Tezos_scoru_wasm.Wasm_pvm_state.input_request =
+    type input_request =
       | No_input_required
       | Input_required
       | Reveal_required of reveal
 
-    type info = Tezos_scoru_wasm.Wasm_pvm_state.info = {
+    type info = {
       current_tick : Z.t;
       last_input_read : input option;
       input_request : input_request;
@@ -1126,9 +1137,13 @@ struct
     module Make
         (Tree : Context.TREE with type key = string list and type value = bytes) =
     struct
-      type Tezos_lazy_containers.Lazy_map.tree += PVM_tree of Tree.tree
+      type Tezos_tree_encoding.tree_instance += PVM_tree of Tree.tree
 
-      include Tezos_scoru_wasm.Wasm_pvm.Make (struct
+      include
+        Tezos_protocol_environment_structs.V8.Wasm_pvm_machine.Make (Tezos_scoru_wasm
+                                                                     .Tree_state
+                                                                     .Make
+                                                                       (struct
         include Tree
 
         let select = function
@@ -1136,9 +1151,46 @@ struct
           | _ -> raise Tezos_tree_encoding.Incorrect_tree_type
 
         let wrap t = PVM_tree t
-      end)
+      end))
 
       let initial_state = initial_state V0
+
+      let compute_step =
+        compute_step ~wasm_entrypoint:Tezos_scoru_wasm.Constants.wasm_entrypoint
+
+      let reveal_compat reveal =
+        match
+          Tezos_scoru_wasm.Wasm_pvm_state.Compatibility.of_current_opt reveal
+        with
+        | Some r -> r
+        | None ->
+            (* The WASM PVM before environment V11 will not request a value
+               outside of the [Compatibility.reveal] domain. As a consequence,
+               the only execution path leading to executing this branch is
+               by having two dishonest nodes playing against each other.
+
+               As a consequence, it is safe to return an arbitrary value here,
+               and we do so to avoid raising an exception. *)
+            Reveal_raw_data "this line costs 10k XTZ to execute"
+
+      let input_request_compat = function
+        | Tezos_scoru_wasm.Wasm_pvm_state.No_input_required -> No_input_required
+        | Input_required -> Input_required
+        | Reveal_required req -> Reveal_required (reveal_compat req)
+
+      let info_compat
+          Tezos_scoru_wasm.Wasm_pvm_state.
+            {current_tick; last_input_read; input_request} =
+        {
+          current_tick;
+          last_input_read;
+          input_request = input_request_compat input_request;
+        }
+
+      let get_info tree =
+        let open Lwt_syntax in
+        let+ info = get_info tree in
+        info_compat info
     end
   end
 
@@ -1229,13 +1281,18 @@ struct
 
     let finalize_application state shell_header =
       let open Lwt_syntax in
-      let+ res = finalize_application state shell_header in
-      wrap_tzresult res
+      let* r = finalize_application state shell_header in
+      match r with
+      | Ok (vr, metadata) ->
+          Lwt.return_ok (lift_legacy_validation_result vr, metadata)
+      | Error e -> Lwt.return (wrap_tzresult (Error e))
 
     let init chain_id c bh =
       let open Lwt_syntax in
-      let+ r = init chain_id c bh in
-      wrap_tzresult r
+      let* r = init chain_id c bh in
+      match r with
+      | Ok vr -> Lwt.return_ok (lift_legacy_validation_result vr)
+      | Error e -> Lwt.return (wrap_tzresult (Error e))
 
     let set_log_message_consumer f = Logging.logging_function := Some f
 
@@ -1245,6 +1302,20 @@ struct
       type add_error =
         | Validation_error of Error_monad.shell_tztrace
         | Add_conflict of operation_conflict
+
+      let unsupported_feature name =
+        let msg =
+          Printf.sprintf
+            "The current protocol does not support the '%s' feature."
+            name
+        in
+        [Exn (Failure msg)]
+
+      let partial_op_validation ?check_signature:_ _ _ =
+        Lwt.return_error (unsupported_feature "partial_op_validation")
+
+      let add_valid_operation ?conflict_handler:_ _ _ =
+        Error (Validation_error (unsupported_feature "add_valid_operation"))
 
       let add_operation ?check_signature ?conflict_handler info mempool op :
           (t * add_result, add_error) result Lwt.t =
@@ -1285,79 +1356,79 @@ struct
   class ['chain, 'block] proto_rpc_context (t : Tezos_rpc.Context.t)
     (prefix : (unit, (unit * 'chain) * 'block) RPC_path.t) =
     object
-      method call_proto_service0
-          : 'm 'q 'i 'o.
-            ( ([< RPC_service.meth] as 'm),
-              RPC_context.t,
-              RPC_context.t,
-              'q,
-              'i,
-              'o )
-            RPC_service.t ->
-            'chain * 'block ->
-            'q ->
-            'i ->
-            'o tzresult Lwt.t =
+      method call_proto_service0 :
+          'm 'q 'i 'o.
+          ( ([< RPC_service.meth] as 'm),
+            RPC_context.t,
+            RPC_context.t,
+            'q,
+            'i,
+            'o )
+          RPC_service.t ->
+          'chain * 'block ->
+          'q ->
+          'i ->
+          'o tzresult Lwt.t =
         fun s (chain, block) q i ->
           let s = RPC_service.subst0 s in
           let s = RPC_service.prefix prefix s in
           t#call_service s (((), chain), block) q i
 
-      method call_proto_service1
-          : 'm 'a 'q 'i 'o.
-            ( ([< RPC_service.meth] as 'm),
-              RPC_context.t,
-              RPC_context.t * 'a,
-              'q,
-              'i,
-              'o )
-            RPC_service.t ->
-            'chain * 'block ->
-            'a ->
-            'q ->
-            'i ->
-            'o tzresult Lwt.t =
+      method call_proto_service1 :
+          'm 'a 'q 'i 'o.
+          ( ([< RPC_service.meth] as 'm),
+            RPC_context.t,
+            RPC_context.t * 'a,
+            'q,
+            'i,
+            'o )
+          RPC_service.t ->
+          'chain * 'block ->
+          'a ->
+          'q ->
+          'i ->
+          'o tzresult Lwt.t =
         fun s (chain, block) a1 q i ->
           let s = RPC_service.subst1 s in
           let s = RPC_service.prefix prefix s in
           t#call_service s ((((), chain), block), a1) q i
 
-      method call_proto_service2
-          : 'm 'a 'b 'q 'i 'o.
-            ( ([< RPC_service.meth] as 'm),
-              RPC_context.t,
-              (RPC_context.t * 'a) * 'b,
-              'q,
-              'i,
-              'o )
-            RPC_service.t ->
-            'chain * 'block ->
-            'a ->
-            'b ->
-            'q ->
-            'i ->
-            'o tzresult Lwt.t =
+      method call_proto_service2 :
+          'm 'a 'b 'q 'i 'o.
+          ( ([< RPC_service.meth] as 'm),
+            RPC_context.t,
+            (RPC_context.t * 'a) * 'b,
+            'q,
+            'i,
+            'o )
+          RPC_service.t ->
+          'chain * 'block ->
+          'a ->
+          'b ->
+          'q ->
+          'i ->
+          'o tzresult Lwt.t =
         fun s (chain, block) a1 a2 q i ->
           let s = RPC_service.subst2 s in
           let s = RPC_service.prefix prefix s in
           t#call_service s (((((), chain), block), a1), a2) q i
 
-      method call_proto_service3
-          : 'm 'a 'b 'c 'q 'i 'o.
-            ( ([< RPC_service.meth] as 'm),
-              RPC_context.t,
-              ((RPC_context.t * 'a) * 'b) * 'c,
-              'q,
-              'i,
-              'o )
-            RPC_service.t ->
-            'chain * 'block ->
-            'a ->
-            'b ->
-            'c ->
-            'q ->
-            'i ->
-            'o tzresult Lwt.t =
+      method call_proto_service3 :
+          'm 'a 'b 'c 'q 'i 'o.
+          ( ([< RPC_service.meth] as 'm),
+            RPC_context.t,
+            ((RPC_context.t * 'a) * 'b) * 'c,
+            'q,
+            'i,
+            'o )
+          RPC_service.t ->
+          'chain * 'block ->
+          'a ->
+          'b ->
+          'c ->
+          'q ->
+          'i ->
+          'o tzresult Lwt.t =
         fun s (chain, block) a1 a2 a3 q i ->
           let s = RPC_service.subst3 s in
           let s = RPC_service.prefix prefix s in
@@ -1368,76 +1439,76 @@ struct
     ['block] RPC_context.simple =
     let lookup = new Tezos_rpc.Context.of_directory dir in
     object
-      method call_proto_service0
-          : 'm 'q 'i 'o.
-            ( ([< RPC_service.meth] as 'm),
-              RPC_context.t,
-              RPC_context.t,
-              'q,
-              'i,
-              'o )
-            RPC_service.t ->
-            'block ->
-            'q ->
-            'i ->
-            'o tzresult Lwt.t =
+      method call_proto_service0 :
+          'm 'q 'i 'o.
+          ( ([< RPC_service.meth] as 'm),
+            RPC_context.t,
+            RPC_context.t,
+            'q,
+            'i,
+            'o )
+          RPC_service.t ->
+          'block ->
+          'q ->
+          'i ->
+          'o tzresult Lwt.t =
         fun s block q i ->
           let rpc_context = conv block in
           lookup#call_service s rpc_context q i
 
-      method call_proto_service1
-          : 'm 'a 'q 'i 'o.
-            ( ([< RPC_service.meth] as 'm),
-              RPC_context.t,
-              RPC_context.t * 'a,
-              'q,
-              'i,
-              'o )
-            RPC_service.t ->
-            'block ->
-            'a ->
-            'q ->
-            'i ->
-            'o tzresult Lwt.t =
+      method call_proto_service1 :
+          'm 'a 'q 'i 'o.
+          ( ([< RPC_service.meth] as 'm),
+            RPC_context.t,
+            RPC_context.t * 'a,
+            'q,
+            'i,
+            'o )
+          RPC_service.t ->
+          'block ->
+          'a ->
+          'q ->
+          'i ->
+          'o tzresult Lwt.t =
         fun s block a1 q i ->
           let rpc_context = conv block in
           lookup#call_service s (rpc_context, a1) q i
 
-      method call_proto_service2
-          : 'm 'a 'b 'q 'i 'o.
-            ( ([< RPC_service.meth] as 'm),
-              RPC_context.t,
-              (RPC_context.t * 'a) * 'b,
-              'q,
-              'i,
-              'o )
-            RPC_service.t ->
-            'block ->
-            'a ->
-            'b ->
-            'q ->
-            'i ->
-            'o tzresult Lwt.t =
+      method call_proto_service2 :
+          'm 'a 'b 'q 'i 'o.
+          ( ([< RPC_service.meth] as 'm),
+            RPC_context.t,
+            (RPC_context.t * 'a) * 'b,
+            'q,
+            'i,
+            'o )
+          RPC_service.t ->
+          'block ->
+          'a ->
+          'b ->
+          'q ->
+          'i ->
+          'o tzresult Lwt.t =
         fun s block a1 a2 q i ->
           let rpc_context = conv block in
           lookup#call_service s ((rpc_context, a1), a2) q i
 
-      method call_proto_service3
-          : 'm 'a 'b 'c 'q 'i 'o.
-            ( ([< RPC_service.meth] as 'm),
-              RPC_context.t,
-              ((RPC_context.t * 'a) * 'b) * 'c,
-              'q,
-              'i,
-              'o )
-            RPC_service.t ->
-            'block ->
-            'a ->
-            'b ->
-            'c ->
-            'q ->
-            'i ->
-            'o tzresult Lwt.t =
+      method call_proto_service3 :
+          'm 'a 'b 'c 'q 'i 'o.
+          ( ([< RPC_service.meth] as 'm),
+            RPC_context.t,
+            ((RPC_context.t * 'a) * 'b) * 'c,
+            'q,
+            'i,
+            'o )
+          RPC_service.t ->
+          'block ->
+          'a ->
+          'b ->
+          'c ->
+          'q ->
+          'i ->
+          'o tzresult Lwt.t =
         fun s block a1 a2 a3 q i ->
           let rpc_context = conv block in
           lookup#call_service s (((rpc_context, a1), a2), a3) q i
@@ -1452,7 +1523,7 @@ struct
     let verify_page t commitment ~page_index page page_proof =
       match verify_page t commitment ~page_index page page_proof with
       | Error `Page_length_mismatch -> Error `Page_length_mismatch
-      | Error `Segment_index_out_of_range -> Error `Segment_index_out_of_range
+      | Error `Page_index_out_of_range -> Error `Segment_index_out_of_range
       | Error (`Invalid_page | `Invalid_degree_strictly_less_than_expected _) ->
           Ok false
       | Ok () -> Ok true

@@ -23,9 +23,18 @@
 (*                                                                           *)
 (*****************************************************************************)
 
+(** WebAssembly function type signatures.
+
+    Uses GADTs and phantom types to represent function signatures
+    (parameters and results) in a type-safe way. Signatures are
+    composed using {!Cons_param} and checked against Wasmer function
+    types at instantiation and call time. *)
+
 open Api
 open Vectors
 
+(** GADT for function parameters. ['f] is the OCaml function type being
+    built, ['r] is the final return type. *)
 type (_, _) params =
   | End_param : ('r, 'r) params
   | Trigger_param : ('a, 'r) params -> (unit -> 'a, 'r) params
@@ -59,6 +68,7 @@ let param_types params =
   go params 0 ;
   inputs
 
+(** GADT for function results. ['r] is the OCaml type of the return value. *)
 type _ results =
   | No_result : unit results
   | One_result : 'a Value_type.t -> 'a results
@@ -92,28 +102,34 @@ let result_types results =
   go results 0 ;
   outputs
 
+(** A complete function type: parameters and results. *)
 type 'f t = Function : ('f, 'r Lwt.t) params * 'r results -> 'f t
 
+(** [to_owned typ] creates an owned Wasmer function type pointer from [typ]. *)
 let to_owned (Function (params, results)) =
   let inputs = param_types params in
   let outputs = result_types results in
-  (* Note, this consumes the elements in [inputs] and [outputs] but not the
-     structures themselves. Ctypes will free the structures once they go out
-     of scope. *)
-  Functions.Functype.new_ (Ctypes.addr inputs) (Ctypes.addr outputs)
+  let type_ =
+    Functions.Functype.new_ (Ctypes.addr inputs) (Ctypes.addr outputs)
+  in
+  (* Since creating a new function type does not consume the input and output
+     type vectors, we can safely delete them here. *)
+  Functions.Valtype_vec.delete (Ctypes.addr inputs) ;
+  Functions.Valtype_vec.delete (Ctypes.addr outputs) ;
+  type_
 
 exception
   Wrong_number_of_params of {expected : Unsigned.size_t; got : Unsigned.size_t}
 
 let () =
   Printexc.register_printer (function
-      | Wrong_number_of_params {expected; got} ->
-          Some
-            (Printf.sprintf
-               "Wrong number of parameters: expected %s, got %s"
-               (Unsigned.Size_t.to_string expected)
-               (Unsigned.Size_t.to_string got))
-      | _ -> None)
+    | Wrong_number_of_params {expected; got} ->
+        Some
+          (Printf.sprintf
+             "Wrong number of parameters: expected %s, got %s"
+             (Unsigned.Size_t.to_string expected)
+             (Unsigned.Size_t.to_string got))
+    | _ -> None)
 
 let check_param_types params param_types =
   let expected = num_params params in
@@ -138,19 +154,20 @@ exception
 
 let () =
   Printexc.register_printer (function
-      | Not_enough_results {expected; got} ->
-          Some
-            (Printf.sprintf
-               "Not enough results: expected %s, got %s"
-               (Unsigned.Size_t.to_string expected)
-               (Unsigned.Size_t.to_string got))
-      | _ -> None)
+    | Not_enough_results {expected; got} ->
+        Some
+          (Printf.sprintf
+             "Not enough results: expected %s, got %s"
+             (Unsigned.Size_t.to_string expected)
+             (Unsigned.Size_t.to_string got))
+    | _ -> None)
 
 let check_result_types results result_types =
   let expected = num_results results in
   let got = Value_type_vector.length result_types in
-  if (* Fewer resuls than expected. *)
-     Unsigned.Size_t.compare got expected < 0
+  if
+    (* Fewer resuls than expected. *)
+    Unsigned.Size_t.compare got expected < 0
   then raise (Not_enough_results {got; expected}) ;
   let rec go : type r. r results -> int -> unit =
    fun results index ->
@@ -168,13 +185,16 @@ exception Function_type_mismatch of {reason : exn}
 
 let () =
   Printexc.register_printer (function
-      | Function_type_mismatch {reason} ->
-          Some
-            (Printf.sprintf
-               "Function type does not match: %s"
-               (Printexc.to_string reason))
-      | _ -> None)
+    | Function_type_mismatch {reason} ->
+        Some
+          (Printf.sprintf
+             "Function type does not match: %s"
+             (Printexc.to_string reason))
+    | _ -> None)
 
+(** [check_types typ func_type] verifies that the OCaml function type
+    [typ] matches the Wasmer [func_type]. Raises
+    {!Function_type_mismatch} on mismatch. *)
 let check_types (Function (params, results)) func_type =
   try
     let param_types = Functions.Functype.params func_type in

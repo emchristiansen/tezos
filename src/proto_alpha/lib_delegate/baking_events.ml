@@ -25,12 +25,91 @@
 
 open Protocol
 open Alpha_context
+open Baking_state_types
+open Baking_state
 
-let section = [Protocol.name; "baker"]
+let section = Baking_events_section.section
 
 let pp_int32 fmt n = Format.fprintf fmt "%ld" n
 
 let pp_int64 fmt n = Format.fprintf fmt "%Ld" n
+
+let waiting_color = Internal_event.Magenta
+
+module Commands = struct
+  include Internal_event.Simple
+
+  let section = section @ ["commands"]
+
+  let no_dal_node_provided =
+    declare_0
+      ~section
+      ~name:"no_dal_node_provided"
+      ~level:Warning
+      ~msg:
+        "No DAL node endpoint has been provided.\n\
+         Not running a DAL node might result in losing a share of the \
+         participation rewards.\n\
+         For instructions on how to run a DAL node, please visit \
+         https://docs.tezos.com/tutorials/join-dal-baker."
+      ()
+
+  let healthy_dal_node =
+    declare_0
+      ~section
+      ~name:"healthy_dal_node"
+      ~level:Notice
+      ~msg:"The DAL node is healthy."
+      ()
+
+  let unhealthy_dal_node =
+    declare_2
+      ~section
+      ~name:"unhealthy_dal_node"
+      ~level:Error
+      ~msg:
+        "The DAL node running on {endpoint} is not healthy. DAL attestations \
+         cannot be sent. Its health is {health}. Please check that your DAL \
+         node is configured correctly."
+      ~pp1:Uri.pp
+      ("endpoint", Tezos_rpc.Encoding.uri_encoding)
+      ~pp2:Tezos_dal_node_services.Types.Health.pp
+      ("health", Tezos_dal_node_services.Types.Health.encoding)
+
+  let unreachable_dal_node =
+    declare_1
+      ~section
+      ~name:"unreachable_dal_node"
+      ~level:Error
+      ~msg:
+        "The DAL node cannot be reached on endpoint: {endpoint}.\n\
+         Please check your DAL node and possibly restart it."
+      ~pp1:Uri.pp
+      ("endpoint", Tezos_rpc.Encoding.uri_encoding)
+
+  let deprecated_proto_specific_baker =
+    declare_0
+      ~section
+      ~name:"deprecated_proto_specific_baker"
+      ~level:Warning
+      ~msg:
+        "DEPRECATED: The `octez-baker-<protocol>` binaries are deprecated, and \
+         will be removed in the next major version of Octez. Please use \
+         `octez-baker` instead, which automatically handles protocol switches."
+      ()
+
+  let deprecated_proto_specific_accuser =
+    declare_0
+      ~section
+      ~name:"deprecated_proto_specific_accuser"
+      ~level:Warning
+      ~msg:
+        "DEPRECATED: The `octez-accuser-<protocol>` binaries are deprecated, \
+         and will be removed in the next major version of Octez. Please use \
+         `octez-accuser` instead, which automatically handles protocol \
+         switches."
+      ()
+end
 
 module State_transitions = struct
   include Internal_event.Simple
@@ -71,6 +150,15 @@ module State_transitions = struct
       ~msg:"received new head with level increasing"
       ()
 
+  let new_forge_event =
+    declare_1
+      ~section
+      ~name:"new_forge_event"
+      ~level:Info
+      ~msg:"received new forge event: {event}"
+      ~pp1:pp_forge_event
+      ("event", forge_event_encoding_for_logging__cannot_decode)
+
   let no_proposal_slot =
     declare_3
       ~section
@@ -100,8 +188,8 @@ module State_transitions = struct
       ("level", Data_encoding.int32)
       ~pp3:Round.pp
       ("next_round", Round.encoding)
-      ~pp4:Baking_state.pp_consensus_key_and_delegate
-      ("delegate", Baking_state.consensus_key_and_delegate_encoding)
+      ~pp4:Delegate.pp_without_companion_key
+      ("delegate", Delegate.encoding_for_logging__cannot_decode)
 
   let new_head_while_waiting_for_qc =
     declare_0
@@ -143,30 +231,6 @@ module State_transitions = struct
       ~level:Info
       ~msg:"received valid proposal for a block already applied"
       ()
-
-  let unexpected_pqc_while_waiting_for_application =
-    declare_2
-      ~section
-      ~name:"unexpected_pqc_while_waiting_for_application"
-      ~level:Info
-      ~msg:
-        "received an unexpected prequorum for {prequorum} while waiting for \
-         the proposal's {proposal} application"
-      ~pp1:Block_hash.pp
-      ("prequorum", Block_hash.encoding)
-      ~pp2:Block_hash.pp
-      ("proposal", Block_hash.encoding)
-
-  let pqc_while_waiting_for_application =
-    declare_1
-      ~section
-      ~name:"pqc_while_waiting_for_application"
-      ~level:Info
-      ~msg:
-        "received expected prequorum for {prequorum} while waiting for the \
-         proposal's application"
-      ~pp1:Block_hash.pp
-      ("prequorum", Block_hash.encoding)
 
   let unexpected_proposal_round =
     declare_2
@@ -279,12 +343,21 @@ module State_transitions = struct
       ~msg:"different branch proposal has the same prequorum"
       ()
 
-  let attempting_preendorse_proposal =
+  let attempting_preattest_proposal =
     declare_1
       ~section
-      ~name:"attempting_preendorsing_proposal"
+      ~name:"attempting_preattest_proposal"
       ~level:Info
-      ~msg:"attempting to preendorse proposal {block_hash}"
+      ~msg:"attempting to preattest proposal {block_hash}"
+      ~pp1:Block_hash.pp
+      ("block_hash", Block_hash.encoding)
+
+  let attempting_vote_proposal =
+    declare_1
+      ~section
+      ~name:"attempting_vote_proposal"
+      ~level:Info
+      ~msg:"attempting to vote for proposal {block_hash}"
       ~pp1:Block_hash.pp
       ("block_hash", Block_hash.encoding)
 
@@ -305,23 +378,27 @@ module State_transitions = struct
       ~pp1:Block_hash.pp
       ("block_hash", Block_hash.encoding)
 
-  let proposing_fresh_block =
+  let preparing_fresh_block =
     declare_2
       ~section
-      ~name:"proposing_fresh_block"
+      ~name:"preparing_fresh_block"
       ~level:Info
-      ~msg:"proposing fresh block for {delegate} at round {round}"
-      ~pp1:Baking_state.pp_consensus_key_and_delegate
-      ("delegate", Baking_state.consensus_key_and_delegate_encoding)
+      ~msg:"preparing fresh block at round {round}{delegate}"
+      ~pp1:(fun fmt ->
+        Format.fprintf
+          fmt
+          "@ for@ delegate@ %a"
+          Delegate.pp_without_companion_key)
+      ("delegate", Delegate.encoding_for_logging__cannot_decode)
       ~pp2:Round.pp
       ("round", Round.encoding)
 
-  let no_endorsable_payload_fresh_block =
+  let no_attestable_payload_fresh_block =
     declare_0
       ~section
-      ~name:"no_endorsable_payload_fresh_block"
+      ~name:"no_attestable_payload_fresh_block"
       ~level:Info
-      ~msg:"no endorsable payload, proposing fresh block"
+      ~msg:"no attestable payload, proposing fresh block"
       ()
 
   let repropose_block =
@@ -359,48 +436,130 @@ module State_transitions = struct
       ~pp2:Block_hash.pp
       ("expected_hash", Block_hash.encoding)
 
-  let handling_prequorum_on_non_applied_proposal =
-    declare_0
-      ~section
-      ~name:"handling_prequorum_on_non_applied_proposal"
-      ~level:Error
-      ~msg:"Handling prequorum on a non-applied proposal"
-      ()
-
   let step_current_phase =
     declare_2
       ~section
       ~name:"step_current_phase"
       ~level:Debug
       ~msg:"automaton step: current phase {phase}, event {event}"
-      ~pp1:Baking_state.pp_phase
-      ("phase", Baking_state.phase_encoding)
-      ~pp2:Baking_state.pp_event
-      ("event", Baking_state.event_encoding)
+      ~pp1:pp_phase
+      ("phase", phase_encoding)
+      ~pp2:pp_event
+      ("event", event_encoding_for_logging__cannot_decode)
+
+  let discarding_attestation =
+    declare_1
+      ~section
+      ~name:"discarding_attestation"
+      ~level:Info
+      ~msg:"discarding outdated {operation_information}"
+      ~pp1:pp_signed_consensus_vote
+      ( "operation_information",
+        signed_consensus_vote_encoding_for_logging__cannot_decode )
+
+  let discarding_unexpected_preattestation_with_different_payload =
+    declare_3
+      ~section
+      ~name:"discarding_unexpected_preattestation_with_different_payload"
+      ~level:Warning
+      ~msg:
+        "discarding {operation_information} with payload {operation_payload} \
+         where the prequorum was locked on a different payload \
+         {state_payload}."
+      ~pp1:pp_signed_consensus_vote
+      ( "operation_information",
+        signed_consensus_vote_encoding_for_logging__cannot_decode )
+      ~pp2:Block_payload_hash.pp
+      ("operation_payload", Block_payload_hash.encoding)
+      ~pp3:Block_payload_hash.pp
+      ("state_payload", Block_payload_hash.encoding)
+
+  let emit_discarding_unexpected_preattestation_with_different_payload
+      signed_preattestation ~state_payload =
+    let op_payload =
+      signed_preattestation.unsigned_consensus_vote.vote_consensus_content
+        .block_payload_hash
+    in
+    emit
+      discarding_unexpected_preattestation_with_different_payload
+      (signed_preattestation, op_payload, state_payload)
+
+  let discarding_unexpected_attestation_not_matching_prequorum =
+    declare_3
+      ~section
+      ~name:"discarding_unexpected_attestation_not_matching_prequorum"
+      ~level:Warning
+      ~msg:
+        "discarding {operation_information} with payload {operation_payload} \
+         where {prequorum_payload_if_any}."
+      ~pp1:pp_signed_consensus_vote
+      ( "operation_information",
+        signed_consensus_vote_encoding_for_logging__cannot_decode )
+      ~pp2:Block_payload_hash.pp
+      ("operation_payload", Block_payload_hash.encoding)
+      ~pp3:(fun fmt -> function
+        | None -> Format.fprintf fmt "no prequorum was reached"
+        | Some prequorum_payload ->
+            Format.fprintf
+              fmt
+              "the prequorum was on a different payload %a"
+              Block_payload_hash.pp
+              prequorum_payload)
+      ( "prequorum_payload_if_any",
+        Data_encoding.option Block_payload_hash.encoding )
+
+  let emit_discarding_unexpected_attestation_not_matching_prequorum
+      signed_attestation ~attestable_payload_hash_opt =
+    let attestation_payload =
+      signed_attestation.unsigned_consensus_vote.vote_consensus_content
+        .block_payload_hash
+    in
+    emit
+      discarding_unexpected_attestation_not_matching_prequorum
+      (signed_attestation, attestation_payload, attestable_payload_hash_opt)
+
+  let discarding_unexpected_prequorum_reached =
+    declare_2
+      ~section
+      ~name:"discarding_unexpected_prequorum_reached"
+      ~level:Info
+      ~msg:
+        "discarding unexpected prequorum reached for {candidate} while in \
+         {phase} phase."
+      ~pp1:Block_hash.pp
+      ("candidate", Block_hash.encoding)
+      ~pp2:pp_phase
+      ("phase", phase_encoding)
+
+  let discarding_unexpected_quorum_reached =
+    declare_2
+      ~section
+      ~name:"discarding_unexpected_quorum_reached"
+      ~level:Info
+      ~msg:
+        "discarding unexpected quorum reached for {candidate} while in {phase} \
+         phase."
+      ~pp1:Block_hash.pp
+      ("candidate", Block_hash.encoding)
+      ~pp2:pp_phase
+      ("phase", phase_encoding)
 end
 
-module Node_rpc = struct
+module Launch = struct
   include Internal_event.Simple
 
-  let section = section @ ["rpc"]
+  let section = section @ ["launch"]
 
-  let error_while_monitoring_heads =
+  let keys_used =
     declare_1
       ~section
-      ~name:"error_while_monitoring_heads"
-      ~level:Error
-      ~msg:"error while monitoring heads {trace}"
-      ~pp1:Error_monad.pp_print_trace
-      ("trace", Error_monad.trace_encoding)
-
-  let error_while_monitoring_valid_proposals =
-    declare_1
-      ~section
-      ~name:"error_while_monitoring_valid_proposals"
-      ~level:Error
-      ~msg:"error while monitoring valid proposals {trace}"
-      ~pp1:Error_monad.pp_print_trace
-      ("trace", Error_monad.trace_encoding)
+      ~alternative_color:Internal_event.Cyan
+      ~name:"keys_used"
+      ~level:Notice
+      ~msg:"Baker will run with the following keys:{keys}"
+      ~pp1:(fun ppf keys ->
+        Format.fprintf ppf "@[<v 2>@,%a@]" (Format.pp_print_list Key.pp) keys)
+      ("keys", Data_encoding.list Key.encoding_for_logging__cannot_decode)
 end
 
 module Scheduling = struct
@@ -420,6 +579,7 @@ module Scheduling = struct
   let waiting_for_new_head =
     declare_0
       ~section
+      ~alternative_color:waiting_color
       ~name:"waiting_for_new_head"
       ~level:Info
       ~msg:"no possible timeout, waiting for a new head to arrive..."
@@ -438,34 +598,31 @@ module Scheduling = struct
       ~pp2:Round.pp
       ("round", Round.encoding)
 
-  let proposal_already_injected =
-    declare_0
-      ~section
-      ~name:"proposal_already_injected"
-      ~level:Debug
-      ~msg:"proposal already injected for next level, skipping..."
-      ()
-
   let next_potential_slot =
     declare_4
       ~section
       ~name:"next_potential_slot"
       ~level:Info
       ~msg:
-        "next potential slot for level {level} is at round {round} at \
-         {timestamp} for {delegate}"
+        "next potential slot for level {level} is at round \
+         {round}{timestamp}{delegate}"
       ~pp1:pp_int32
       ("level", Data_encoding.int32)
       ~pp2:Round.pp
       ("round", Round.encoding)
-      ~pp3:Timestamp.pp
+      ~pp3:(fun fmt -> Format.fprintf fmt "@ at %a" Timestamp.pp)
       ("timestamp", Timestamp.encoding)
-      ~pp4:Baking_state.pp_consensus_key_and_delegate
-      ("delegate", Baking_state.consensus_key_and_delegate_encoding)
+      ~pp4:(fun fmt ->
+        Format.fprintf
+          fmt
+          "@ for@ delegate@ %a"
+          Delegate.pp_without_companion_key)
+      ("delegate", Delegate.encoding_for_logging__cannot_decode)
 
   let waiting_end_of_round =
     declare_3
       ~section
+      ~alternative_color:waiting_color
       ~name:"waiting_end_of_round"
       ~level:Info
       ~msg:"waiting {timespan} until end of round {round} at {timestamp}"
@@ -479,6 +636,7 @@ module Scheduling = struct
   let waiting_delayed_end_of_round =
     declare_4
       ~section
+      ~alternative_color:waiting_color
       ~name:"waiting_delayed_end_of_round"
       ~level:Info
       ~msg:
@@ -496,6 +654,7 @@ module Scheduling = struct
   let waiting_time_to_bake =
     declare_2
       ~section
+      ~alternative_color:waiting_color
       ~name:"waiting_time_to_bake"
       ~level:Info
       ~msg:"waiting {timespan} until it's time to bake at {timestamp}"
@@ -538,6 +697,81 @@ module Scheduling = struct
       ~msg:"process proposal received in the future with hash {block_hash}"
       ~pp1:Block_hash.pp
       ("block_hash", Block_hash.encoding)
+
+  let waiting_to_forge_block =
+    declare_2
+      ~section
+      ~alternative_color:waiting_color
+      ~name:"waiting_to_forge_block"
+      ~level:Info
+      ~msg:"waiting {timespan} until it's time to forge block at {timestamp}"
+      ~pp1:Ptime.Span.pp
+      ("timespan", Time.System.Span.encoding)
+      ~pp2:Timestamp.pp
+      ("timestamp", Timestamp.encoding)
+
+  let no_need_to_wait_to_forge_block =
+    declare_0
+      ~section
+      ~name:"no_need_to_wait_to_forge_block"
+      ~level:Info
+      ~msg:"no need to wait to forge a block"
+      ()
+
+  let first_baker_of_next_level =
+    declare_0
+      ~section
+      ~name:"first_baker_of_next_level"
+      ~level:Info
+      ~msg:
+        "first baker of next level found among delegates. pre-emptively \
+         forging block."
+      ()
+
+  let dal_node_no_attester_profile =
+    declare_0
+      ~section
+      ~name:"dal_node_no_attester_profile"
+      ~level:Warning
+      ~msg:
+        "The DAL node has no registered attester profile. It is recommended to \
+         start the DAL node with '--attester-profiles <manager_key>'."
+      ()
+
+  let supervisor_starting_automaton =
+    declare_1
+      ~section
+      ~name:"supervisor_starting_automaton"
+      ~level:Notice
+      ~msg:"Supervisor: starting automaton for node {uri}"
+      ("uri", Data_encoding.string)
+
+  let supervisor_automaton_crashed =
+    declare_1
+      ~section
+      ~name:"supervisor_automaton_crashed"
+      ~level:Warning
+      ~msg:
+        "Supervisor: automaton for node {uri} crashed, restarting the \
+         connection."
+      ("uri", Data_encoding.string)
+
+  let supervisor_automaton_retry =
+    declare_1
+      ~section
+      ~name:"supervisor_automaton_retry"
+      ~level:Warning
+      ~msg:"Supervisor: retrying connection to node {uri}."
+      ~pp1:Format.pp_print_string
+      ("uri", Data_encoding.string)
+
+  let supervisor_all_down =
+    declare_0
+      ~section
+      ~name:"supervisor_all_automatons_down"
+      ~level:Error
+      ~msg:"Supervisor: all automatons are simultaneously down, shutting down"
+      ()
 end
 
 module Lib = struct
@@ -545,23 +779,30 @@ module Lib = struct
 
   let section = section @ ["lib"]
 
-  let attempting_preendorse_proposal =
-    declare_1
+  let attempting_to_vote_for_proposal =
+    declare_2
       ~section
-      ~name:"attempting_preendorsing_proposal"
+      ~name:"attempting_preattest_proposal"
       ~level:Debug
-      ~msg:"attempting to preendorse proposal {proposal}"
-      ~pp1:Baking_state.pp_proposal
-      ("proposal", Baking_state.proposal_encoding)
+      ~msg:"attempting to {action} proposal {proposal}"
+      ("action", consensus_vote_kind_encoding)
+      ~pp1:(fun fmt -> function
+        | Preattestation -> Format.fprintf fmt "preattest"
+        | Attestation -> Format.fprintf fmt "attest")
+      ("proposal", proposal_encoding)
+      ~pp2:pp_proposal
 
-  let attempting_endorse_proposal =
-    declare_1
+  let waiting_block_timestamp =
+    declare_2
       ~section
-      ~name:"attempting_endorsing_proposal"
-      ~level:Debug
-      ~msg:"attempting to endorse proposal {proposal}"
-      ~pp1:Baking_state.pp_proposal
-      ("proposal", Baking_state.proposal_encoding)
+      ~alternative_color:waiting_color
+      ~name:"waiting_block_timestamp"
+      ~level:Notice
+      ~msg:"Waiting {diff_time} until block timestamp {timestamp}"
+      ("timestamp", Time.Protocol.encoding)
+      ("diff_time", Time.System.Span.encoding)
+      ~pp1:Time.Protocol.pp_hum
+      ~pp2:Time.System.Span.pp_hum
 end
 
 module Actions = struct
@@ -569,58 +810,49 @@ module Actions = struct
 
   let section = section @ ["actions"]
 
-  let skipping_preendorsement =
+  let skipping_consensus_vote =
     declare_2
       ~section
-      ~name:"skipping_preendorsement"
+      ~name:"skipping_consensus_vote"
       ~level:Error
-      ~msg:"unable to sign preendorsement for {delegate} -- {trace}"
-      ~pp1:Baking_state.pp_consensus_key_and_delegate
-      ("delegate", Baking_state.consensus_key_and_delegate_encoding)
+      ~msg:"unable to sign {operation_information} -- {trace}"
+      ~pp1:pp_unsigned_consensus_vote
+      ( "operation_information",
+        unsigned_consensus_vote_encoding_for_logging__cannot_decode )
       ~pp2:Error_monad.pp_print_trace
       ("trace", Error_monad.trace_encoding)
 
-  let skipping_endorsement =
+  let failed_to_inject_consensus_vote =
     declare_2
       ~section
-      ~name:"skipping_endorsement"
+      ~name:"failed_to_inject_consensus_vote"
       ~level:Error
-      ~msg:"unable to sign endorsement for {delegate} -- {trace}"
-      ~pp1:Baking_state.pp_consensus_key_and_delegate
-      ("delegate", Baking_state.consensus_key_and_delegate_encoding)
+      ~msg:"failed to inject {operation_information} -- {trace}"
+      ~pp1:pp_signed_consensus_vote
+      ( "operation_information",
+        signed_consensus_vote_encoding_for_logging__cannot_decode )
       ~pp2:Error_monad.pp_print_trace
       ("trace", Error_monad.trace_encoding)
 
-  let skipping_attestation =
+  let failed_to_prepare_block =
     declare_2
       ~section
-      ~name:"skipping_attestation"
+      ~name:"failed_to_prepare_block"
       ~level:Error
-      ~msg:"unable to sign attestation for {delegate} -- {trace}"
-      ~pp1:Baking_state.pp_consensus_key_and_delegate
-      ("delegate", Baking_state.consensus_key_and_delegate_encoding)
+      ~msg:"failed to prepare block for {delegate} -- {trace}"
+      ~pp1:Delegate.pp
+      ("delegate", Delegate.encoding_for_logging__cannot_decode)
       ~pp2:Error_monad.pp_print_trace
       ("trace", Error_monad.trace_encoding)
 
-  let failed_to_inject_preendorsement =
+  let failed_to_sign_block =
     declare_2
       ~section
-      ~name:"failed_to_inject_preendorsement"
+      ~name:"failed_to_sign_block"
       ~level:Error
-      ~msg:"failed to inject preendorsement for {delegate} -- {trace}"
-      ~pp1:Baking_state.pp_consensus_key_and_delegate
-      ("delegate", Baking_state.consensus_key_and_delegate_encoding)
-      ~pp2:Error_monad.pp_print_trace
-      ("trace", Error_monad.trace_encoding)
-
-  let failed_to_inject_endorsement =
-    declare_2
-      ~section
-      ~name:"failed_to_inject_endorsement"
-      ~level:Error
-      ~msg:"failed to inject endorsement for {delegate} -- {trace}"
-      ~pp1:Baking_state.pp_consensus_key_and_delegate
-      ("delegate", Baking_state.consensus_key_and_delegate_encoding)
+      ~msg:"failed to sign block for {delegate} -- {trace}"
+      ~pp1:Delegate.pp
+      ("delegate", Delegate.encoding_for_logging__cannot_decode)
       ~pp2:Error_monad.pp_print_trace
       ("trace", Error_monad.trace_encoding)
 
@@ -635,40 +867,76 @@ module Actions = struct
       ("level", Data_encoding.int32)
       ("round", Round.encoding)
 
-  let preendorsement_injected =
+  let skipping_outdated_consensus_vote =
+    declare_1
+      ~section
+      ~name:"skipping_outdated_consensus_vote"
+      ~level:Info
+      ~msg:"skipping outdated consensus vote for {operation_information}"
+      ~pp1:pp_unsigned_consensus_vote
+      ( "operation_information",
+        unsigned_consensus_vote_encoding_for_logging__cannot_decode )
+
+  let skipping_outdated_block_forge_request =
     declare_2
       ~section
-      ~name:"preendorsement_injected"
-      ~level:Notice
-      ~msg:"injected preendorsement {ophash} for {delegate}"
-      ~pp1:Operation_hash.pp
-      ("ophash", Operation_hash.encoding)
-      ~pp2:Baking_state.pp_consensus_key_and_delegate
-      ("delegate", Baking_state.consensus_key_and_delegate_encoding)
+      ~name:"skipping_outdated_block_forge_request"
+      ~level:Info
+      ~msg:"skipping outdated block forge request for (l{level}, r{round})"
+      ~pp1:pp_int32
+      ~pp2:Round.pp
+      ("level", Data_encoding.int32)
+      ("round", Round.encoding)
 
-  let endorsement_injected =
+  let consensus_op_injected =
     declare_2
       ~section
-      ~name:"endorsement_injected"
+      ~name:"consensus_operation_injected"
       ~level:Notice
-      ~msg:"injected endorsement {ophash} for {delegate}"
-      ~pp1:Operation_hash.pp
-      ("ophash", Operation_hash.encoding)
-      ~pp2:Baking_state.pp_consensus_key_and_delegate
-      ("delegate", Baking_state.consensus_key_and_delegate_encoding)
+      ~msg:"injected {operation_information}{operation_hash}"
+      ~pp1:pp_signed_consensus_vote
+      ( "operation_information",
+        signed_consensus_vote_encoding_for_logging__cannot_decode )
+      ~pp2:(fun fmt oph ->
+        Format.fprintf fmt "@ (operation hash: %a)" Operation_hash.pp oph)
+      ("operation_hash", Operation_hash.encoding)
 
-  let attestation_injected =
-    declare_3
+  let attach_dal_attestation =
+    declare_5
       ~section
-      ~name:"attestation_injected"
+      ~name:"attach_dal_attestation"
+      ~level:Info
+      ~msg:
+        "ready to attach DAL attestation for level {attestation_level}, round \
+         {round}, with bitset {bitset} for {delegate} to attest slots \
+         published at levels {published_levels}"
+      ("delegate", Delegate_id.encoding)
+      ~pp2:pp_dal_content
+      ("bitset", dal_content_encoding)
+      ("published_levels", Data_encoding.(list int32))
+      ("attestation_level", Data_encoding.int32)
+      ("round", Round.encoding)
+
+  let not_in_dal_committee =
+    declare_2
+      ~section
+      ~name:"not_in_dal_committee"
       ~level:Notice
-      ~msg:"injected attestation {ophash} with bitset {bitset} for {delegate}"
-      ~pp1:Operation_hash.pp
-      ("ophash", Operation_hash.encoding)
-      ~pp2:Baking_state.pp_consensus_key_and_delegate
-      ("delegate", Baking_state.consensus_key_and_delegate_encoding)
-      ~pp3:Z.pp_print
-      ("bitset", Data_encoding.n)
+      ~msg:"{delegate} has no assigned DAL shards at level {attestation_level}"
+      ("delegate", Delegate_id.encoding)
+      ("attestation_level", Data_encoding.int32)
+
+  let missing_companion_key_for_dal_with_bls =
+    declare_2
+      ~section
+      ~name:"missing_companion_key_for_dal_with_bls"
+      ~level:Warning
+      ~msg:
+        "Cannot issue an attestation with DAL because the BLS consensus key \
+         has no corresponding companion key. Crafting the attestation without \
+         DAL at level {attestation_level} for {delegate}"
+      ("delegate", Delegate_id.encoding)
+      ("attestation_level", Data_encoding.int32)
 
   let synchronizing_round =
     declare_1
@@ -688,23 +956,47 @@ module Actions = struct
         "prepare forging block at level {level}, round {round} for {delegate}"
       ~pp1:pp_int32
       ~pp2:Round.pp
-      ~pp3:Baking_state.pp_consensus_key_and_delegate
+      ~pp3:Delegate.pp
       ("level", Data_encoding.int32)
       ("round", Round.encoding)
-      ("delegate", Baking_state.consensus_key_and_delegate_encoding)
+      ("delegate", Delegate.encoding_for_logging__cannot_decode)
 
   let forging_block =
-    declare_3
+    declare_4
       ~section
       ~name:"forging_block"
       ~level:Info
-      ~msg:"forging block at level {level}, round {round} for {delegate}"
+      ~msg:
+        "forging block at level {level}, round {round}{delegate}(force apply: \
+         {force_apply})"
       ~pp1:pp_int32
       ~pp2:Round.pp
-      ~pp3:Baking_state.pp_consensus_key_and_delegate
+      ~pp3:(fun fmt ->
+        Format.fprintf
+          fmt
+          "@ for@ delegate@ %a@ "
+          Delegate.pp_without_companion_key)
       ("level", Data_encoding.int32)
       ("round", Round.encoding)
-      ("delegate", Baking_state.consensus_key_and_delegate_encoding)
+      ("delegate", Delegate.encoding_for_logging__cannot_decode)
+      ("force_apply", Data_encoding.bool)
+
+  let delayed_block_injection =
+    declare_4
+      ~section
+      ~name:"delayed_block_injection"
+      ~level:Debug
+      ~msg:
+        "waiting {delay} before injecting block at level {level}, round \
+         {round} for {delegate}"
+      ("delay", Time.System.Span.encoding)
+      ~pp1:Time.System.Span.pp_hum
+      ("level", Data_encoding.int32)
+      ~pp2:pp_int32
+      ("round", Round.encoding)
+      ~pp3:Round.pp
+      ("delegate", Delegate.encoding_for_logging__cannot_decode)
+      ~pp4:Delegate.pp
 
   let injecting_block =
     declare_3
@@ -714,44 +1006,77 @@ module Actions = struct
       ~msg:"injecting block at level {level}, round {round} for {delegate}"
       ~pp1:pp_int32
       ~pp2:Round.pp
-      ~pp3:Baking_state.pp_consensus_key_and_delegate
+      ~pp3:Delegate.pp
       ("level", Data_encoding.int32)
       ("round", Round.encoding)
-      ("delegate", Baking_state.consensus_key_and_delegate_encoding)
+      ("delegate", Delegate.encoding_for_logging__cannot_decode)
 
   let block_injected =
-    declare_4
+    declare_5
+      ~alternative_color:Internal_event.Blue
       ~section
       ~name:"block_injected"
       ~level:Notice
       ~msg:
-        "block {block} at level {level}, round {round} injected for {delegate}"
+        "block {block} at level {level}, round {round} \
+         injected{delegate}{manager_operations_infos}"
       ~pp1:Block_hash.pp
       ~pp2:pp_int32
       ~pp3:Round.pp
-      ~pp4:Baking_state.pp_consensus_key_and_delegate
+      ~pp4:(fun fmt ->
+        Format.fprintf
+          fmt
+          "@ for@ delegate@ %a"
+          Delegate.pp_without_companion_key)
+      ~pp5:
+        (Format.pp_print_option
+           (fun fmt {manager_operation_number; total_fees} ->
+             Format.fprintf
+               fmt
+               "@ with %d manager operations@ summing up to %a μtz in fees"
+               manager_operation_number
+               pp_int64
+               total_fees))
       ("block", Block_hash.encoding)
       ("level", Data_encoding.int32)
       ("round", Round.encoding)
-      ("delegate", Baking_state.consensus_key_and_delegate_encoding)
+      ("delegate", Delegate.encoding_for_logging__cannot_decode)
+      ( "manager_operations_infos",
+        Data_encoding.option manager_operations_infos_encoding )
 
-  let signing_preendorsement =
+  let block_injection_failed =
+    declare_2
+      ~section
+      ~name:"block_injection_failed"
+      ~level:Error
+      ~msg:"failed to inject block {block_hash} -- {trace}"
+      ("block_hash", Block_hash.encoding)
+      ~pp1:Block_hash.pp
+      ("trace", Error_monad.trace_encoding)
+      ~pp2:Error_monad.pp_print_trace
+
+  let signing_consensus_op =
     declare_1
       ~section
-      ~name:"signing_preendorsement"
+      ~name:"signing_consensus_operation"
       ~level:Info
-      ~msg:"signing preendorsement for {delegate}"
-      ~pp1:Baking_state.pp_consensus_key_and_delegate
-      ("delegate", Baking_state.consensus_key_and_delegate_encoding)
+      ~msg:"signing {operation_information}"
+      ~pp1:pp_unsigned_consensus_vote
+      ( "operation_information",
+        unsigned_consensus_vote_encoding_for_logging__cannot_decode )
 
-  let signing_endorsement =
-    declare_1
+  let signing_block =
+    declare_3
       ~section
-      ~name:"signing_endorsement"
+      ~name:"signing_block"
       ~level:Info
-      ~msg:"signing endorsement for {delegate}"
-      ~pp1:Baking_state.pp_consensus_key_and_delegate
-      ("delegate", Baking_state.consensus_key_and_delegate_encoding)
+      ~msg:"signing block at level {level}, round {round} for {delegate}"
+      ~pp1:pp_int32
+      ~pp2:Round.pp
+      ~pp3:Delegate.pp
+      ("level", Data_encoding.int32)
+      ("round", Round.encoding)
+      ("delegate", Delegate.encoding_for_logging__cannot_decode)
 
   let invalid_json_file =
     declare_1
@@ -784,18 +1109,110 @@ module Actions = struct
       ~level:Notice
       ~msg:"Voting {value} for liquidity baking toggle vote"
       ( "value",
-        Protocol.Alpha_context.Liquidity_baking
-        .liquidity_baking_toggle_vote_encoding )
+        Protocol.Alpha_context.Per_block_votes.liquidity_baking_vote_encoding )
 
-  let no_dal_node =
-    declare_0
+  let signature_timeout =
+    declare_1
       ~section
-      ~name:"no_dal_node"
+      ~name:"signature_timeout"
+      ~level:Error
+      ~msg:"Signature call reached a timeout of {timeout}"
+      ("timeout", Data_encoding.float)
+
+  let signature_error =
+    declare_1
+      ~section
+      ~name:"signature_error"
+      ~level:Error
+      ~msg:"Signature call failed with {errors}"
+      ~pp1:pp_print_top_error_of_trace
+      ("errors", Error_monad.(TzTrace.encoding error_encoding))
+
+  let delegates_without_slots =
+    declare_2
+      ~section
+      ~name:"delegates_without_slots"
       ~level:Notice
       ~msg:
-        "DAL feature enabled, but no DAL node specified: cannot fetch \
-         attestations"
-      ()
+        "The following delegates have no attesting rights at level {level}: \
+         {delegates}"
+      ~pp1:(Format.pp_print_list Key.pp)
+      ("delegates", Data_encoding.list Key.encoding_for_logging__cannot_decode)
+      ~pp2:pp_int32
+      ("level", Data_encoding.int32)
+
+  let no_dal_node_provided = Commands.no_dal_node_provided
+
+  let unhealthy_dal_node = Commands.unhealthy_dal_node
+
+  let unreachable_dal_node = Commands.unreachable_dal_node
+
+  let stalling_signature =
+    declare_4
+      ~section
+      ~name:"stalling_signature"
+      ~level:Warning
+      ~msg:
+        "Signature call of {kind} for level {level} at round {round} has not \
+         resolved in the last {seconds} seconds"
+      ("kind", Baking_errors.signing_request_encoding)
+      ("level", Data_encoding.int32)
+      ("round", Round.encoding)
+      ("seconds", Data_encoding.float)
+
+  let stalling_forge_block =
+    declare_3
+      ~section
+      ~name:"stalling_forge_block"
+      ~level:Warning
+      ~msg:
+        "Forge block for level {level} at round {round} has not resolved in \
+         the last {seconds} seconds"
+      ("level", Data_encoding.int32)
+      ("round", Round.encoding)
+      ("seconds", Data_encoding.float)
+
+  let dal_attestation_deduplication_error =
+    declare_3
+      ~section
+      ~name:"dal_attestation_deduplication_error"
+      ~level:Warning
+      ~msg:
+        "DAL attestation deduplication failed for {delegate_id} at published \
+         level {published_level}, with error: {trace}"
+      ("delegate_id", Delegate_id.encoding)
+      ("published_level", Data_encoding.int32)
+      ("trace", Error_monad.trace_encoding)
+      ~pp3:Error_monad.pp_print_trace
+
+  let no_attestable_dal_slots_for_levels =
+    declare_4
+      ~section
+      ~name:"no_attestable_dal_slots_for_levels"
+      ~level:Warning
+      ~msg:
+        "[{automaton_name}] No DAL attestation data received for {delegate_id} \
+         at attested level {attested_level} for published levels \
+         [{published_levels}]"
+      ~pp1:Format.pp_print_string
+      ("automaton_name", Data_encoding.string)
+      ("delegate_id", Delegate_id.encoding)
+      ~pp3:pp_int32
+      ("attested_level", Data_encoding.int32)
+      ~pp4:Format.pp_print_string
+      ("published_levels", Data_encoding.string)
+
+  let dal_slots_not_attested_due_to_traps =
+    declare_2
+      ~section
+      ~name:"dal_slots_not_attested_due_to_traps"
+      ~level:Notice
+      ~msg:
+        "{delegate_id} did not DAL attest slots due to traps at published \
+         levels: {trap_details}"
+      ("delegate_id", Delegate_id.encoding)
+      ("trap_details", Data_encoding.string)
+      ~pp2:Format.pp_print_string
 end
 
 module VDF = struct
@@ -809,7 +1226,7 @@ module VDF = struct
       ~name:"vdf_revelation_injected"
       ~level:Notice
       ~msg:
-        "injected VDF revelation for cycle {cycle} (chain {chain} with \
+        "Injected VDF revelation for cycle {cycle} (chain {chain} with \
          operation {ophash})"
       ~pp1:pp_int32
       ("cycle", Data_encoding.int32)
@@ -818,31 +1235,34 @@ module VDF = struct
       ~pp3:Operation_hash.pp
       ("ophash", Operation_hash.encoding)
 
-  let vdf_daemon_start =
-    declare_1
-      ~section
-      ~level:Info
-      ~name:"vdf_daemon_start"
-      ~msg:"starting {worker} VDF daemon"
-      ("worker", Data_encoding.string)
-
   let vdf_daemon_error =
     declare_2
       ~section
-      ~level:Error
       ~name:"vdf_daemon_error"
+      ~level:Error
       ~msg:"{worker}: error while running VDF daemon: {errors}"
-      ~pp2:pp_print_top_error_of_trace
+      ~pp1:Format.pp_print_string
       ("worker", Data_encoding.string)
+      ~pp2:pp_print_top_error_of_trace
       ("errors", Error_monad.(TzTrace.encoding error_encoding))
 
   let vdf_daemon_connection_lost =
     declare_1
       ~section
-      ~level:Error
       ~name:"vdf_daemon_connection_lost"
-      ~msg:"connection to node lost, VDF daemon {worker} exiting"
+      ~level:Error
+      ~msg:"Connection to node lost, VDF daemon {worker} exiting"
+      ~pp1:Format.pp_print_string
       ("worker", Data_encoding.string)
+
+  let vdf_daemon_cannot_kill_computation =
+    declare_1
+      ~section
+      ~name:"vdf_daemon_cannot_kill_computation"
+      ~level:Error
+      ~msg:"Error when killining running computation: {error}"
+      ~pp1:Format.pp_print_string
+      ("error", Data_encoding.string)
 
   let vdf_info =
     declare_1
@@ -850,6 +1270,7 @@ module VDF = struct
       ~name:"vdf_internal"
       ~level:Notice
       ~msg:"{msg}"
+      ~pp1:Format.pp_print_string
       ("msg", Data_encoding.string)
 end
 
@@ -866,23 +1287,26 @@ module Nonces = struct
       ~msg:"found nonce to reveal for block {block}, level {level}"
       ~pp1:Block_hash.pp
       ("block", Block_hash.encoding)
-      ~pp2:pp_int32
-      ("level", Data_encoding.int32)
+      ~pp2:Raw_level.pp
+      ("level", Raw_level.encoding)
 
   let revealing_nonce =
-    declare_3
+    declare_4
+      ~alternative_color:Internal_event.Cyan
       ~section
       ~name:"revealing_nonce"
       ~level:Notice
       ~msg:
         "revealing nonce of level {level} (chain {chain} with operation \
-         {ophash})"
+         {ophash} injected to {node})"
       ~pp1:pp_int32
       ("level", Data_encoding.int32)
       ~pp2:Format.pp_print_string
       ("chain", Data_encoding.string)
       ~pp3:Operation_hash.pp
       ("ophash", Operation_hash.encoding)
+      ~pp4:Format.pp_print_string
+      ("node", Data_encoding.string)
 
   let cannot_fetch_chain_head_level =
     declare_0
@@ -898,8 +1322,8 @@ module Nonces = struct
       ~name:"incoherent_nonce"
       ~level:Error
       ~msg:"incoherent nonce for level {level}"
-      ~pp1:pp_int32
-      ("level", Data_encoding.int32)
+      ~pp1:(fun fmt -> Format.fprintf fmt "%a" Raw_level.pp)
+      ("level", Raw_level.encoding)
 
   let cannot_read_nonces =
     declare_1
@@ -938,18 +1362,6 @@ module Nonces = struct
       ~pp2:Error_monad.pp_print_trace
       ("trace", Error_monad.trace_encoding)
 
-  let too_many_nonces =
-    declare_1
-      ~section
-      ~name:"too_many_nonces"
-      ~level:Warning
-      ~msg:
-        "too many nonces associated with blocks unknown by node in \
-         '$TEZOS_CLIENT/{filename}'. After checking that these blocks were \
-         never included in the chain (e.g., via a block explorer), consider \
-         using `octez-client filter orphan nonces` to clear them."
-      ("filename", Data_encoding.string)
-
   let registering_nonce =
     declare_1
       ~section
@@ -975,69 +1387,121 @@ module Nonces = struct
       ~level:Info
       ~msg:"revelation worker started"
       ()
-end
 
-module Liquidity_baking = struct
-  include Internal_event.Simple
-
-  let reading_per_block =
-    declare_1
+  let revelation_worker_new_proposal =
+    declare_3
       ~section
-      ~name:"reading_per_block"
-      ~level:Notice
-      ~msg:"reading per block vote file path: {path}"
-      ("path", Data_encoding.string)
+      ~name:"revelation_worker_new_proposal"
+      ~level:Debug
+      ~msg:"revelation worker received proposal at level {level} from {uri}"
+      ~pp1:pp_int32
+      ("level", Data_encoding.int32)
+      ("uri", Data_encoding.string)
+      ~pp3:Block_hash.pp
+      ("block", Block_hash.encoding)
 
-  let per_block_vote_file_notice =
-    declare_1
-      ~section
-      ~name:"per_block_vote_file_notice"
-      ~level:Notice
-      ~msg:"per block vote file {event}"
-      ("event", Data_encoding.string)
-
-  let reading_liquidity_baking =
+  let success_migrate_nonces =
     declare_0
       ~section
-      ~name:"reading_liquidity_baking"
+      ~name:"success_migrate_nonces"
       ~level:Notice
-      ~msg:"reading liquidity baking toggle vote"
+      ~msg:"successfully migrated nonces: legacy nonces are safe to delete"
       ()
+
+  let ignore_failed_nonce_migration =
+    declare_3
+      ~section
+      ~name:"ignore_failed_nonce_migration"
+      ~level:Warning
+      ~msg:
+        "Found orphaned nonces while migrating baking nonces to the new file \
+         format. Please review the list of associated blocks. If the block is \
+         older than the last cycle or if it was not included, the file at \
+         '{legacy_nonces_file}' and '{orphaned_nonces_file}'should be archived \
+         and then removed. If the block is in the current or last cycle, you \
+         must start from a snapshot that is old enough to boostrap those \
+         blocks to avoid losing some of your baking rewards. Blocks associated \
+         with orphaned nonces:\n\
+         {failed}"
+      ~pp1:(Format.pp_print_list Block_hash.pp)
+      ("failed", Data_encoding.list Block_hash.encoding)
+      ("legacy_nonces_file", Data_encoding.string)
+      ("orphaned_nonces_file", Data_encoding.string)
+
+  let outdated_nonce =
+    declare_1
+      ~section
+      ~name:"outdated_nonce"
+      ~level:Info
+      ~msg:"outdated nonce for block {block_hash} is safe to delete"
+      ~pp1:Block_hash.pp
+      ("block_hash", Block_hash.encoding)
+
+  let unexpected_nonce =
+    declare_1
+      ~section
+      ~name:"unexpected_nonce"
+      ~level:Info
+      ~msg:"unexpected nonce for block {block_hash} is safe to delete"
+      ~pp1:Block_hash.pp
+      ("block_hash", Block_hash.encoding)
+
+  let revealed_nonce =
+    declare_1
+      ~section
+      ~name:"revealed_nonce"
+      ~level:Info
+      ~msg:"revealed nonce for block {block_hash} is safe to delete"
+      ~pp1:Block_hash.pp
+      ("block_hash", Block_hash.encoding)
+
+  let deterministic_nonce_timeout =
+    declare_1
+      ~section
+      ~name:"deterministic_nonce_timeout"
+      ~level:Error
+      ~msg:
+        "Call to generate a deterministic nonce reached a timeout of {timeout}"
+      ("timeout", Data_encoding.float)
+
+  let deterministic_nonce_error =
+    declare_1
+      ~section
+      ~name:"deterministic_nonce_error"
+      ~level:Error
+      ~msg:"Call to deterministic nonce failed with {errors}"
+      ~pp1:pp_print_top_error_of_trace
+      ("errors", Error_monad.(TzTrace.encoding error_encoding))
+end
+
+module Per_block_votes = struct
+  include Internal_event.Simple
+
+  let reading_per_block_votes =
+    declare_1
+      ~section
+      ~name:"reading_per_block_votes"
+      ~level:Notice
+      ~msg:"reading votes file: {path}"
+      ("path", Data_encoding.string)
 
   let liquidity_baking_toggle_vote =
     declare_1
       ~section
-      ~name:"liquidity_baking_toggle_vote"
+      ~name:"read_liquidity_baking_toggle_vote"
       ~level:Notice
-      ~msg:"liquidity baking toggle vote = {value}"
+      ~msg:"read liquidity baking toggle vote = {value}"
       ( "value",
-        Protocol.Alpha_context.Liquidity_baking
-        .liquidity_baking_toggle_vote_encoding )
+        Protocol.Alpha_context.Per_block_votes.liquidity_baking_vote_encoding )
 
   let per_block_vote_file_fail =
     declare_1
       ~section
       ~name:"per_block_vote_file_error"
-      ~level:Notice
+      ~level:Error
       ~msg:"Error reading the block vote file: {errors}"
       ~pp1:pp_print_top_error_of_trace
       ("errors", Error_monad.(TzTrace.encoding error_encoding))
-
-  let liquidity_baking_off =
-    declare_0
-      ~section
-      ~name:"liquidity_baking_off"
-      ~level:Notice
-      ~msg:"Will vote to stop Liquidity Baking"
-      ()
-
-  let liquidity_baking_on =
-    declare_0
-      ~section
-      ~name:"liquidity_baking_on"
-      ~level:Notice
-      ~msg:"Will vote to continue or restart Liquidity Baking"
-      ()
 end
 
 module Selection = struct
@@ -1064,4 +1528,52 @@ module Selection = struct
       ~msg:"cannot serialize operation {op} metadata"
       ~pp1:Operation_hash.pp
       ("op", Operation_hash.encoding)
+end
+
+module Forge_worker = struct
+  include Internal_event.Simple
+
+  let section = section @ ["forge_worker"]
+
+  let error_while_processing_forge_request =
+    declare_1
+      ~section
+      ~name:"error_while_processing_forge_request"
+      ~level:Warning
+      ~msg:"error while processing forge request: {errors}"
+      ("errors", Error_monad.trace_encoding)
+      ~pp1:pp_print_top_error_of_trace
+
+  let error_while_authorizing_consensus_votes =
+    declare_1
+      ~section
+      ~name:"error_while_authorizing_consensus_votes"
+      ~level:Error
+      ~msg:"error while authorizing consensus votes: {errors}"
+      ("errors", Error_monad.(TzTrace.encoding error_encoding))
+      ~pp1:pp_print_top_error_of_trace
+
+  let forge_worker_unavailable =
+    declare_0
+      ~section
+      ~name:"forge_worker_unavailable"
+      ~level:Error
+      ~msg:"forge worker unavailable (queue closed or crashed)"
+      ()
+end
+
+module Client_daemon = struct
+  include Internal_event.Simple
+
+  let section = section @ ["client_daemon"]
+
+  let extra_node_warning =
+    declare_0
+      ~section
+      ~name:"extra_node_warning"
+      ~level:Warning
+      ~msg:
+        "the extra-node feature is under development.\n\
+         You must not use it in your baking setup."
+      ()
 end

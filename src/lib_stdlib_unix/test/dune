@@ -6,10 +6,15 @@
  (instrumentation (backend bisect_ppx))
  (libraries
   tezt.core
-  tezos-error-monad
-  tezos-stdlib-unix
+  bls12-381.archive
+  octez-libs.error-monad
+  octez-libs.stdlib-unix
+  octez-libs.event-logging
+  octez-libs.test-helpers
   qcheck-alcotest
-  octez-alcotezt)
+  octez-alcotezt
+  tezt-bam)
+ (preprocess (pps ppx_hash))
  (library_flags (:standard -linkall))
  (flags
   (:standard)
@@ -18,20 +23,28 @@
   -open Tezos_error_monad
   -open Tezos_error_monad.TzLwtreslib
   -open Tezos_stdlib_unix
+  -open Tezos_event_logging
+  -open Tezos_test_helpers
   -open Octez_alcotezt)
- (modules test_key_value_store_fuzzy))
+ (modules
+  test_atomic_write
+  test_key_value_store
+  test_key_value_store_fuzzy
+  test_log_config_rules))
 
 (executable
  (name main)
+ (instrumentation (backend bisect_ppx --bisect-sigterm))
  (libraries
   src_lib_stdlib_unix_test__tezt_lib
   tezt)
  (modules main))
 
 (rule
- (alias runtezt)
- (package tezos-stdlib-unix)
- (action (run %{dep:./main.exe})))
+ (alias runtest)
+ (package octez-libs)
+ (enabled_if (<> false %{env:RUNTEZTALIAS=true}))
+ (action (run %{dep:./main.exe} /flaky /ci_disabled)))
 
 (rule
  (targets main.ml)

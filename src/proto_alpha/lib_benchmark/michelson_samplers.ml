@@ -217,13 +217,21 @@ let (_ : 'a comparable_and_atomic -> type_name) = fun x -> (x :> type_name)
 
 open Sampling_helpers
 
-let uniform : 'a array -> 'a sampler =
- fun arr rng_state ->
+let uniform : ?blacklist:('a -> bool) -> 'a array -> 'a sampler =
+ fun ?blacklist arr rng_state ->
+  let arr =
+    match blacklist with
+    | None -> arr
+    | Some blacklist ->
+        Array.to_seq arr
+        |> Seq.filter (fun x -> not (blacklist x))
+        |> Array.of_seq
+  in
   let i = Random.State.int rng_state (Array.length arr) in
   arr.(i)
 
-let uniform_atomic_type_name : atomic_type_name sampler =
-  uniform all_atomic_type_names
+let uniform_atomic_type_name ?blacklist : atomic_type_name sampler =
+  uniform ?blacklist all_atomic_type_names
 
 let uniform_comparable_atomic_type_name : 'a comparable_and_atomic sampler =
   uniform all_comparable_atomic_type_names
@@ -239,7 +247,11 @@ module type S = sig
   module Michelson_base : Michelson_samplers_base.S
 
   module Random_type : sig
-    val m_type : size:int -> Script_typed_ir.ex_ty sampler
+    val m_type :
+      size:int ->
+      ?blacklist:(type_name -> bool) ->
+      unit ->
+      Script_typed_ir.ex_ty sampler
 
     val m_comparable_type :
       size:int -> Script_ir_translator.ex_comparable_ty sampler
@@ -258,10 +270,11 @@ exception SamplingError of string
 
 let fail_sampling error = raise (SamplingError error)
 
-module Make (P : sig
-  val parameters : parameters
-end)
-(Crypto_samplers : Crypto_samplers.Finite_key_pool_S) : S = struct
+module Make
+    (P : sig
+      val parameters : parameters
+    end)
+    (Crypto_samplers : Crypto_samplers.Finite_key_pool_S) : S = struct
   module Michelson_base = Michelson_samplers_base.Make (struct
     let parameters = P.parameters.base_parameters
   end)
@@ -326,24 +339,30 @@ end)
       | `TKey -> Ex_comparable_ty key_t
       | `TChain_id -> Ex_comparable_ty chain_id_t
 
-    let rec m_type ~size : Script_typed_ir.ex_ty sampler =
+    let rec m_type ~size ?blacklist () : Script_typed_ir.ex_ty sampler =
       let open Script_ir_translator in
       let open M in
+      let blacklist =
+        match blacklist with
+        | None -> None
+        | Some blacklist -> Some (fun x -> blacklist (x :> type_name))
+      in
       if size <= 0 then Stdlib.failwith "m_type: size <= 0"
       else if size = 1 then
         (* only atomic types can have size 1 *)
-        let* at_tn = uniform_atomic_type_name in
+        let* at_tn = uniform_atomic_type_name ?blacklist in
         return (type_of_atomic_type_name at_tn)
       else if size = 2 then
-        bind (uniform [|`TOption; `TList; `TSet; `TTicket; `TContract|])
+        bind
+          (uniform [|`TOption; `TList; `TSet; `TTicket; `TContract|] ?blacklist)
         @@ function
         | `TOption -> (
-            let* (Ex_ty t) = m_type ~size:1 in
+            let* (Ex_ty t) = m_type ~size:1 ?blacklist () in
             match option_t (-1) t with
             | Error _ -> assert false
             | Ok res_ty -> return @@ Ex_ty res_ty)
         | `TList -> (
-            let* (Ex_ty t) = m_type ~size:1 in
+            let* (Ex_ty t) = m_type ~size:1 ?blacklist () in
             match list_t (-1) t with
             | Error _ -> assert false
             | Ok res_ty -> return @@ Ex_ty res_ty)
@@ -358,42 +377,42 @@ end)
             | Error _ -> assert false
             | Ok res_ty -> return @@ Ex_ty res_ty)
         | `TContract -> (
-            let* (Ex_ty t) = m_type ~size:1 in
+            let* (Ex_ty t) = m_type ~size:1 ?blacklist () in
             match contract_t (-1) t with
             | Error _ -> assert false
             | Ok res_ty -> return @@ Ex_ty res_ty)
       else
-        bind (uniform all_non_atomic_type_names) @@ function
+        bind (uniform all_non_atomic_type_names ?blacklist) @@ function
         | `TPair -> (
             let* lsize, rsize = pick_split (size - 1) in
-            let* (Ex_ty left) = m_type ~size:lsize in
-            let* (Ex_ty right) = m_type ~size:rsize in
+            let* (Ex_ty left) = m_type ~size:lsize ?blacklist () in
+            let* (Ex_ty right) = m_type ~size:rsize ?blacklist () in
             match pair_t (-1) left right with
             | Error _ -> assert false
             | Ok (Ty_ex_c res_ty) -> return @@ Ex_ty res_ty)
         | `TLambda -> (
             let* lsize, rsize = pick_split (size - 1) in
-            let* (Ex_ty domain) = m_type ~size:lsize in
-            let* (Ex_ty range) = m_type ~size:rsize in
+            let* (Ex_ty domain) = m_type ~size:lsize ?blacklist () in
+            let* (Ex_ty range) = m_type ~size:rsize ?blacklist () in
             match lambda_t (-1) domain range with
             | Error _ -> assert false
             | Ok res_ty -> return @@ Ex_ty res_ty)
         | `TOr -> (
             let* lsize, rsize = pick_split (size - 1) in
-            let* (Ex_ty left) = m_type ~size:lsize in
-            let* (Ex_ty right) = m_type ~size:rsize in
+            let* (Ex_ty left) = m_type ~size:lsize ?blacklist () in
+            let* (Ex_ty right) = m_type ~size:rsize ?blacklist () in
             match or_t (-1) left right with
             | Error _ -> assert false
             | Ok (Ty_ex_c res_ty) -> return @@ Ex_ty res_ty)
         | `TOption -> (
-            let* (Ex_ty t) = m_type ~size:(size - 1) in
+            let* (Ex_ty t) = m_type ~size:(size - 1) ?blacklist () in
             match option_t (-1) t with
             | Error _ -> assert false
             | Ok res_ty -> return @@ Ex_ty res_ty)
         | `TMap -> (
             let* lsize, rsize = pick_split (size - 1) in
             let* (Ex_comparable_ty key) = m_comparable_type ~size:lsize in
-            let* (Ex_ty elt) = m_type ~size:rsize in
+            let* (Ex_ty elt) = m_type ~size:rsize ?blacklist () in
             match map_t (-1) key elt with
             | Error _ -> assert false
             | Ok res_ty -> return @@ Ex_ty res_ty)
@@ -405,7 +424,7 @@ end)
             | Error _ -> assert false
             | Ok res_ty -> return @@ Ex_ty res_ty)
         | `TList -> (
-            let* (Ex_ty elt) = m_type ~size:(size - 1) in
+            let* (Ex_ty elt) = m_type ~size:(size - 1) ?blacklist () in
             match list_t (-1) elt with
             | Error _ -> assert false
             | Ok res_ty -> return @@ Ex_ty res_ty)
@@ -417,13 +436,13 @@ end)
             | Error _ -> assert false
             | Ok res_ty -> return @@ Ex_ty res_ty)
         | `TContract -> (
-            let* (Ex_ty t) = m_type ~size:(size - 1) in
+            let* (Ex_ty t) = m_type ~size:(size - 1) ?blacklist () in
             match contract_t (-1) t with
             | Error _ -> assert false
             | Ok res_ty -> return @@ Ex_ty res_ty)
         | `TBig_map ->
             (* Don't know what to do with theses. Redraw. *)
-            m_type ~size
+            m_type ~size ?blacklist ()
 
     and m_comparable_type ~size : Script_ir_translator.ex_comparable_ty sampler
         =
@@ -508,7 +527,10 @@ end)
     let address rng_state =
       if Base_samplers.uniform_bool rng_state then
         let destination =
-          Alpha_context.Destination.Contract (Implicit (implicit rng_state))
+          (* FIXME-PA *)
+          Alpha_context.Destination.Contract
+            (Implicit
+               (Implicit_account_repr.Forbidden.of_pkh (implicit rng_state)))
         in
         {destination; entrypoint = Alpha_context.Entrypoint.default}
       else
@@ -518,8 +540,7 @@ end)
         let entrypoint = entrypoint rng_state in
         {destination; entrypoint}
 
-    let generate_originated_contract :
-        type arg argc.
+    let generate_originated_contract : type arg argc.
         (arg, argc) Script_typed_ir.ty ->
         arg Script_typed_ir.typed_contract sampler =
      fun arg_ty ->
@@ -533,8 +554,7 @@ end)
            destination
            entrypoint)
 
-    let generate_sc_rollup_contract :
-        type arg argc.
+    let generate_sc_rollup_contract : type arg argc.
         (arg, argc) Script_typed_ir.ty ->
         arg Script_typed_ir.typed_contract sampler =
      fun arg_ty ->
@@ -547,8 +567,7 @@ end)
            destination
            Alpha_context.Entrypoint.default)
 
-    let generate_any_type_contract :
-        type arg argc.
+    let generate_any_type_contract : type arg argc.
         (arg, argc) Script_typed_ir.ty ->
         arg Script_typed_ir.typed_contract sampler =
      fun arg_ty ->
@@ -557,8 +576,7 @@ end)
       if b then generate_originated_contract arg_ty
       else generate_sc_rollup_contract arg_ty
 
-    let generate_contract :
-        type arg argc.
+    let generate_contract : type arg argc.
         (arg, argc) Script_typed_ir.ty ->
         arg Script_typed_ir.typed_contract sampler =
      fun arg_ty ->
@@ -568,8 +586,10 @@ end)
           let* b = Base_samplers.uniform_bool in
           if b then
             let* pkh = implicit in
+            (* FIXME-PA *)
             let destination =
-              Alpha_context.Destination.Contract (Implicit pkh)
+              Alpha_context.Destination.Contract
+                (Implicit (Implicit_account_repr.Forbidden.of_pkh pkh))
             in
             let entrypoint = Alpha_context.Entrypoint.default in
             return
@@ -585,7 +605,9 @@ end)
       Data_encoding.Binary.of_string_exn Script_chain_id.encoding string
 
     let signature rng_state =
-      Script_signature.make (Michelson_base.signature rng_state)
+      Script_signature.make
+        (Tezos_crypto.Signature.V3.Of_V_latest.get_signature_exn
+           (Michelson_base.signature rng_state))
 
     let rec value : type a ac. (a, ac) Script_typed_ir.ty -> a sampler =
       let open Script_typed_ir in
@@ -599,8 +621,8 @@ end)
         | String_t -> Michelson_base.string
         | Bytes_t -> Michelson_base.bytes
         | Mutez_t -> Michelson_base.tez
-        | Key_hash_t -> Crypto_samplers.pkh
-        | Key_t -> Crypto_samplers.pk
+        | Key_hash_t -> fun pkh -> Crypto_samplers.pkh pkh
+        | Key_t -> fun pk -> Crypto_samplers.pk pk
         | Timestamp_t -> Michelson_base.timestamp
         | Bool_t -> Base_samplers.uniform_bool
         | Address_t -> address
@@ -630,9 +652,6 @@ end)
         | Bls12_381_g2_t -> generate_bls12_381_g2
         | Bls12_381_fr_t -> generate_bls12_381_fr
         | Ticket_t (contents_ty, _) -> generate_ticket contents_ty
-        | Tx_rollup_l2_address_t ->
-            fail_sampling
-              "Michelson_samplers: tx_rollup_l2_address is deprecated"
         | Sapling_transaction_t _ ->
             fail_sampling
               "Michelson_samplers: sapling transactions not handled yet"
@@ -645,16 +664,14 @@ end)
             fail_sampling "Michelson_samplers: chest key not handled yet"
         | Chest_t -> fail_sampling "Michelson_samplers: chest not handled yet"
 
-    and generate_lambda :
-        type arg argc ret retc.
+    and generate_lambda : type arg argc ret retc.
         (arg, argc) Script_typed_ir.ty ->
         (ret, retc) Script_typed_ir.ty ->
         (arg, ret) Script_typed_ir.lambda sampler =
      fun _arg_ty _ret_ty _rng_state ->
       fail_sampling "Michelson_samplers: lambda not handled yet"
 
-    and generate_list :
-        type elt eltc.
+    and generate_list : type elt eltc.
         (elt, eltc) Script_typed_ir.ty -> elt Script_list.t sampler =
      fun elt_type ->
       let open M in
@@ -667,8 +684,7 @@ end)
 
     (* Note that we might very well generate sets smaller than the specified range (consider the
        case of a set of type [unit]). *)
-    and generate_set :
-        type elt.
+    and generate_set : type elt.
         elt Script_typed_ir.comparable_ty -> elt Script_typed_ir.set sampler =
      fun elt_ty ->
       let open M in
@@ -683,8 +699,7 @@ end)
            (Script_set.empty elt_ty)
            elements
 
-    and generate_map :
-        type key elt eltc.
+    and generate_map : type key elt eltc.
         key Script_typed_ir.comparable_ty ->
         (elt, eltc) Script_typed_ir.ty ->
         (key, elt) Script_typed_ir.map sampler =
@@ -700,30 +715,35 @@ end)
         keys
         elts
 
-    and generate_big_map :
-        type key elt eltc.
+    and generate_big_map : type key elt eltc.
         key Script_typed_ir.comparable_ty ->
         (elt, eltc) Script_typed_ir.ty ->
         (key, elt) Script_typed_ir.big_map sampler =
+      let open Lwt_result_wrap_syntax in
       let open Script_typed_ir in
       fun key_ty elt_ty rng_state ->
         let open TzPervasives in
         let result =
           Lwt_main.run
-            ( Execution_context.make ~rng_state >>=? fun (ctxt, _) ->
-              let big_map = Script_big_map.empty key_ty elt_ty in
-              (* Cannot have big maps under big maps *)
-              option_t (-1) elt_ty |> Environment.wrap_tzresult
-              >>?= fun opt_elt_ty ->
-              let map = generate_map key_ty opt_elt_ty rng_state in
-              Script_map.fold
-                (fun k v acc ->
-                  acc >>=? fun (bm, ctxt_acc) ->
-                  Script_big_map.update ctxt_acc k v bm)
-                map
-                (return (big_map, ctxt))
-              >|= Environment.wrap_tzresult
-              >>=? fun (big_map, _) -> return big_map )
+            (let* ctxt, _ = Execution_context.make ~rng_state () in
+             let big_map = Script_big_map.empty key_ty elt_ty in
+             (* Cannot have big maps under big maps *)
+             let*? opt_elt_ty =
+               option_t (-1) elt_ty |> Environment.wrap_tzresult
+             in
+             let map = generate_map key_ty opt_elt_ty rng_state in
+             let* big_map, _ =
+               let*! result =
+                 Script_map.fold
+                   (fun k v acc ->
+                     let* bm, ctxt_acc = acc in
+                     Script_big_map.update ctxt_acc k v bm)
+                   map
+                   (return (big_map, ctxt))
+               in
+               Lwt.return @@ Environment.wrap_tzresult result
+             in
+             return big_map)
         in
         match result with
         | Ok x -> x
@@ -764,13 +784,15 @@ end)
       | Some x -> x
       | None -> assert false
 
-    and generate_ticket :
-        type a ac.
+    and generate_ticket : type a ac.
         (a, ac) Script_typed_ir.ty -> a Script_typed_ir.ticket sampler =
      fun ty rng_state ->
       let contents = value ty rng_state in
       let ticketer =
-        Alpha_context.Contract.Implicit (Crypto_samplers.pkh rng_state)
+        (* FIXME-PA *)
+        Alpha_context.Contract.Implicit
+          (Implicit_account_repr.Forbidden.of_pkh
+             (Crypto_samplers.pkh rng_state))
       in
       let amount =
         let open Ticket_amount in

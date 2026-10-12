@@ -41,12 +41,13 @@ let test_bad_indentation_ill_typed =
     ~__FILE__
     ~title:"Bad indentation contract is ill-typed"
     ~tags
+    ~uses_node:false
   @@ fun protocol ->
   let* client = Client.init_mockup ~protocol () in
   let script =
     Michelson_script.(find ["ill_typed"; "badly_indented"] protocol |> path)
   in
-  let process = Client.spawn_typecheck_script ~script client in
+  let process = Client.spawn_typecheck_script ~scripts:[script] client in
   Process.check_error ~exit_code:1 ~msg:(rex "syntax error in program") process
 
 let test_bad_indentation_hash =
@@ -54,6 +55,7 @@ let test_bad_indentation_hash =
     ~__FILE__
     ~title:"Bad indentation contract hash is expected"
     ~tags
+    ~uses_node:false
   @@ fun protocol ->
   let* client = Client.init_mockup ~protocol () in
   let script =
@@ -72,6 +74,7 @@ let test_formatted_typechecks =
     ~__FILE__
     ~title:"Formatted bad indentation contract is well-typed"
     ~tags
+    ~uses_node:false
   @@ fun protocol ->
   let* client = Client.init_mockup ~protocol () in
   let* formatted_script =
@@ -82,7 +85,7 @@ let test_formatted_typechecks =
       ~dst_format:`Michelson
       client
   in
-  let* () = Client.typecheck_script ~script:formatted_script client in
+  let* () = Client.typecheck_script ~scripts:[formatted_script] client in
   unit
 
 let test_formatted_hash =
@@ -90,6 +93,7 @@ let test_formatted_hash =
     ~__FILE__
     ~title:"Formatted bad indentation contract hash is expected"
     ~tags
+    ~uses_node:false
   @@ fun protocol ->
   let* client = Client.init_mockup ~protocol () in
   let* formatted_script =

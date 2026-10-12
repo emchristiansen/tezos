@@ -179,6 +179,8 @@ module Make_minimal (K : Name) = struct
   end)
 end
 
+module Make_minimal_with_data (Name : Name) = Make_minimal (Name)
+
 module type Register = sig
   val register_encoding :
     prefix:string ->
@@ -314,20 +316,22 @@ end
 
 let rec log2 x = if x <= 1 then 0 else 1 + log2 ((x + 1) / 2)
 
-module Make_merkle_tree (R : sig
-  val register_encoding :
-    prefix:string ->
-    length:int ->
-    to_raw:('a -> string) ->
-    of_raw:(string -> 'a option) ->
-    wrap:('a -> Base58.data) ->
-    'a Base58.encoding
-end)
-(K : PrefixedName) (Contents : sig
-  type t
+module Make_merkle_tree
+    (R : sig
+      val register_encoding :
+        prefix:string ->
+        length:int ->
+        to_raw:('a -> string) ->
+        of_raw:(string -> 'a option) ->
+        wrap:('a -> Base58.data) ->
+        'a Base58.encoding
+    end)
+    (K : PrefixedName)
+    (Contents : sig
+      type t
 
-  val to_bytes : t -> Bytes.t
-end) =
+      val to_bytes : t -> Bytes.t
+    end) =
 struct
   include Make (R) (K)
 

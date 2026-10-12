@@ -26,7 +26,8 @@
 (** Testing
     -------
     Component:    Client
-    Invocation:   dune build @src/lib_proxy/runtest
+    Invocation:   dune exec src/lib_proxy/test/main.exe \
+                  -- --file test_proxy.ml
     Subject:      --mode proxy of the client
 *)
 
@@ -59,7 +60,7 @@ let mock_proto_rpc () =
   (module struct
     let calls : Local.key Stack.t = Stack.create ()
 
-    let split_key _ (k : Local.key) =
+    let split_key (k : Local.key) =
       match k with
       (* These constants are used in tests below *)
       | "split" :: "key" :: "trigger_now!" :: tail ->
@@ -81,13 +82,13 @@ let mock_proto_rpc () =
 
 class mock_rpc_context : Tezos_rpc.Context.simple =
   object
-    method call_service
-        : 'm 'p 'q 'i 'o.
-          (([< Resto.meth] as 'm), unit, 'p, 'q, 'i, 'o) Tezos_rpc.Service.t ->
-          'p ->
-          'q ->
-          'i ->
-          'o tzresult Lwt.t =
+    method call_service :
+        'm 'p 'q 'i 'o.
+        (([< Resto.meth] as 'm), unit, 'p, 'q, 'i, 'o) Tezos_rpc.Service.t ->
+        'p ->
+        'q ->
+        'i ->
+        'o tzresult Lwt.t =
       assert false
   end
 
@@ -96,12 +97,7 @@ let mock_chain = `Main
 let mock_block = `Head 0
 
 let mock_input : Tezos_proxy.Proxy.proxy_getter_input =
-  {
-    rpc_context = new mock_rpc_context;
-    mode = Client;
-    chain = mock_chain;
-    block = mock_block;
-  }
+  {rpc_context = new mock_rpc_context; chain = mock_chain; block = mock_block}
 
 open Assert
 open Lwt_assert
@@ -232,9 +228,10 @@ let test_split_key_triggers () =
 
 let () =
   Alcotest_lwt.run
+    ~__FILE__
     "tezos-proxy"
     [
-      ( "all",
+      ( "all tests",
         [
           Alcotest_lwt.test_case "RequestsTree" `Quick test_tree;
           Tztest.tztest "test do_rpc" `Quick test_do_rpc_no_longer_key;

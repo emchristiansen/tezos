@@ -1,10 +1,8 @@
-.. TODO tezos/tezos#2170: search shifted protocol name/number & adapt
-
 Connecting to a Network
 =======================
 
 Tezos is run on several networks, such as Mainnet (the main network)
-and various :ref:`test Networks<test-networks>`. Some users may also want to run
+and various :ref:`test Networks<test_networks>`. Some users may also want to run
 their own networks for various reasons. Networks differ in various ways:
 
 - they start from their own genesis block;
@@ -26,19 +24,42 @@ To connect to other networks, you can either use one of the
 See also `Alias Versus Explicit Configuration`_ for a discussion
 regarding what happens when you update your node, in each case.
 
+.. _test_networks:
+
+Test Networks
+-------------
+
+Mainnet is the main Tezos network, but is not appropriate for testing.
+A number of `predefined test networks <https://teztnets.com>`__ are available to this end. Test networks usually run
+with different :ref:`constants <protocol_constants>` to speed up the chain.
+
+.. _faucet:
+
+Each test network listed there indicates:
+
+- a URL defining the network parameters
+
+- a **faucet** delivering test tokens. Enter the public key hash of any test account on the corresponding website to receive test tokens
+
+- a server providing :doc:`snapshots` that allows one to start a node quickly on the test network.
+
+The faucet interface is meant for interactive use.
+If you are looking for a scriptable alternative, check the programmatic `faucet frontend <https://github.com/tacoinfra/tezos-faucet>`__ which includes the ``get-tez`` tool.
+
 .. _builtin_networks:
 
 Built-In Networks
 -----------------
 
 The simplest way to select the network to connect to is to use the ``--network``
-option for selecting a :ref:`test network<test-networks>` when you initialize your :doc:`node configuration <./node-configuration>`.
+option for selecting a :ref:`test network<test_networks>` when you initialize your :doc:`node configuration <./node-configuration>`.
 
-For instance, to run on Ghostnet::
+Some of the `predefined test networks <https://teztnets.com>`__ are built in Octez.
+For instance, to run on Shadownet::
 
-  octez-node config init --data-dir ~/tezos-ghostnet --network ghostnet
-  octez-node identity generate --data-dir ~/tezos-ghostnet
-  octez-node run --data-dir ~/tezos-ghostnet
+  octez-node config init --data-dir ~/tezos-shadownet --network shadownet
+  octez-node identity generate --data-dir ~/tezos-shadownet
+  octez-node run --data-dir ~/tezos-shadownet
 
 .. note::
    Once initialized, the node remembers its network settings on subsequent runs
@@ -56,21 +77,17 @@ the following built-in networks:
 
 - ``sandbox``
 
-- ``ghostnet``
-
-- ``limanet`` (available from version 15.0)
-
-- ``mumbainet`` (available from version :doc:`../releases/version-16`)
+- ``shadownet`` (starting from Octez v24)
 
 If you did not initialize your node configuration, or if your configuration
 file contains no ``network`` field, the node assumes you want to run Mainnet.
 You can use the ``--network`` option with ``octez-node run`` to make sure
 your node runs on the expected network. For instance, to make sure that
-it runs on Ghostnet::
+it runs on Shadownet::
 
-  octez-node run --data-dir ~/tezos-ghostnet --network ghostnet
+  octez-node run --data-dir ~/tezos-shadownet --network shadownet
 
-This command will fail with an error if the configured network is not Ghostnet.
+This command will fail with an error if the configured network is not Shadownet.
 The node also displays the chain name (such as ``TEZOS_MAINNET``) when it starts.
 Also mind opening the :doc:`RPC interface <../developer/rpc>` as appropriate.
 
@@ -78,10 +95,34 @@ The list of built-in networks is in :src:`src/lib_node_config/config_file.ml`.
 Octez developers edit the ``builtin_blockchain_networks_with_tags`` variable in this file to
 add or remove built-in networks.
 
+Pre-defined Networks
+--------------------
+
+Not all the `predefined test networks <https://teztnets.com>`__ are built in Octez.
+For instance, the "protocol testnets" or periodic teztnets are not built in.
+
+In this case, you can pass to the ``--network`` option the corresponding predefined network description file.
+For instance, for running on weeklynet, you may use ``--network https://teztnets.com/weeklynet``.
+Note that this also works for builtin networks, albeit a bit longer.
+
+.. _network_aliases:
+
+There are also the following *predefined network aliases*:
+
+- ``currentnet``: designates the test network running the same protocol as mainnet
+
+- ``proposednet``: designates the test network running the protocol under voting, when there is one (note that in all the voting periods but the first one, there is at most one protocol under voting)
+
+For instance, for running on the current protocol's testnet, you may:
+
+- use option ``octez-node --network https://teztnets.com/currentnet`` to connect to it
+- get tokens from its faucet at ``https://faucet.currentnet.teztnets.com/``
+- download snapshots from ``https://snapshots.tzinit.org/currentnet/rolling``
+
 Custom Networks
 ---------------
 
-If the network you want to connect to is not in the list of built-in networks,
+If the network you want to connect to is not in the list of built-in or predefined networks,
 you need a corresponding network configuration file. There are several ways to
 set that up. If you have an appropriate file, you can specify it with the ``--network``
 argument when you initialize your node configuration (see above), and the node will load it. If you know a URL from which the file can be
@@ -134,7 +175,12 @@ Here is an example configuration file for Mainnet::
           "replacement_protocol": "PtHangz2aRngywmSRGGvrcTyMbbdpWdpFKuS4uMWxg2RaH9i1qx"
         }
       ],
-      "default_bootstrap_peers": [ "boot.tzbeta.net" ]
+      "default_bootstrap_peers":
+        [
+         "boot.tzinit.org",
+         "boot.tzboot.net",
+         "boot.tzbeta.net"
+       ]
     }
   }
 
@@ -222,11 +268,11 @@ When connecting to existing networks, both options may apply, so here are some u
 
 If you use alias configuration, the configuration file stores
 the name of the network to connect to. For instance, if you configured it
-to connect to Ghostnet, it will contain something like::
+to connect to Shadownet, it will contain something like::
 
   {
     "p2p": {},
-    "network": "ghostnet"
+    "network": "shadownet"
   }
 
 For Mainnet, it would contain ``mainnet``, or nothing as this is actually the default.
@@ -238,7 +284,7 @@ overrides may be added. Because the configuration file only contains the name
 of the network and not its parameters, it will automatically use the updated values.
 
 However, if you use explicit configuration, the configuration file will
-no longer contain an alias such as ``mainnet`` or ``ghostnet``. Instead,
+no longer contain an alias such as ``mainnet`` or ``shadownet``. Instead,
 it will explicitly contain the list of bootstrap peers, user-activated upgrades
 and user-activated protocol overrides that you specify. This means that when
 you update your node, the updated values will not be used.

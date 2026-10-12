@@ -61,15 +61,23 @@ type t
 
 type operation := t
 
+type consensus_kind =
+  | Attestation of {with_dal : bool; companion_key : Account.key option}
+  | Preattestation
+
 (** The kind is necessary because it determines the watermark of an
    operation which is necessary for signing an operation. This type
    aims to be extended when other kinds of operations are added into
    this module. *)
-type kind = Consensus of {chain_id : string} | Voting | Manager
+type kind =
+  | Consensus of {kind : consensus_kind; chain_id : string}
+  | Anonymous
+  | Voting
+  | Manager
 
-(** [make ~branch ~signer ~kind json client] builds the representation
+(** [make ~branch ?signer ~kind json client] builds the representation
    of an unsigned operation. *)
-val make : branch:string -> signer:Account.key -> kind:kind -> JSON.u -> t
+val make : branch:string -> ?signer:Account.key -> kind:kind -> JSON.u -> t
 
 (** [json t] gives the json representation of an unsigned operation. *)
 val json : t -> JSON.u
@@ -95,17 +103,39 @@ val hex :
   Client.t ->
   Hex.t Lwt.t
 
-(** [sign t client] signs the raw representation of operation [t] by
-   its signer (see {!val:make}). [client] is used to construct the
-   binary representation of [t]. *)
+(** [sign t client] signs the raw representation of operation [t] by its signer
+    (see {!val:make}). [client] is used to construct the binary representation
+    of [t]. Note that if no signer have been given to [t] the function returns
+    [Tezos_crypto.Signature.zero]. *)
 val sign :
   ?protocol:Protocol.t -> t -> Client.t -> Tezos_crypto.Signature.t Lwt.t
 
-(** [inject ?(request=`Inject) ?(force=false) ?(signature=None)
+(** [hash t client] returns the hash of the operation  *)
+val hash : t -> Client.t -> [`OpHash of string] Lwt.t
+
+(** Returns the size (in bytes) of the operation.
+
+    @param protocol Allows using the operation encoding rather than
+    using the [forge_operations] RPC to compute the hexadecimal
+    representation of the operation.
+
+    @param signature Allows to manually set the signature of the
+    operation. When omitted, the operation is correctly signed using {!sign}. *)
+val byte_size :
+  ?protocol:Protocol.t ->
+  ?signature:Tezos_crypto.Signature.t ->
+  t ->
+  Client.t ->
+  int Lwt.t
+
+(** [inject dont_wait ?(request=`Inject) ?(force=false) ?(signature=None)
    ?(error=None) t] injects an operation into the node. The node is
    extracted from the [Client]. If a node cannot be extracted, the
    injection fails. If the injection succeeds, the hash of the
    operation is returned.
+
+   @param dont_wait If [true], the operation is injected without waiting
+   on some node event. Making [request] ignore. Default is [false].
 
    @param request If [`Inject], we do not wait the [prevalidator] to
    classify the operation. This can create some flakyness in the test
@@ -128,6 +158,7 @@ val sign :
    @param error If the injection is expecting to fail, allows to
    specify the expected error.  *)
 val inject :
+  ?dont_wait:bool ->
   ?request:[`Inject | `Notify] ->
   ?force:bool ->
   ?protocol:Protocol.t ->
@@ -136,6 +167,35 @@ val inject :
   t ->
   Client.t ->
   [`OpHash of string] Lwt.t
+
+(** Same as [inject], but do not wait for the process to exit. *)
+val spawn_inject :
+  ?force:bool ->
+  ?protocol:Protocol.t ->
+  ?signature:Tezos_crypto.Signature.t ->
+  t ->
+  Client.t ->
+  JSON.t Runnable.process Lwt.t
+
+(** Run [spawn_inject] then capture one group on stderr with [rex]. *)
+val inject_and_capture1_stderr :
+  rex:rex ->
+  ?force:bool ->
+  ?protocol:Protocol.t ->
+  ?signature:Tezos_crypto.Signature.t ->
+  t ->
+  Client.t ->
+  string Lwt.t
+
+(** Run [spawn_inject] then capture two groups on stderr with [rex]. *)
+val inject_and_capture2_stderr :
+  rex:rex ->
+  ?force:bool ->
+  ?protocol:Protocol.t ->
+  ?signature:Tezos_crypto.Signature.t ->
+  t ->
+  Client.t ->
+  (string * string) Lwt.t
 
 (** [inject_operations ?protocol ?request ?force ?error ?use_tmp_file ops
     client] is similar as [inject] for a list of operations. This function calls
@@ -173,15 +233,52 @@ val inject_operations :
    [chain_id] when it is not provided. *)
 val make_run_operation_input : ?chain_id:string -> t -> Client.t -> JSON.u Lwt.t
 
+(** Craft a json representing the full operation, in a format that is
+   compatible with the [preapply/operations] RPC
+   ({!RPC.post_chain_block_helpers_preapply_operations}).
+
+   This json contains many more fields than the one produced by the
+   {!json} function above. *)
+val make_preapply_operation_input :
+  protocol:Protocol.t -> signature:Tezos_crypto.Signature.t -> t -> JSON.u
+
 module Consensus : sig
   (** A representation of a consensus operation. *)
   type t
 
-  (** [dal_attestation ~attestation ~level] crafts a slot attestation
-     operation to attest at [level] slot headers published at level
-     [level - attestation_lag].  For each slot, the value of the
-     booleans indicates whether the data is deemed available. *)
-  val dal_attestation : attestation:bool array -> level:int -> t
+  (** [consensus ~kind ~level ~round ~slot ~block_payload_hash]
+      crafts a consensus operation with the [kind] at [level] on the [round]
+      with the [slot] and [block_payload_hash]. *)
+  val consensus :
+    kind:consensus_kind ->
+    slot:int ->
+    level:int ->
+    round:int ->
+    block_payload_hash:string ->
+    t
+
+  (** [preattestation ~level ~round ~slot ~block_payload_hash]
+      crafts a preattestation operation at [level] on the [round] with the
+      [slot] and [block_payload_hash]. *)
+  val preattestation :
+    slot:int -> level:int -> round:int -> block_payload_hash:string -> t
+
+  (** [attestation ~level ~round ~slot ~block_payload_hash
+      ?dal_attestation ()] crafts an attestation operation at the given [level]
+      on the given [round] with the given [slot] and [block_payload_hash] and
+      optionally the given [dal_attestation]. *)
+  val attestation :
+    slot:int ->
+    level:int ->
+    round:int ->
+    block_payload_hash:string ->
+    ?dal_attestation:string ->
+    unit ->
+    t
+
+  (** [kind_to_string kind ] returns the name of the
+      [kind]. *)
+  val kind_to_string : consensus_kind -> string
 
   (** [operation] constructs an operation from a consensus
      operation. the [client] is used to fetch the branch and the
@@ -189,6 +286,7 @@ module Consensus : sig
   val operation :
     ?branch:string ->
     ?chain_id:string ->
+    ?signer_companion:Account.key ->
     signer:Account.key ->
     t ->
     Client.t ->
@@ -204,10 +302,162 @@ module Consensus : sig
     ?branch:string ->
     ?chain_id:string ->
     ?error:rex ->
+    protocol:Protocol.t ->
+    ?signer_companion:Account.key ->
     signer:Account.key ->
     t ->
     Client.t ->
     [`OpHash of string] Lwt.t
+
+  (** Retrieves the attestation rounds at [level] by calling the
+      [GET /chains/<chain>/blocks/<block>/helpers/validators] RPC.
+      Returns an association list that maps a public key hash to
+      the owned rounds list *)
+  val get_rounds :
+    level:int ->
+    protocol:Protocol.t ->
+    Client.t ->
+    (string * int list) list Lwt.t
+
+  (** Returns the attestation slot of the provided delegate.
+
+      Causes the test to fail if the delegate is not found. *)
+  val get_attestation_slot :
+    level:int ->
+    protocol:Protocol.t ->
+    ?delegate:Account.key ->
+    ?consensus_key:Account.key ->
+    Client.t ->
+    int Lwt.t
+
+  (** Returns the attestation slot of the provided delegate.
+
+      Returns None if the delegate is not found. *)
+  val get_attestation_slot_opt :
+    level:int ->
+    protocol:Protocol.t ->
+    ?delegate:Account.key ->
+    ?consensus_key:Account.key ->
+    Client.t ->
+    int option Lwt.t
+
+  (** Calls the [GET /chains/<chain>/blocks/<block>/header] RPC and
+      extracts the head block's payload hash from the result. *)
+  val get_block_payload_hash : ?block:string -> Client.t -> string Lwt.t
+
+  (** Calls the [GET /chains/main/blocks/<block>/hash] RPC with
+      <block> = [attested_level] - 2. The returned block hash can be used as the
+      branch field of a consensus operation for [attested_level]. *)
+  val get_branch : attested_level:int -> Client.t -> string Lwt.t
+
+  (** Forge and inject a preattestation for the given account. *)
+  val preattest_for :
+    ?error:rex ->
+    protocol:Protocol.t ->
+    slot:int ->
+    level:int ->
+    round:int ->
+    block_payload_hash:string ->
+    ?branch:string ->
+    Account.key ->
+    Client.t ->
+    [`OpHash of string] Lwt.t
+
+  (** Forge and inject an attestation for the given account. *)
+  val attest_for :
+    ?error:rex ->
+    protocol:Protocol.t ->
+    slot:int ->
+    level:int ->
+    round:int ->
+    block_payload_hash:string ->
+    ?branch:string ->
+    ?dal_attestation:string ->
+    ?companion_key:Account.key ->
+    Account.key ->
+    Client.t ->
+    [`OpHash of string] Lwt.t
+end
+
+module Anonymous : sig
+  (** A representation of an anonymous operation. *)
+  type t
+
+  type double_consensus_evidence_kind =
+    | Double_attestation_evidence
+    | Double_preattestation_evidence
+
+  (** [double_consensus_evidence ~kind op1 op2] crafts a double
+      consensus evidence operation with the [kind], [op1] and [op2]. Both
+      operations should be of the same kind and the same as the one expected by
+      [kind]. *)
+  val double_consensus_evidence :
+    kind:double_consensus_evidence_kind ->
+    operation * Tezos_crypto.Signature.t ->
+    operation * Tezos_crypto.Signature.t ->
+    t
+
+  (** [double_attestation_evidence op1 op2] crafts a double
+      attestation evidence operation with op1 and op2. Both operations should be
+      attestations. *)
+  val double_attestation_evidence :
+    operation * Tezos_crypto.Signature.t ->
+    operation * Tezos_crypto.Signature.t ->
+    t
+
+  (** [double_preattestation_evidence op1 op2] crafts a double
+      preattestation evidence operation with op1 and op2. Both operations should be
+      preattestations. *)
+  val double_preattestation_evidence :
+    operation * Tezos_crypto.Signature.t ->
+    operation * Tezos_crypto.Signature.t ->
+    t
+
+  (** [dal_entrapment_evidence] crafts a DAL entrapment evidence operation. *)
+  val dal_entrapment_evidence_standalone_attestation :
+    protocol:Protocol.t ->
+    attestation:operation * Tezos_crypto.Signature.t ->
+    slot_index:int ->
+    ?lag_index:int ->
+    Tezos_crypto_dal.Cryptobox.shard ->
+    Tezos_crypto_dal.Cryptobox.shard_proof ->
+    t
+
+  (** [kind_to_string kind] return the name of the [kind]. *)
+  val kind_to_string : double_consensus_evidence_kind -> string
+
+  (** [operation] constructs an operation from an anonymous operation. the
+      [client] is used to fetch the branch and the [chain_id]. *)
+  val operation : ?branch:string -> t -> Client.t -> operation Lwt.t
+
+  (** A wrapper for {!val:inject} with anonymous operations. The client is used
+      to get all the data that was not provided if it can be recovered via RPCs.
+      Mainly those are the [branch] and the [chain_id]. *)
+  val inject :
+    ?request:[`Inject | `Notify] ->
+    ?force:bool ->
+    ?branch:string ->
+    ?error:rex ->
+    t ->
+    Client.t ->
+    [`OpHash of string] Lwt.t
+
+  (** Crafts two (pre)attestations that only differ in their block
+      payload hash, then a well-formed double (pre)attestation
+      evidence operation on them.
+
+      The denounced (pre)attestations have the specified
+      [misbehaviour_level] and [misbehaviour_round], the first slot of
+      [culprit], and two constant and distinct block payload
+      hashes. They are signed by [culprit]. *)
+  val make_double_consensus_evidence_with_distinct_bph :
+    kind:double_consensus_evidence_kind ->
+    misbehaviour_level:int ->
+    misbehaviour_round:int ->
+    culprit:Account.key ->
+    protocol:Protocol.t ->
+    Client.t ->
+    t Lwt.t
 end
 
 (** Voting operations (validation pass [1]): [proposals] and [ballot].
@@ -278,8 +528,9 @@ module Manager : sig
   (** Build a public key revelation.
 
      The [Account.key] argument has no default value because it will
-     typically be a fresh account. *)
-  val reveal : Account.key -> payload
+     typically be a fresh account. [proof] is required only for tz4
+     public keys. *)
+  val reveal : Account.key -> ?proof:string -> unit -> payload
 
   (** [transfer ?(dest=Constant.bootstrap2) ~amount:1_000_000 ()]
      builds a transfer operation. Note that the amount is expressed in
@@ -302,11 +553,21 @@ module Manager : sig
     unit ->
     payload
 
-  (** [dal_publish_slot_header ~level ~index ~header] builds an
+  (** [create_proof_of_possession] generates a proof of possession
+      (aka PoP) for the secret key of the [signer]. For now, this is
+      required only for BLS (tz4) keys. *)
+  val create_proof_of_possession : signer:Account.key -> string option
+
+  (** [update_consensus_key ~public_key ~proof ()] builds an
+      update_consenus_key operation. [proof] is required only for tz4
+      public keys. *)
+  val update_consensus_key :
+    public_key:string -> ?proof:string -> unit -> payload
+
+  (** [dal_publish_commitment ~level ~index ~header] builds an
      operation for the data-availability layer that publishes a
      slot. *)
-  val dal_publish_slot_header :
-    level:int ->
+  val dal_publish_commitment :
     index:int ->
     commitment:Tezos_crypto_dal.Cryptobox.commitment ->
     proof:Tezos_crypto_dal.Cryptobox.commitment_proof ->
@@ -350,6 +611,18 @@ module Manager : sig
     refutation:sc_rollup_refutation ->
     sc_rollup:string ->
     opponent:string ->
+    unit ->
+    payload
+
+  (** [sc_rollup_execute_outbox_message ~sc_rollup ~cemented_commitment
+      ~output_proof] builds a smart-rollup outbox execution manager operation
+      payload. [output_proof] is the hexadecimal representation of the
+      serialized output proof, as the protocol encodes that field with
+      [Data_encoding.string Hex]. *)
+  val sc_rollup_execute_outbox_message :
+    sc_rollup:string ->
+    cemented_commitment:string ->
+    output_proof:string ->
     unit ->
     payload
 
@@ -411,6 +684,7 @@ module Manager : sig
      recovered via RPCs. Mainly those are the [branch] and the
      [counter]. *)
   val inject :
+    ?dont_wait:bool ->
     ?request:[`Inject | `Notify] ->
     ?force:bool ->
     ?branch:string ->
@@ -426,10 +700,156 @@ module Manager : sig
       Tenderbake.
   *)
   val get_branch : ?chain:string -> ?offset:int -> Client.t -> string Lwt.t
+
+  (** A wrapper for {!val-operation} on a list consisting in a single
+      {!val-transfer}. See both functions for details and default
+      values of arguments. *)
+  val mk_single_transfer :
+    ?source:Account.key ->
+    ?counter:int ->
+    ?fee:int ->
+    ?gas_limit:int ->
+    ?storage_limit:int ->
+    ?dest:Account.key ->
+    ?amount:int ->
+    ?branch:string ->
+    ?signer:Account.key ->
+    Client.t ->
+    operation Lwt.t
+
+  (** A wrapper for {!inject}ing a batch consisting in a single
+      transfer. See {!transfer}, {!make_batch}, and {!inject} for the
+      descriptions and default values of the arguments. *)
+  val inject_single_transfer :
+    ?source:Account.key ->
+    ?counter:int ->
+    ?fee:int ->
+    ?gas_limit:int ->
+    ?storage_limit:int ->
+    ?dest:Account.key ->
+    ?amount:int ->
+    ?request:[< `Arrived | `Flush | `Inject | `Notify > `Inject] ->
+    ?force:bool ->
+    ?branch:string ->
+    ?signer:Account.key ->
+    ?error:rex ->
+    Client.t ->
+    [`OpHash of string] Lwt.t
 end
 
-(** Regular expression recognizing the mempool error that arises when
-    the operation conflicts with another previously validated operation.
+(** Regular expressions for specific error messages.
 
-    Intended to be provided as the [error] argument to {!val:inject}. *)
-val conflict_error : rex
+    Can be used as e.g.
+    - the [error] argument of {!val:inject}
+    - the [rex] argument of {!val:inject_and_capture2_stderr}
+    - the [msg] argument of {!val:Process.check_error}. *)
+
+(** Matches the client message for the [Operation_quota_exceeded]
+    protocol error. *)
+val gas_limit_exceeded : rex
+
+(** Matches the message produced by
+    [Operation_conflict {new_hash; needed_fee_in_mutez = Some fee}]
+    from [src/lib_shell_services/validation_errors].
+
+    Captures [new_hash] and [fee]. *)
+val conflict_error_with_needed_fee : rex
+
+(** Matches the message produced by
+    [Operation_conflict {new_hash; needed_fee_in_mutez = None}]
+    from [src/lib_shell_services/validation_errors].
+
+    Captures [new_hash]. *)
+val conflict_error_no_possible_fee : rex
+
+(** Matches the message produced by
+    [Rejected_by_full_mempool {hash; needed_fee_in_mutez = Some fee}]
+    from [src/lib_shell_services/validation_errors].
+
+    Captures [hash] and [fee]. *)
+val rejected_by_full_mempool_with_needed_fee : rex
+
+(** Matches the message produced by
+    [Rejected_by_full_mempool {hash; needed_fee_in_mutez = None}]
+    from [src/lib_shell_services/validation_errors].
+
+    Captures [hash]. *)
+val rejected_by_full_mempool_no_possible_fee : rex
+
+(** Matches the message produced by
+    [Dal_data_availibility_attester_not_in_committee {attester; level; slot}]
+    from [src/proto_alpha/lib_protocol/dal_errors_repr].
+
+    Captures [attester], [level], and [slot]. *)
+val dal_data_availibility_attester_not_in_committee : Protocol.t -> rex
+
+(** Calls {!inject_and_capture2_stderr} and checks that the second
+    captured group is [expected_fee].
+
+    Intended to be used with {!conflict_error_with_needed_fee} or
+    {!rejected_by_full_mempool_with_needed_fee} as [rex]. *)
+val inject_error_check_recommended_fee :
+  loc:string -> rex:rex -> expected_fee:int -> t -> Client.t -> unit Lwt.t
+
+(** Matches the message produced by
+    [Already_denounced {kind; delegate; level}]
+    from [src/proto_xxx/lib_protocol/validate_errors].
+
+    Captures [delegate], [level], [kind]. *)
+val already_denounced : rex
+
+(** Matches the message produced by
+    [Dal_already_denounced {delegate; level}]
+    from [src/proto_xxx/lib_protocol/validate_errors].
+
+    Captures [delegate], [level]. *)
+val already_dal_denounced : rex
+
+(** Matches the message produced by
+    [Outdated_dal_denunciation {kind; level; last_cycle}]
+    from [src/proto_xxx/lib_protocol/validate_errors].
+
+    Captures [kind], [last_cycle], [level]. *)
+val outdated_denunciation : rex
+
+(** Matches the message produced by
+    [Outdated_dal_denunciation {level; last_cycle}]
+    from [src/proto_xxx/lib_protocol/validate_errors].
+
+    Captures [last_cycle], [level]. *)
+val outdated_dal_denunciation : rex
+
+(** Matches the message
+    [Operation %a is branched on either:]
+    from [src/lib_shell/prevalidator.ml].
+
+    Captures [hash]. *)
+val injection_error_unknown_branch : rex
+
+(** Matches the message
+    [DAL shard proof error: Invalid shard (for commitment = %a)]
+    from [src/proto_alpha/lib_protocol/dal_slot_repr.ml]. *)
+val dal_entrapment_wrong_commitment : rex
+
+(** Matches the message
+    [Invalid accusation for delegate %a, level %d, lag_index %d and DAL slot index %d: the DAL slot was not published.]
+    or
+    [Invalid accusation for delegate %a, level %d, and DAL slot index %d: the DAL slot was not published.],
+    depending on the protocol version, from
+    [src/proto_<proto>/lib_protocol/validate_errors.ml]
+*)
+val dal_entrapment_of_not_published_commitment : Protocol.t -> rex
+
+(** Matches the message [The given lag index <lag_index> is out of range of
+    representable lag indices [0, <max_bound>]], from
+    [src/proto_<proto>/lib_protocol/validate_errors.ml]
+*)
+val dal_entrapment_invalid_lag_index : lag_index:int -> max_bound:int -> rex
+
+(** Matches accusation errors where the attester did not attest the targeted
+    DAL slot. *)
+val dal_entrapment_slot_not_attested : rex
+
+(** Matches accusation errors where the provided shard is not assigned to the
+    accused attester. *)
+val dal_entrapment_wrong_shard_owner : rex

@@ -30,7 +30,8 @@ open Sc_rollup_repr
 
 type error +=
   | (* `Temporary *)
-      Dissection_choice_not_found of Sc_rollup_tick_repr.t
+      Dissection_choice_not_found of
+      Sc_rollup_tick_repr.t
   | (* `Permanent *) Proof_unexpected_section_size of Z.t
   | (* `Temporary *)
       Proof_start_state_hash_mismatch of {
@@ -323,7 +324,8 @@ module V1 = struct
              start_level;
              inbox_level;
              game_state;
-           } ->
+           }
+         ->
         ( turn,
           inbox_snapshot,
           dal_snapshot,
@@ -335,7 +337,8 @@ module V1 = struct
              dal_snapshot,
              start_level,
              inbox_level,
-             game_state ) ->
+             game_state )
+         ->
         {
           turn;
           inbox_snapshot;
@@ -458,10 +461,9 @@ module Index = struct
       match String.split_on_char '-' s with
       | [a; b] -> (
           match both_of_b58check_opt (a, b) with
-          | Some stakers -> ok stakers
-          | None ->
-              Result.error (Format.sprintf "Invalid game index notation %s" s))
-      | _ -> Result.error (Format.sprintf "Invalid game index notation %s" s)
+          | Some stakers -> Ok stakers
+          | None -> Error (Format.sprintf "Invalid game index notation %s" s))
+      | _ -> Error (Format.sprintf "Invalid game index notation %s" s)
     in
     RPC_arg.make ~descr ~name:"game_index" ~construct ~destruct ()
 
@@ -472,7 +474,8 @@ let make_chunk state_hash tick = {state_hash; tick}
 
 let initial inbox dal_snapshot ~start_level
     ~(parent_commitment : Sc_rollup_commitment_repr.t)
-    ~(defender_commitment : Sc_rollup_commitment_repr.t) ~refuter ~defender
+    ~(defender_commitment : Sc_rollup_commitment_repr.t)
+    ~(refuter : Implicit_account_repr.t) ~(defender : Implicit_account_repr.t)
     ~default_number_of_sections =
   let ({alice; _} : Index.t) = Index.make refuter defender in
   let alice_to_play = Staker.equal alice refuter in
@@ -689,7 +692,7 @@ let find_choice dissection tick =
   let rec traverse states =
     match states with
     | ({state_hash = _; tick = state_tick} as curr) :: next :: others ->
-        if Sc_rollup_tick_repr.(tick = state_tick) then return (curr, next)
+        if Sc_rollup_tick_repr.(tick = state_tick) then Ok (curr, next)
         else traverse (next :: others)
     | _ -> tzfail (Dissection_choice_not_found tick)
   in
@@ -728,11 +731,11 @@ let check_proof_stop_state ~pvm ~stop_state input_given
     (let b = Option.equal State_hash.equal stop_state stop_proof in
      if validate then b else not b)
     (if validate then
-     Proof_stop_state_hash_failed_to_validate
-       {stop_state_hash = stop_state; stop_proof}
-    else
-      Proof_stop_state_hash_failed_to_refute
-        {stop_state_hash = stop_state; stop_proof})
+       Proof_stop_state_hash_failed_to_validate
+         {stop_state_hash = stop_state; stop_proof}
+     else
+       Proof_stop_state_hash_failed_to_refute
+         {stop_state_hash = stop_state; stop_proof})
 
 (** Check the proof validates the stop state. *)
 let check_proof_validate_stop_state ~stop_state input input_request proof =
@@ -743,8 +746,9 @@ let check_proof_refute_stop_state ~stop_state input input_request proof =
   check_proof_stop_state ~stop_state input input_request proof false
 
 (** Returns the validity of the first final move on top of a dissection. *)
-let validity_final_move ~pvm ~dal_parameters ~dal_attestation_lag ~first_move
-    ~metadata ~proof ~game ~start_chunk ~stop_chunk =
+let validity_final_move ~pvm ~dal_activation_level ~find_dal_parameters
+    ~first_move ~metadata ~proof ~game ~start_chunk ~stop_chunk
+    ~is_reveal_enabled ~dal_attested_slots_validity_lag =
   let open Lwt_result_syntax in
   let*! res =
     let {inbox_snapshot; inbox_level; dal_snapshot; _} = game in
@@ -758,8 +762,10 @@ let validity_final_move ~pvm ~dal_parameters ~dal_attestation_lag ~first_move
         inbox_snapshot
         inbox_level
         dal_snapshot
-        dal_parameters
-        ~dal_attestation_lag
+        ~find_dal_parameters
+        ~dal_activation_level
+        ~is_reveal_enabled
+        ~dal_attested_slots_validity_lag
         proof
     in
     let*? () =
@@ -767,7 +773,7 @@ let validity_final_move ~pvm ~dal_parameters ~dal_attestation_lag ~first_move
         check_proof_distance_is_one
           ~start_tick:start_chunk.tick
           ~stop_tick:stop_chunk.tick
-      else ok ()
+      else Result_syntax.return_unit
     in
     let*? () =
       check_proof_start_state
@@ -806,12 +812,12 @@ let validity_final_move ~pvm ~dal_parameters ~dal_attestation_lag ~first_move
     - The proof stop on the state different than the refuted one.
     - The proof is correctly verified.
 *)
-let validity_first_final_move ~pvm ~dal_parameters ~dal_attestation_lag
+let validity_first_final_move ~pvm ~find_dal_parameters ~dal_activation_level
     ~metadata ~proof ~game ~start_chunk ~stop_chunk =
   validity_final_move
     ~pvm
-    ~dal_parameters
-    ~dal_attestation_lag
+    ~dal_activation_level
+    ~find_dal_parameters
     ~first_move:true
     ~metadata
     ~proof
@@ -826,12 +832,12 @@ let validity_first_final_move ~pvm ~dal_parameters ~dal_attestation_lag
     - The proof stop on the state validates the refuted one.
     - The proof is correctly verified.
 *)
-let validity_second_final_move ~pvm ~dal_parameters ~dal_attestation_lag
+let validity_second_final_move ~pvm ~dal_activation_level ~find_dal_parameters
     ~metadata ~agreed_start_chunk ~refuted_stop_chunk ~game ~proof =
   validity_final_move
     ~pvm
-    ~dal_parameters
-    ~dal_attestation_lag
+    ~dal_activation_level
+    ~find_dal_parameters
     ~first_move:false
     ~metadata
     ~proof
@@ -881,25 +887,18 @@ let cost_play ~step ~choice =
          mgas for the cost of executing a tick.
 
       *)
-      let open Saturation_repr in
-      (* model N_IBlake2b *)
-      (* Approximating 1.120804 x term *)
-      let cost_N_IBlake2b size =
-        let open Syntax in
-        let v0 = safe_int size in
-        safe_int 430 + v0 + (v0 lsr 3)
-      in
       let overapproximated_hashing_size =
         2 * Constants_repr.max_operation_data_length
       in
       let scale10 x = Saturation_repr.(mul (safe_int 10) x) in
       scale10 @@ Gas_limit_repr.atomic_step_cost
-      @@ cost_N_IBlake2b overapproximated_hashing_size
+      @@ Michelson_v1_gas_costs.cost_N_IBlake2b overapproximated_hashing_size
 
-let play kind dal_parameters ~dal_attestation_lag ~stakers metadata game ~step
-    ~choice =
+let play kind ~config ~dal_activation_level ~find_dal_parameters ~stakers
+    metadata game ~step ~choice ~is_reveal_enabled
+    ~dal_attested_slots_validity_lag =
   let open Lwt_result_syntax in
-  let (Packed ((module PVM) as pvm)) = Sc_rollups.Kind.pvm_of kind in
+  let (Packed ((module PVM) as pvm)) = Sc_rollups.Kind.pvm_of ~config kind in
   let mk_loser loser =
     let loser = Index.staker stakers loser in
     Either.Left (Loser {loser; reason = Conflict_resolved})
@@ -937,13 +936,15 @@ let play kind dal_parameters ~dal_attestation_lag ~stakers metadata game ~step
       let*! player_result =
         validity_first_final_move
           ~pvm
-          ~dal_parameters
-          ~dal_attestation_lag
+          ~dal_activation_level
+          ~find_dal_parameters
           ~proof
           ~metadata
           ~game
           ~start_chunk
           ~stop_chunk
+          ~is_reveal_enabled
+          ~dal_attested_slots_validity_lag
       in
       if player_result then return @@ mk_loser (opponent game.turn)
       else
@@ -970,13 +971,15 @@ let play kind dal_parameters ~dal_attestation_lag ~stakers metadata game ~step
       let*! player_result =
         validity_second_final_move
           ~pvm
-          ~dal_parameters
-          ~dal_attestation_lag
+          ~dal_activation_level
+          ~find_dal_parameters
           ~metadata
           ~agreed_start_chunk
           ~refuted_stop_chunk
           ~game
           ~proof
+          ~is_reveal_enabled
+          ~dal_attested_slots_validity_lag
       in
       if player_result then
         (* If we play when the final move started, the opponent provided

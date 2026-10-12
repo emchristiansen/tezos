@@ -54,7 +54,7 @@ let decode_block_repr encoding block_bytes =
             ({
                message = legacy_message;
                max_operations_ttl = legacy_max_operations_ttl;
-               last_allowed_fork_level = legacy_last_allowed_fork_level;
+               last_preserved_block_level = legacy_last_allowed_fork_level;
                block_metadata = legacy_block_metadata;
                operations_metadata;
              }
@@ -107,7 +107,10 @@ let pread_block fd ~file_offset =
 let raw_pruned_block_length bytes =
   (* Hypothesis: (Int32.to_int total_len + 4 <= Bytes.length bytes) *)
   let offset = 4 in
-  let offset = offset + Block_hash.size (* hash *) in
+  let offset =
+    offset + Block_hash.size
+    (* hash *)
+  in
   let header_length = Bytes.get_int32_be bytes offset in
   let offset = offset + 4 + Int32.to_int header_length in
   let operations_length = Bytes.get_int32_be bytes offset in
@@ -153,7 +156,7 @@ let raw_get_block_predecessor block_bytes =
   Block_hash.of_bytes_exn
     (Bytes.sub block_bytes predecessor_offset Block_hash.size)
 
-let raw_get_last_allowed_fork_level block_bytes total_block_length =
+let raw_get_last_preserved_block_level block_bytes total_block_length =
   let header_length = Bytes.get_int32_be block_bytes header_length_offset in
   let operations_length_offset =
     header_length_offset + 4 + Int32.to_int header_length
@@ -182,7 +185,7 @@ let raw_get_last_allowed_fork_level block_bytes total_block_length =
   in
   if metadata_offset = total_block_length then (* Pruned *) None
   else
-    let lafl_offset =
+    let lpbl_offset =
       (* max op ttl *)
       2
       +
@@ -194,7 +197,7 @@ let raw_get_last_allowed_fork_level block_bytes total_block_length =
         metadata_offset + 1 + 4 + Int32.to_int message_length
       else metadata_offset + 1
     in
-    Some (Bytes.get_int32_be block_bytes lafl_offset)
+    Some (Bytes.get_int32_be block_bytes lpbl_offset)
 
 let fitness_length_offset =
   predecessor_offset + Block_hash.size + 8 (* timestamp *) + 1

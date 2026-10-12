@@ -54,10 +54,12 @@ type t = {
       (** Size in bytes of the buffer passed to [Lwt_unix.read]. *)
   read_queue_size : int option;
   write_queue_size : int option;
-  incoming_app_message_queue_size : int option;
   incoming_message_queue_size : int option;
   outgoing_message_queue_size : int option;
-      (** Various bounds for internal queues. *)
+      (** Various bounds for internal queues (in bytes). *)
+  incoming_app_message_queue_size : int option;
+      (** Maximum number of decoded application messages buffered per connection
+      waiting to be handled by the shell (message count, not bytes). *)
   max_known_peer_ids : (int * int) option;
   max_known_points : (int * int) option;
       (** Optional limitation of internal hashtables (max, target) *)
@@ -67,9 +69,9 @@ type t = {
       (** The size of the IP address greylist in kilobytes. *)
   ip_greylist_cleanup_delay : Time.System.Span.t;
       (** The time an IP address is kept in the greylist. *)
-  swap_linger : Time.System.Span.t;
+  swap_linger : Time.System.Span.t option;
       (** Peer swapping does not occur more than once during a timespan of
-      [swap_linger]. *)
+          [swap_linger]. If None, the swap mechanism is disabled.  *)
   binary_chunks_size : int option;
       (** Size (in bytes) of binary blocks that are sent to other
       peers. Default value is 64 kB. Max value is 64kB. *)

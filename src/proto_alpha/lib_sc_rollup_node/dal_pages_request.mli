@@ -26,51 +26,38 @@
 open Protocol
 open Alpha_context
 
-(** Access DAL slots and pages content.
+(** Access DAL page contents for a rollup.
 
-    This module is a wrapper on top of {!Store.Dal_slot_pages} module to
-    access DAL slots and pages' data that have been previously fetched by
-    the rollup node.
-*)
+    This module exposes helpers to retrieve DAL page data for a rollup, while
+    validating import conditions against the DAL attestation lag and the
+    rollup's context. It queries a DAL node to obtain the status of the page's
+    slot and, when appropriate, to download the page content. *)
 
-(** This error is returned when a slot, identified by its ID, is not found in
-    the store. *)
-type error += Dal_slot_not_found_in_store of Dal.Slot.Header.id
+(** Retrieve the content of a single DAL page.
 
-(** Retrieve the pages' content of the given slot ID's from the store.
+    The function queries the DAL node for the attestation status of the page's
+    slot:
 
-    The function returns [Dal_slot_not_found_in_store] if no entry is found in
-    the store for the given ID (i.e. no page is registered with or without content).
+    - If the slot is [Attested lag], the function checks that importing the slot
+      at [inbox_level] is valid given:
+        - the DAL activation level,
+        - the rollup origination level,
+        - the attested slots validity lag, and
+        - index bounds (number of slots).
+      If valid, it downloads and returns [Some content]; otherwise returns
+      [None].
 
-    If the returned value is [Some pages]], the slot whose ID is given is
-    supposed to be confirmed and [pages] correspond to the pages of the slot.
-    Otherwise [None] is returned.
+    - If the slot is [Unattested] or [Unpublished], returns [None].
 
-    The function relies on {!Store.Dal_slot_pages}'s invariants to guarantee that:
-    - the pages are returned in increasing order w.r.t. their indexes in the slot;
-    - the size of the list, in case it is not empty, is equal to the expected
-      number of pages in a slot.
+    - If the status is [Waiting_attestation], the function returns an error
+      ([Dal_attestation_status_not_final]).
 
-    [dal_attestation_lag] is used to retrieve the correct entry in [store].
-*)
-val slot_pages :
-  dal_attestation_lag:int ->
-  _ Node_context.t ->
-  Dal.slot_id ->
-  Dal.Page.content list option tzresult Lwt.t
-
-(** Retrieve the content of the page identified by the given ID from the store.
-
-    The function returns [Dal_slot_not_found_in_store] if no entry is found in
-    the store for the given ID. It
-    returns [None] in case the entry is found, but the slot is not confirmed. Said
-    otherwise, some content is only returned for confirmed pages (slots) for
-    which the content has already been downloaded and saved to the store.
-
-    [dal_attestation_lag] is used to retrieve the correct entry in [store].
-*)
+    When present, the returned content corresponds to the page index carried by
+    the given [Dal.Page.t]. *)
 val page_content :
-  dal_attestation_lag:int ->
+  dal_activation_level:Raw_level.t option ->
+  inbox_level:int32 ->
   _ Node_context.t ->
   Dal.Page.t ->
+  dal_attested_slots_validity_lag:int ->
   Dal.Page.content option tzresult Lwt.t

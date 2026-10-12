@@ -27,10 +27,18 @@
 open Protocol
 
 let error ~loc v f =
+  let open Lwt_result_syntax in
   match v with
   | Error err when List.exists f err -> return_unit
   | Ok _ -> failwith "Unexpected successful result (%s)" loc
   | Error err -> failwith "@[Unexpected error (%s): %a@]" loc pp_print_trace err
+
+let join_errors e1 e2 =
+  let open Lwt_result_syntax in
+  match (e1, e2) with
+  | Ok (), Ok () -> return_unit
+  | Error e, Ok () | Ok (), Error e -> fail e
+  | Error e1, Error e2 -> fail (e1 @ e2)
 
 let test_error_encodings e =
   let module E = Environment.Error_monad in
@@ -40,10 +48,10 @@ let test_error_encodings e =
 
 let proto_error ~loc v f =
   error ~loc v (function
-      | Environment.Ecoproto_error err ->
-          test_error_encodings err ;
-          f err
-      | _ -> false)
+    | Environment.Ecoproto_error err ->
+        test_error_encodings err ;
+        f err
+    | _ -> false)
 
 let proto_error_with_info ?(error_info_field = `Title) ~loc v
     expected_error_info =
@@ -63,12 +71,38 @@ let proto_error_with_info ?(error_info_field = `Title) ~loc v
       let info = info err in
       String.equal info expected_error_info)
 
+let as_proto_error = function
+  | Environment.Ecoproto_error err -> Ok err
+  | err -> Error err
+
+(** Similar to {!proto_error}, except that [errs] is directly an error
+    trace instead of a [tzresult].
+
+    [expect_error ~loc errs] has the right type to be used as the
+    [expect_failure] or [expect_apply_failure] argument of
+    {!Incremental.add_operation}. *)
+let expect_error ~loc errs f =
+  let open Lwt_result_syntax in
+  let proto_errs = List.map_e as_proto_error errs in
+  match proto_errs with
+  | Ok proto_errs when f proto_errs ->
+      List.iter test_error_encodings proto_errs ;
+      return_unit
+  | Ok _ | Error _ ->
+      failwith
+        "%s: expected a specific error, but instead got:@, %a"
+        loc
+        Error_monad.pp_print_trace
+        errs
+
 let equal ~loc (cmp : 'a -> 'a -> bool) msg pp a b =
+  let open Lwt_result_syntax in
   if not (cmp a b) then
     failwith "@[@[[%s]@] - @[%s : %a is not equal to %a@]@]" loc msg pp a pp b
   else return_unit
 
 let leq ~loc (cmp : 'a -> 'a -> int) msg pp a b =
+  let open Lwt_result_syntax in
   if cmp a b > 0 then
     failwith
       "@[@[[%s]@] - @[%s : %a is not less or equal to %a@]@]"
@@ -81,11 +115,13 @@ let leq ~loc (cmp : 'a -> 'a -> int) msg pp a b =
   else return_unit
 
 let lt ~loc (cmp : 'a -> 'a -> int) msg pp a b =
+  let open Lwt_result_syntax in
   if cmp a b >= 0 then
     failwith "@[@[[%s]@] - @[%s : %a is not less than %a@]@]" loc msg pp a pp b
   else return_unit
 
 let not_equal ~loc (cmp : 'a -> 'a -> bool) msg pp a b =
+  let open Lwt_result_syntax in
   if cmp a b then
     failwith "@[@[[%s]@] - @[%s : %a is equal to %a@]@]" loc msg pp a pp b
   else return_unit
@@ -120,11 +156,17 @@ let leq_int ~loc (a : int) (b : int) =
 let equal_int32 ~loc (a : int32) (b : int32) =
   equal ~loc Int32.equal "Int32 aren't equal" Int32.pp a b
 
+let not_equal_int32 ~loc (a : int32) (b : int32) =
+  not_equal ~loc Int32.equal "Int32 are equal" Int32.pp a b
+
 let leq_int32 ~loc (a : int32) (b : int32) =
   leq ~loc Compare.Int32.compare "Int32 comparison" Int32.pp a b
 
 let lt_int32 ~loc (a : int32) (b : int32) =
   lt ~loc Compare.Int32.compare "Int32 comparison" Int32.pp a b
+
+let lt_int64 ~loc (a : int64) (b : int64) =
+  lt ~loc Compare.Int64.compare "Int64 comparison" Int64.pp a b
 
 (* int64 *)
 let equal_int64 ~loc (a : int64) (b : int64) =
@@ -139,12 +181,18 @@ let leq_int64 ~loc (a : int64) (b : int64) =
 let equal_z ~loc (a : Z.t) (b : Z.t) =
   equal ~loc Compare.Z.( = ) "Z are not equal" Z.pp_print a b
 
+let equal_q ~loc (a : Q.t) (b : Q.t) =
+  equal ~loc Compare.Q.( = ) "Q are not equal" Q.pp_print a b
+
 (* bool *)
 let equal_bool ~loc (a : bool) (b : bool) =
   equal ~loc Bool.equal "Booleans aren't equal" Format.pp_print_bool a b
 
 let not_equal_bool ~loc (a : bool) (b : bool) =
   not_equal ~loc Bool.equal "Booleans are equal" Format.pp_print_bool a b
+
+let is_true ~loc (a : bool) =
+  equal ~loc Bool.equal "Boolean is not true" Format.pp_print_bool a true
 
 (* string *)
 let equal_string ~loc (a : string) (b : string) =
@@ -162,16 +210,37 @@ let not_equal_tez ~loc (a : Alpha_context.Tez.t) (b : Alpha_context.Tez.t) =
   let open Alpha_context in
   not_equal ~loc Tez.( = ) "Tez are equal" Tez.pp a b
 
-(* pkh *)
-let equal_pkh ~loc (a : Signature.Public_key_hash.t)
-    (b : Signature.Public_key_hash.t) =
-  let module PKH = Signature.Public_key_hash in
-  equal ~loc PKH.equal "Public key hashes aren't equal" PKH.pp a b
+(* tez_repr *)
+let equal_tez_repr ~loc (a : Tez_repr.t) (b : Tez_repr.t) =
+  equal ~loc Tez_repr.( = ) "Tez_repr aren't equal" Tez_repr.pp a b
 
-let not_equal_pkh ~loc (a : Signature.Public_key_hash.t)
-    (b : Signature.Public_key_hash.t) =
-  let module PKH = Signature.Public_key_hash in
-  not_equal ~loc PKH.equal "Public key hashes are equal" PKH.pp a b
+(* level_repr *)
+let equal_level_repr ~loc (a : Level_repr.t) (b : Level_repr.t) =
+  equal ~loc Level_repr.( = ) "Level_repr aren't equal" Level_repr.pp a b
+
+(* cycle_repr *)
+let equal_cycle_repr ~loc (a : Cycle_repr.t) (b : Cycle_repr.t) =
+  equal ~loc Cycle_repr.( = ) "Cycle_repr aren't equal" Cycle_repr.pp a b
+
+(* pkh *)
+let equal_pkh ~loc (a : Implicit_account_repr.t) (b : Implicit_account_repr.t) =
+  equal
+    ~loc
+    (fun x y -> Implicit_account_repr.compare x y = 0)
+    "Public key hashes aren't equal"
+    Implicit_account_repr.pp
+    a
+    b
+
+let not_equal_pkh ~loc (a : Implicit_account_repr.t)
+    (b : Implicit_account_repr.t) =
+  not_equal
+    ~loc
+    (fun x y -> Implicit_account_repr.compare x y = 0)
+    "Public key hashes are equal"
+    Implicit_account_repr.pp
+    a
+    b
 
 (* protocol hash *)
 let equal_protocol_hash ~loc (a : Protocol_hash.t) (b : Protocol_hash.t) =
@@ -192,11 +261,13 @@ let not_equal_protocol_hash ~loc (a : Protocol_hash.t) (b : Protocol_hash.t) =
     a
     b
 
-let get_some ~loc = function
-  | Some x -> return x
-  | None -> failwith "Unexpected None (%s)" loc
+let get_some ~loc =
+  let open Lwt_result_syntax in
+  function Some x -> return x | None -> failwith "Unexpected None (%s)" loc
 
-let is_none ~loc ~pp = function
+let is_none ~loc ~pp =
+  let open Lwt_result_syntax in
+  function
   | Some x -> failwith "Unexpected (Some %a) (%s)" pp x loc
   | None -> return_unit
 
@@ -209,11 +280,15 @@ let equal_result ~loc ~pp_ok ~pp_error eq_ok eq_error a b =
     a
     b
 
-let is_error ~loc ~pp = function
+let is_error ~loc ~pp =
+  let open Lwt_result_syntax in
+  function
   | Ok x -> failwith "Unexpected (Ok %a) (%s)" pp x loc
   | Error _ -> return_unit
 
-let get_ok ~__LOC__ = function
+let get_ok ~__LOC__ =
+  let open Lwt_result_syntax in
+  function
   | Ok r -> return r
   | Error err ->
       failwith "@[Unexpected error (%s): %a@]" __LOC__ pp_print_trace err
@@ -223,7 +298,9 @@ open Context
 (* Some asserts for account operations *)
 
 let contract_property_is property ~loc b contract expected =
-  property b contract >>=? fun balance -> equal_tez ~loc balance expected
+  let open Lwt_result_syntax in
+  let* balance = property b contract in
+  equal_tez ~loc balance expected
 
 (** [balance_is b c amount] checks that the current balance [b] of contract [c]
     is [amount].
@@ -237,7 +314,8 @@ let frozen_bonds_is = contract_property_is Contract.frozen_bonds
 
 let balance_or_frozen_bonds_was_operated ~is_balance ~operand ~loc b contract
     old_balance amount =
-  operand old_balance amount |> Environment.wrap_tzresult >>?= fun expected ->
+  let open Lwt_result_wrap_syntax in
+  let*?@ expected = operand old_balance amount in
   let f = if is_balance then balance_is else frozen_bonds_is in
   f ~loc b contract expected
 
@@ -285,6 +363,88 @@ let pp_print_list pp out xs =
 
 let assert_equal_list ~loc eq msg pp =
   equal ~loc (List.equal eq) msg (pp_print_list pp)
+
+let assert_equal_list_opt ~loc eq msg pp =
+  equal
+    ~loc
+    (Option.equal (List.equal eq))
+    msg
+    (Format.pp_print_option (pp_print_list pp))
+
+(** [assert_is_subset_list ~loc eq msg pp l1 l2] checks that l1 is a subset of
+    l2: all items from l1 must be present in l2, in the same order. *)
+let assert_is_subset_list ~loc eq msg pp l1 l2 =
+  let rec is_subset l1 l2 =
+    match (l1, l2) with
+    | [], _ -> true
+    | h1 :: l1', h2 :: l2' ->
+        if eq h1 h2 then is_subset l1' l2' else is_subset (h1 :: l1') l2'
+    | _ :: _, [] -> false
+  in
+  if not (is_subset l1 l2) then
+    failwith
+      "@[@[[%s]@] - @[%s : %a is not a subset of %a@]@]"
+      loc
+      msg
+      (pp_print_list pp)
+      l1
+      (pp_print_list pp)
+      l2
+  else Lwt_result_syntax.return_unit
+
+(** Checks that both lists have the same elements, not taking the
+    order of these elements into account, but taking their
+    multiplicity into account. *)
+let equal_list_any_order ~loc ~compare msg pp list1 list2 =
+  let ordered_list1 = List.sort compare list1 in
+  let ordered_list2 = List.sort compare list2 in
+  equal
+    ~loc
+    (List.equal (fun a b -> compare a b = 0))
+    msg
+    (pp_print_list pp)
+    ordered_list1
+    ordered_list2
+
+let clst_frozen_redeemed_balance_was_credited ~loc b contract old_balance amount
+    =
+  let open Lwt_result_wrap_syntax in
+  let* ctxt = Context.get_alpha_ctxt b in
+  let*?@ expected = Alpha_context.Tez.(old_balance +? amount) in
+  let*@ frozen_unstaked_balance =
+    Alpha_context.Clst.For_RPC.get_unfinalizable_redeemed_balance ctxt contract
+  in
+  equal_tez
+    ~loc
+    (Option.value ~default:Alpha_context.Tez.zero frozen_unstaked_balance)
+    expected
+
+let stez_redeemed_balance_is kind ~loc b contract amount =
+  let open Lwt_result_wrap_syntax in
+  let* redeemed_balance =
+    match kind with
+    | `Frozen ->
+        Plugin.Contract_services.stez_redeemed_frozen_balance
+          Block.rpc_ctxt
+          b
+          contract
+    | `Finalizable ->
+        Plugin.Contract_services.stez_redeemed_finalizable_balance
+          Block.rpc_ctxt
+          b
+          contract
+  in
+  match redeemed_balance with
+  | None ->
+      Test.fail
+        "Redeemed balance is None, %a is not an implicit account"
+        Contract.pp
+        contract
+  | Some redeemed_balance -> equal_tez ~loc amount redeemed_balance
+
+let stez_frozen_redeemed_balance_is = stez_redeemed_balance_is `Frozen
+
+let stez_finalizable_redeemed_balance_is = stez_redeemed_balance_is `Finalizable
 
 let to_json_string encoding x =
   x

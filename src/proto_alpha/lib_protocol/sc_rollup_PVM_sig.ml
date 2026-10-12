@@ -2,7 +2,7 @@
 (*                                                                           *)
 (* Open Source License                                                       *)
 (* Copyright (c) 2021 Nomadic Labs <contact@nomadic-labs.com>                *)
-(* Copyright (c) 2022 Trili Tech, <contact@trili.tech>                       *)
+(* Copyright (c) 2022-2024 TriliTech <contact@trili.tech>                    *)
 (*                                                                           *)
 (* Permission is hereby granted, free of charge, to any person obtaining a   *)
 (* copy of this software and associated documentation files (the "Software"),*)
@@ -62,8 +62,30 @@ type reveal_data =
   | Raw_data of string
   | Metadata of Sc_rollup_metadata_repr.t
   | Dal_page of Dal_slot_repr.Page.content option
+  | Dal_parameters of Sc_rollup_dal_parameters_repr.t
 
 type input = Inbox_message of inbox_message | Reveal of reveal_data
+
+(** [reveal_response_to_bytes reveal_data] computes the bytes to be sent to PVMs
+    when performing a reveal request.
+    Useful for unifying the encodings used by the WASM and RISC-V PVMs *)
+let reveal_response_to_bytes reveal_data =
+  match reveal_data with
+  | Raw_data data -> Bytes.of_string data
+  | Metadata data ->
+      Data_encoding.Binary.to_bytes_exn Sc_rollup_metadata_repr.encoding data
+  | Dal_page content_bytes ->
+      Option.value ~default:Bytes.empty content_bytes
+      (* [content_opt] is [None] when the slot was not confirmed in the L1.
+         In this case, we return empty bytes.
+
+         Note that the kernel can identify this unconfirmed slot scenario because
+         all confirmed pages have a size of 4KiB. Thus, a page can only be considered
+         empty (0KiB) if it is unconfirmed. *)
+  | Dal_parameters dal_parameters ->
+      Data_encoding.Binary.to_bytes_exn
+        Sc_rollup_dal_parameters_repr.encoding
+        dal_parameters
 
 let pp_inbox_message fmt {inbox_level; message_counter; _} =
   Format.fprintf
@@ -83,6 +105,8 @@ let pp_reveal_data fmt = function
         (fun fmt _a -> Format.fprintf fmt "<Some_dal_data>")
         fmt
         content_opt
+  | Dal_parameters dal_parameters ->
+      Sc_rollup_dal_parameters_repr.pp fmt dal_parameters
 
 let pp_input fmt = function
   | Inbox_message msg ->
@@ -136,7 +160,17 @@ let reveal_data_encoding =
       (function Dal_page p -> Some ((), p) | _ -> None)
       (fun ((), p) -> Dal_page p)
   in
-  union [case_raw_data; case_metadata; case_dal_page]
+  let case_dal_parameters =
+    case
+      ~title:"dal parameters"
+      (Tag 3)
+      (obj2
+         (kind "dal_parameters")
+         (req "dal_parameters" Sc_rollup_dal_parameters_repr.encoding))
+      (function Dal_parameters p -> Some ((), p) | _ -> None)
+      (fun ((), p) -> Dal_parameters p)
+  in
+  union [case_raw_data; case_metadata; case_dal_page; case_dal_parameters]
 
 let input_encoding =
   let open Data_encoding in
@@ -174,6 +208,9 @@ let reveal_data_equal a b =
   | Metadata _, _ -> false
   | Dal_page a, Dal_page b -> Option.equal Bytes.equal a b
   | Dal_page _, _ -> false
+  | Dal_parameters a, Dal_parameters b ->
+      Sc_rollup_dal_parameters_repr.equal a b
+  | Dal_parameters _, _ -> false
 
 let input_equal a b =
   match (a, b) with
@@ -196,10 +233,23 @@ module Input_hash =
       let size = Some 20
     end)
 
+(* TODO: https://gitlab.com/tezos/tezos/-/issues/6562
+   Consider supporting revealing historical DAL parameters. *)
 type reveal =
   | Reveal_raw_data of Sc_rollup_reveal_hash.t
   | Reveal_metadata
   | Request_dal_page of Dal_slot_repr.Page.t
+  | Request_adal_page of {
+      page_id : Dal_slot_repr.Page.t;
+          (* The id of the DAL page we want to import. *)
+      attestation_threshold_percent : int;
+          (* The required attestation ratio expressed as percentage . *)
+      restricted_commitments_publishers : Contract_repr.t list option;
+          (* If none, no filtering by commitments publishers is made. *)
+    }
+  | Reveal_dal_parameters
+      (** Request DAL parameters that were used for the slots published at
+      the current inbox level. *)
 
 let reveal_encoding =
   let open Data_encoding in
@@ -217,7 +267,7 @@ let reveal_encoding =
     case
       ~title:"Reveal_metadata"
       (Tag 1)
-      (obj1 (kind "reveal_kind"))
+      (obj1 (kind "reveal_metadata"))
       (function Reveal_metadata -> Some () | _ -> None)
       (fun () -> Reveal_metadata)
   in
@@ -225,11 +275,90 @@ let reveal_encoding =
     case
       ~title:"Request_dal_page"
       (Tag 2)
-      (obj2 (kind "reveal_kind") (req "page_id" Dal_slot_repr.Page.encoding))
+      (obj2
+         (kind "request_dal_page")
+         (req "page_id" Dal_slot_repr.Page.encoding))
       (function Request_dal_page s -> Some ((), s) | _ -> None)
       (fun ((), s) -> Request_dal_page s)
   in
-  union [case_raw_data; case_metadata; case_dal_page]
+  let case_dal_parameters =
+    case
+      ~title:"Reveal_dal_parameters"
+      (Tag 3)
+      (obj1 (kind "reveal_dal_parameters"))
+      (function Reveal_dal_parameters -> Some () | _ -> None)
+      (fun () -> Reveal_dal_parameters)
+  in
+  let case_adal_page =
+    case
+      ~title:"Request_adaptive_dal_page"
+      (Tag 4)
+      (obj4
+         (kind "request_adaptive_dal_page")
+         (req "page_id" Dal_slot_repr.Page.encoding)
+         (req "attestation_threshold_percent" Data_encoding.uint8)
+         (dft
+            "restricted_commitments_publishers"
+            (option (list ~max_length:10 Contract_repr.encoding))
+            None))
+      (function
+        | Request_adal_page
+            {
+              page_id;
+              attestation_threshold_percent;
+              restricted_commitments_publishers;
+            } ->
+            Some
+              ( (),
+                page_id,
+                attestation_threshold_percent,
+                restricted_commitments_publishers )
+        | _ -> None)
+      (fun ( (),
+             page_id,
+             attestation_threshold_percent,
+             restricted_commitments_publishers )
+         ->
+        Request_adal_page
+          {
+            page_id;
+            attestation_threshold_percent;
+            restricted_commitments_publishers;
+          })
+  in
+  union
+    [
+      case_raw_data;
+      case_metadata;
+      case_dal_page;
+      case_dal_parameters;
+      case_adal_page;
+    ]
+
+(** [is_reveal_enabled] is the type of a predicate that tells if a kind of
+     reveal is activated at a certain block level. *)
+type is_reveal_enabled = current_block_level:Raw_level_repr.t -> reveal -> bool
+
+let is_reveal_enabled_predicate
+    (t : Constants_parametric_repr.sc_rollup_reveal_activation_level) :
+    is_reveal_enabled =
+ fun ~current_block_level reveal ->
+  let check activation_level =
+    Raw_level_repr.(current_block_level >= activation_level)
+  in
+  match reveal with
+  | Reveal_raw_data h -> (
+      match Sc_rollup_reveal_hash.scheme_of_hash h with
+      | Blake2B -> check t.raw_data.blake2B)
+  | Reveal_metadata -> check t.metadata
+  | Request_dal_page _ -> check t.dal_page
+  | Request_adal_page _ ->
+      (* ADAL is not yet activated: no activation level exists in the
+         constants. Returning [false] causes [try_return_reveal] to fall back
+         to the well-known-hash sentinel, so proof verification rejects the
+         move gracefully without raising [Assert_failure]. *)
+      false
+  | Reveal_dal_parameters -> check t.dal_parameters
 
 (** The PVM's current input expectations:
     - [No_input_required] if the machine is busy and has no need for new input.
@@ -290,7 +419,26 @@ let input_request_encoding =
 let pp_reveal fmt = function
   | Reveal_raw_data hash -> Sc_rollup_reveal_hash.pp fmt hash
   | Reveal_metadata -> Format.pp_print_string fmt "Reveal metadata"
-  | Request_dal_page id -> Dal_slot_repr.Page.pp fmt id
+  | Request_dal_page id -> Format.fprintf fmt "DAL:%a" Dal_slot_repr.Page.pp id
+  | Request_adal_page
+      {
+        page_id;
+        attestation_threshold_percent;
+        restricted_commitments_publishers;
+      } ->
+      Format.fprintf
+        fmt
+        "ADAL:{page:%a; attestation_threshold_percent:%d; publishers:%a}"
+        Dal_slot_repr.Page.pp
+        page_id
+        attestation_threshold_percent
+        (Format.pp_print_option
+           ~none:(fun fmt () -> Format.fprintf fmt "Any")
+           (Format.pp_print_list
+              ~pp_sep:(fun fmt () -> Format.pp_print_string fmt ", ")
+              Contract_repr.pp_short))
+        restricted_commitments_publishers
+  | Reveal_dal_parameters -> Format.pp_print_string fmt "Reveal DAL parameters"
 
 (** [pp_input_request fmt i] pretty prints the given input [i] to the formatter
     [fmt]. *)
@@ -317,6 +465,24 @@ let reveal_equal p1 p2 =
   | Reveal_metadata, _ -> false
   | Request_dal_page a, Request_dal_page b -> Dal_slot_repr.Page.equal a b
   | Request_dal_page _, _ -> false
+  | ( Request_adal_page
+        {
+          page_id;
+          attestation_threshold_percent;
+          restricted_commitments_publishers;
+        },
+      Request_adal_page b ) ->
+      Dal_slot_repr.Page.equal page_id b.page_id
+      && Compare.Int.equal
+           attestation_threshold_percent
+           b.attestation_threshold_percent
+      && Option.equal
+           (List.equal Contract_repr.equal)
+           restricted_commitments_publishers
+           b.restricted_commitments_publishers
+  | Request_adal_page _, _ -> false
+  | Reveal_dal_parameters, Reveal_dal_parameters -> true
+  | Reveal_dal_parameters, _ -> false
 
 (** [input_request_equal i1 i2] return whether [i1] and [i2] are equal. *)
 let input_request_equal a b =
@@ -331,12 +497,17 @@ let input_request_equal a b =
   | Needs_reveal p1, Needs_reveal p2 -> reveal_equal p1 p2
   | Needs_reveal _, _ -> false
 
-(** Type that describes output values. *)
-type output = {
+(** Type that describes output metadata. *)
+type output_info = {
   outbox_level : Raw_level_repr.t;
       (** The outbox level containing the message. The level corresponds to the
           inbox level for which the message was produced.  *)
   message_index : Z.t;  (** The message index. *)
+}
+
+(** Type that describes output values. *)
+type output = {
+  output_info : output_info;
   message : Sc_rollup_outbox_message_repr.t;  (** The message itself. *)
 }
 
@@ -344,10 +515,10 @@ type output = {
 let output_encoding =
   let open Data_encoding in
   conv
-    (fun {outbox_level; message_index; message} ->
+    (fun {output_info = {outbox_level; message_index}; message} ->
       (outbox_level, message_index, message))
     (fun (outbox_level, message_index, message) ->
-      {outbox_level; message_index; message})
+      {output_info = {outbox_level; message_index}; message})
     (obj3
        (req "outbox_level" Raw_level_repr.encoding)
        (req "message_index" n)
@@ -355,7 +526,7 @@ let output_encoding =
 
 (** [pp_output fmt o] pretty prints the given output [o] to the formatter
     [fmt]. *)
-let pp_output fmt {outbox_level; message_index; message} =
+let pp_output fmt {output_info = {outbox_level; message_index}; message} =
   Format.fprintf
     fmt
     "@[%a@;%a@;%a@;@]"
@@ -366,7 +537,8 @@ let pp_output fmt {outbox_level; message_index; message} =
     Sc_rollup_outbox_message_repr.pp
     message
 
-module type S = sig
+(** Minimal protocol signature of a PVM for performing an origination *)
+module type PROTO_ORIGINATION = sig
   (** The state of the PVM denotes a state of the rollup.
 
       The life cycle of the PVM is as follows. It starts its execution
@@ -381,15 +553,35 @@ module type S = sig
       inbox to be executable. *)
   type state
 
+  (** A [hash] characterizes the contents of a state. *)
+  type hash = Sc_rollup_repr.State_hash.t
+
+  (** [state_hash state] returns a compressed representation of [state]. *)
+  val state_hash : state -> hash Lwt.t
+
+  (** [initial_state ~empty] is the initial state of the PVM, before its
+      specialization with a given [boot_sector]. The initial state is built on
+      the [empty] state which must be provided. *)
+  val initial_state : empty:state -> state Lwt.t
+
+  (** [install_boot_sector state boot_sector] specializes the initial
+      [state] of a PVM using a dedicated [boot_sector], submitted at
+      the origination of the rollup. *)
+  val install_boot_sector : state -> string -> state Lwt.t
+end
+
+(** Minimal signature for a protocol implementation of a PVM *)
+module type PROTO_VERIFICATION = sig
+  include PROTO_ORIGINATION
+
+  val parse_boot_sector : string -> string option
+
   val pp : state -> (Format.formatter -> unit -> unit) Lwt.t
 
   (** A [context] represents the executable environment needed by the state to
       exist. Typically, the rollup node storage can be part of this context to
       allow the PVM state to be persistent. *)
   type context
-
-  (** A [hash] characterizes the contents of a state. *)
-  type hash = Sc_rollup_repr.State_hash.t
 
   (** During interactive refutation games, a player may need to provide a proof
       that a given execution step is valid. The PVM implementation is
@@ -451,58 +643,20 @@ module type S = sig
       execution step. *)
   val proof_stop_state : proof -> hash
 
-  (** [state_hash state] returns a compressed representation of [state]. *)
-  val state_hash : state -> hash Lwt.t
-
-  (** [initial_state ~empty] is the initial state of the PVM, before its
-      specialization with a given [boot_sector]. The initial state is built on
-      the [empty] state which must be provided. *)
-  val initial_state : empty:state -> state Lwt.t
-
-  (** [install_boot_sector state boot_sector] specializes the initial
-      [state] of a PVM using a dedicated [boot_sector], submitted at
-      the origination of the rollup. *)
-  val install_boot_sector : state -> string -> state Lwt.t
-
-  (** [is_input_state state] returns the input expectations of the
-      [state]---does it need input, and if so, how far through the inbox
-      has it read so far? *)
-  val is_input_state : state -> input_request Lwt.t
-
-  (** [set_input input state] sets [input] in [state] as the next
-      input to be processed. This must answer the [input_request]
-      from [is_input_state state]. *)
-  val set_input : input -> state -> state Lwt.t
-
-  (** [eval s0] returns a state [s1] resulting from the
-      execution of an atomic step of the rollup at state [s0]. *)
-  val eval : state -> state Lwt.t
-
-  (** [verify_proof input p] checks the proof [p] with input [input] and returns
-      the [input_request] before the evaluation of the proof. See the doc-string
-      for the [proof] type.
+  (** [verify_proof ~is_reveal_enabled input p] checks the proof [p] with input [input]
+      and returns the [input_request] before the evaluation of the proof. See the
+      doc-string for the [proof] type.
 
       [verify_proof input p] fails when the proof is invalid in regards to the
       given input. *)
-  val verify_proof : input option -> proof -> input_request tzresult Lwt.t
+  val verify_proof :
+    is_reveal_enabled:is_reveal_enabled ->
+    input option ->
+    proof ->
+    input_request tzresult Lwt.t
 
-  (** [produce_proof ctxt input_given state] should return a [proof] for
-      the PVM step starting from [state], if possible. This may fail for
-      a few reasons:
-        - the [input_given] doesn't match the expectations of [state] ;
-        - the [context] for this instance of the PVM doesn't have access
-        to enough of the [state] to build the proof. *)
-  val produce_proof : context -> input option -> state -> proof tzresult Lwt.t
-
-  (** [verify_origination_proof proof boot_sector] verifies a proof
-      supposedly generated by [produce_origination_proof]. *)
-  val verify_origination_proof : proof -> string -> bool Lwt.t
-
-  (** [produce_origination_proof context boot_sector] produces a proof
-      [p] covering the specialization of a PVM, from the
-      [initial_state] up to the genesis state wherein the
-      [boot_sector] has been installed. *)
-  val produce_origination_proof : context -> string -> proof tzresult Lwt.t
+  (** [get_proof_state_level proof] returns the tezos level of the proof inner state. *)
+  val get_proof_state_level : proof -> Raw_level_repr.t option tzresult Lwt.t
 
   (** The following type is inhabited by the proofs that a given [output]
       is part of the outbox of a given [state]. *)
@@ -511,22 +665,18 @@ module type S = sig
   (** [output_proof_encoding] encoding value for [output_proof]s. *)
   val output_proof_encoding : output_proof Data_encoding.t
 
-  (** [output_of_output_proof proof] returns the [output] that is referred to in
+  (** [output_info_of_output_proof proof] returns the [output_info] that is referred to in
       [proof]'s statement. *)
-  val output_of_output_proof : output_proof -> output
+  val output_info_of_output_proof : output_proof -> output_info
 
   (** [state_of_output_proof proof] returns the [state] hash that is referred to
       in [proof]'s statement. *)
   val state_of_output_proof : output_proof -> hash
 
-  (** [verify_output_proof output_proof] returns [true] iff [proof] is a valid
-      witness that its [output] is part of its [state]'s outbox. *)
-  val verify_output_proof : output_proof -> bool Lwt.t
-
-  (** [produce_output_proof ctxt state output] returns a proof that witnesses
-      the fact that [output] is part of [state]'s outbox. *)
-  val produce_output_proof :
-    context -> state -> output -> (output_proof, error) result Lwt.t
+  (** [verify_output_proof output_proof] returns the [output_proof]'s output
+      iff the proof is a valid witness that its [output] is part of its
+      [state]'s outbox. *)
+  val verify_output_proof : output_proof -> output tzresult Lwt.t
 
   (** [check_dissection ~default_number_of_sections ~start_chunk
       ~stop_chunk chunks] fails if the dissection encoded by the list
@@ -542,10 +692,74 @@ module type S = sig
   (** [get_current_level state] returns the current level of the [state],
       returns [None] if it is not possible to compute the level. *)
   val get_current_level : state -> Raw_level_repr.t option Lwt.t
+end
+
+(** Full signature of a PVM for the current protocol *)
+module type S = sig
+  include PROTO_VERIFICATION
+
+  (** [is_input_state ~is_reveal_enabled state] returns the input expectations of the
+      [state]---does it need input, and if so, how far through the inbox
+      has it read so far? *)
+  val is_input_state :
+    is_reveal_enabled:is_reveal_enabled -> state -> input_request Lwt.t
+
+  (** [set_input input state] sets [input] in [state] as the next
+      input to be processed. This must answer the [input_request]
+      from [is_input_state state]. *)
+  val set_input : input -> state -> state Lwt.t
+
+  (** [eval s0] returns a state [s1] resulting from the
+      execution of an atomic step of the rollup at state [s0]. *)
+  val eval : state -> state Lwt.t
+
+  (** [produce_proof ctxt ~is_reveal_enabled input_given state] should return a [proof]
+      for the PVM step starting from [state], if possible. This may fail for
+      a few reasons:
+        - the [input_given] doesn't match the expectations of [state] ;
+        - the [context] for this instance of the PVM doesn't have access
+        to enough of the [state] to build the proof. *)
+  val produce_proof :
+    context ->
+    is_reveal_enabled:is_reveal_enabled ->
+    input option ->
+    state ->
+    proof tzresult Lwt.t
+
+  (** [produce_output_proof ctxt state output] returns a proof that witnesses
+      the fact that [output] is part of [state]'s outbox. *)
+  val produce_output_proof :
+    context -> state -> output -> (output_proof, error) result Lwt.t
 
   module Internal_for_tests : sig
     (** [insert_failure state] corrupts the PVM state. This is used in
         the loser mode of the rollup node. *)
     val insert_failure : state -> state Lwt.t
   end
+end
+
+module type Generic_irmin_pvm_context_sig = sig
+  module Tree : Context.TREE with type key = string list and type value = bytes
+
+  type tree = Tree.tree
+
+  type proof
+
+  val proof_encoding : proof Data_encoding.t
+
+  val proof_before : proof -> Sc_rollup_repr.State_hash.t
+
+  val proof_after : proof -> Sc_rollup_repr.State_hash.t
+
+  (** [cast_read_only proof] replaces [proof.after] with [proof.before].
+      This allows to use {!verify_proof} with another step transition to read
+      the inner state of the proof. This leaks abstraction on how Irmin proof
+      verification work. *)
+  val cast_read_only : proof -> proof
+
+  val verify_proof :
+    proof -> (tree -> (tree * 'a) Lwt.t) -> (tree * 'a) option Lwt.t
+
+  val produce_proof :
+    Tree.t -> tree -> (tree -> (tree * 'a) Lwt.t) -> (proof * 'a) option Lwt.t
 end

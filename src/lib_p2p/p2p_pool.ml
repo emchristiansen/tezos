@@ -52,11 +52,14 @@ type config = {
   ip_greylist_cleanup_delay : Time.System.Span.t;
 }
 
+module Point_LRU_set : Aches.Vache.SET with type elt = P2p_point.Id.t =
+  Aches.Vache.Set (Aches.Vache.LRU_Precise) (Aches.Vache.Strong) (P2p_point.Id)
+
 type ('msg, 'peer, 'conn) t = {
   config : config;
   peer_meta_config : 'peer P2p_params.peer_meta_config;
   (* Set of points corresponding to this peer *)
-  my_id_points : unit P2p_point.Table.t;
+  my_id_points : Point_LRU_set.t;
   known_peer_ids :
     (('msg, 'peer, 'conn) P2p_conn.t, 'peer, 'conn) P2p_peer_state.Info.t
     P2p_peer.Table.t;
@@ -70,7 +73,10 @@ type ('msg, 'peer, 'conn) t = {
   triggers : P2p_trigger.t;
   log : P2p_connection.P2p_event.t -> unit;
   acl : P2p_acl.t;
+  fd_pool : P2p_fd.fd_pool option;
 }
+
+let get_fd_pool t = t.fd_pool
 
 module Gc_point_set = Bounded_heap.Make (struct
   type t = Time.System.t * P2p_point.Id.t
@@ -125,7 +131,7 @@ let set_expected_peer_id :
       | Running {current_peer_id; data} ->
           if not (P2p_peer.Id.equal peer_id current_peer_id) then (
             greylist_addr pool (fst point) ;
-            P2p_conn.disconnect data)
+            P2p_conn.disconnect ~reason:Unexpected_peer_id data)
           else Lwt.return_unit
       | Accepted {current_peer_id; _} ->
           if not (P2p_peer.Id.equal peer_id current_peer_id) then (
@@ -167,7 +173,7 @@ let register_point ?trusted ?expected_peer_id pool ((addr, port) as point) =
 let unregister_point pool point = P2p_point.Table.remove pool.known_points point
 
 let register_new_point ?trusted t point =
-  if not (P2p_point.Table.mem t.my_id_points point) then
+  if not (Point_LRU_set.mem t.my_id_points point) then
     Some (register_point ?trusted t point)
   else None
 
@@ -318,7 +324,7 @@ module Points = struct
       (fun conn ->
         if ban_peers then
           P2p_acl.PeerBlacklist.add pool.acl (P2p_conn.peer_id conn) ;
-        P2p_conn.disconnect conn)
+        P2p_conn.disconnect ~reason:IP_manually_banned conn)
       (connections_of_addr pool addr)
 
   let unban pool (addr, _port) =
@@ -390,7 +396,7 @@ module Peers = struct
     P2p_acl.PeerBlacklist.add pool.acl peer ;
     (* Kick [peer] if it is in `Running` state. *)
     match connection_of_peer_id pool peer with
-    | Some conn -> P2p_conn.disconnect conn
+    | Some conn -> P2p_conn.disconnect ~reason:Peer_id_manually_banned conn
     | None -> Lwt.return_unit
 
   let unban pool peer = P2p_acl.unban_peer pool.acl peer
@@ -404,6 +410,47 @@ module Peers = struct
   let banned pool peer = P2p_acl.banned_peer pool.acl peer
 
   let get_greylisted_list pool = P2p_acl.PeerGreylist.list pool.acl
+
+  let find_by_peer_id pool peer_id =
+    Option.bind (info pool peer_id) (fun p ->
+        match P2p_peer_state.get p with
+        | Running {data; _} -> Some data
+        | _ -> None)
+
+  let info_of_peer_info pool i =
+    let open P2p_peer.Info in
+    let open P2p_peer.State in
+    let state, id_point =
+      match P2p_peer_state.get i with
+      | Accepted {current_point; _} -> (Accepted, Some current_point)
+      | Running {current_point; _} -> (Running, Some current_point)
+      | Disconnected -> (Disconnected, None)
+    in
+    let peer_id = P2p_peer_state.Info.peer_id i in
+    let score = get_score pool peer_id in
+    let conn_opt = find_by_peer_id pool peer_id in
+    let stat =
+      match conn_opt with
+      | None -> P2p_stat.empty
+      | Some conn -> P2p_conn.stat conn
+    in
+    let meta_opt = Option.map P2p_conn.remote_metadata conn_opt in
+    P2p_peer_state.Info.
+      {
+        score;
+        trusted = trusted i;
+        conn_metadata = meta_opt;
+        peer_metadata = peer_metadata i;
+        state;
+        id_point;
+        stat;
+        last_failed_connection = last_failed_connection i;
+        last_rejected_connection = last_rejected_connection i;
+        last_established_connection = last_established_connection i;
+        last_disconnection = last_disconnection i;
+        last_seen = last_seen i;
+        last_miss = last_miss i;
+      }
 end
 
 module Connection = struct
@@ -507,13 +554,13 @@ let score {peer_meta_config = {score; _}; _} meta = score meta
 
 let active_connections pool = P2p_peer.Table.length pool.connected_peer_ids
 
-let create config peer_meta_config triggers ~log =
+let create ?fd_pool config peer_meta_config triggers ~log =
   let open Lwt_syntax in
   let pool =
     {
       config;
       peer_meta_config;
-      my_id_points = P2p_point.Table.create ~random:true 7;
+      my_id_points = Point_LRU_set.create 7;
       known_peer_ids = P2p_peer.Table.create ~random:true 53;
       connected_peer_ids = P2p_peer.Table.create ~random:true 53;
       known_points = P2p_point.Table.create ~random:true 53;
@@ -525,6 +572,7 @@ let create config peer_meta_config triggers ~log =
           ~ip_size:config.ip_greylist_size_in_kilobytes
           ~ip_cleanup_delay:config.ip_greylist_cleanup_delay;
       log;
+      fd_pool;
     }
   in
   List.iter (Points.set_trusted pool) config.trusted_points ;
@@ -564,14 +612,14 @@ let save_peers {config; peer_meta_config; known_peer_ids; _} =
   in
   Result.iter_error_s Event.(emit save_peers_error) r
 
-let tear_down_connections {known_peer_ids; known_points; _} =
+let tear_down_connections ~reason {known_peer_ids; known_points; _} =
   let open Lwt_syntax in
   let* () =
     P2p_peer.Table.iter_p
       (fun _peer_id peer_info ->
         match P2p_peer_state.get peer_info with
         | Accepted {cancel; _} -> Error_monad.cancel_with_exceptions cancel
-        | Running {data = conn; _} -> P2p_conn.disconnect conn
+        | Running {data = conn; _} -> P2p_conn.disconnect ~reason conn
         | Disconnected -> Lwt.return_unit)
       known_peer_ids
   in
@@ -580,17 +628,17 @@ let tear_down_connections {known_peer_ids; known_points; _} =
       match P2p_point_state.get point_info with
       | Requested {cancel} | Accepted {cancel; _} ->
           Error_monad.cancel_with_exceptions cancel
-      | Running {data = conn; _} -> P2p_conn.disconnect conn
+      | Running {data = conn; _} -> P2p_conn.disconnect ~reason conn
       | Disconnected -> Lwt.return_unit)
     known_points
 
 let destroy pool =
   let open Lwt_syntax in
   let* () = save_peers pool in
-  tear_down_connections pool
+  tear_down_connections ~reason:Pool_destroyed pool
 
 let add_to_id_points t point =
-  P2p_point.Table.add t.my_id_points point () ;
+  Point_LRU_set.add t.my_id_points point ;
   P2p_point.Table.remove t.known_points point
 
 (* [sample best other points] return a list of elements selected in [points].
@@ -699,7 +747,7 @@ module Internal_for_tests = struct
       ip_greylist_cleanup_delay;
     }
 
-  let create peer_meta_encoding initial_peer =
+  let create ?fd_pool peer_meta_encoding initial_peer =
     let triggers = P2p_trigger.create () in
     let config = dumb_config in
     let peer_meta_config : 'peer P2p_params.peer_meta_config =
@@ -714,7 +762,7 @@ module Internal_for_tests = struct
     {
       config;
       peer_meta_config;
-      my_id_points = P2p_point.Table.create ~random:true 7;
+      my_id_points = Point_LRU_set.create 7;
       known_peer_ids = P2p_peer.Table.create ~random:true 53;
       connected_peer_ids = P2p_peer.Table.create ~random:true 53;
       known_points = P2p_point.Table.create ~random:true 53;
@@ -726,5 +774,6 @@ module Internal_for_tests = struct
           ~ip_size:config.ip_greylist_size_in_kilobytes
           ~ip_cleanup_delay:config.ip_greylist_cleanup_delay;
       log;
+      fd_pool;
     }
 end

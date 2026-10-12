@@ -1,0 +1,580 @@
+// SPDX-FileCopyrightText: [2023] Serokell <hi@serokell.io>
+//
+// SPDX-License-Identifier: MIT
+
+//! Utilities and types for representing a stack.
+
+use crate::ast::*;
+
+/// Error returned when a stack index is out of bounds.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, thiserror::Error)]
+#[error("stack index out of bounds")]
+pub struct StackOob;
+
+/// Stack of [Type]s.
+pub type TypeStack = Stack<Type>;
+
+/// Stack of [TypedValue]s. Named `IStack` for "interpeter stack".
+pub type IStack<'a> = Stack<RcTypedValue<'a>>;
+
+/// Possibly failed type stack. Stacks are considered failed after
+/// always-failing instructions. A failed stack can be unified (in terms of
+/// typechecking) with any other stack.
+#[derive(Debug, PartialEq, Eq, Clone)]
+pub enum FailingTypeStack {
+    /// The stack isn't failed.
+    Ok(TypeStack),
+    /// The stack is failed.
+    Failed,
+}
+
+impl FailingTypeStack {
+    /// Try to access a mutable reference to the underlying `TypeStack`, return
+    /// `err` if the stack is failed.
+    pub fn access_mut<E>(&mut self, err: E) -> Result<&mut TypeStack, E> {
+        match self {
+            FailingTypeStack::Ok(ok) => Ok(ok),
+            FailingTypeStack::Failed => Err(err),
+        }
+    }
+}
+
+/// Construct a `Stack` with the given content. Note that stack top is the
+/// _rightmost_ element.
+#[macro_export]
+macro_rules! stk {
+    [$($args:tt)*] => {
+        $crate::stack::TopIsLast::from(vec![$($args)*]).0
+    };
+}
+
+/// Construct a `FailingTypeStack` with the given content. Note that stack top is the
+/// _rightmost_ element. Called `tc_stk` as it's used in the typechecker.
+#[macro_export]
+macro_rules! tc_stk {
+    [$($args:tt)*] => {
+        $crate::stack::FailingTypeStack::Ok($crate::stack::stk![$($args)*])
+    };
+}
+
+pub use {stk, tc_stk};
+
+/// A stack abstraction based on `Vec`.
+#[derive(Debug, PartialEq, Eq, Clone)]
+pub struct Stack<T>(Vec<T>);
+
+impl<T> Stack<T> {
+    /// Allocate a new empty stack.
+    pub fn new() -> Stack<T> {
+        Stack::stack_from_vec(Vec::new())
+    }
+
+    /// Construct a `Stack` from `Vec` by using the vec as the backing store
+    /// directly. Last `Vec` element will end up on the top of the stack. O(1)
+    /// complexity.
+    fn stack_from_vec(data: Vec<T>) -> Self {
+        Stack(data)
+    }
+
+    /// Construct a `Stack` from elements.
+    fn stack_from_elems(data: Vec<T>) -> Self {
+        Stack::stack_from_vec(data)
+    }
+
+    /// Convert stack index to vec index.
+    fn vec_index_checked(&self, i: usize) -> Result<usize, StackOob> {
+        let len = self.len();
+        len.checked_sub(i + 1).ok_or(StackOob)
+    }
+
+    /// Removes and returns the element at position `i` within the stack, where
+    /// 0 corresponds to the top, shifting all elements below it up. This has
+    /// worst-case complexity of O(n).
+    ///
+    /// Returns `Err(StackOob)` if `i` is out of bounds.
+    pub fn remove(&mut self, i: usize) -> Result<T, StackOob> {
+        let vi = self.vec_index_checked(i)?;
+        Ok(self.0.remove(vi))
+    }
+
+    /// Insert an element at i'th stack index, such that after the call there
+    /// are `i` number of elements before the newly inserted element. `insert(0,
+    /// x)` is equivalent to `push(x)`.
+    ///
+    /// This has to move elements of the stack after insertion, so worst-case
+    /// complexity is O(n).
+    ///
+    /// Returns `Err(StackOob)` if `i` is out of bounds.
+    pub fn insert(&mut self, i: usize, e: impl Into<T>) -> Result<(), StackOob> {
+        let e = e.into();
+        if i > 0 {
+            // We subtract one from the index because since our stack is inverted, the insertion
+            // point is to the right of the index, instead of the left of it, as considered by the
+            // `insert` method of the `Vec`. So, we have to use an index that is one element further
+            // to the right, which in terms of stack index, means substracting one from the input
+            // index.
+            let vi = self.vec_index_checked(i - 1)?;
+            self.0.insert(vi, e);
+        } else {
+            self.push(e);
+        }
+        Ok(())
+    }
+
+    /// Push an element onto the top of the stack.
+    pub fn push(&mut self, elt: impl Into<T>) {
+        self.0.push(elt.into())
+    }
+
+    /// Pop an element off the top of the stack.
+    pub fn pop(&mut self) -> Option<T> {
+        self.0.pop()
+    }
+
+    /// Borrow an element by stack index, where `0` corresponds to the top.
+    pub fn get(&self, index: usize) -> Result<&T, StackOob> {
+        let i = self.vec_index_checked(index)?;
+        self.0.get(i).ok_or(StackOob)
+    }
+
+    /// Mutably borrow an element by stack index, where `0` corresponds to the top.
+    pub fn get_mut(&mut self, index: usize) -> Result<&mut T, StackOob> {
+        let i = self.vec_index_checked(index)?;
+        self.0.get_mut(i).ok_or(StackOob)
+    }
+
+    /// Get the stack's element count.
+    #[allow(clippy::len_without_is_empty)]
+    pub fn len(&self) -> usize {
+        self.0.len()
+    }
+
+    /// Removes the specified number of elements from the top of the stack in
+    /// bulk.
+    ///
+    /// Returns `Err(StackOob)` if `size` is larger than the stack length.
+    pub fn drop_top(&mut self, size: usize) -> Result<(), StackOob> {
+        let new_len = self.len().checked_sub(size).ok_or(StackOob)?;
+        self.0.truncate(new_len);
+        Ok(())
+    }
+
+    /// Removes the specified number of elements from the top of the stack and
+    /// returns them as an iterator over the removed items, starting with the stack's top.
+    ///
+    /// Returns `Err(StackOob)` if `size` is larger than the stack length.
+    ///
+    /// If you do not need the items, use `drop_top` instead.
+    pub fn drain_top(
+        &mut self,
+        size: usize,
+    ) -> Result<impl DoubleEndedIterator<Item = T> + '_, StackOob> {
+        let split_at = self.len().checked_sub(size).ok_or(StackOob)?;
+        Ok(self.0.drain(split_at..).rev())
+    }
+
+    /// Reserve additional space on the stack for at least `additional`
+    /// elements. Similar to [Vec::reserve].
+    ///
+    /// # Panics
+    ///
+    /// If the new capacity exceeds [isize::MAX] bytes.
+    pub fn reserve(&mut self, additional: usize) {
+        self.0.reserve(additional)
+    }
+
+    /// Borrow the stack content as immutable references. Note that stack top is
+    /// the _rightmost_ element.
+    pub fn as_slice(&self) -> Vec<&T> {
+        self.0.iter().collect()
+    }
+
+    /// Split off the top `size` elements of the stack into a new `Stack`.
+    ///
+    /// # Panics
+    ///
+    /// Panics if the `size` is larger than length of the stack.
+    pub fn split_off(&mut self, size: usize) -> Stack<T> {
+        let len = self.len();
+        Self::stack_from_vec(
+            self.0
+                .split_off(len.checked_sub(size).expect("size too large in split_off")),
+        )
+    }
+
+    /// Like [`Stack::split_off`], but returns `Err(StackOob)` instead of
+    /// panicking, as `drop_top` and `drain_top` do. Prefer it where the length
+    /// is a runtime invariant: a panic in WASM traps the kernel.
+    pub fn split_off_checked(&mut self, size: usize) -> Result<Stack<T>, StackOob> {
+        let split_at = self.len().checked_sub(size).ok_or(StackOob)?;
+        Ok(Self::stack_from_vec(self.0.split_off(split_at)))
+    }
+
+    /// Move elements from `other` to the top of the stack. New stack top is the
+    /// top of `other`. Note that elements are moved out of `other`.
+    pub fn append(&mut self, other: &mut Stack<T>) {
+        self.0.append(&mut other.0)
+    }
+
+    /// Swap two elements in the stack, identified by their index from the top,
+    /// with `0` being the top.
+    ///
+    /// Returns `Err(StackOob)` if either index is out of bounds.
+    pub fn swap(&mut self, i1: usize, i2: usize) -> Result<(), StackOob> {
+        let i1v = self.vec_index_checked(i1)?;
+        let i2v = self.vec_index_checked(i2)?;
+        self.0.swap(i1v, i2v);
+        Ok(())
+    }
+
+    /// Iterator over the stack content, starting from the top.
+    pub fn iter(&self) -> impl Iterator<Item = &T> {
+        self.0.iter().rev()
+    }
+}
+
+/// Newtype for specifying the order of elements in a [Stack] vs elements in
+/// a [Vec]/slice. Used in the [From] trait for [Stack]. _First_ element of
+/// the [Vec] will end up at the _top_ of the stack. `from()` conversion has
+/// O(n) complexity. See also [TopIsLast].
+///
+/// `from_iter()` implementation is slightly inefficient, still O(n), but
+/// the constant is a bit higher than necessary. If you're worried about
+/// efficiency, consider using [TopIsLast] with an explicit `rev()`.
+pub struct TopIsFirst<T>(pub Stack<T>);
+
+/// Newtype for specifying the order of elements in a [Stack] vs elements in
+/// a [Vec]/slice. Used in the [From] trait for [Stack]. _First_ element of
+/// the [Vec] will end up at the _bottom_ of the stack. `from()` conversion
+/// has O(1) complexity for vectors, O(n) for slices since those have to be
+/// cloned. See also [TopIsFirst].
+pub struct TopIsLast<T>(pub Stack<T>);
+
+impl<T> From<Vec<T>> for TopIsFirst<T> {
+    fn from(mut data: Vec<T>) -> Self {
+        data.reverse();
+        Self(Stack::stack_from_elems(data))
+    }
+}
+
+impl<'a> From<Vec<TypedValue<'a>>> for TopIsFirst<RcTypedValue<'a>> {
+    fn from(mut data: Vec<TypedValue<'a>>) -> Self {
+        data.reverse();
+        Self(Stack::stack_from_vec(
+            data.into_iter().map(RcTypedValue::new).collect(),
+        ))
+    }
+}
+
+impl<T> From<Vec<T>> for TopIsLast<T> {
+    fn from(data: Vec<T>) -> Self {
+        Self(Stack::stack_from_elems(data))
+    }
+}
+
+impl<'a> From<Vec<TypedValue<'a>>> for TopIsLast<RcTypedValue<'a>> {
+    fn from(data: Vec<TypedValue<'a>>) -> Self {
+        Self(Stack::stack_from_vec(
+            data.into_iter().map(RcTypedValue::new).collect(),
+        ))
+    }
+}
+
+macro_rules! boilerplate {
+    ($nm:tt) => {
+        impl<T: Clone> From<&[T]> for $nm<T> {
+            fn from(data: &[T]) -> Self {
+                Vec::from(data).into()
+            }
+        }
+
+        impl<T, const N: usize> From<[T; N]> for $nm<T> {
+            fn from(data: [T; N]) -> Self {
+                Vec::from(data).into()
+            }
+        }
+
+        impl<T> FromIterator<T> for $nm<T> {
+            fn from_iter<I: IntoIterator<Item = T>>(iter: I) -> Self {
+                Self::from(Vec::from_iter(iter))
+            }
+        }
+    };
+}
+
+boilerplate!(TopIsFirst);
+boilerplate!(TopIsLast);
+
+impl<T> Default for Stack<T> {
+    fn default() -> Self {
+        Stack::new()
+    }
+}
+
+/// Owning [Stack] iterator.
+pub struct IntoIter<T>(std::iter::Rev<std::vec::IntoIter<T>>);
+
+impl<T> Iterator for IntoIter<T> {
+    type Item = T;
+
+    fn next(&mut self) -> Option<Self::Item> {
+        self.0.next()
+    }
+
+    fn size_hint(&self) -> (usize, Option<usize>) {
+        self.0.size_hint()
+    }
+}
+
+impl<T> IntoIterator for Stack<T> {
+    type IntoIter = IntoIter<T>;
+
+    type Item = T;
+
+    fn into_iter(self) -> Self::IntoIter {
+        IntoIter(self.0.into_iter().rev())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    type IntStack = Stack<i32>;
+
+    #[test]
+    fn stk_macro() {
+        let stk: IntStack = stk![1, 2, 3, 4];
+        assert_eq!(stk.as_slice(), vec![&1, &2, &3, &4]);
+        let stk: IntStack = stk![1; 5];
+        assert_eq!(stk.as_slice(), vec![&1; 5]);
+    }
+
+    #[test]
+    fn conversion_from_vec() {
+        assert_eq!(
+            TopIsLast::<i32>::from(vec![1, 2, 3, 4]).0.as_slice(),
+            vec![&1, &2, &3, &4] // NB: top is right
+        );
+        assert_eq!(TopIsLast::<i32>::from(vec![1, 2, 3, 4]).0.pop(), Some(4));
+        assert_eq!(
+            TopIsFirst::<i32>::from(vec![1, 2, 3, 4]).0.as_slice(),
+            vec![&4, &3, &2, &1] // NB: top is right
+        );
+        assert_eq!(TopIsFirst::<i32>::from(vec![1, 2, 3, 4]).0.pop(), Some(1));
+    }
+
+    #[test]
+    fn conversion_from_slice() {
+        let s: &[u32] = &[1, 2, 3, 4];
+        assert_eq!(
+            TopIsLast::from(s).0.as_slice(),
+            vec![&1, &2, &3, &4] // NB: top is right
+        );
+        assert_eq!(
+            TopIsFirst::from(s).0.as_slice(),
+            vec![&4, &3, &2, &1] // NB: top is right
+        );
+    }
+
+    #[test]
+    fn conversion_from_array() {
+        let a: [u32; 4] = [1, 2, 3, 4];
+        assert_eq!(
+            TopIsLast::from(a).0.as_slice(),
+            vec![&1, &2, &3, &4] // NB: top is right
+        );
+        assert_eq!(
+            TopIsFirst::from(a).0.as_slice(),
+            vec![&4, &3, &2, &1] // NB: top is right
+        );
+    }
+
+    #[test]
+    fn conversion_from_iter() {
+        let it = 1..=4;
+        assert_eq!(
+            TopIsLast::from_iter(it.clone()).0.as_slice(),
+            vec![&1, &2, &3, &4] // NB: top is right
+        );
+        assert_eq!(
+            TopIsFirst::from_iter(it).0.as_slice(),
+            vec![&4, &3, &2, &1] // NB: top is right
+        );
+    }
+
+    #[test]
+    fn push() {
+        let mut stk: IntStack = Stack::new();
+        stk.push(1);
+        stk.push(2);
+        stk.push(3);
+        assert_eq!(stk, stk![1, 2, 3]);
+    }
+
+    #[test]
+    fn pop() {
+        let mut stk: IntStack = stk![1, 2, 3];
+        assert_eq!(stk.pop(), Some(3));
+        assert_eq!(stk.pop(), Some(2));
+        assert_eq!(stk.pop(), Some(1));
+        assert_eq!(stk.pop(), None);
+    }
+
+    #[test]
+    fn remove() {
+        let mut stk: IntStack = stk![1, 2, 3, 4];
+        assert_eq!(stk.remove(1), Ok(3));
+        assert_eq!(stk, stk![1, 2, 4]);
+
+        assert_eq!(stk.remove(2), Ok(1));
+        assert_eq!(stk, stk![2, 4]);
+
+        assert_eq!(stk.remove(0), Ok(4));
+        assert_eq!(stk, stk![2]);
+
+        assert_eq!(stk.remove(5), Err(StackOob));
+    }
+
+    #[test]
+    fn insert() {
+        let mut stk: IntStack = stk![1, 2, 3];
+        assert_eq!(stk.insert(2, 10), Ok(()));
+        assert_eq!(stk, stk![1, 10, 2, 3]);
+
+        let mut stk: IntStack = stk![];
+        assert_eq!(stk.insert(0, 10), Ok(()));
+        assert_eq!(stk, stk![10]);
+
+        let mut stk: IntStack = stk![1, 2, 3];
+        assert_eq!(stk.insert(3, 10), Ok(()));
+        assert_eq!(stk, stk![10, 1, 2, 3]);
+
+        let mut stk: IntStack = stk![1, 2, 3];
+        assert_eq!(stk.insert(10, 42), Err(StackOob));
+    }
+
+    #[test]
+    fn len() {
+        let mut stk: IntStack = stk![1, 2, 3];
+        assert_eq!(stk.len(), 3);
+        stk.push(42);
+        assert_eq!(stk.len(), 4);
+    }
+
+    #[test]
+    fn drop_top() {
+        let mut stk: IntStack = stk![1, 2, 3, 4];
+        assert_eq!(stk.drop_top(3), Ok(()));
+        assert_eq!(stk, stk![1]);
+    }
+
+    #[test]
+    fn drain_top() {
+        let mut stk: IntStack = stk![1, 2, 3, 4];
+        let drained = stk.drain_top(3).unwrap();
+        assert_eq!(drained.collect::<Vec<_>>(), vec![4, 3, 2]);
+        assert_eq!(stk, stk![1]);
+    }
+
+    #[test]
+    fn drain_top_0() {
+        let mut stk: IntStack = stk![1, 2, 3, 4];
+        let drained = stk.drain_top(0).unwrap();
+        assert!(drained.collect::<Vec<_>>().is_empty());
+        assert_eq!(stk, stk![1, 2, 3, 4]);
+    }
+
+    #[test]
+    fn drop_top_out_of_bounds() {
+        let mut stk: IntStack = stk![1, 2, 3, 4];
+        assert_eq!(stk.drop_top(42), Err(StackOob));
+        assert_eq!(stk, stk![1, 2, 3, 4], "stack must be unchanged on Err");
+    }
+
+    #[test]
+    fn drain_top_out_of_bounds() {
+        let mut stk: IntStack = stk![1, 2, 3, 4];
+        assert!(stk.drain_top(42).is_err());
+        assert_eq!(stk, stk![1, 2, 3, 4], "stack must be unchanged on Err");
+    }
+
+    #[test]
+    fn as_slice() {
+        let stk: IntStack = stk![1, 2, 3, 4];
+        assert_eq!(stk.as_slice(), vec![&1, &2, &3, &4]);
+    }
+
+    #[test]
+    fn split_off() {
+        let mut stk: IntStack = stk![1, 2, 3, 4, 5];
+        let stk2 = stk.split_off(3);
+        assert_eq!(stk2, stk![3, 4, 5]);
+        assert_eq!(stk, stk![1, 2]);
+    }
+
+    #[test]
+    #[should_panic(expected = "size too large in split_off")]
+    fn split_off_out_of_bounds() {
+        let mut stk: IntStack = stk![1, 2, 3, 4, 5];
+        stk.split_off(42);
+    }
+
+    #[test]
+    fn append() {
+        let mut stk1: IntStack = stk![1, 2, 3];
+        let mut stk2: IntStack = stk![4, 5];
+        stk1.append(&mut stk2);
+        assert_eq!(stk1, stk![1, 2, 3, 4, 5]);
+        assert_eq!(stk2, stk![]);
+    }
+
+    #[test]
+    fn get() {
+        let stk: IntStack = stk![1, 2, 3, 4, 5];
+        assert_eq!(stk.get(0), Ok(&5));
+        assert_eq!(stk.get(4), Ok(&1));
+        assert_eq!(stk.get(7), Err(StackOob));
+    }
+
+    #[test]
+    fn get_mut() {
+        let mut stk: IntStack = stk![1, 2, 3, 4, 5];
+        *stk.get_mut(2).unwrap() = 42;
+        assert_eq!(stk, stk![1, 2, 42, 4, 5]);
+        assert_eq!(stk.get_mut(7), Err(StackOob));
+    }
+
+    #[test]
+    fn swap() {
+        let mut stk: IntStack = stk![1, 2, 3, 4, 5];
+        assert_eq!(stk.swap(0, 1), Ok(()));
+        assert_eq!(stk, stk![1, 2, 3, 5, 4]);
+        assert_eq!(stk.swap(0, 10), Err(StackOob));
+    }
+
+    #[test]
+    fn default() {
+        assert_eq!(Stack::<()>::default(), stk![]);
+    }
+
+    #[test]
+    fn split_off_checked() {
+        let mut stk: IntStack = stk![1, 2, 3, 4, 5];
+        let stk2 = stk.split_off_checked(3);
+        assert_eq!(stk2, Ok(stk![3, 4, 5]));
+        assert_eq!(stk, stk![1, 2]);
+        // The boundary `size == len` splits off the whole stack.
+        let mut whole: IntStack = stk![1, 2];
+        assert_eq!(whole.split_off_checked(2), Ok(stk![1, 2]));
+        assert_eq!(whole, stk![]);
+    }
+
+    #[test]
+    fn split_off_checked_out_of_bounds() {
+        let mut stk: IntStack = stk![1, 2, 3, 4, 5];
+        assert_eq!(stk.split_off_checked(42), Err(StackOob));
+        // The stack is left untouched on the error path.
+        assert_eq!(stk, stk![1, 2, 3, 4, 5]);
+    }
+}

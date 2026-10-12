@@ -30,12 +30,12 @@ From a higher-level, *abstract* perspective, the validation system in
 the Tezos protocol implements this business logic in a functional,
 state-passing machine where:
 
-- Its state is given by the :ref:`context<Context>`, the internal
+- Its state is given by the :ref:`context<def_context_alpha>`, the internal
   representation of the state of the Tezos ledger at a given blockchain
   level. For instance, the context contains the information of all
   activated accounts and contracts, and their balances. More
   generally, the context must provide enough information to determine
-  the validity of operations, and blocks.
+  the validity of operations and blocks.
 
 - The *apply_operation* method determines whether an operation is safe
   to be executed in a given context. If so, it proceeds to execute it
@@ -67,9 +67,9 @@ operations included in newly received blocks, whose validation is
 triggered by the :ref:`block validator<block_validator>`, in order to
 localize validation rules as needed. The resulting concrete API is
 specified by the :package-api:`Protocol
-<tezos-protocol-environment/Tezos_protocol_environment/V8/module-type-T/Updater/module-type-PROTOCOL/index.html>`
+<octez-proto-libs/Tezos_protocol_environment/V15/module-type-T/Updater/module-type-PROTOCOL/index.html>`
 module in the :doc:`protocol
-environment<../shell/protocol_environment>` ``V8``, and it is
+environment<../shell/protocol_environment>` ``V15``, and it is
 implemented by this protocol in the
 :package-api:`Main<tezos-protocol-alpha/Tezos_raw_protocol_alpha/Main/index.html>`
 module.
@@ -86,7 +86,7 @@ Validation modes
 
 The Tezos protocol provides different validation modes, intended to be
 used by the Tezos *shell* and *baker* software implementations when
-needing to apply (or to assert the validity) of blocks and operations
+needing to apply (or to assert the validity of) blocks and operations
 under different, or specialized, circumstances -- for example, in
 order to *bake* a block. For each of these validation modes, the API
 specified by the protocol environment offers an entry point so that
@@ -163,7 +163,7 @@ protocol environment:
   any possible context from its future successors, but it might still
   be valid in an alternative branch. For example: a manager operation
   with a smaller counter than the one expected (a
-  *"counter-in-the-past"* error), an unexpected endorsement for the
+  *"counter-in-the-past"* error), an unexpected attestation for the
   current level, etc.
 
 - ``Permanent``: the operation is invalid in the current context, and
@@ -173,7 +173,7 @@ protocol environment:
 - ``Outdated``: the operation is *too old* to be included in a
   block. Furthermore, there might be still some value in the
   information provided by an ``Outdated`` operation. An example is the
-  case of an endorsement which was received *too late*, but that could
+  case of an attestation which was received *too late*, but that could
   still be used to form a consensus quorum.
 
 .. _partial_application_alpha:
@@ -181,15 +181,14 @@ protocol environment:
 Partial Application
 ~~~~~~~~~~~~~~~~~~~
 
-The ``Partial application`` mode is used for :ref:`multi-pass
-validation<multi_pass_validation>`. Its aim is to provide Tezos shell
+The ``Partial application`` mode is no longer used, but it subsists in the code. Its aim is to provide Tezos shell
 implementations with a light-weight (read "fast") block application
 mechanism, which can determine whether a block has a *chance* of being
 valid or not, in a situation when the provided context is *not a
 recent one*. That is, when the block candidate succeeds neither the
 head of the chain, nor a close ancestor.
 
-This validation mode is typically used when the node receives a
+This validation mode could be used when the node receives a
 significantly large branch -- for instance, while bootstrapping. To
 check whether this branch is plausibly valid or potentially malicious
 spam, the shell retrieves the context from the most recent common
@@ -198,11 +197,11 @@ proceeds to "partially apply" each block of this branch using the
 common ancestor's context.
 
 Indeed, by relying on the ancestor context, this mode can *only*
-assert the validity of consensus-related preconditions (endorsing
+assert the validity of consensus-related preconditions (attesting
 power, block fitness, etc.), as future consensus slots are known in
 advance -- how much in advance being specified by the
-``<PRESERVED_CYCLES>`` protocol constant. Thus, the `Partial
-application` mode provides an over-approximation of the branch's
+``<CONSENSUS_RIGHTS_DELAY>`` protocol constant. Thus, the ``Partial
+application`` mode provides an over-approximation of the branch's
 validity, and as a result intermediate results are not committed on
 disk in order to prevent potential attacks.
 
@@ -215,7 +214,7 @@ Block Validation
 
    Adapt to pipelined block validation up to Lima and v7 environment.
 
-The validity of a blocks depends on a set of precondition checks
+The validity of a block depends on a set of precondition checks
 implemented in different steps, which happen at different stages of
 the application (and the construction) of a block.
 
@@ -223,8 +222,8 @@ The first step in the process is to decide whether a candidate block
 is *well-formed*, that is, that it has the expected "shape" of a valid
 block under the current Tezos economic protocol. Given a block
 candidate, the block validation process will then verify that the
-candidate block declares consistent :ref:`level<Level>`,
-:ref:`round<Round>`, and timestamp values; that it carries a valid
+candidate block declares consistent :ref:`level<def_level_alpha>`,
+:ref:`round<def_round_alpha>`, and timestamp values; that it carries a valid
 signature, etc. At this step, the block validation process will also
 initialize the data-structures required for subsequent steps.
 
@@ -237,7 +236,7 @@ considered as invalid.
 The last step in the block validation process, known as "block
 finalization", aims to verify that the collected consensus operations
 constitute a sufficiently large :ref:`quorum<quorum_alpha>`. That is,
-it will verify that the total endorsing power present in the block is
+it will verify that the total attesting power present in the block is
 greater than the ``CONSENSUS_THRESHOLD`` constant.
 
 This sequence of three steps also yields a new context -- the
@@ -282,17 +281,28 @@ application process for each of the different validation passes.
 
 .. _manager_operations_validity_alpha:
 
+Validity of operations
+~~~~~~~~~~~~~~~~~~~~~~
+
+For consensus, voting, and anonymous validation passes, validation is sufficient
+to ensure successful application. For manager operations, validation only
+ensures that the manager’s balance is sufficient to cover the fees, in addition
+to verifying that the operation is well-formed. It does not guarantee that the
+operation’s execution will be error-free. If an operation does result in an
+error, all side effects will be canceled, but the fees will be forfeited.
+
+
 Validity of Manager Operations
-~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+..............................
 
 In this sub-section, we explain the conditions for manager operations
 (and batches of managers operations) to be considered valid and hence
 suitable for inclusion in a block.
 
 Validity of Individual Manager Operations
-.........................................
+^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
 
-:ref:`Manager operation<manager_operations_alpha>` are a class of
+:ref:`Manager operations<manager_operations_alpha>` are a class of
 operations, issued by a single *manager* account which signs the
 operation and pays their fees. The different manager operation kinds
 share several common fields:
@@ -326,7 +336,7 @@ conditions hold:
 - The manager account is solvent to pay the announced fees.
 
 Validity of Manager Operation Batches
-.....................................
+^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
 
 A :ref:`batch<manager_operations_batches_alpha>` of manager operations
 includes one or more manager operations for sequential and atomic
@@ -347,13 +357,41 @@ defined as the conjunction of the following conditions:
 - When a ``Reveal`` operation is present, **it must only occur once**,
   and **it must be placed at the head** of the batch -- that is, the
   ``Reveal`` operation must be the first operation in the batch.
-- Every operation in the batch should declare the same `source`.
+- Every operation in the batch should declare the same ``source``.
 - Each of the individual operation counters must be incremented
   correctly and sequentially.
 - The sum of each individual operation's declared fees must be lower
   than the account's balance. That is, the manager account must be
   solvent to pay the announced fees for all the operations in the
   batch.
+
+.. _co-valid_operations_alpha:
+
+Co-valid operations
+^^^^^^^^^^^^^^^^^^^
+
+However, two valid manager operations (or batches) do not always form a valid
+block together. For example, operations ``op1`` and ``op2`` might both be valid
+in the context ``C``, but after applying ``op1`` to ``C``, ``op2`` might no
+longer be valid in the resulting context because the manager's balance may no
+longer cover the fees.
+
+In order to enforce that a set of valid managers
+operations forms a valib block, the protocol over-approximate this property by
+requiring the property of *co-validity*:
+
+Two manager operations are *compatible* if they correspond to distinct managers.
+
+Two manager operations are *co-valid* in a context if they are
+compatible and valid in this context.
+
+Considering two co-valid operations in a context, the
+application of one of them preserves the solvability of the other.
+
+This property extends to a set of operations if every pair of distinct
+operations is co-valid. In this case, the operations could be included in
+the next block in any order, modulo block limits (eg. maximum gas, block size
+limit, etc).
 
 .. _manager_operations_application_alpha:
 
@@ -394,7 +432,7 @@ For example, let's consider a simple batch of three manager operations
 ticket result for the application of the manager operation batch will
 report:
 
-* ``op1`` -- ``Backtracked``, ```op1`` was applied successfully, but
+* ``op1`` -- ``Backtracked``, ``op1`` was applied successfully, but
   after ``op2`` failed, the operation was canceled;
 * ``op2`` -- ``Failed``, the application of this particular operation failed;
 * ``op3`` -- ``Skipped``, this operation was never executed because

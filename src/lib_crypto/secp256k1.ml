@@ -3,6 +3,7 @@
 (* Open Source License                                                       *)
 (* Copyright (c) 2018 Dynamic Ledger Solutions, Inc. <contact@tezos.com>     *)
 (* Copyright (c) 2020 Metastate AG <hello@metastate.dev>                     *)
+(* Copyright (c) 2023 Functori <contact@functori.com>                        *)
 (*                                                                           *)
 (* Permission is hereby granted, free of charge, to any person obtaining a   *)
 (* copy of this software and associated documentation files (the "Software"),*)
@@ -317,6 +318,10 @@ let sign ?watermark sk msg =
   in
   Sign.sign_exn context ~sk (Bigstring.of_bytes msg)
 
+let sign_keccak256 sk msg =
+  let msg = Hacl.Hash.Keccak_256.digest msg in
+  Sign.sign_exn context ~sk (Bigstring.of_bytes msg)
+
 let check ?watermark public_key signature msg =
   let msg =
     Blake2B.to_bytes @@ Blake2B.hash_bytes
@@ -327,6 +332,10 @@ let check ?watermark public_key signature msg =
     ~pk:public_key
     ~msg:(Bigstring.of_bytes msg)
     ~signature
+
+let check_keccak256 pk signature msg =
+  let msg = Bigstring.of_bytes @@ Hacl.Hash.Keccak_256.digest msg in
+  Sign.verify_exn context ~pk ~msg ~signature
 
 let generate_key ?(seed = Hacl.Rand.gen 32) () =
   let sk = Key.read_sk_exn context (Bigstring.of_bytes seed) in
@@ -341,3 +350,28 @@ let deterministic_nonce sk msg =
 let deterministic_nonce_hash sk msg =
   let nonce = deterministic_nonce sk msg in
   Blake2B.to_bytes (Blake2B.hash_bytes [nonce])
+
+let pop_verify _ ?msg:_ _ = false
+
+let public_key_to_bytes_uncompressed pk =
+  Bigstring.to_bytes (Key.to_bytes ~compress:false context pk)
+
+let eth_address_of_public_key s =
+  let s_bytes = public_key_to_bytes_uncompressed s in
+  (* The public key hash is the hash of pk[1..]. *)
+  let s_hash =
+    Hacl.Hash.Keccak_256.digest Bytes.(sub s_bytes 1 (length s_bytes - 1))
+  in
+  (* The ethereum address is pkhash[12..]. *)
+  Bytes.(sub s_hash 12 (length s_hash - 12))
+
+let recover signature msg =
+  let open Error_monad.Result_syntax in
+  (* Decode the signature. *)
+  let* signature =
+    Sign.read_recoverable context (Bigstring.of_bytes signature)
+  in
+  (* Recover the public key that signed the message. *)
+  let* public_key = Sign.recover context ~signature (Bigstring.of_bytes msg) in
+  let address = eth_address_of_public_key public_key in
+  return address

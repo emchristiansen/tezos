@@ -30,32 +30,32 @@ module I32 = Tezos_webassembly_interpreter.I32
 module Wasmer : Host_funcs.Memory_access with type t = Memory.t = struct
   type t = Memory.t
 
-  exception Out_of_bounds
+  exception Out_of_bounds = Memory.Out_of_bounds
 
-  let translate_array_exception (body : unit -> 'a) : 'a =
-    try body ()
-    with Invalid_argument msg when msg = "index out of bounds" ->
-      raise Out_of_bounds
+  let load_bytes memory address length =
+    let address = I32.to_int_u address in
+    Lwt.return (Memory.get_string memory ~address ~length)
 
-  let load_bytes memory addr size =
-    let addr = I32.to_int_u addr in
-    let char_at (ptr : int) =
-      translate_array_exception @@ fun () ->
-      Memory.get memory ptr |> Unsigned.UInt8.to_int |> Char.chr
-    in
+  let load_bytes_to_bytes memory address length =
+    let address = I32.to_int_u address in
+    (* [Memory.get_string] allocates a fresh string that is not aliased
+       elsewhere, so [Bytes.unsafe_of_string] avoids the redundant copy
+       that [Bytes.of_string] would perform. *)
+    Lwt.return
+      (Bytes.unsafe_of_string (Memory.get_string memory ~address ~length))
 
-    Lwt.return @@ String.init size (fun idx -> char_at (addr + idx))
+  let store_bytes memory address data =
+    let address = I32.to_int_u address in
+    Memory.set_string memory ~address ~data ;
+    Lwt.return_unit
 
-  let store_bytes memory addr data =
-    let char_to_uint8 char = Char.code char |> Unsigned.UInt8.of_int in
-    let addr = I32.to_int_u addr in
-    let set_char idx chr =
-      translate_array_exception @@ fun () ->
-      Memory.set memory (addr + idx) @@ char_to_uint8 chr
-    in
-
-    String.iteri set_char data ;
-    Lwt.return ()
+  let store_bytes_from_bytes memory address data =
+    let address = I32.to_int_u address in
+    (* [Memory.set_string] only reads from the data and copies into wasm
+       linear memory, so [Bytes.unsafe_to_string] is sound: the resulting
+       view is local to this call and never escapes. *)
+    Memory.set_string memory ~address ~data:(Bytes.unsafe_to_string data) ;
+    Lwt.return_unit
 
   let to_bits (num : Tezos_webassembly_interpreter.Values.num) : int * int64 =
     let open Tezos_webassembly_interpreter in
@@ -82,9 +82,9 @@ module Wasmer : Host_funcs.Memory_access with type t = Memory.t = struct
         loop (steps - 1) (addr + 1) bits)
     in
 
-    translate_array_exception (fun () -> loop num_bytes abs_addr bits) ;
+    loop num_bytes abs_addr bits ;
 
-    Lwt.return ()
+    Lwt.return_unit
 
   let bound (memory : Memory.t) = Int64.of_int (Memory.length memory)
 

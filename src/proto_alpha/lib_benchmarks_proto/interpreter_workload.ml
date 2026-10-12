@@ -44,7 +44,8 @@ type instruction_name =
   | N_IDrop
   | N_IDup
   | N_ISwap
-  | N_IConst
+  | N_IPush
+  | N_IUnit
   (* pairs *)
   | N_ICons_pair
   | N_ICar
@@ -54,7 +55,8 @@ type instruction_name =
   | N_ICons_some
   | N_ICons_none
   | N_IIf_none
-  | N_IOpt_map
+  | N_IOpt_map_none
+  | N_IOpt_map_some
   (* ors *)
   | N_ILeft
   | N_IRight
@@ -147,12 +149,15 @@ type instruction_name =
   | N_INot_int
   (* control *)
   | N_IIf
-  | N_ILoop
-  | N_ILoop_left
+  | N_ILoop_in
+  | N_ILoop_out
+  | N_ILoop_left_in
+  | N_ILoop_left_out
   | N_IDip
   | N_IExec
   | N_IApply
-  | N_ILambda
+  | N_ILambda_lam
+  | N_ILambda_lamrec
   | N_IFailwith
   (* comparison, warning: ad-hoc polymorphic instruction *)
   | N_ICompare
@@ -168,8 +173,11 @@ type instruction_name =
   | N_IContract
   | N_ITransfer_tokens
   | N_IImplicit_account
+  | N_IIs_implicit_account
   | N_ICreate_contract
   | N_ISet_delegate
+  | N_IIndex_address
+  | N_IGet_address_index
   (* time *)
   | N_INow
   | N_IMin_block_time
@@ -182,6 +190,7 @@ type instruction_name =
   | N_ICheck_signature_secp256k1
   | N_ICheck_signature_p256
   | N_ICheck_signature_bls
+  | N_ICheck_signature_mldsa44
   | N_IHash_key
   | N_IPack
   | N_IUnpack
@@ -247,7 +256,8 @@ type continuation_name =
   | N_KUndip
   | N_KLoop_in
   | N_KLoop_in_left
-  | N_KIter
+  | N_KIter_empty
+  | N_KIter_nonempty
   | N_KList_enter_body
   | N_KList_exit_body
   | N_KMap_enter_body
@@ -267,14 +277,16 @@ let string_of_instruction_name : instruction_name -> string =
   | N_IDrop -> "N_IDrop"
   | N_IDup -> "N_IDup"
   | N_ISwap -> "N_ISwap"
-  | N_IConst -> "N_IConst"
+  | N_IPush -> "N_IPush"
+  | N_IUnit -> "N_IUnit"
   | N_ICons_pair -> "N_ICons_pair"
   | N_ICar -> "N_ICar"
   | N_ICdr -> "N_ICdr"
   | N_ICons_some -> "N_ICons_some"
   | N_ICons_none -> "N_ICons_none"
   | N_IIf_none -> "N_IIf_none"
-  | N_IOpt_map -> "N_IOpt_map"
+  | N_IOpt_map_none -> "N_IOpt_map_none"
+  | N_IOpt_map_some -> "N_IOpt_map_some"
   | N_ILeft -> "N_ILeft"
   | N_IRight -> "N_IRight"
   | N_IIf_left -> "N_IIf_left"
@@ -353,12 +365,15 @@ let string_of_instruction_name : instruction_name -> string =
   | N_IXor_nat -> "N_IXor_nat"
   | N_INot_int -> "N_INot_int"
   | N_IIf -> "N_IIf"
-  | N_ILoop -> "N_ILoop"
-  | N_ILoop_left -> "N_ILoop_left"
+  | N_ILoop_in -> "N_ILoop_in"
+  | N_ILoop_out -> "N_ILoop_out"
+  | N_ILoop_left_in -> "N_ILoop_left_in"
+  | N_ILoop_left_out -> "N_ILoop_left_out"
   | N_IDip -> "N_IDip"
   | N_IExec -> "N_IExec"
   | N_IApply -> "N_IApply"
-  | N_ILambda -> "N_ILambda"
+  | N_ILambda_lam -> "N_ILambda_lam"
+  | N_ILambda_lamrec -> "N_ILambda_lamrec"
   | N_IFailwith -> "N_IFailwith"
   | N_ICompare -> "N_ICompare"
   | N_IEq -> "N_IEq"
@@ -371,6 +386,9 @@ let string_of_instruction_name : instruction_name -> string =
   | N_IContract -> "N_IContract"
   | N_ITransfer_tokens -> "N_ITransfer_tokens"
   | N_IImplicit_account -> "N_IImplicit_account"
+  | N_IIndex_address -> "N_IIndex_address"
+  | N_IGet_address_index -> "N_IGet_address_index"
+  | N_IIs_implicit_account -> "N_IIs_implicit_account"
   | N_ICreate_contract -> "N_ICreate_contract"
   | N_ISet_delegate -> "N_ISet_delegate"
   | N_INow -> "N_INow"
@@ -380,6 +398,7 @@ let string_of_instruction_name : instruction_name -> string =
   | N_ICheck_signature_secp256k1 -> "N_ICheck_signature_secp256k1"
   | N_ICheck_signature_p256 -> "N_ICheck_signature_p256"
   | N_ICheck_signature_bls -> "N_ICheck_signature_bls"
+  | N_ICheck_signature_mldsa44 -> "N_ICheck_signature_mldsa44"
   | N_IHash_key -> "N_IHash_key"
   | N_IPack -> "N_IPack"
   | N_IUnpack -> "N_IUnpack"
@@ -446,7 +465,8 @@ let string_of_continuation_name : continuation_name -> string =
   | N_KUndip -> "N_KUndip"
   | N_KLoop_in -> "N_KLoop_in"
   | N_KLoop_in_left -> "N_KLoop_in_left"
-  | N_KIter -> "N_KIter"
+  | N_KIter_empty -> "N_KIter_empty"
+  | N_KIter_nonempty -> "N_KIter_nonempty"
   | N_KList_enter_body -> "N_KList_enter_body"
   | N_KList_exit_body -> "N_KList_exit_body"
   | N_KMap_enter_body -> "N_KMap_enter_body"
@@ -494,19 +514,21 @@ let cont_sized_step cont_name args = {name = Cont_name cont_name; args}
 
 (* ------------------------------------------------------------------------- *)
 
+(* Changing the ordering breaks the workload file compatibility *)
 let all_instructions =
   [
     N_IDrop;
     N_IDup;
     N_ISwap;
-    N_IConst;
+    N_IPush;
     N_ICons_pair;
     N_ICar;
     N_ICdr;
     N_ICons_some;
     N_ICons_none;
     N_IIf_none;
-    N_IOpt_map;
+    N_IOpt_map_none;
+    N_IOpt_map_some;
     N_ILeft;
     N_IRight;
     N_IIf_left;
@@ -579,12 +601,15 @@ let all_instructions =
     N_IXor_nat;
     N_INot_int;
     N_IIf;
-    N_ILoop;
-    N_ILoop_left;
+    N_ILoop_in;
+    N_ILoop_out;
+    N_ILoop_left_in;
+    N_ILoop_left_out;
     N_IDip;
     N_IExec;
     N_IApply;
-    N_ILambda;
+    N_ILambda_lam;
+    N_ILambda_lamrec;
     N_IFailwith;
     N_ICompare;
     N_IEq;
@@ -597,6 +622,9 @@ let all_instructions =
     N_IContract;
     N_ITransfer_tokens;
     N_IImplicit_account;
+    N_IIs_implicit_account;
+    N_IIndex_address;
+    N_IGet_address_index;
     N_ICreate_contract;
     N_ISet_delegate;
     N_INow;
@@ -606,6 +634,7 @@ let all_instructions =
     N_ICheck_signature_secp256k1;
     N_ICheck_signature_p256;
     N_ICheck_signature_bls;
+    N_ICheck_signature_mldsa44;
     N_IHash_key;
     N_IPack;
     N_IUnpack;
@@ -666,8 +695,10 @@ let all_instructions =
     N_IAnd_bytes;
     N_IXor_bytes;
     N_INot_bytes;
+    N_IUnit;
   ]
 
+(* Changing the ordering breaks the workload file compatibility *)
 let all_continuations =
   [
     N_KNil;
@@ -678,7 +709,8 @@ let all_continuations =
     N_KUndip;
     N_KLoop_in;
     N_KLoop_in_left;
-    N_KIter;
+    N_KIter_empty;
+    N_KIter_nonempty;
     N_KList_enter_body;
     N_KList_exit_body;
     N_KMap_enter_body;
@@ -752,7 +784,9 @@ module Instructions = struct
 
   let swap = ir_sized_step N_ISwap nullary
 
-  let const = ir_sized_step N_IConst nullary
+  let push = ir_sized_step N_IPush nullary
+
+  let unit = ir_sized_step N_IUnit nullary
 
   let cons_pair = ir_sized_step N_ICons_pair nullary
 
@@ -766,7 +800,9 @@ module Instructions = struct
 
   let if_none = ir_sized_step N_IIf_none nullary
 
-  let opt_map = ir_sized_step N_IOpt_map nullary
+  let opt_map ~is_some =
+    if is_some then ir_sized_step N_IOpt_map_some nullary
+    else ir_sized_step N_IOpt_map_none nullary
 
   let left = ir_sized_step N_ILeft nullary
 
@@ -965,9 +1001,13 @@ module Instructions = struct
 
   let if_ = ir_sized_step N_IIf nullary
 
-  let loop = ir_sized_step N_ILoop nullary
+  let loop bool =
+    if bool then ir_sized_step N_ILoop_in nullary
+    else ir_sized_step N_ILoop_out nullary
 
-  let loop_left = ir_sized_step N_ILoop_left nullary
+  let loop_left or_ =
+    if or_ then ir_sized_step N_ILoop_left_in nullary
+    else ir_sized_step N_ILoop_left_out nullary
 
   let dip = ir_sized_step N_IDip nullary
 
@@ -976,7 +1016,9 @@ module Instructions = struct
   let apply ~(rec_flag : bool) =
     ir_sized_step N_IApply (unary "rec" (if rec_flag then 1 else 0))
 
-  let lambda = ir_sized_step N_ILambda nullary
+  let lambda ~(rec_flag : bool) =
+    if rec_flag then ir_sized_step N_ILambda_lamrec nullary
+    else ir_sized_step N_ILambda_lam nullary
 
   let failwith_ = ir_sized_step N_IFailwith nullary
 
@@ -1003,6 +1045,12 @@ module Instructions = struct
 
   let implicit_account = ir_sized_step N_IImplicit_account nullary
 
+  let is_implicit_account = ir_sized_step N_IIs_implicit_account nullary
+
+  let index_address = ir_sized_step N_IIndex_address nullary
+
+  let get_address_index = ir_sized_step N_IGet_address_index nullary
+
   let create_contract = ir_sized_step N_ICreate_contract nullary
 
   let set_delegate = ir_sized_step N_ISet_delegate nullary
@@ -1024,6 +1072,9 @@ module Instructions = struct
 
   let check_signature_bls _pk _signature message =
     ir_sized_step N_ICheck_signature_bls (unary "message" message)
+
+  let check_signature_mldsa44 _pk _signature message =
+    ir_sized_step N_ICheck_signature_mldsa44 (unary "message" message)
 
   let hash_key = ir_sized_step N_IHash_key nullary
 
@@ -1181,7 +1232,9 @@ module Control = struct
 
   let loop_in_left = cont_sized_step N_KLoop_in_left nullary
 
-  let iter size = cont_sized_step N_KIter (unary "size" size)
+  let iter size =
+    if size = 0 then cont_sized_step N_KIter_empty nullary
+    else cont_sized_step N_KIter_nonempty nullary
 
   let list_enter_body xs_size ys_size =
     cont_sized_step
@@ -1203,15 +1256,14 @@ end
 
 open Script_typed_ir
 
-let extract_compare_sized_step :
-    type a. a comparable_ty -> a -> a -> ir_sized_step =
+let extract_compare_sized_step : type a.
+    a comparable_ty -> a -> a -> ir_sized_step =
  fun comparable_ty x y ->
   Instructions.compare
     (Size.size_of_comparable_value comparable_ty x)
     (Size.size_of_comparable_value comparable_ty y)
 
-let extract_ir_sized_step :
-    type bef_top bef res_top res.
+let extract_ir_sized_step : type bef_top bef res_top res.
     Alpha_context.t ->
     (bef_top, bef, res_top, res) Script_typed_ir.kinstr ->
     bef_top * bef ->
@@ -1222,7 +1274,8 @@ let extract_ir_sized_step :
   | IDrop (_, _), _ -> Instructions.drop
   | IDup (_, _), _ -> Instructions.dup
   | ISwap (_, _), _ -> Instructions.swap
-  | IConst (_, _, _, _), _ -> Instructions.const
+  | IPush (_, _, _, _), _ -> Instructions.push
+  | IUnit (_, _), _ -> Instructions.unit
   | ICons_pair (_, _), _ -> Instructions.cons_pair
   | ICar (_, _), _ -> Instructions.car
   | ICdr (_, _), _ -> Instructions.cdr
@@ -1230,7 +1283,9 @@ let extract_ir_sized_step :
   | ICons_some (_, _), _ -> Instructions.cons_some
   | ICons_none (_, _, _), _ -> Instructions.cons_none
   | IIf_none _, _ -> Instructions.if_none
-  | IOpt_map _, _ -> Instructions.opt_map
+  | IOpt_map _, (opt, _) ->
+      let is_some = match opt with None -> false | Some _ -> true in
+      Instructions.opt_map ~is_some
   | ICons_left (_, _, _), _ -> Instructions.left
   | ICons_right (_, _, _), _ -> Instructions.right
   | IIf_left _, _ -> Instructions.if_left
@@ -1376,15 +1431,18 @@ let extract_ir_sized_step :
       Instructions.xor_nat (Size.integer x) (Size.integer y)
   | INot_int (_, _), (x, _) -> Instructions.not_int (Size.integer x)
   | IIf _, _ -> Instructions.if_
-  | ILoop (_, _, _), _ -> Instructions.loop
-  | ILoop_left (_, _, _), _ -> Instructions.loop_left
+  | ILoop (_, _, _), (b, _) -> Instructions.loop b
+  | ILoop_left (_, _, _), (or_, _) ->
+      let or_ = match or_ with L _ -> true | R _ -> false in
+      Instructions.loop_left or_
   | IDip (_, _, _, _), _ -> Instructions.dip
   | IExec (_, _, _), _ -> Instructions.exec
-  | IApply (_, _, _), (_, (l, _)) -> (
-      match l with
-      | Lam _ -> Instructions.apply ~rec_flag:false
-      | LamRec _ -> Instructions.apply ~rec_flag:true)
-  | ILambda (_, _, _), _ -> Instructions.lambda
+  | IApply (_, _, _), (_, (l, _)) ->
+      let rec_flag = match l with Lam _ -> false | LamRec _ -> true in
+      Instructions.apply ~rec_flag
+  | ILambda (_, l, _), _ ->
+      let rec_flag = match l with Lam _ -> false | LamRec _ -> true in
+      Instructions.lambda ~rec_flag
   | IFailwith (_, _), _ -> Instructions.failwith_
   | ICompare (_, cmp_ty, _), (a, (b, _)) ->
       extract_compare_sized_step cmp_ty a b
@@ -1399,6 +1457,9 @@ let extract_ir_sized_step :
   | ITransfer_tokens (_, _), _ -> Instructions.transfer_tokens
   | IView (_, _, _, _), _ -> Instructions.view
   | IImplicit_account (_, _), _ -> Instructions.implicit_account
+  | IIs_implicit_account (_, _), _ -> Instructions.is_implicit_account
+  | IIndex_address (_, _), _ -> Instructions.index_address
+  | IGet_address_index (_, _), _ -> Instructions.get_address_index
   | ICreate_contract _, _ -> Instructions.create_contract
   | ISet_delegate (_, _), _ -> Instructions.set_delegate
   | INow (_, _), _ -> Instructions.now
@@ -1425,7 +1486,12 @@ let extract_ir_sized_step :
           let pk = Size.of_int (Signature.Bls.Public_key.size pk) in
           let signature = Size.of_int Signature.Bls.size in
           let message = Size.bytes message in
-          Instructions.check_signature_bls pk signature message)
+          Instructions.check_signature_bls pk signature message
+      | Signature.Mldsa44 pk ->
+          let pk = Size.of_int (Signature.Mldsa44.Public_key.size pk) in
+          let signature = Size.of_int Signature.Mldsa44.size in
+          let message = Size.bytes message in
+          Instructions.check_signature_mldsa44 pk signature message)
   | IHash_key (_, _), _ -> Instructions.hash_key
   | IPack (_, ty, _), (v, _) -> (
       let script_res =
@@ -1578,8 +1644,8 @@ let extract_deps (type bef_top bef aft_top aft) ctxt step_constants
       (module struct
         let log_interp _instr _ctxt _log _stack_ty _stack = ()
 
-        let log_entry :
-            type a s b f. (a, s, b, f, a, s) Script_typed_ir.logging_function =
+        let log_entry : type a s b f.
+            (a, s, b, f, a, s) Script_typed_ir.logging_function =
          fun kinstr ctxt _loc _stack_ty stack ->
           trace := extract_ir_sized_step ctxt kinstr stack :: !trace ;
           match kinstr with IFailwith _ -> raise Stop_bench | _ -> ()
@@ -1623,8 +1689,8 @@ let extract_deps_continuation (type bef_top bef aft_top aft) ctxt step_constants
       (module struct
         let log_interp _instr _ctxt _log _stack_ty _stack = ()
 
-        let log_entry :
-            type a s b f. (a, s, b, f, a, s) Script_typed_ir.logging_function =
+        let log_entry : type a s b f.
+            (a, s, b, f, a, s) Script_typed_ir.logging_function =
          fun kinstr ctxt _loc _stack_ty stack ->
           trace := extract_ir_sized_step ctxt kinstr stack :: !trace ;
           match kinstr with IFailwith _ -> raise Stop_bench | _ -> ()

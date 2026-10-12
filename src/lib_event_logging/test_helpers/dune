@@ -3,20 +3,23 @@
 
 (library
  (name tezos_event_logging_test_helpers)
- (public_name tezos-event-logging-test-helpers)
+ (public_name octez-libs.event-logging-test-helpers)
  (libraries
-  tezos-stdlib
-  tezos-lwt-result-stdlib
-  data-encoding
-  tezos-error-monad
-  tezos-event-logging
-  tezos-test-helpers
-  alcotest)
- (js_of_ocaml)
+  octez-libs.stdlib
+  octez-libs.lwt-result-stdlib
+  octez-libs.data-encoding
+  octez-libs.error-monad
+  octez-libs.event-logging
+  octez-libs.test-helpers
+  tezt.core
+  octez-alcotezt)
  (library_flags (:standard -linkall))
  (flags
   (:standard)
+  -open Tezos_lwt_result_stdlib
   -open Tezos_error_monad
   -open Tezos_error_monad.TzLwtreslib
   -open Tezos_event_logging
-  -open Tezos_test_helpers))
+  -open Tezos_test_helpers
+  -open Tezt_core
+  -open Octez_alcotezt))

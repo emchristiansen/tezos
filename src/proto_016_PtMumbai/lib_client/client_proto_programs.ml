@@ -89,8 +89,7 @@ let print_run_result (cctxt : #Client_context.printer) ~show_source ~parsed =
         (Format.pp_print_list Operation_result.pp_internal_operation)
         operations
         (fun ppf -> function
-          | None -> ()
-          | Some diff -> print_big_map_diff ppf diff)
+          | None -> () | Some diff -> print_big_map_diff ppf diff)
         maybe_lazy_storage_diff
       >>= fun () -> return_unit
   | Error errs -> print_errors cctxt errs ~show_source ~parsed
@@ -112,8 +111,7 @@ let print_trace_result (cctxt : #Client_context.printer) ~show_source ~parsed =
         (Format.pp_print_list Operation_result.pp_internal_operation)
         operations
         (fun ppf -> function
-          | None -> ()
-          | Some diff -> print_big_map_diff ppf diff)
+          | None -> () | Some diff -> print_big_map_diff ppf diff)
         maybe_lazy_storage_diff
         print_execution_trace
         trace
@@ -126,7 +124,7 @@ type simulation_params = {
   now : Script_timestamp.t option;
   level : Script_int.n Script_int.num option;
   source : Contract.t option;
-  payer : Tezos_crypto.Signature.public_key_hash option;
+  payer : Signature.public_key_hash option;
   gas : Gas.Arith.integral option;
 }
 
@@ -300,8 +298,8 @@ let script_size cctxt ~(chain : Chain_services.chain) ~block ?gas ?legacy
     ~script:program.expanded
     ~storage:storage.expanded
 
-let print_typecheck_result ~emacs ~show_types ~print_source_on_error program res
-    (cctxt : #Client_context.printer) =
+let print_typecheck_result ~emacs ~show_types ~print_source_on_error
+    ~display_names ~name program res (cctxt : #Client_context.printer) =
   if emacs then
     let type_map, errs, _gas =
       match res with
@@ -324,7 +322,11 @@ let print_typecheck_result ~emacs ~show_types ~print_source_on_error program res
     match res with
     | Ok (type_map, gas) ->
         let program = Michelson_v1_printer.inject_types type_map program in
-        cctxt#message "@[<v 0>Well typed@,Gas remaining: %a@]" Gas.pp gas
+        cctxt#message
+          "@[Well typed (Gas remaining: %a)\t%t@]"
+          Gas.pp
+          gas
+          (fun fmt -> if display_names then Format.pp_print_string fmt name)
         >>= fun () ->
         if show_types then
           cctxt#message "%a" Micheline_printer.print_expr program >>= fun () ->
@@ -338,7 +340,7 @@ let print_typecheck_result ~emacs ~show_types ~print_source_on_error program res
              ~show_source:print_source_on_error
              ~parsed:program)
           errs
-        >>= fun () -> cctxt#error "ill-typed script"
+        >>= fun () -> cctxt#error "script %S is ill-typed" name
 
 let entrypoint_type cctxt ~(chain : Chain_services.chain) ~block
     (program : Michelson_v1_parser.parsed) ~entrypoint =

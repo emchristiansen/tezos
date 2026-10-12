@@ -3,6 +3,3053 @@
 Changelog
 '''''''''
 
+Version 25.2
+============
+
+General
+-------
+
+- ``data-encoding``: the binary decoder now bounds its recursion depth,
+  rejecting deeply-nested input with a new ``Too_many_recursive_calls`` decode
+  error instead of recursing on the native OCaml stack. The bound is above the
+  maximum nesting any protocol accepts, so no valid value is affected. (MR
+  :gl:`!22785`)
+
+- **Security**: Harden the validation of staking operations: forbid unstaking
+  operations that would yield no tez (MR :gl:`!22872`), and staking from
+  non-finalizable unstaking requests from delegates. (MR :gl:`!22784`)
+
+- **Security**: Harden the validation of Increase paid storage operation on
+  invalid input. (MR :gl:`!22781`)
+
+- **Security**: Harden refutation operations validation to reject inbox proofs
+  with a mismatched claimed level. (MR :gl:`!22786`)
+
+- **Security**: WASM PVM: make NDS host functions total, preventing a crash of
+  the PVM. (MR :gl:`!22786`)
+
+- **Security**: Harden refutation operation validation to reject illformed proofs.
+  (MR :gl:`!22788`)
+
+- **Security**: Harden refutation operations to reject refutation proofs move
+  played during the dissecting phase on a section whose agreed start state is
+  absent. (MR :gl:`!22787`)
+
+Baker
+-----
+
+- Fixed the baker silently stopping to include DAL attestations after its DAL
+  node restarted or the connection to it was reset or left half-open. The baker
+  now detects a stalled ``/profiles/<pkh>/monitor/attestable_slots`` stream (via
+  a periodic heartbeat) and reconnects on its own, instead of relying on a clean
+  end-of-stream that a reset or half-open connection never delivers. (MR
+  :gl:`!22471`)
+
+- Fixed the baker blocking on its DAL node health check: the periodic health
+  request was awaited while building attestations, so an unresponsive DAL node
+  (e.g. an unreachable or half-open connection) could stall block production and
+  attestation for all of the baker's delegates. The health check now runs
+  asynchronously, off the consensus path, and is bounded by a timeout.
+  (MR :gl:`!22538`)
+
+Data Availability Layer (DAL)
+-----------------------------
+
+DAL node
+~~~~~~~~
+
+- Fixed an issue where the attester branch of the shard reception callback
+  could issue L1 committee RPCs for message levels far beyond the current
+  head. The fetch is now skipped when the committee level exceeds
+  ``head_level + attestation_lag + validation_slack``. Additionally, the
+  application callback in the P2P receive loop is now spawned
+  asynchronously, so a slow callback on one peer connection no longer
+  delays shard ingestion from other peers.
+  (MR :gl:`!22542`)
+
+- The wire encodings for the Gossipsub IHave, IWant, and Prune control
+  messages now enforce upper bounds on the lengths of their list fields
+  (``message_ids`` for IHave/IWant, ``px`` for Prune), consistent with
+  the limits already applied on the send side. (MR :gl:`!22537`)
+
+- The ``/profiles/<pkh>/monitor/attestable_slots`` streaming RPC now emits a
+  periodic heartbeat event (one per level), letting consumers detect a stalled
+  connection during periods with no attestable-slot activity. (MR :gl:`!22471`)
+
+- Bounded the amplification reconstruction queue of the DAL node and stopped it
+  from enqueuing duplicates. This prevents a sustained flow of shards from
+  growing the queue without bound and driving observer/operator nodes out of
+  memory. When the bound is reached, excess amplification requests are dropped
+  and a warning is logged. (MR :gl:`!22169`)
+
+- Fixed a DAL node crash that could occur after a restart with a persisted
+  store: the startup status backfill could leave a slot's status inconsistent
+  with the skip-list store, tearing down the node's daemon (gossipsub, P2P and
+  RPC) while the process stayed alive. (MR :gl:`!22469`)
+
+- Fixed the attester monitoring logs (``attested slot(s) …``) which, with the
+  dynamic attestation lag, could attribute an attestation to the wrong delegate
+  and report slots as attested by a baker that did not attest them.
+  (MR :gl:`!22472`)
+
+- The DAL gossipsub worker now caps the number of distinct topics a remote peer
+  may subscribe to (default 65,536) and the depth of the P2P input queue
+  (default 8,192); excess subscriptions and messages are silently dropped.
+  (MR :gl:`!22611`)
+
+- Added a mutex in the trap store used by the DAL node to avoid potential race
+  conditions when concurrently modifying the store. (MR :gl:`!22558`)
+
+Version 25.1
+============
+
+General
+-------
+
+- **Security** Ensured the cache is rebuilt from the committed context whenever
+  the in-memory protocol cache contains stale data computed before a chain
+  reorganization. (MR :gl:`!22462`)
+
+- **Security** Hardened the validation of the smart rollup operation used to
+  advance an ongoing refutation game to reject malformed inputs at the shell
+  level. (MR :gl:`!22476`)
+
+- **Security** Hardened the validation of the double-baking evidence at the
+  shell level against adversarial inputs. (MR :gl:`!22484`)
+
+
+Version 25.0
+============
+
+General
+-------
+
+- Fixed a file descriptor leak in the RPC client: the connection of each
+  followed HTTP redirect was never released. This affected every Octez
+  executable issuing RPC calls through an endpoint answering redirects
+  (e.g. behind a reverse proxy). (MR :gl:`!22138`)
+
+Data Availability Layer (DAL)
+------------------------------
+
+DAL node
+~~~~~~~~
+
+- Added a ``--skip-shards`` flag to the ``snapshot export`` and ``snapshot
+  import`` commands. When set, shards are neither exported nor imported,
+  producing smaller snapshots for nodes that only need slot data. (MR
+  :gl:`!21937`)
+
+- **Breaking change**: The DAL node RPC server now binds to ``127.0.0.1:10732``
+  by default instead of ``0.0.0.0:10732``. Operators who need to expose the RPC
+  interface publicly must explicitly pass ``--rpc-addr 0.0.0.0:10732``. When
+  bound to a non-loopback address, a warning is emitted and a restrictive ACL is
+  applied (only safe/read-only endpoints are accessible). The ACL can be
+  overridden per-bind-address via the new ``acl`` field in ``config.json``,
+  using the same policy syntax as the L1 node's ``rpc.acl``. (MR :gl:`!21743`)
+
+Version 25.0~rc1
+================
+
+Smart Rollup node
+-----------------
+
+- Registered the missing handler for the ``/global/last_cemented_commitment``
+  RPC, which previously returned 404 even though the service was declared. (MR
+  :gl:`!21757`)
+
+- Skip context reconstruction during ``snapshot import`` when the head's commit
+  is already present in the imported context, so non-compact snapshots no longer
+  pay for unnecessary PVM replay. Fixes a regression. (MR :gl:`!21810`)
+
+- Add a ``--dal-node`` option to ``snapshot import`` so reconstruction of
+  compact snapshots can fetch DAL pages from a DAL node. (MR :gl:`!21810`)
+
+- Make ``snapshot import`` more robust when verifying that the snapshot's
+  commitment is published on L1: search around the snapshot's head level
+  rather than only at the L1 head, and report a clear error suggesting an
+  archive L1 node when the snapshot is older than the savepoint. (MR
+  :gl:`!21841`)
+
+- The rollup node no longer exits when the L1 RPC is unreachable at startup;
+  the initial connection is retried with the configured
+  ``--reconnection-delay`` exponential backoff, matching the existing behaviour
+  for runtime disconnections. A ``reconnected`` notice is emitted once the
+  connection is re-established. (MR :gl:`!21854`)
+
+Version 25.0~beta1
+==================
+
+General
+-------
+
+- Hardened ``lib_bees`` worker lifecycle for OCaml 5.x Eio domains: switched
+  the worker registry to Saturn lock-free tables, serialized worker creation
+  with mutex protection, added retries under resource pressure, ensured worker
+  launch/initialization runs on the Event_loop main switch, and exposed clean
+  shutdown for tests. Improves reliability under domain contention and low
+  resources. (MR :gl:`!19990`) (MR :gl:`!20258`) (MR :gl:`!20261`)
+
+- The Seoul protocol (023) has been frozen. The ``octez-baker-PtSeouLo`` and
+  ``octez-accuser-PtSeouLo`` executables have been removed. The ``--network
+  seoulnet`` alias has also been removed.
+
+- Fixed Prometheus metrics output to include spaces after ``#`` in ``# HELP``
+  and ``# TYPE`` comment lines, as required by the text format.
+  this restores compatibility with scrapers. (MR :gl:`!20469`)
+
+Node
+----
+
+- For protocol Seoul and later, The
+  ``helpers/scripts/normalize_stack`` and
+  ``helpers/scripts/normalize_data`` Michelson RPCs now accept
+  ill-typed inputs. To test if some Michelson value is well-typed or
+  not, the ``helpers/scripts/typecheck_data`` Michelson RPC can still
+  be used. (MR :gl:`!20297`)
+
+- Fixed the external validator process being unnecessarily restarted when a
+  bootstrap pipeline is canceled (e.g. due to peer disconnection). Also improved
+  canceled error matching to handle all forms of ``Lwt.Canceled`` errors,
+  including serialized forms from IPC round-trips. (MR :gl:`!20903`)
+
+- Fixed node shutdown ordering so the node shuts down before RPC servers,
+  avoiding EPIPE errors and slow shutdown when many external RPC processes are
+  running. (MR :gl:`!20476`)
+
+- Disabled backward compatibility of v8 snapshot import (MR :gl:`!19542`)
+
+Client
+------
+
+- ``octez-client`` now fetches ``minimal_nanotez_per_byte`` from the node's
+  mempool filter RPC (``GET /chains/<chain>/mempool/filter``) when estimating
+  fees for manager operations, instead of always using the hardcoded default
+  (1000 nanotez/byte). User-provided ``--minimal-nanotez-per-byte`` values
+  still take priority over the RPC value. (MR :gl:`!21028`)
+
+- ``octez-client`` now fetches ``minimal_nanotez_per_gas_unit`` from the node's
+  mempool filter RPC (``GET /chains/<chain>/mempool/filter``) when estimating
+  fees for manager operations, instead of always using the hardcoded default
+  (100 nanotez/gas unit). User-provided ``--minimal-nanotez-per-gas-unit``
+  values still take priority over the RPC value. (MR :gl:`!21155`)
+
+Signer
+------
+
+- Added ``create bls proof for`` command to generate BLS proofs of possession
+  directly on the signer, without requiring the client. (MR :gl:`!20961`)
+
+Baker
+-----
+
+- **Breaking change**: Removed the optional baker argument
+  ``--adaptive-issuance-vote <vote>``, as well as the
+  ``adaptive_issuance_vote`` field of the per-block-vote configuration
+  file. Both had been deprecated in Octez v24.0~rc1. This per-block
+  vote was meant to decide the activation of the Adaptive Issuance
+  feature, and has had no effects since the Paris protocol has been
+  voted in.
+
+Packaging
+---------
+
+- **Breaking change**: Debian/Ubuntu packages now install services as disabled
+  by default. Users must explicitly enable services with
+  ``systemctl enable octez-node`` (and similar for other services) before
+  starting them. This prevents accidental service starts during package
+  installation or upgrades. (MR :gl:`!19996`)
+
+- **Breaking change**: Services (octez-node, octez-baker, octez-dal-node) are
+  now gracefully stopped during package upgrade and NOT automatically restarted.
+  Users must manually restart services after upgrade with
+  ``systemctl start octez-node`` (and similar). (MR :gl:`!19996`)
+
+Smart Rollup node
+-----------------
+
+- Fixed ``l1_monitor_finalized`` being ignored when set in the configuration
+  file, and fixed the ``/global/monitor_finalized_blocks`` streaming RPC not
+  working when ``--l1-monitor-finalized`` was used. (MRs :gl:`!20239`,
+  :gl:`!20256`)
+
+- Fixed inbox divergence when DAL attestation lags produce published levels
+  before the rollup's genesis level. Errors fetching DAL attested slots messages
+  are now propagated instead of silently returning an empty list. (MR
+  :gl:`!21293`)
+
+- Delayed the start of a refutation game by one commitment period (approximately
+  15 minutes) to prevent some edge cases in dispute resolution. (MR
+  :gl:`!20674`)
+
+- Added ``max_batch_length`` configuration option in the injector
+  settings to limit the maximum number of operations included in a
+  single L1 batch. This allows operators to control batch length
+  independently of the operation size limit, which can help avoid gas
+  quota exceeded errors when multiple operations of the same type
+  would consume too much gas when batched together. Configure via
+  ``injector.max_batch_length`` in the rollup node configuration file.
+  (MR :gl:`!20670`)
+
+- Removed protocol plugin for Nairobi (17). This still allows to replay Etherlink
+  mainnet from genesis but not Etherlink testnet. (MR :gl:`!20301`)
+
+- Fixed the status of traces for our workers' handlers remaining unset. (MR
+  :gl:`!20379`)
+
+- The rollup node only monitors finalized L1 heads when used on a RISC-V
+  rollup. (MR :gl:`!20448`)
+
+- When the fast WASM execution engine (Wasmer) fails, the node now exits by
+  default instead of falling back to the slow OCaml interpreter. Use
+  ``--slow-vm-fallback`` to opt in to the previous behavior. (MR :gl:`!21069`)
+
+- Fixed Wasmer host function errors (e.g. during ``reveal_preimage``) being lost
+  across the OCaml-Wasmer boundary. Exceptions are now passed through a
+  side-channel instead of Wasmer traps, which also fixes crashes (SIGILL) on
+  macOS ARM64 caused by unreliable Cranelift panic unwinding. (MRs
+  :gl:`!21082`, :gl:`!21125`)
+
+- Store the PVM state hash and status during block evaluation and serve RPCs
+  directly from the store, avoiding expensive context checkouts. This includes
+  a migration of the SQL database. (MR :gl:`!21016`)
+
+- Added a ``--level`` option to snapshot export and import commands. For export,
+  it controls the last level included in the snapshot (defaults to
+  ``finalized``). For import, it allows importing a snapshot at an earlier level
+  than provided by the snapshot. This fixes snapshot imports failing when the L2
+  head in the snapshot is on a branch that was reorganized on L1. (MR
+  :gl:`!21201`)
+
+- Fixed an expensive and unnecessary reorg computation when the rollup node
+  connects to an L1 node that is behind on the same chain. Previously this could
+  cause the daemon to catch up very slowly. (MR :gl:`!21323`)
+
+- Refactored PVM state handling to use mutable state, avoiding redundant copies
+  of the PVM state during block evaluation. This is particularly beneficial for
+  RISC-V rollups where the PVM state is large. (MRs :gl:`!20158`, :gl:`!20186`,
+  :gl:`!20214`, :gl:`!20403`, :gl:`!20409`, :gl:`!20465`, :gl:`!21183`)
+
+- Added ``--commit-on`` option to control how frequently the rollup node commits
+  PVM context to disk, reducing I/O overhead for PVMs with expensive
+  serialization such as RISC-V. (MR :gl:`!19902`)
+
+- Fixed DAL-related refutation games: handle invalid page IDs with a dedicated
+  proof variant, support changing DAL attestation lag across protocol migrations,
+  hardened page import when published levels are far in the future relative
+  to the import level, and use publication-time DAL parameters when importing
+  pages. (MRs :gl:`!19533`, :gl:`!19977`, :gl:`!20051`, :gl:`!20402`)
+
+- Optimized refutation game state caching by sharing immutable state copies
+  across tick caches and avoiding expensive context checkouts between blocks.
+  For RISC-V rollups, cached dissection states are now snapshotted to disk
+  instead of kept in memory, reducing live PVM states from ~131 to ~4 during
+  games. (MRs :gl:`!20996`, :gl:`!21156`)
+
+- The rollup node now reads DAL slot attestation status directly from L1 instead
+  of relying on the DAL node, which only updates after block finalization. (MRs
+  :gl:`!19532`, :gl:`!20326`)
+
+- The rollup node now retries fetching DAL slot status for a few seconds when
+  the status is not yet final, instead of immediately returning an error that
+  could crash the node. (MR :gl:`!19919`)
+
+- Added Prometheus metrics for RISC-V PVM live states (immutable and mutable),
+  exposed at the ``/metrics`` endpoint as
+  ``octez_sc_rollup_node_riscv_states``. (MR :gl:`!20688`)
+
+- Added OpenTelemetry tracing for RPCs between the rollup node and the DAL
+  node. (MR :gl:`!19801`)
+
+- Fixed ``injection_ttl`` configuration being ignored by the injector, which
+  always used the default of 120 L1 blocks. (MR :gl:`!21193`)
+
+DAL node
+--------
+
+- Option ``--slots-backup-uri`` now supports shard archives in addition to slot
+  archives. Use URI fragments #shards or #slots (default if omitted). (MR :gl:`!19293`)
+
+- Dal node now respect the exit code documentation on unhandled errors
+  and exit with code 123. (MR :gl:`!20584`)
+
+- Dal node exit with code 1 on configuration file handling error. (MR :gl:`!20584`)
+
+- **Breaking change** ``octez-dal-node config init`` now fails if a configuration
+  file exists. new command ``octez-dal-node config reset`` should be used instead.
+  (MR :gl:`!20584`)
+
+- **Breaking change** ``octez-dal-node config update`` now fails if no
+  configuration file exists. (MR :gl:`!20584`)
+
+- The DAL node now refuses to publish a slot during the last ``attestation_lag = 8``
+  levels before the migration to protocol U to avoid publishing a slot that cannot
+  be attested under the new protocol. (MR :gl:`!20957`)
+
+- Added a ``--ban-addr`` option to ban an IP address when launching the DAL node.
+  (MR :gl:`!21358`)
+
+Version 24.4
+============
+
+Nodes
+-----
+
+- Fixed a bug that made the node unresponsible. (:gl:`!21643`)
+
+- Fixed a gas-limit computation error in run-code RPC. (:gl:`!21595`)
+
+Version 24.3
+============
+
+Nodes
+-----
+
+- Updated the default secure RPC ACL policy: tightened ``contracts`` and
+  ``delegates`` endpoint patterns to require an explicit identifier, and removed
+  ``merkle_tree``, ``merkle_tree_v2``, ``network/version``, and
+  ``network/versions`` endpoints from the default allowlist.
+
+- P2P hardening improvements: setting message-queue size and count limit
+  (:gl:`!21349`, :gl:`!21363`); per-connection throttling (:gl:`!21436`); faster
+  on connection loss peer shutdown (:gl:`!21335`); updated welcome-worker
+  admission rules (:gl:`!21415`).
+
+- RPC: Updated the default secure RPC ACL policy. (MR :gl:`!21131`)
+
+Version 24.2
+============
+
+Nodes
+-----
+
+- Fixed the external validator process being unnecessarily restarted when a
+  bootstrap pipeline is canceled (e.g. due to peer disconnection). Also improved
+  canceled error matching to handle all forms of ``Lwt.Canceled`` errors,
+  including serialized forms from IPC round-trips. (MR :gl:`!20903`)
+
+- Fixed node shutdown ordering so the node shuts down before RPC servers,
+  avoiding EPIPE errors and slow shutdown when many external RPC processes are
+  running. (MR :gl:`!20476`)
+
+Version 24.1
+============
+
+- Fixed a regression in the snapshot import mechanism, which made the process slower than usual. (MR :gl:`!20501`)
+
+- Fixed a downstream ``opam`` dependency issue that can prevent bakers and operators from building from sources in certain setups. Now the opam cache is the default archive provider when building Octez from sources. (MR :gl:`!20554`)
+
+Version 24.0
+============
+
+No changes compared to octez-v24.0~rc2.
+
+Version 24.0~rc2
+================
+
+Nodes
+-----
+
+- Fixed a memory leak in lib_bees. (MR :gl:`!20261` and :gl:`!20258`)
+
+Smart Rollup node
+-----------------
+
+- Fixed an issue where setting for ``l1_monitor_finalized`` would be ignored from the
+  configuration file. (MR :gl:`!20239`)
+
+- Fixed an issue where finalized blocks would not be notified when using
+  ``--l1-monitor-finalized``. (MR :gl:`!20256`)
+
+Version 24.0~rc1
+================
+
+Node
+----
+
+- **Breaking change** Only the short hash of blocks is output in the following
+  events from the block validator ``validation_or_application_failed``,
+  ``application_failed``, ``application_failure_after_validation``,
+  ``validation_failure``, ``validation_canceled``, ``commit_block_failure``,
+  ``validated_block``, ``validation_and_application_success`` and
+  ``updated_to_checkpoint`` events. From the prevalidator
+  ``request_completed_info`` event. And from the store ``<block_hash> (level:
+  <level>)`` into ``<short_block_hash> (level: <level>)`` events. (MR
+  :gl:`!19720`)
+
+- **Breaking change** ``validator.block.validating_block`` level has been
+  changed from ``Debug`` to ``Info`` (output in the daily-logs) and now shows the long
+  block hash, the level, predecessor, fitness and timestamp of the block. (MR
+  :gl:`!19720`)
+
+- **Breaking change** ``validator.chain.block_info`` level is now ``Debug``
+  (previously ``Info``) and is no longer output in daily-logs. (MR :gl:`!19720`)
+
+- Brassaia context backend is no longer experimental. (MR :gl:`!20079`)
+
+- A new store version (v3.3) is introduced. At node startup, an existing
+  ``data_dir`` containing a store with a supported version (v3.1 and v3.2) is
+  automatically upgraded to v3.3. (MR :gl:`!19967`)
+
+- **Breaking change** Brassaia becomes the default context backend. During the
+  v3.3 store upgrade, any store containing an Irmin context will automatically
+  migrate to Brassaia unless the user explicitly opts out using
+  ``TEZOS_CONTEXT_BACKEND=irmin``. (MR :gl:`!20079`)
+
+Baker
+-----
+
+- **Deprecation** The optional baker argument
+  ``--adaptive-issuance-vote <vote>`` is now deprecated, and will be
+  removed in the next major version of Octez. It was meant to decide
+  the activation of the Adaptive Issuance feature, and has had no
+  effects since the Paris protocol has been voted in. The
+  ``adaptive_issuance_vote`` field of the per-block-vote configuration
+  file is similarly deprecated. (MR :gl:`!19215`)
+
+- **Deprecation** The ``octez-baker-<protocol>`` binaries are
+   deprecated, and will be removed in the next major version of
+   Octez. Please use ``octez-baker`` instead, which automatically
+   handles protocol switches. (MR :gl:`!19641`)
+
+- Fixed an issue when connecting to Octez nodes behind a proxy that can rearrange
+  chunks. (MR :gl:`!20057`)
+
+Accuser
+-------
+
+- **Deprecation** The ``octez-accuser-<protocol>`` binaries are
+   deprecated, and will be removed in the next major version of
+   Octez. Please use ``octez-accuser`` instead, which automatically
+   handles protocol switches. (MR :gl:`!19641`)
+
+Smart Rollup node
+-----------------
+
+- Updated opentelemetry library to 0.12 which should fix the issue where a log
+  protobuf encoding crashes the node when telemetry is activated. (MR
+  :gl:`!19516`)
+
+- Ensured metrics are initialized before starting metrics server. (MR
+  :gl:`!19707`)
+
+- Allow to only monitor finalized L1 blocks with CLI switch
+  ``--l1-monitor-finalized``. This allows a more efficient processing when the
+  consumer is only interested in finalized blocks. (MR :gl:`!19568`)
+
+- New RPC **GET** ``/global/monitor_finalized_blocks`` to stream only finalized
+  blocks (similarly to ``/global/monitor_blocks``). (MR :gl:`!19568`)
+
+- Fixed streaming RPC ``/global/monitor_blocks``
+  (resp. ``/global/monitor_finalized_blocks``) which could return an empty body
+  if they were called before the first (resp. finalized) block is produced. (MR
+  :gl:`!19569`)
+
+- Reduced number of RPCs to L1 node by fetching chain id on startup. (MR
+  :gl:`!19788`)
+
+- The rollup node now properly supports DAL on Shadownet. (MRs :gl:`!19765`,
+  :gl:`!19809`)
+
+- Fixed an issue when connecting to Octez nodes behind a proxy that can rearrange
+  chunks. (MR :gl:`!20057`)
+
+
+DAL node
+--------
+
+- **Breaking change** The ``/levels/<slot_level>/slots/<slot_index>/status``
+  RPC now answers with ``unpublished`` status for unpublished slots instead
+  of a 404 empty response. (MR :gl:`!19613`)
+
+- Added RPC ``GET /profiles/{pkh}/monitor/attestable_slots`` to open a monitoring
+  stream that emits a JSON ``slot_id`` each time a slot becomes attestable for the
+  given public key hash (``pkh``). A slot id is emitted when all shards assigned to
+  that ``pkh`` at the corresponding attestation level are available in the DAL
+  node's store. If traps are detected within the slot, then it should not be attested,
+  so the id is not sent via the stream. (MR :gl:`!19459`)
+
+- The DAL node now starts propagating shards one level after the inclusion of the
+  corresponding published slot header operation (i.e., when the operation is finalized),
+  instead of two levels after, when the block is finalized. (MR :gl:`!19366`)
+
+- **Breaking change** Slots status are not stored in dedicated files on disk
+  anymore, but found in a cache and the skip list. A consequence of this is that
+  the ``/levels/<slot_level>/slots/<slot_index>/status`` will only work with nodes that store the
+  skip list, and therefore not with observer nodes. Also, the RPC will now answer
+  a 500 error if querying a level at which the DAL was not supported instead
+  of a 404 error. (MR :gl:`!19471`)
+
+
+Version 23.3
+============
+
+Baker
+-----
+
+- Improved keep-alive handling during bootstrap. This feature may still exhibit
+  undesirable behavior, but less likely. (MR :gl:`!18717`)
+
+- Baker exits with code 111 if the node becomes unreachable via the
+  ``monitor_operations`` RPC for more than 1m15sec. (MR :gl:`!19559`)
+
+Version 23.2
+============
+
+No changes compared to octez-v23.1
+
+Version 23.1
+============
+
+General
+-------
+
+- Fixed a potential resource leak ensuring that the child process spawned to
+  execute the uname command is properly waited for. This prevents the creation
+  of zombie processes. (MR :gl:`!19122`)
+
+Version 23.0
+============
+
+No changes compared to octez-v23.0~rc2.
+
+Version 23.0~rc2
+================
+
+General
+-------
+
+Node
+----
+
+- Fixed snapshot import backward compatibility (MR :gl:`!18791`)
+
+- **Breaking change** Enforced stricter validation for the JSON configuration
+  file. Previously, the parser would silently ignore any content that appeared
+  after the first valid JSON object. Now, any extraneous data will cause the
+  function to return an error. (MR :gl:`!18745`)
+
+Client
+------
+
+- **Breaking change** Enforced stricter validation for the JSON files
+  manipulated by the client. Previously, the parser would silently ignore any
+  content that appeared after the first valid JSON object. Now, any extraneous
+  data will cause the function to return an error. (MR :gl:`!18745`)
+
+Signer
+------
+
+- **Breaking change** Enforced stricter validation for the JSON files
+  manipulated by the signer. Previously, the parser would silently ignore any
+  content that appeared after the first valid JSON object. Now, any extraneous
+  data will cause the function to return an error. (MR :gl:`!18745`)
+
+Baker
+-----
+
+- **Breaking change** Enforced stricter validation for the JSON files
+  manipulated by the baker. Previously, the parser would silently ignore any
+  content that appeared after the first valid JSON object. Now, any extraneous
+  data will cause the function to return an error. (MR :gl:`!18745`)
+
+Agnostic Baker
+--------------
+
+- **Breaking change** Enforced stricter validation for the JSON files
+  manipulated by the agnostic baker. Previously, the parser would silently
+  ignore any content that appeared after the first valid JSON object. Now, any
+  extraneous data will cause the function to return an error. (MR :gl:`!18745`)
+
+Accuser
+-------
+
+- **Breaking change** Enforced stricter validation for the JSON files
+  manipulated by the accuser. Previously, the parser would silently
+  ignore any content that appeared after the first valid JSON object. Now, any
+  extraneous data will cause the function to return an error. (MR :gl:`!18745`)
+
+Agnostic Accuser
+----------------
+
+- **Breaking change** Enforced stricter validation for the JSON files
+  manipulated by the agnostic accuser. Previously, the parser would silently
+  ignore any content that appeared after the first valid JSON object. Now, any
+  extraneous data will cause the function to return an error. (MR :gl:`!18745`)
+
+Smart Rollup node
+-----------------
+
+- **Breaking change** Enforced stricter validation for the JSON configuration
+  file. Previously, the parser would silently ignore any content that appeared
+  after the first valid JSON object. Now, any extraneous data will cause the
+  function to return an error. (MR :gl:`!18745`)
+
+Data Availability Layer (DAL)
+-----------------------------
+
+DAL node
+~~~~~~~~
+
+- **Breaking change** Enforced stricter validation for the JSON configuration
+  file. Previously, the parser would silently ignore any content that appeared
+  after the first valid JSON object. Now, any extraneous data will cause the
+  function to return an error. (MR :gl:`!18745`)
+
+Version 23.0~rc1
+================
+
+General
+-------
+
+- Removed binaries for Quebec. (MR :gl:`!17983`)
+
+Node
+----
+
+- **Breaking change** modified RPC ``../context/contracts/<pkh>``: the result
+  now contains, when called on an implicit account, a boolean field ``revealed``
+  that tells if the public key of the manager has been revealed.
+
+- Added RPC ``POST /bls/aggregate_public_keys`` to aggregate BLS
+  public keys. (MR :gl:`!17461`)
+
+- Added RPC ``POST /bls/aggregate_signatures`` to aggregate BLS
+  signatures. (MR :gl:`!17461`)
+
+- Added RPC ``POST /bls/check_proof`` to check a BLS proof. (MR
+  :gl:`!17461`)
+
+- Added RPC ``POST /bls/threshold_signatures`` to recover a BLS
+  threshold signature. (MR :gl:`!17467`)
+
+- Fixed a race condition in the external process restart mechanism which would
+  prevent the validator from properly restarting. (MR :gl:`!15322`)
+
+- Small mempool optimization: conflicts between two valid consensus
+  operations are now always resolved in favor of the preexisting
+  operation, regardless of contents. (MR :gl:`!18208`)
+
+- **Breaking change** Bumped the snapshot version from 8 to 9, to support
+  early baking, just after importing a snapshot. Snapshots of version 8 exported
+  with previous versions of Octez (v22) can still be imported. Snapshots of
+  version 9 are not retro-compatible with previous Octez versions (MR
+  :gl:`!18387`).
+
+- __Experimental__ Add support for UPnP manual port mapping.
+  (MR :gl:`!18135`)
+
+Client
+------
+
+- Update signer messages encoding. Signing message for BLS (Tz4) addresses now
+  contain signing version. (MR :gl:`!16986`)
+
+- Add a new command ``list known remote keys <remote_signer_addr>`` that lists
+  the public key hashes known to the remote signer. The signer returns them only
+  if it is launched with ``--allow-list-known-keys`` argument. (MR :gl:`!17403`)
+
+- Add a new command ``aggregate bls public keys`` to aggregate BLS
+  public keys. (MR :gl:`!17461`)
+
+- Add a new command ``aggregate bls signatures`` to aggregate BLS
+  signatures. (MR :gl:`!17461`)
+
+- Add a new command ``create bls proof`` to create a BLS proof. (MR
+  :gl:`!17461`)
+
+- Add a new command ``check bls proof`` to check a BLS proof. (MR
+  :gl:`!17461`)
+
+- It is possible to specify a different public key for ``create bls proof``
+  and ``check bls proof``, using the command line option ``--override-public-key``.
+  (MR :gl:`!18110`)
+
+- Add a new command ``share bls secret key <sk> between <n> shares
+  with threshold <m>`` to share a BLS secret key between ``n``
+  participants so that any ``m`` participants can collaboratively sign
+  messages, while fewer than ``m`` participants cannot produce a valid
+  signature. Note that this command requires a secret key: make sure
+  that you are in a secure environment before using it. Alternatively,
+  one can implement their own version of secret sharing. (MR
+  :gl:`!17467`)
+
+- Add a new command ``threshold bls signatures`` to recover a BLS
+  threshold signature. (MR :gl:`!17467`)
+
+- Added ``--consensus-key`` and ``--companion-key`` arguments setting
+  companion or consensus key at the same time as registering a given
+  key as a delegate. (MRs :gl:`!17960`, :gl:`!18317`)
+
+- Added ``--consensus-key-pop`` and ``--companion-key-pop`` arguments when updating
+  bls consensus or companion key. These argument allow to provide a pre-computed
+  proof of possession for the bls key instead of asking the client to compute
+  it. (MR :gl:`!18084`)
+
+- Added ``octez-client set companion key for <delegate> to <bls_key>``, setting a
+  companion key for the given delegate. (MR :gl:`!17320`)
+
+- Added ``--initial-stake`` argument to stake at the same time as
+  registering a given key as a delegate or setting a delegate for a
+  contract. (MR :gl:`!18282`)
+
+- Secret key URI is no longer printed if an alias conflict occurs during key
+  generation or import. (MR :gl:`!18509`)
+
+- Add a new command ``update delegate parameters`` that allows to change either
+  one or both of the staking parameters of a delegate. (MR :gl:`!17472`)
+
+- Added ``--unencrypted`` argument for ``gen keys`` command. By default keys are
+  encrypted on mainnet, this argument allow users to explicitly create
+  unencrypted keys. (MR :gl:`!18601`)
+
+Signer
+------
+
+- Add a ``--allow-list-known-keys`` argument at signer launch to allow client to
+  ask for the signer list of known public key hashes. The signer returns ``List
+  known keys request not allowed.`` otherwise. (MR :gl:`!17403`)
+
+- Add a ``--allow-to-prove-possession`` argument at signer launch to allow
+  client to request proof of possession of known public key hashes. The signer
+  returns ``Request to prove possession is not allowed`` otherwise.
+  (MR :gl:`!18137`)
+
+- Enables daily logs by default, located under
+  ``<base-dir>/logs/octez-signer/``. (MR :gl:`!18429`)
+
+- Rename the preendorsement_high_watermarks and endorsement_high_watermarks
+  files in preattestation_high_watermarks attestation_high_watermarks.
+  (MR :gl:`!18481`)
+
+Baker
+-----
+
+- Enables ``advertises_level`` in baker logs by default, logs are prefixed by
+  the logging level. It can be disabled by setting ``"log" : { advertises_level
+  : false }`` in the client configuration. (MR :gl:`!17737`)
+
+- Deprecates the adaptive issuance vote from the CLI (and vote file
+  configuration), the feature has been enabled and no longer requires a vote.
+  Please remove it from your CLI and configuration, as the support will be
+  removed in the next release. (MR :gl:`!18138`)
+
+- Updates many baker events to better display information related to
+  consensus operations, delegates, and keys. Note that these changes
+  may break automatic event parsing. (MR :gl:`!18330`)
+
+Agnostic Baker
+--------------
+
+- Deprecates the adaptive issuance vote from the CLI (and vote file
+  configuration), the feature has been enabled and no longer requires a vote.
+  Please remove it from your CLI and configuration, as the support will be
+  removed in the next release. (MR :gl:`!18138`)
+
+- Add support for ``run dal` and all other commands of the ``octez-dal-node`` to
+  the baker. (MR :gl:`!18050`)
+
+- Add ``run accuser`` command to replicate the behaviour of the accuser.
+  (MR :gl:`!17767`)
+
+- Enables ``advertises_level`` in baker logs by default, logs are prefixed by
+  the logging level. It can be disabled by setting ``"log" : { advertises_level
+  : false }`` in the client configuration. (MR :gl:`!17737`)
+
+- Fix the support of ``--keep-alive`` for the agnostic baker. (MR :gl:`!17685`)
+
+- The agnostic baker binary becomes ``octez-baker``. (MR :gl:`!17491`, :gl:`!17747`)
+
+- The agnostic baker now has the same CLI as the classical baker, getting rid of the
+  ``--`` separator. (MR :gl:`!17348`)
+
+- The agnostic baker has a unified CLI such that incompatibilities between baking arguments
+  for consecutive protocols can occur much harder, and will probably generate compilation
+  errors. (MR :gl:`!16968`)
+
+- The agnostic baker no longer requires the protocol specific baking binaries, instead
+  it directly spawns baking processes using a protocol plugin to retrieve the necessary
+  functionalities. (MR :gl:`!16583`)
+
+- Release agnostic baker binary as experimental. (MR :gl:`!16318`)
+
+- Use of a generic watchdog. (MR :gl:`!15508`)
+
+- Change the binary name to ``octez-experimental-agnostic-baker``. (MR :gl:`!16434`)
+
+- Added a mechanism for the agnostic baker to switch on new protocol. (MR :gl:`!15305`)
+
+- Introduced a dummy agnostic baker. (MR :gl:`!15029`)
+
+Overview: The Agnostic Baker is a protocol-independent binary that dynamically determines
+and executes the appropriate baking binary based on the active protocol. It continuously
+monitors the blockchain state and automatically transitions to the correct binary whenever
+a new protocol is detected, such as during migrations or at startup.
+
+Please note that this feature is in an EXPERIMENTAL phase, as clearly suggested by its name.
+Therefore, it should NOT be used on ``mainnet``. For further clarifications, you can consult
+the README from ``src/bin_agnostic_baker``.
+
+Accuser
+-------
+
+- Consensus operations with different slots are no longer denunced, as this no
+  longer considered a punishable misbehaviour (MR :gl:`!18049`).
+
+- Can now denounce double consensus operations where one or both
+  involved operations are aggregates. (MR :gl:`!18091`)
+
+- Enables daily logs by default, located under
+  ``<base-dir>/logs/octez-accuser-<proto>/``. (MR :gl:`!18429`)
+
+- Updated many baker events to better display information related to
+  consensus operations, delegates, and keys. Note that these changes
+  may break automatic event parsing. (MR :gl:`!18330`)
+
+Agnostic Accuser
+----------------
+
+- Add ``octez-accuser`` agnostic accuser binary. This behaves in a similar way
+  to the agnostic baker binary, automatically switching the underlying accuser
+  process at protocol migration. (MR :gl:`!17738`)
+
+- Enables daily logs by default, located under
+  ``<base-dir>/logs/octez-accuser/``. (MR :gl:`!18429`)
+
+Protocol Compiler And Environment
+---------------------------------
+
+- Environment V15 uses signature V2. This change impacts the way BLS signatures
+  are handled. In previous environments that used signature V1, the BLS
+  signatures were expected to be produced with the ``Augmented`` cryptographic
+  scheme. Starting from V15, they are expected to be produced with the ``Proof
+  of possession`` cryptographic scheme. (MR :gl:`!17036`)
+
+Smart Rollup node
+-----------------
+
+- Added query parameter ``outbox_level`` for RPCs
+  ``/local/outbox/pending/executable`` and
+  ``/local/outbox/pending/unexecutable``. (MR :gl:`!16831`)
+
+- Added a new RPC ``/local/outbox/pending`` to fetch all known outbox messages
+  with their status. (MR :gl:`!16831`)
+
+- Added a CLI argument ``--config-file`` to allow specifying a configuration file
+  outside the data directory. (MR :gl:`!17225`)
+
+- Allowed to provide a remote URL for downloading snapshots in commands ``snapshot
+  info`` and ``snapshot import``. (MRs :gl:`!17407`, :gl:`!17420`, :gl:`!17477`)
+
+- Display logging levels in logs by default. (MR :gl:`!17479`)
+
+- Allowed to import snapshots from standard input with ``-``. (MR :gl:`!17463`)
+
+- Retired old store implementation. The rollup node cannot read stores produced
+  by versions < v21.0 anymore. (MR :gl:`!17933`)
+
+- Aggregate performance metrics for all child processes (including Irmin
+  GC). (MR :gl:`!17973`)
+
+- Added new commands ``replay block`` and ``replay blocks`` to replay one or
+  multiple L1 blocks. The results are compared with what the rollup node has
+  stored on disk. (MR :gl:`!18160`)
+
+- Produce Opentelemetry traces with ``--profiling``, configurable with a field
+  ``"opentelemetry"`` in the configuration. (MRs :gl:`!18274`, :gl:`!18290`,
+  :gl:`!18331`, :gl:`!18344`, :gl:`!18368`, :gl:`!18433`, :gl:`!18434`,
+  :gl:`!18441`, :gl:`!18466`)
+
+- The rollup node now identifies Etherlink rollups (the rollup can also be
+  forced to be identified as Etherlink with the CLI switch ``--etherlink``) and
+  emit events for processed Etherlink blocks in the logs and in the traces. (MR
+  :gl:`!18466`)
+
+- The RPCs ``/global/block/{block_id}/dal/slot_headers`` and
+  ``/global/block/{block_id}/dal/processed_slots`` have been deleted, since they
+  are now obsolete, the DAL-related indexing logic having been moved out of the
+  rollup-node (MR :gl:`!17466`).
+
+Smart Rollup WASM Debugger
+--------------------------
+
+- Moved from Released to Unreleased and removed the deb/rpm packages
+
+Data Availability Layer (DAL)
+-----------------------------
+
+- Added an option ``--ignore-l1-config-peers`` to run nodes in isolation, without
+  trying to connect to peers provided via L1 config (MR :gl:`!17632`)
+
+DAL node
+~~~~~~~~
+
+- **Breaking change** The CLI experimental flag ``--sqlite3-backend``
+  and its corresponding configuration file field have been removed
+  since SQLite is now the default storage backend for storing skip
+  list cells of DAL slots. (MR :gl:`!17424`)
+
+- **Feature** The DAL node stores now a peers.json file in its
+  directory when it is shutdown with SIGINT. This file is read if it
+  exists when starting the DAL node to restore previous known
+  connections quickly.
+
+- **Bugfix** When shutting down the DAL node using SIGINT, it does a
+  best effort to shutdown properly its running P2P connections
+
+- The DAL node now supports a ``config update`` command to update an
+  existing configuration. It takes the same arguments as for the other
+  commands. (MR :gl:`!15759`)
+
+- **Breaking change** The configuration value ``metrics-addr`` is now an option.
+  It should not break unless the value differs from the default value
+  (``0.0.0.0:11733``). The new default value is ``None``, so no metrics are
+  exported by default.
+
+- **Breaking change** For the RPCs ``/p2p/gossipsub/topics/peers``,
+  ``/p2p/gossipsub/pkhs/peers``, and ``/p2p/gossipsub/slot_indexes/peers``, the
+  flag ``subscribed`` is removed and a new flag ``all`` is introduced. The
+  default behavior is now to list peers only for topics the current peer is
+  subscribed to, while the ``all`` flag can be used to recover the previous
+  behavior. (MR :gl:`!14518`)
+
+- Fixed file descriptor leak in resto affecting connections to the L1 node.
+  (MR :gl:`!15322`)
+
+- **Feature** The DAL node downloads trusted setup files when launched in observer
+   or operator mode. (MR :gl:`!16102`)
+
+- Added a new RPC ``/last_processed_level`` to retrieve the last (finalized) L1
+  level processed by a DAL node (MR :gl:`!16420`)
+
+- A warning is now emitted when registering a public key hash (as an attester
+  profile) that does not correspond to that of a delegate. (MR :gl:`!16336`)
+
+- Set the message validation function at node startup, fixing
+  https://gitlab.com/tezos/tezos/-/issues/7629. (MR :gl:`!15830`)
+
+- A warning has been introduced in case it is observed that the DAL node lags
+  behind the L1 node. (MR :gl:`!15756`)
+
+- **Change** The DAL node store version has been upgraded from 1 to 2.
+  The DAL node store will automatically upgrade without requiring any
+  user action. For users running the DAL node with the
+  ``--operator-profiles`` flag enabled, the node now uses SQLite
+  specifically for managing skip list cells (MR :gl:`!15780`),
+  preventing inode exhaustion. All other stores remain unchanged.
+
+- Added a new RPC ``GET /protocol_parameters/`` that retrieve the protocol
+  parameters that the DAL node uses for a given level, which by default is the
+  last finalized level the node is aware of. (MR :gl:`!16704`)
+
+- The configuration file was updated to version 2. Unused field ``neighbors``
+  has been deleted. Field ``network_name`` is also deleted since it is now inferred
+  from the layer 1 node (MR :gl:`!17284`). Profile encoding has been modified
+  (MR :gl:`!17200`).
+
+- RPC ``GET /p2p/gossipsub/mesh`` now accepts 2 optional flags ``slot_index`` and
+  ``delegate`` which restrict the output mesh to topics related to specified slot index
+  or delegate pkh (MR :gl:`!17770`).
+
+- The DAL node now supports retrieving missing slot content from backup URIs
+  specified via the ``--slots-backup-uri`` option. Current supported URI schemes
+  include http(s):// and file://, allowing both remote and local fallback
+  sources. An optional ``--trust-slots-backup-uris`` flag can be used to skip
+  cryptographic verification of retrieved data. This is especially useful when
+  replaying history or debugging. (MRs :gl:`!18059`, :gl:`!18074`, :gl:`!18124`
+  and :gl:`!18181`).
+
+- A command line option ``--config-file`` has been added, allowing to have a
+  configuration file out of the data directory. (MR :gl:`!18464`)
+
+- Added two new RPCs to track the synchronization status between the DAL node and the L1 node:
+
+  + ``GET /synchronized``: returns the current synchronization status.
+
+  + ``GET /monitor/synchronized``: provides a streamed view of the status as it changes
+    over time.
+
+  These endpoints help operators monitor whether the DAL node is catching up, lagging,
+  or fully synchronized with the L1 chain. (MR :gl:`!18686`)
+
+Grafazos
+--------
+
+- Fixed netdata metrics used for hardware monitoring, and add more flexibility
+  over the mountpoint allowing to observe only / and /opt mountpoints if needed . Also,
+  fixed the network IOs panel presentation, avoiding a grafana panel transformation.
+
+- Added a filter on the selected ``node_instance`` variable over all metrics (was
+  previously showing data from all sources on some panels even when a specific source had
+  been selected in the grafana dashboard's variable)
+
+
+Miscellaneous
+-------------
+
+- Reverted Renamed ``Bls`` file from the crypto library in ``Bls_aug.ml``. (MR :gl:`!17051`).
+
+- Logs: Fixed lines with milliseconds part as ``0000`` so that all timestamps have
+  the same width. (MR :gl:`!18040`)
+
+Version 22.1
+============
+
+Smart Rollup node
+-----------------
+
+- Fixed an issue with the execution of outbox messages (e.g. withdrawals on
+  Etherlink) during reorgs, when messages are not in the new chain. (MR :gl:`!17961`)
+
+Version 22.0
+============
+
+Node
+----
+
+- Added RPC ``GET
+  /chains/<chain>/delegators_contribution/<cycle>/<baker_pkh>``, which
+  provides a breakdown of all the contributions to the delegation
+  portion of the baking power of the baker for the given cycle. (MR
+  :gl:`!17406`)
+
+DAL node
+--------
+
+- **Deprecation** The CLI experimental flag ``--sqlite3-backend`` and its
+  corresponding configuration file field have been deprecated since
+  SQLite is now the default storage backend for storing skip list
+  cells for DAL slots.
+
+- Aliases have been added to the command line. ``--operator-profiles`` is now
+  equivalent to ``--operator`` and ``-E`` is equivalent to ``--endpoint``.
+  (MR :gl:`!17496`)
+
+Version 22.0~rc3
+================
+
+- Use the correct constant to determine executable or lost outbox messages for the
+  ``/local/outbox/pending`` and ``/local/outbox/pending/executable`` RPC endpoints. (MR
+  :gl:`!17279`)
+
+Version 22.0~rc2
+================
+
+DAL node
+--------
+
+- **Feature** The node will detect stalled connections more quickly (on
+  Linux-based distributions). This behavior can be controlled via the
+  environment variable ``OCTEZ_P2P_TCP_USER_TIMEOUT``. Its default
+  value is ``15000``, meaning that it will now take ``15s`` to detect
+  a stalled connection (compared to up to ``15`` minutes by default on
+  Linux). Users can opt out by setting the value to ``0``. (MR
+  :gl:`!16907`)
+
+- Added a new RPC ``GET /published_levels/<level>/known_traps`` that returns the
+  trap shards that the DAL node knows. (MR :gl:`!16870`)
+
+Version 22.0~rc1
+================
+
+General
+-------
+
+- Changed the compiler version to 5.2.1 and added a manual job to compile with
+  ocaml 4.14.2. (MR :gl:`!15404`)
+
+- Logging output on TTYs now adapt to the terminal width. (MR :gl:`!12348`)
+
+- Logging output can now advertise the level associated to each events, by
+  enabling the ``advertise-levels`` option in the file-descriptor sink URI. (MR :gl:`!16190`)
+
+- Removed binaries for ParisC. (MR :gl:`!16427`)
+
+Node
+----
+
+- Changed the default ``history-mode`` from ``Full`` to ``Rolling``. (MR :gl:`!15942`)
+
+- Introduced a specific exit code for the ``octez-node upgrade storage
+  --status`` command. It now returns the exit code 1 when an upgrade
+  is available. 0 is returned when the storage is up to date. (MR :gl:`!15152`)
+
+- New RPCs ``/chain/{chain_id}/protocols`` (and
+  ``/chain/{chain_id}/protocols/{protocol_hash}``) to retrieve protocol
+  activation levels of the chain. (MR :gl:`!15447`)
+
+Client
+------
+
+- Registered ``operation.bls_mode_unsigned`` encoding. (MR :gl:`!16655`)
+
+- Allow tz4 (BLS) addresses to be registered as delegate and or as consensus
+  keys. (MR :gl:`!15302`)
+
+ - **Breaking change** Removed read-write commands specific to ParisC. (MR :gl:`!16431`)
+
+Baker
+-----
+
+- The baker emits a warning when it is started with ``--dal-node``, but the DAL
+  node has no registered attester, that is, it was not started with
+  ``--attester-profiles <manager_key>``. (MR :gl:`!16333`)
+
+- **Breaking change** For ``proto_alpha``, providing the endpoint of a running
+  DAL node is required for the baker to be launched, unless opted out with the
+  newly introduced ``--without-dal`` option. (MR :gl:`!16049`)
+
+- **Breaking change** The baker daemon ``--dal-node-timeout-percentage``
+  argument has been removed. (MR :gl:`!15554`)
+
+Smart Rollup node
+-----------------
+
+- In the bailout mode there was a bug where the wrong key was used
+  when recovering the bond. The node uses the ``cementing`` key and not
+  the ``operating`` key. (MR :gl:`!16016`).
+
+- Extended the ``DELETE /admin/injector/queues`` RPC endpoint with new query to
+  clear injector queues based on priority order. The RPC can takes two
+  optional arguments:
+
+  + ``order_below``: an integer that filters out all operations with
+    order strictly inferior to it.
+
+  + ``drop_no_order``: a boolean that if true remove all operations
+    that has no order specified. ``false`` by default.
+
+  When ``tag`` is specified only operation of that type will be
+  considered, else all operations are considered.(MR :gl:`!15929`)
+
+- Added an RPC ``DELETE /admin/batcher/queue`` endpoint, which can take two optional
+  arguments:
+
+  + ``order_below``: an integer that filters all messages with order
+    inferior to it.
+
+  + ``drop_no_order``: a boolean that if true remove all messages that
+    has no order specified. ``false` by default. If no ``order_below``
+    is specified it completely clear the queue.
+
+  (MR :gl:`!15929`)
+
+- Improved error messages for RPC
+  ``/global/block/<block_id>/helpers/proofs/outbox/<outbox_level>/messages?index=<message_index>``. (MR :gl:`!15507`)
+
+- Fixed potential issue with store with SQLite < 3.35. (MR :gl:`!15631`)
+
+- Improved error messages for RPC
+  ``/global/block/<block_id>/helpers/proofs/outbox/<outbox_level>/messages?index=<message_index>``. (MR :gl:`!15507`)
+
+- Fix potential issue with store with SQLite < 3.35. (MR :gl:`!15631`)
+
+- Addeed a new CLI switch ``--unsafe-disable-wasm-kernel-checks`` which allows to bypass
+  invalid kernel checks in the WASM VM, for use by jstz. (MR :gl:`!15910`)
+
+- Support ``remote`` signer scheme and check remote signer available on
+  startup. (MR :gl:`!16651`)
+
+Agnostic Baker
+--------------
+
+- The agnostic baker binary becomes ``octez-baker``. (MR :gl:`!17491`, :gl:`!17747`)
+
+- Released agnostic baker binary as experimental. (MR :gl:`!16318`)
+
+- Use of a generic watchdog. (MR :gl:`!15508`)
+
+- Changed the binary name to ``octez-experimental-agnostic-baker``. (MR :gl:`!16434`)
+
+- Added a mechanism for the agnostic baker to switch on new protocol. (MR :gl:`!15305`)
+
+- Introduced a dummy agnostic baker. (MR :gl:`!15029`)
+
+Overview: The Agnostic Baker is a protocol-independent binary that dynamically determines
+and executes the appropriate baking binary based on the active protocol. It continuously
+monitors the blockchain state and automatically transitions to the correct binary whenever
+a new protocol is detected, such as during migrations or at startup.
+
+
+Protocol Compiler And Environment
+---------------------------------
+
+- Added a new version of the protocol environment (V14). (MR :gl:`!15345`)
+
+- Added a new version of the protocol environment (V15). (MR :gl:`!16599`)
+
+Docker Images
+-------------
+
+- Fixed the Docker ``octez-snapshot-import`` command to properly pass
+  arguments to the snapshot import process. (MR :gl:`!11259`)
+
+Data Availability Committee (DAC)
+---------------------------------
+
+- **Breaking_change** DAC node and client have been removed to
+  simplify the codebase. (MR :gl:`!14862`)
+
+Data Availability Layer (DAL)
+-----------------------------
+
+DAL node
+~~~~~~~~
+
+- **Breaking_change** The configuration value ``metrics-addr`` is now an option.
+  It should not break unless the value differs from the default value
+  (``0.0.0.0:11733``). The new default value is ``None``, so no metrics are
+  exported by default.
+
+- **Breaking change** For the RPCs ``/p2p/gossipsub/topics/peers``,
+  ``/p2p/gossipsub/pkhs/peers``, and ``/p2p/gossipsub/slot_indexes/peers``, the
+  flag ``subscribed`` is removed and a new flag ``all`` is introduced. The
+  default behavior is now to list peers only for topics the current peer is
+  subscribed to, while the ``all`` flag can be used to recover the previous
+  behavior. (MR :gl:`!14518`)
+
+- **Bugfix** When shutting down the DAL node using SIGINT, it does a
+  best effort to shutdown properly its running P2P connections
+
+- **Feature** The DAL node stores now a peers.json file in its
+  directory when it is shutdown with SIGINT. This file is read if it
+  exists when starting the DAL node to restore previous known
+  connections quickly.
+
+- **Change** The DAL node store version has been upgraded from 1 to 2.
+  The DAL node store will automatically upgrade without requiring any
+  user action. For users running the DAL node with the
+  ``--operator-profiles`` flag enabled, the node now uses SQLite
+  specifically for managing skip list cells (MR :gl:`!15780`),
+  preventing inode exhaustion. All other stores remain unchanged.
+
+- **Feature** The DAL node downloads trusted setup files when launched in observer
+   or operator mode. (MR :gl:`!16102`)
+
+- The DAL node supports a ``config update`` command to update an
+  existing configuration. It takes the same arguments as for the other
+  commands. (MR :gl:`!15759`)
+
+- Fixed file descriptor leak in resto affecting connections to the L1 node.
+  (MR :gl:`!15322`)
+
+- Added a new RPC ``/last_processed_level`` to retrieve the last (finalized) L1
+  level processed by a DAL node. (MR :gl:`!16420`)
+
+- A warning is emitted when registering a public key hash (as an attester
+  profile) that does not correspond to that of a delegate. (MR :gl:`!16336`)
+
+- Set the message validation function at node startup, fixing
+  https://gitlab.com/tezos/tezos/-/issues/7629. (MR :gl:`!15830`)
+
+- A warning has been introduced in case it is observed that the DAL node lags
+  behind the L1 node. (MR :gl:`!15756`)
+
+- Added a new RPC ``GET /protocol_parameters/`` that retrieve the protocol
+  parameters that the DAL node uses for a given level, which by default is the
+  last finalized level the node is aware of. (MR :gl:`!16704`)
+
+Miscellaneous
+-------------
+
+- Renamed ``Bls`` file from the crypto library in ``Bls_aug.ml``. (MR :gl:`!16683`).
+
+Version 21.4
+============
+
+Node
+----
+
+- Fixed the storage maintenance default value in the config file (MR :gl:`!16744`)
+
+- The node will detect stalled connections more quickly (on
+  Linux-based distributions). This behavior can be controlled via the
+  environment variable ``OCTEZ_P2P_TCP_USER_TIMEOUT``. Its default
+  value is ``15000``, meaning that it will now take ``15s`` to detect
+  a stalled connection (compared to up to ``15`` minutes by default on
+  Linux). Users can opt out by setting the value to ``0``. (MR
+  :gl:`!16907`)
+
+DAL node
+--------
+
+- **Bugfix** Fixed the timing of the reconnection to peers attempts. (MR :gl:`!16466`)
+
+- **Feature** A new RPC ``/p2p/gossipsub/reconnection_delays`` which
+  provides for each unreachable point, the time remaining until the
+  next reconnection attempt. (MR :gl:`!16767`)
+
+- **Feature** Added a new RPC ``GET /p2p/gossipsub/mesh/`` that returns the GossipSub mesh
+  (i.e. full data connections per topic) of a peer. (MR :gl:`!16754`)
+
+- **Feature** Added a new RPC ``GET /p2p/gossipsub/fanout/`` that returns the GossipSub
+  fanout of a peer. (MR :gl:`!16764`)
+
+- **Bugfix** Fixed the timing of the reconnection to peers attempts. (MR :gl:`!16466`)
+
+- **Bugfix** From v21.2, the ``SO_KEEP_ALIVE`` socket option was used
+  for incoming connections only. It is now used with both incoming
+  connections and outgoing connections. (MR :gl:`!16820`)
+
+Baker
+-----
+
+- Fixed a long time running baker memory leak. (MR :gl:`!16719`)
+
+Version 21.3
+============
+
+Baker
+-----
+
+- **Deprecation:** For Paris and Quebec protocols, launching a
+  baker daemon without specifying a DAL node endpoint is deprecated.
+  To opt out of this requirement, use the newly introduced
+  ``--without-dal`` option (MR :gl:`!16213`).
+  Using one of the CLI arguments ``--dal-node <uri>`` or ``--without-dal`` will be mandatory
+  The CLI argument ``--dal-node <uri>`` or ``--without-dal`` will be mandatory
+  in the next version of Octez.
+
+Smart Rollup node
+-----------------
+
+- Updated batcher with a new order structure. The RPC
+  ``/local/batcher/injection`` now has a new query argument
+  possibility ``"order": <int>``. The batcher will batch the
+  received chunk with the following priority order: First chunks with
+  ascending order then chunks by order of arrival. (MR :gl:`!15672`)
+
+- Injector now uses a heap structure for its queue which allows
+  to prioritize operations to send on L1. (MR :gl:`!15864`)
+
+- New RPC to retrieve values under a key in the durable storage
+  ``/global/block/<block_id>/durable/wasm_2_0_0/values?key=<key>&offset=<offset>&length=<length>``.
+  (MR :gl:`!15627`)
+
+- Added RPCs ``/global/block/<block_id>/committed_status`` to retrieve commitment
+  and cementation status for a given block (or an estimated timestamp
+  otherwise). (MR :gl:`!15409`)
+
+- Fixed an issue in the background store migration which could make the rollup
+  node send old heads in its stream at the end of the migration.  (MR :gl:`!15739`)
+
+- Fixed an issue in the background store migration which could make the rollup
+  node send old heads in its stream at the end of the migration.  (MR :gl:`!15739`)
+
+Version 21.2
+============
+
+Miscellaneous
+-------------
+
+- Fixed an issue on Ghostnet originated from lowering
+  ``consensus_rights_delay`` from 3 to 2 with the recent activation of the Quebec protocol. This issue does not affect mainnet, where
+  ``consensus_rights_delay`` was already set to 2 by the activation of Paris and will remain
+  unchanged with the activation of Quebec. (MR :gl:`!16219`)
+
+Version 21.1
+============
+
+DAL node
+--------
+
+- Fix a peering issue when the P2P identity changed recently. (MR :gl:`!15977`)
+
+- Do not attempt to connect to a peer we are already connected with. (MR :gl:`!15984`)
+
+- Introduce a timeout preventing too many reconnections to unreachable
+  points. (MR :gl:`!16005`)
+
+- Emit various warnings when the registered attester does not seem to attest
+  correctly, or when the DAL node seems to be lagging. (:gl:`!15306`,
+  :gl:`!15607`, :gl:`!15756`)
+
+- Set the message validation function at node startup, fixing :gl:`#7629`. (MR
+  :gl:`!15830`)
+
+- Retry DNS resolution of bootstrap points every 5 minutes. (MR :gl:`!15858`)
+
+- Keep established connections alive. This applies to the Layer 1 node as
+  well. (MR :gl:`!15914`)
+
+Baker
+-----
+
+- **Breaking change** Removed the baker daemon's
+  ``--dal-node-timeout-percentage`` argument. The DAL node now fetches the
+  slots' attestation status from the DAL node one level in advance. (MR
+  :gl:`!15554`)
+
+- An event at Notice level is now emitted when the delegate is not in the DAL committee,
+  that is, it has no assigned shards at the current level. (:gl:`!15846`)
+
+Version 21.0
+============
+
+General
+-------
+
+- Integrated binaries for Quebec (MR :gl:`!15611`).
+
+Smart Rollup node
+-----------------
+
+- Storage now uses SQLite as a backend instead of the custom indexed-file based
+  store. This change makes the rollup node more robust but entails a migration
+  of the store data. (MRs :gl:`!15053`, :gl:`!15026`, :gl:`!15059`,
+  :gl:`!15073`, :gl:`!15218`, :gl:`!15257`)
+
+- Allow to import snaphosts for older stores by migrating the data on import.
+  (MR :gl:`!15422`)
+
+- Fixed a bug which would make injection of messages in the batcher with the RPC
+  ``/local/batcher/injection`` fail if called too early. (MR :gl:`!15459`)
+
+DAL node
+~~~~~~~~
+
+- **Breaking_change** The configuration value ``metrics-addr`` is now an option.
+  It should not break unless the value differs from the default value
+  (``0.0.0.0:11733``). The new default value is ``None``, so no metrics are
+  exported by default.
+
+- **Breaking change** For the RPCs ``/p2p/gossipsub/topics/peers``,
+  ``/p2p/gossipsub/pkhs/peers``, and ``/p2p/gossipsub/slot_indexes/peers``, the
+  flag ``subscribed`` is removed and a new flag ``all`` is introduced. The
+  default behavior is now to list peers only for topics the current peer is
+  subscribed to, while the ``all`` flag can be used to recover the previous
+  behavior. (MR :gl:`!14518`)
+
+- **Breaking** Changed binary encoding of /config/network/dal. This change is
+  not retro-compatible.  As a result, the v21 DAL node is not compatible with
+  earlier Octez nodes.
+
+Version 21.0~rc3
+================
+
+General
+-------
+
+- Integrated binaries for Qena (MR :gl:`!15123`).
+
+DAL node
+--------
+
+- Fixed a memory leak in the DAL node.
+
+- Deactivate the metrics server by default
+
+- Fix ``--public-addr`` when the specified port was different
+  from the default one. (MR :gl:`!11732`)
+
+Version 21.0~rc1 and 21.0~rc2
+=============================
+
+General
+-------
+
+- Add and **experimental** switch to enable the use of the Brassaia context
+  backend using ``TEZOS_CONTEXT_BACKEND=Brassaia`` environment variable. (MR :gl:`!13054`)
+
+- Removed binaries for Oxford. (MR :gl:`!13795`)
+
+- Removed binaries for ParisB. (MR :gl:`!14026`)
+
+Node
+----
+
+- Added a ``source`` argument to ``GET
+  /chains/<chain>/mempool/pending_operations`` which allows operations
+  to be filtered by source. (MR :gl:`!11278`)
+
+- Added an ``operation_hash`` argument to ``GET
+  /chains/<chain>/mempool/pending_operations`` which allows operations
+  to be filtered by hash. (MR :gl:`!13977`)
+
+- Added a ``source`` argument to ``GET
+  /chains/<chain>/mempool/monitor_operations`` which allows operations
+  to be filtered by source. (MR :gl:`!14284`)
+
+- Added an RPC
+  ``/chains/<chain>/blocks/<block>/context/smart_rollups/smart_rollup/<sr1...>/consumed_outputs/<outbox_level>``
+  that returns the consumed output's indexes for the given outbox
+  level. (MR :gl:`!12776`)
+
+- Restart the block application/peer validation once when encountering a context
+  error to mitigate the error crashing by replaying the application/validation
+  before raising an uncaught failure (MR :gl:`!13398` and :gl:`!13437`)
+
+- Importing a snapshot uses the configuration if it exists. It's
+  useful when an archive snapshot contains some
+  ``unsafe_pvm_patches``. The same ``unsafe_pvm_patches`` must be set
+  in the export and import or the import will fail. (MR :gl:`!13397`)
+
+- When available, add some colors to some event logs: (MR :gl:`!13610`)
+
+   - node_is_ready is now Green
+   - synchronization status changes are now Magenta
+   - store merge start/end events are now Cyan
+   - update to protocol table is now Blue
+
+- Removed Oxford mempool plugin. (MR :gl:`!13798`)
+
+- Removed support for deprecated version ``0`` for RPCs ``GET
+  ../mempool/monitor_operations``, ``POST ../helpers/preapply/operations``,
+  ``GET ../blocks/<block>``, ``GET ../blocks/<blocks>/metadata``. and ``GET
+  ../blocks/<blocks>/operations``. (MR :gl:`!13449`)
+
+- Removed support for deprecated version ``1`` for RPC ``GET
+  ../mempool/pending_operations``. (MR :gl:`!13449`)
+
+- Removed support for deprecated version ``0`` from RPCs ``POST
+  ../helpers/parse/operations``, ``POST ../helpers/scripts/run_operation`` and
+  ``POST ../helpers/scripts/simulate_operation``. (MR :gl:`!13451`)
+
+- **Breaking change** Decommissioned deprecated
+  ``/chains/<chain_id>/checkpoint`` RPC endpoint. Use
+  ``/chains/<chain_id>/levels/{checkpoint, caboose, savepoint}``, or
+  ``/config/history_mode`` instead to obtain the current checkpoint
+  for this chain. (MR :gl:`!13880`)
+
+- **Breaking change** Decommissioned deprecated
+  ``/monitor/commit_hash`` RPC endpoint. Use ``/version`` instead. (MR
+  :gl:`!13879`)
+
+- Removed ParisB mempool plugin. (MR :gl:`!14031`)
+
+- Introduced the external RPC process to reduce the load of the node
+  when answering heavy RPCs. This can be enabled using
+  ``--external-rpc-addr`` (MR :gl:`!9490`)
+
+- Introduced ``--storage-maintenance-delay`` to allow delaying the
+  storage maintenance. It is set to ``auto`` by default, to
+  automatically trigger the maintenance whenever it is the most
+  suitable. (MR :gl:`!14503`)
+
+- **Breaking change** Bumped the node’s storage version to
+  ``3.2``. This new version changes the store’s representation,
+  allowing the storage to scale to the increasing number of blocks per
+  cycles, thus paving the way to reducing even more the block
+  time. Upgrading to this new version must be done manually (using the
+  ``octez-node upgrade storage`` command) and is irreversible. (MR
+  :gl:`!14211`)
+
+- **Breaking change** Bumped the snapshot version from ``7`` to ``8``,
+  in order to support the changes introduced by the ``3.2`` storage
+  version. Snapshots of version ``7`` exported with previous versions
+  of Octez (``v20``) can still be imported. Snapshots of version ``8``
+  are not retro-compatible with previous octez versions (MR
+  :gl:`!14398`).
+
+- Environment variable ``TEZOS_USE_YES_CRYPTO_I_KNOW_WHAT_I_AM_DOING`` can be
+  set to ``yes`` or ``y`` to use yes-crypto in testing. With yes-cryptography
+  activated, signatures are faked and always considered valid. This should be
+  used for testing purposes only and/or with extreme care. This can put your
+  software at risk of being considered faulty/malicious if it fake signs
+  and exploited by attackers if it fake-checks signatures.
+
+- To avoid misusage of ``TEZOS_USE_YES_CRYPTO_I_KNOW_WHAT_I_AM_DOING``
+  environment variable, if it is set to 'yes' or 'y', nodes must explicitly be
+  launched with the ``--allow-yes-crypto`` argument to run.
+
+- **Breaking change** removed the ``octez-proxy-server`` binary. The
+  feature is subsumed by the external RPC server.
+
+Client
+------
+
+- The ``--extra-big-maps`` and ``--other-contracts`` command-line
+  parameters, which are used to specify contextual information in some
+  Michelson-related commands, now allow file names as argument. (MR
+  :gl:`!13311`)
+
+- **Breaking change** Removed read-write commands specific to Oxford. (MR :gl:`!13799`)
+
+- **Breaking changes** client's encoding with legacy attestation name are no
+  longer supported starting from protocol following ParisC. (MR :gl:`!13454`)
+
+- **Breaking change** Removed read-write commands specific to ParisB. (MR :gl:`!14033`)
+
+- **Breaking change** Removed all bls key related command in favor of
+  generics one. All keys that were generated with ``bls gen keys`` can
+  be used with usual command of the octez-client (``list``, ``known``,
+  ``sign``, ...).  (MR :gl:`!14417`)
+
+Baker
+-----
+
+- When available, added some colors to some event logs: (MR :gl:`!13611`)
+
+   - block_injected is now Blue
+   - revealing_nonce is now Cyan
+
+- Branch used in consensus operation is now the grandparent block instead of the
+  parent block. This is done to avoid having consensus operation branched on
+  blocks that are not part of the canonical chain anymore.(MR :gl:`!13619`)
+
+- Removed ``preendorse for`` and ``endorse for`` deprecated commands from baker.
+  (MR :gl:`!14096`)
+
+- By default, the Baker only accepts to communicate with nodes of the same or
+  more recent version. To allow the Baker to communicate with nodes of older
+  version or dev version, use the --node-version-check-bypass or
+  --node-version-allowed option. (MRs :gl:`!14044`, :gl:`!14189`)
+
+- The baker accepts a new argument ``--dal-node-timeout-percentage
+  <percentage>``, which specifies the percentage of the time until the end of
+  round determining the timeout to wait for the DAL node to provide shards'
+  attestation status. The default value is 10%. For instance, the default value
+  means that if there are 5 seconds left till the end of the round, then the
+  baker will wait for ``0.5`` seconds for the DAL attestations' status. (MR
+  :gl:`!14480`)
+
+- **Breaking_change** The baker now accepts a new argument,
+  ``--force_apply_from_round <round>``, which replaces ``--force-apply``.
+  Previously, the baker applied blocks from round 0 if ``--force_apply`` was
+  used, and from round 1 otherwise. The default is now set to 3 and can be
+  adjusted using ``--force_apply_from_round <round>``. (MR :gl:`!14875`)
+
+Accuser
+-------
+
+- When available, add some colors to some event logs: (MR :gl:`!13611`)
+
+   - double_attestation_detected and double_preattestation_detected is now
+     Magenta
+   - double_attestation_denounced and double_preattestation_denounced is now
+     Blue
+
+Protocol Compiler and Environment
+---------------------------------
+
+- Added a new version of the protocol environment (V13). (MR :gl:`!12966`)
+
+- Remove with_legacy_attestation_name encodings from the protocol environment.
+  (MR :gl:`!14046`)
+
+Smart Rollup node
+-----------------
+
+- Updated RPC ``/local/batcher/injection`` with a new query argument
+  possibility. When the rpc contains ``"drop_duplicate": true`` then
+  the batcher will drop the messages that were already injected with a
+  previous RPC call.  If ``"drop_duplicate": false`` then the rollup
+  node defaults to its the previous behavior, where messages are
+  injected again, even if the exact same one was previously
+  injected. By default ``"drop_duplicate": false``. (MR :gl:`!13165`)
+
+- RPC ``/health`` now returns meaningful health related data to asses if the
+  rollup node operates correctly. Old ``/health`` RPC is renamed to ``/ping``.
+  (MR :gl:`!12940`)
+
+- Use a local cache per game for intermediate states of dissections. (MR
+  :gl:`!12899`)
+
+- Introduced the 5th version of the WASM PVM, which defaults to a higher tick
+  limit to delegate refutability to the kernel. (MR :gl:`!12999`)
+
+- Trigger GC every 1000 blocks (instead of 100) by default to reduce CPU
+  consumption. (MR :gl:`!13177`)
+
+- Default history mode is now "full". (MR :gl:`!13178`)
+
+- Allow to import archive snapshots in "full" rollup node. (MR :gl:`!13186`)
+
+- Fixed a bug in how commitments are computed after a protocol migration
+  where the commitment period changes. (MR :gl:`!13588`)
+
+- Ensure penultimate commitment is published on snapshot export as a
+  failsafe. (MR :gl:`!13544`)
+
+- Included commitment publication information in snapshots. (MR :gl:`!13724`)
+
+- Under-approximate publication level for cementation when it is missing. (MR
+  :gl:`!13725`)
+
+- New metrics for the rollup node, including performance ones which can be
+  enabled with the flag ``--enable-performance-metrics`` (requires
+  ``lsof``). (MR :gl:`!12290`)
+
+- Rotate multiple batcher keys in injector so that they are used evenly. (MR
+  :gl:`!14194`)
+
+- RPC ``/global/block/<block_id>?outbox=true`` now returns the outbox messages
+  produced by the PVM for ``block_id`` if the query parameter ``outbox`` is
+  present. (MR :gl:`!14140`)
+
+- Introduced the 6th version of the WASM PVM. (MR :gl:`!14493`)
+
+- New RPC ``GET /admin/cancel_gc`` to cancel any on-going garbage collection in
+  the rollup node. (MR :gl:`!14693`)
+
+- Refined GC for rollup node is now triggered every ~3 days to make it less
+  wasteful on resources. Gc is not run anymore after importing an archive
+  snapshot in a full node. (MR :gl:`!14717`)
+
+- The command ``snapshot export`` tries to cancel ongoing GC, if any. Add
+  ``--rollup-node-endpoint`` to specify the RPC server endpoint, if the address
+  and port of the running node have been changed via command-line arguments. (MR
+  :gl:`!14694`)
+
+- Fix an issue which could introduce a discrepancy between the snapshot header
+  and its content. (MR :gl:`!14777`)
+
+- The command ``generate openapi`` now exports mimified JSON. (MR :gl:`!14908`)
+
+- The rollup node can be configured to execute outbox message automatically with
+  filters. (MRs :gl:`!14498`, :gl:`!14499`)
+
+Data Availability Layer (DAL)
+-----------------------------
+
+DAL node
+~~~~~~~~
+
+- Reduce the number of inodes used by a bootstrap node. This fixes an issue
+  where the number of inodes used was too high with respect to the disk size. (MR :gl:`!12900`)
+
+- The DAL node's store has been updated, and it is not compatible with
+  V20. However, a V20 store is upgraded at startup. (MR :gl:`!13820`)
+
+- The format of the configuration file (and in particular that of profiles) has
+  been updated. However, the node is able to read V20 configuration files. (MR
+  :gl:`!12968`, MR :gl:`!13787`)
+
+- The profile names have changed, in particular '(slot) producers' are now called
+  'operators'. Accordingly, the node has a new argument ``--operator`` that should
+  be used instead of ``--producer-profiles``, which is deprecated and will be
+  removed at the next release, but still supported. (MR :gl:`!14261`, MR
+  :gl:`!14277`)
+
+- The following RPCs have been removed:
+
+  - ``POST /commitments`` (MR :gl:`!12949`), use ``POST /slots`` instead,
+  - ``GET /commitments/<c>/proof`` (MR :gl:`!13080`), also use ``POST /slots`` instead,
+  - ``PATCH /commitments`` (MR :gl:`!12886`),
+  - ``PUT /commitments/<c>/shards`` (MR :gl:`!12949`),
+  - ``GET /levels/<int32>/headers`` (MR :gl:`!13044`),
+
+- The paths or method of the following RPCs have been updated:
+
+  - ``GET /commitments/<c>/slot`` is now ``GET /levels/<l>/slots/<i>/content``  (MR :gl:`!13075`),
+  - ``GET /levels/<l>/slot_indices/<i>/commitment`` is now ``GET /levels/<l>/slots/<i>/commitment``  (MR :gl:`!13046`),
+  - ``POST /pages/<p>/proof`` is now ``GET /levels/<l>/slots/<i>/pages/<p>/proof``  (MR :gl:`!13083`),
+  - ``GET /shard/<c>/<s>`` is now ``GET /levels/<l>/slots/<i>/shards/<s>/content`` (MR :gl:`!13095`),
+  - ``POST /slot`` is now ``POST /slots`` (MR :gl:`!12949`),
+  - ``GET /slot/pages/<c>`` is now ``GET /levels/<l>/slots/<i>/pages`` (MR :gl:`!12880`),
+  - ``GET /commitments/<c>/headers`` is now ``GET /levels/<l>/slots/<i>/status`` (MR :gl:`!13055`),
+  - ``GET /p2p/peers/list`` is now ``GET /p2p/peers`` (MR :gl:`!14521`).
+
+- Two new RPCs have been added:
+
+  - ``GET /p2p/gossipsub/slot_indexes/peers``
+  - ``GET /p2p/gossipsub/pkhs/peers``
+
+  These two new RPCs are similar to ``GET /p2p/gossipsub/topics/`` but instead of
+  grouping peers by topic they group them by slot indices or attester's public key
+  hashes (``pkhs``) appearing in the relevant topics. (MR :gl:`!14504`)
+
+- In the output of ``GET /p2p/peers/info``, the field ``"point"`` has been renamed
+  to ``"peer"``. (MR :gl:`!14521`)
+
+- A new RPC ``GET /health`` has been added to check the status on the node (MR :gl:`!14670`).
+
+- An optional ``slot_index`` numerical query argument has been added to
+  RPC ``POST /slots``. When provided, the DAL node checks that its
+  profile allows to publish data on the given slot index (MR :gl:`!14825`).
+
+Miscellaneous
+-------------
+
+- Now depends on OCaml 4.14.2 (was 4.14.1 before). (MR :gl:`!14536`)
+
+- Current Debian packages are now available via APT repository for Ubuntu
+  (Noble and Jammy) and Debian Bookworm, both for AMD64 and ARM64.
+
+- New set of Debian packages are now available for testing. These new set of
+  packages are built following Debian best practices for packaging, use debconf
+  for configuration and systemd to handle the runtime lifecycle of the daemons.
+  These new packages are going to introduce few breaking changes starting from
+  the next release. Please check our documentation for more details. (MR
+  :gl:`!13273`)
+
+Version 20.3
+============
+
+Node
+----
+
+- Introduced ``--storage-maintenance-delay`` to allow delaying the
+  storage maintenance. It is set to ``auto`` by default, to
+  automatically trigger the maintenance whenever it is the most
+  suitable. (MR :gl:`!14503`)
+
+- **Breaking change** Bumped the node’s storage version to
+  ``3.2``. This new version changes the store’s representation,
+  allowing the storage to scale to the increasing number of blocks per
+  cycles, thus paving the way to reducing even more the block
+  time. Upgrading to this new version must be done manually (using the
+  ``octez-node upgrade storage`` command) and is irreversible. (MR
+  :gl:`!14211`)
+
+- **Breaking change** Bumped the snapshot version from ``7`` to ``8``,
+  in order to support the changes introduced by the ``3.2`` storage
+  version. Snapshots of version ``7`` exported with previous versions
+  of Octez can still be imported. Snapshots of version ``8``
+  are not retro-compatible with previous octez versions (MR
+  :gl:`!14398`).
+
+DAL node
+--------
+
+- Fixed a memory leak in the DAL node.
+
+- Fix ``--public-addr`` when the specified port was different
+  from the default one. (MR :gl:`!11732`)
+
+Version 20.2
+============
+
+Baker
+-----
+
+- Fixes a corner-case implementation bug. In an unlikely but plausible scenario, the baker binary did not behave as expected by the Tenderbake algorithm, and the Tezos protocol. This bugfix reinforces Tenderbake invariants when injecting consensus operations (MR :gl:`!14134`)
+
+Version 20.1
+============
+
+General
+-------
+
+- Added binaries for ParisC. (MR :gl:`!13747`)
+
+Smart Rollup node
+-----------------
+
+- New command ``repair commitments`` which allows the rollup node to recompute
+  correct commitments for a protocol upgrade which did not. (MR :gl:`!13615`)
+
+Version 20.0
+============
+
+Node
+----
+
+- Reduced the maximum allowed timestamp drift to 1 seconds. It is recommended to
+  use NTP to sync the clock of the node. (MR :gl:`!13198`)
+
+- Removed ``ghostnet.kaml.fr`` from ghostnet bootstrap peers. (MR :gl:`!13435`)
+
+Smart Rollup node
+-----------------
+
+- Added support for custom, and user defined, PVM patches for rollup genesis
+  (to be used on private rollups). (MRs :gl:`!12907`, :gl:`!12957`, :gl:`!12983`)
+
+Version 20.0~rc1
+================
+
+General
+-------
+
+- Removed binaries for Nairobi. (MR :gl:`!12043`)
+
+Node
+----
+
+- Bump RPCs ``GET ../mempool/monitor_operations``, ``POST
+  ../helpers/preapply/operations``, ``GET ../blocks/<block>``, ``GET
+  ../blocks/<blocks>/metadata``. and ``GET ../blocks/<blocks>/operations``
+  default version to version ``1``. Version ``0`` can still be used with
+  ``?version=0`` argument. (MR :gl:`!11872`)
+
+- Bump RPC ``GET ../mempool/pending_operations`` default version to version
+  ``2``. Version ``0`` has been removed and version ``1`` can still be used
+  with ``?version=1`` argument. (MR :gl:`!11872`)
+
+- Bump RPCs ``POST ../helpers/parse/operations``, ``POST
+  ../helpers/scripts/run_operation`` and ``POST
+  ../helpers/scripts/simulate_operation`` default version to version ``1``.
+  Version ``0`` can still be used with ``?version=0`` argument. (MR :gl:`!11889`)
+
+- **Breaking change** Removed the deprecated ``endorsing_rights`` RPC,
+  use ``attestation_rights`` instead. (MR :gl:`!11952`)
+
+- Removed the deprecated ``applied`` parameter from RPCs ``GET
+  ../mempool/monitor_operations`` and ``GET
+  ../mempool/pending_operations``. Use ``validated`` instead. (MR
+  :gl:`!12157`)
+
+- Removed the deprecated RPCs ``GET /network/version`` and ``GET
+  /network/versions``. Use ``GET /version`` instead. (MR :gl:`!12289`)
+
+- Removed the deprecated RPCs ``GET /network/greylist/clear``. Use ``DELETE
+  /network/greylist`` instead. (MR :gl:`!12289`)
+
+- Removed the deprecated RPCs ``GET /network/points/<point>/ban``, ``GET
+  /network/points/<point>/unban``, ``GET /network/points/<point>/trust`` and
+  ``GET /network/points/<point>/untrust``. Use ``PATCH
+  /network/points/<point>`` with ``{"acl":"ban"}``, ``{"acl":"open"}`` (for
+  both unban and untrust) or ``{"acl":"trust"}`` instead. (MR :gl:`!12289`)
+
+- Removed the deprecated RPCs ``GET /network/peers/<peer>/ban``, ``GET
+  /network/peers/<peer>/unban``, ``GET /network/peers/<peer>/trust`` and ``GET
+  /network/peers/<peer>/untrust``. Use ``PATCH /network/peers/<peer>`` with
+  ``{"acl":"ban"}``, ``{"acl":"open"}`` (for both unban and untrust) or
+  ``{"acl":"trust"}`` instead. (MR :gl:`!12289`)
+
+- Introduced a new RPC ``GET
+  /chains/main/blocks/<block>/context/delegates/<pkh>/is_forbidden``, to check
+  if a delegate is forbidden after being denounced for misbehaving. This RPC
+  will become available when protocol P is activated. (MR :gl:`!12341`)
+
+- Introduced a new ``/health/ready`` RPC endpoint that aims to return
+  whether or not the node is fully initialized and ready to answer to
+  RPC requests. (MR :gl:`!6820`)
+
+- Removed the deprecated ``local-listen-addrs`` configuration file
+  field. Use ``listen-addrs`` instead. (MR :gl:`!12489`)
+
+ - Augmented the ``--max-active-rpc-connections <NUM>`` argument to contain
+   an ``unlimited`` option to remove the threshold of RPC connections.
+   (MR :gl:`!12324`)
+
+Client
+------
+
+- Extended the support for the TZT format when using the ``run unit
+  tests`` client command. (MR :gl:`!4474`)
+
+- The ``timelock create`` command now takes the message to lock in hexadecimal
+  format. (MR :gl:`!11597`)
+
+- Added optional argument ``--safety-guard`` to specify the amount of gas to
+  the one computed automatically by simulation. (MR :gl:`!11753`)
+
+- For the protocols that support it, added an
+  ``operation_with_legacy_attestation_name`` and
+  ``operation_with_legacy_attestation_name.unsigned`` registered encodings that
+  support legacy ``endorsement`` kind instead of ``attestation``. (MR
+  :gl:`!11871`)
+
+- **Breaking change** Removed read-write commands specific to Nairobi. (MR :gl:`!12058`)
+
+Baker
+-----
+
+- Added optional ``--pre-emptive-forge-time t`` argument that, when
+  set, will cause the baker to pre-emptively forge its block if
+  the current level quorum has been reached, and it is the round 0
+  proposer of the next level. The amount of time to wait before forging
+  is ``round_time - t``. This optimization increases the chance for the
+  proposed block to reach quorum by slightly reducing the operation
+  inclusion window. Note that a ``t`` value that is too high could
+  cause forging to begin too early and result in lower baking rewards.
+  If not given, defaults to ``0.15 * block_time``. Set to ``0`` to
+  ignore. (MR :gl:`!10712`)
+
+- Made the baker sign attestations as soon as preattestations were
+  forged without waiting for the consensus pre-quorum. However, the
+  baker will still wait for the pre-quorum to inject them as specified
+  by the Tenderbake consensus algorithm. (MR :gl:`!12353`)
+
+- Fixed situations where the baker would stall when a signing request
+  hanged. (MR :gl:`!12353`)
+
+- Introduced two new nonces files (``<chain_id>_stateful_nonces`` and
+  ``<chain_id>_orphaned_nonces``). Each nonce is registered with a state
+  for optimising the nonce lookup, reducing the number of rpc calls
+  required to calculate nonce revelations. (MR :gl:`!12517`)
+
+Smart Rollup node
+-----------------
+
+- Added RPC ``/describe?recurse=true`` to retrieve schema of RPCs for the rollup
+  node. (MR :gl:`!10118`)
+
+- Added RPC ``/openapi?protocol={ProtoHash}`` to retrieve the OpenAPI
+  specification for RPCs of the rollup node. (MR :gl:`!10118`)
+
+- Introduced a new command ``generate openapi``, to generate the OpenAPI JSON
+  specification and output it to stdout. (MR :gl:`!10118`)
+
+- Registered in ``octez-codec`` some of the protocol smart rollup
+  related encodings. (MRs :gl:`!10174`, :gl:`!11200`)
+
+- Added Snapshot inspection command. (MR :gl:`!11456`)
+
+- Added Snapshot export options. (MRs :gl:`!10812`, :gl:`!11078`, :gl:`!11256`,
+  :gl:`!11454`)
+
+- Added Snapshot import. (MR :gl:`!10803`)
+
+- Pre-images endpoint (configurable on the CLI of the config file) to allow the
+  rollup node to fetch missing pre-images from a remote server. (MR
+  :gl:`!11600`)
+
+- Higher gas limit for publish commitment operations to avoid their failing due
+  to gas variations. (MR :gl:`!11761`)
+
+- **Breaking change** Removed RPC ``/helpers/proofs/outbox?message_index=<index>&outbox_level=<level>&serialized_outbox_message=<bytes>``.
+  Use ``helpers/proofs/outbox/<level>/messages?index=<index>`` to avoid generating the ```serialized_outbox_message`` yourself.
+  (MR :gl:`!12140`)
+
+- Compact snapshots with context reconstruction. (MR :gl:`!11651`)
+
+- Prevent some leak of connections to L1 node from rollup node (and avoid
+  duplication). (MR :gl:`!11825`)
+
+- Playing the refutation games completely asynchronous with the rest of the
+  rollup node. (MR :gl:`!12106`)
+
+- Rollup node can recover from degraded mode if they have everything necessary
+  to pick back up the main loop. (MR :gl:`!12107`)
+
+- Added RPC ``/local/synchronized`` to wait for the rollup node to be
+  synchronized with L1. (MR :gl:`!12247`)
+
+- Secure ACL by default on remote connections. Argument ``--acl-override
+  secure`` to choose the secure set of RPCs even for localhost, *e.g.*, for use
+  behind a proxy. (MR :gl:`!12323`)
+
+- Fixed an issue with catching up on rollup originated in previous protocol with an
+  empty rollup node. (MR :gl:`!12565`)
+
+- Fixed issue with catching up on rollup originated in previous protocol with an
+  empty rollup node. (MR :gl:`!12565`)
+
+- Added new administrative RPCs ``/health``, ``/version``, ``/stats/ocaml_gc``,
+  ``/stats/memory``, and ``/config``. (MR :gl:`!12718`)
+
+- Added administrative RPCs to inspect injector queues and clear them. (MR :gl:`!12497`)
+
+Miscellaneous
+-------------
+
+- **Breaking change** Switch encoding of ``nread_total`` field of
+  ``P2p_events.read_fd`` in Octez-p2p library to ``Data_encoding.int64`` to fix an
+  overflow.
+
+- Versions now include information about the product. (MR :gl:`!12366`)
+
+- **Breaking change** Multiple occurrence of same argument now
+  fails when using ``lib-clic``. (MR :gl:`!12780`)
+
+Version 19.2
+============
+
+Node
+----
+
+- Fixed a cemented block store encoding causing an overflow for cycles above 1Gib.
+
+Smart Rollup node
+-----------------
+
+- Fixed an issue with the way the rollup node computes dissections in the refutation games. (MR :gl:`!12534`)
+
+Version 19.1
+============
+
+Node
+----
+
+- Added ``--max-active-rpc-connections <NUM>`` that limits the number
+  of active RPC connections per server to the provided argument. The
+  default limit is set to 100.
+
+- Enforced the proposed default ACL list.
+
+Smart Rollup node
+-----------------
+
+- Fixed a critical bug that could lead to data loss when chain
+  reorganizations happen while a GC is running. (MR :gl:`!11358`)
+
+- Fixed issue with constants fetching during protocol migration. (MR :gl:`!11804`)
+
+Version 19.0
+============
+
+Miscellaneous
+-------------
+
+- References to ``teztnets.xyz`` have been changed to ``teztnets.com``.
+
+Version 19.0~rc1
+================
+
+Node
+----
+
+- **Breaking change** Removed the deprecated ``endorsing_rights`` RPC,
+  use ``attestation_rights`` instead. (MR :gl:`!9849`)
+
+- Added metrics about messages sent, broadcasted, or received by the shell's DDB.
+
+- **Breaking change** Removed the deprecated
+  ``disable-mempool-precheck`` configuration flag and
+  ``disable_precheck`` field of ``prevalidator`` in the shell limits
+  of the configuration file. They already had no effect on the node
+  anymore. (MR :gl:`!10030`)
+
+- Log at ``Info``` level the reasons behind disconnections in the p2p section.
+
+- Removed a spurious "missing validation plugin" warning message that
+  was emitted every time a block was applied using an old protocol
+  whose its plugin was removed.
+
+- **Breaking change** Removed the deprecated ``/monitor/valid_blocks``
+  RPC. Instead, use the ``/monitor/applied_blocks`` RPC that has the
+  same behaviour.
+
+Client
+------
+
+- Fixed indentation of the stacks outputted by the ``normalize stack``
+  command. (MR :gl:`!9944`)
+
+- Added options to temporarily extend the context with other contracts
+  and extra big maps in Michelson commands. (MR :gl:`!9946`)
+
+- Added a ``run_instruction`` RPC in the plugin and a ``run michelson code``
+  client command allowing to run a single Michelson instruction or a
+  sequence of Michelson instructions on a given stack. (MR :gl:`!9935`)
+
+- The legacy unary macros for the ``DIP`` and ``DUP`` Michelson
+  instructions have been deprecated. Using them now displays a warning
+  message on stderr.
+
+Baker
+-----
+
+- Made the baker attest as soon as the pre-attestation quorum is
+  reached instead of waiting for the chain's head to be fully
+  applied (MR :gl:`!10554`)
+
+Docker Images
+-------------
+
+- The rollup node is protocol agnostic and released as part of the Docker
+  image. (MR :gl:`!10086`)
+
+
+Smart Rollup node
+-----------------
+
+- A new bailout mode that solely cements and defends existing
+  commitments without publishing new ones. Recovers bonds when
+  possible, after which the node exits gracefully. (MR :gl:`!9721`, MR
+  :gl:`!9817`, MR :gl:`!9835`)
+
+- RPC ``/global/block/<block-id>/simulate`` accepts inputs with a new optional
+  field ``"log_kernel_debug_file"`` which allows to specify a file in which
+  kernel logs should be written (this file is in
+  ``<data-dir>/simulation_kernel_logs``). (MR :gl:`!9606`)
+
+- The protocol specific rollup nodes binaries are now deprecated and replaced
+  by symbolic links to the protocol agnostic rollup node. In the future, the
+  symbolic links will be removed. (MR :gl:`!10086`)
+
+- Released the protocol agnostic rollup node ``octez-smart-rollup-node`` as part
+  of the Octez distribution. (MR :gl:`!10086`)
+
+- Added the rollup node command inside the docker entrypoint (MR :gl:`!10253`)
+
+- Added the argument ``cors-headers`` and ``cors-origins`` to specify respectively the
+  allowed headers and origins. (MR :gl:`!10571`)
+
+- Fix header in messages store to use predecessor hash to avoid missing pointer
+  in case of reorganization and GC. (MR :gl:`!10847`)
+
+- Added a garbage collection mechanism that cleans historical data before the LCC.
+  (MRs :gl:`!10050`, :gl:`!10135`, :gl:`!10236`, :gl:`!10237`, :gl:`!10452`)
+
+- Added a ``history-mode`` option, which can be either ``archive`` or
+  ``full``. In ``archive``, the default, the rollup node has the whole L2 chain
+  history, no GC happens. In ``full`` the rollup node retains data for possible
+  refutations. (MRs :gl:`!10475`, :gl:`!10695`)
+
+- Snapshot export with integrity checks. (MR :gl:`!10704`)
+
+- Now smart rollup node allows multiple batcher keys. Setting multiple
+  keys for the batching purpose allows to inject multiple operations
+  of the same kind per block by the rollup node. ( MR :gl:`!10512`, MR
+  :gl:`!10529`, MR :gl:`!10533`, MR :gl:`!10567`, MR :gl:`!10582`, MR
+  :gl:`!10584`, MR :gl:`!10588`, MR :gl:`!10597`, MR :gl:`!10601`, MR
+  :gl:`!10622`, MR :gl:`!10642`, MR :gl:`!10643`, MR :gl:`!10839`, MR
+  :gl:`!10842`, MR :gl:`!10861`, MR :gl:`!11008` )
+
+Smart Rollup client
+-------------------
+
+- **Breaking change** Smart Rollup client have been deprecated and
+  no longer exist, most commands have equivalents RPCs and ``octez-codec`` (MR :gl:`!11046`).
+
+- The following table outlines the deprecated commands of the Smart Rollup client and
+  their corresponding replacements with new RPCs:
+
+  .. code-block:: rst
+
+    ==========================================  ====================================================
+    Command                                     RPC
+    ==========================================  ====================================================
+    get smart rollup address                    [GET global/smart_rollup_address]
+    ------------------------------------------  ----------------------------------------------------
+    get state value for <key> [-B --block       [GET global/block/<block>/state]
+    <block>]
+    ------------------------------------------  ----------------------------------------------------
+    get proof for message <index> of outbox     [GET /global/block/<block-id>/helpers/proofs/outbox/
+    at level <level> transferring               <outbox_level>/messages] with message index in query
+    <transactions>
+    ------------------------------------------  ----------------------------------------------------
+    get proof for message <index> of outbox     [GET /global/block/<block-id>/helpers/proofs/outbox/
+    at level <level>                            <outbox_level>/messages] with message index in query
+    ==========================================  ====================================================
+
+
+Smart Rollup WASM Debugger
+--------------------------
+
+- Added flag ``--no-kernel-debug`` to deactivate kernel debug messages. (MR
+  :gl:`!9813`)
+
+- Support special directives using ``write_debug`` host function in the
+  profiler, prefixed with ``__wasm_debugger__::``. Support
+  ``start_section(<data>)`` and ``end_section(<data>)`` to count ticks in
+
+- Partially support the installer configuration of the Smart Rollup's SDK, i.e.
+  support only the instruction ``Set``. The configuration can be passed to
+  the debugger via the option ``--installer-config`` and will initialize the
+  storage with this configuration. (MR :gl:`!9641`)
+
+- The argument ``--kernel`` accepts hexadecimal files (suffixed by ``.hex``), it
+  is consired as an hexadecimal ``.wasm`` file. (MR :gl:`!11094`)
+
+Miscellaneous
+-------------
+
+- Beta scripts to build Debian and RedHat packages have been added to the tree.
+
+- Recommended Rust version bumped to 1.71.1 from 1.64.0.
+
+- Extended the Micheline lexer to allow primitives starting with the
+  underscore symbol (``_``). (MR :gl:`!10782`)
+
+- Beta Debian and Redhat packages are now linked in gitlab releases.
+
+- Renamed package registries for releases from ``tezos-x.y`` to ``octez-x.y``.
+
+Version 18.1
+============
+
+Node
+----
+
+- **Breaking change** Bumped the snapshot version from ``6`` to ``7``,
+  in order to address an issue which resulted in the export of corrupted tar rolling and full
+  snapshots. Octez v18.1 nodes can still import previous version ``6`` (and earlier) snapshots.
+  but snapshots in version 7 are not retro-compatible with previous
+  octez versions (MR :gl:`!10785`).
+
+Version 18.0
+============
+
+Node
+----
+
+- **Breaking change** Bumped Octez store version from ``5`` to
+  ``6`` to explicit the incompatibility with previous store (and hence Octez) versions. As a result snapshots exported from a v6 store are not compatible with earlier Octez versions. Also, improved the consistency of ``snapshot`` import errors
+  messages (MR :gl:`!10138`)
+
+Smart Rollup node
+-----------------
+
+- Fixed an issue where the rollup node could forget to update its Layer 2 head for a
+  block. (MR :gl:`!9868`)
+
+- Remove the batcher simulation. This simulation was generic and could
+  not catch problematic transaction. Batcher configuration now has a
+  one less field ``simulate``. (MR :gl:`!10842`)
+
+Version 18.0-rc1
+================
+
+Node
+----
+
+- Changed the bounding specification of valid operations in the mempool:
+
+  + Before, the number of valid **manager operations** in the mempool
+    was at most ``max_prechecked_manager_operations`` (default 5_000),
+    with no other constraints. (Operations to keep were selected
+    according to a "weight" that consists in the ratio of fee over
+    "resources"; the latter is the maximum between the following
+    ratios: operation gas over maximal allowed gas, and operation size
+    over maximal allowed size. The baker uses the same notion of
+    "weight" to select operations.)
+
+  + Now, the number of valid **operations of any kind** is at most
+    ``max_operations`` (default 10_000), and also the **sum of the
+    sizes in bytes** of all valid operations is at most
+    ``max_total_bytes`` (default 10_000_000). See
+    [src/lib_shell/prevalidator_bounding.mli] for the reasoning behind
+    the default values. (Operations are selected according to the
+    protocol's ``compare_operations`` function, which currently orders
+    operations according to their validation pass (consensus is
+    highest and manager is lowest); note that two manager operations
+    are ordered using their fee over gas ratio.)
+
+  The values of ``max_operations`` and ``max_total_bytes`` can be
+  retrieved with ``GET /chains/<chain>/mempool/filter`` and configured
+  with ``POST /chains/<chain>/mempool/filter`` (just as
+  ``max_prechecked_manager_operations`` used to be). As a result, the
+  JSON format of the outputs of these two RPCs and the input of the
+  second one have slightly changed; see their updated descriptions.
+  (MR :gl:`!6787`)
+
+- Errors ``prefilter.fees_too_low_for_mempool`` and
+  ``plugin.removed_fees_too_low_for_mempool`` have been replaced with
+  ``node.mempool.rejected_by_full_mempool`` and
+  ``node.mempool.removed_from_full_mempool`` with different
+  descriptions and messages. The ``rejected_by_full_mempool`` error
+  still indicates the minimal fee that the operation would need to be
+  accepted by the full mempool, provided that such a fee exists. If
+  not, the error now states that the operation cannot be included no
+  matter its fee (e.g. if it is a non-manager operation). (MRs
+  :gl:`!6787`, :gl:`!8640`)
+
+- Updated the message of the mempool's
+  ``prevalidation.operation_conflict`` error. It now provides the
+  minimal fee that the operation would need to replace the
+  pre-existing conflicting operation, when such a fee exists. (This
+  fee indication used to be available before v16, where it had
+  been removed for technical reasons.) (MR :gl:`!9016`)
+
+- RPC ``/helpers/forge/operations`` can now take JSON formatted operations with
+  ``attestation``, ``preattestation``, ``double_attestation_evidence`` and
+  ``double_preattestation_evidence`` kinds. Note that the existing kinds
+  ``endorsement``, ``preendorsement``, ``double_endorsement_evidence``, and
+  ``double_preendorsement_evidence`` are still accepted. (MR :gl:`!8746`)
+
+- Simplified the peer to peer messages at head switch. The node now
+  systematically broadcasts only its new head (instead of sometime
+  broadcasting a sparse history of the chain).
+
+- Added version ``1`` to RPC ``POST ../helpers/parse/operations``. It can be
+  used by calling the RPC with the parameter ``?version=1`` (default version is
+  still ``0``). Version ``1`` allows the RPC to output ``attestation``,
+  ``preattestation``, ``double_attestation_evidence`` and
+  ``double_preattestation_evidence`` kinds in the JSON result. (MR :gl:`!8840`)
+
+- Added version ``2`` to RPC ``GET ../mempool/pending_operations``. It can be
+  used by calling the RPC with the parameter ``?version=2`` (default version is
+  still ``1``). Version ``2`` allows the RPC to output ``attestation``,
+  ``preattestation``, ``double_attestation_evidence`` and
+  ``double_preattestation_evidence`` kinds in the JSON result. This version
+  also renames the ``applied`` field of the result to ``validated``
+  (MRs :gl:`!8960`, :gl:`!9143`)
+
+- RPCs ``/helpers/scripts/run_operation`` and
+  ``/helpers/scripts/simulate_operation`` can now take JSON formatted operations
+  with ``double_attestation_evidence`` and ``double_preattestation_evidence``
+  kinds. Even though consensus operations are not supported by the RPCs,
+  ``attestation`` and ``preattestation`` are accepted in the input JSON. (MR
+  :gl:`!8768`)
+
+- Removed ``lwt-log`` from the dependencies. The default logger has been updated
+  to use the ``file-descriptor-stdout`` sink instead of the previous ``lwt-log``
+  sink. This change has resulted in the removal of certain features from the log
+  implementation that were specific to "lwt-log". Some features, such as log
+  rules, syslog, and the output format, have been replaced with alternative
+  implementations. Additionally, the previous implementation of "syslog" had
+  some issues, including duplicated log headers or cropped messages, depending
+  on the file output. These issues have been addressed, and the new
+  implementation should now work correctly.
+
+- Removed ``template`` field from ``log`` configuration with the removal of
+  ``lwt-log`` library. Since it was believed to have low usage, no alternative
+  implementation has been provided.
+
+- The configuration flag ``disable-mempool-precheck`` is now
+  deprecated, as well as the ``disable_precheck`` field of
+  ``prevalidator`` in the shell limits of the configuration file. They
+  already didn't do anything since v16. (MR :gl:`!8963`)
+
+- Added version ``1`` to RPCs ``POST ../helpers/scripts/run_operation`` and
+  ``POST ../helpers/scripts/simulate_operation``. It can be used by calling the
+  RPC with the parameter ``?version=1`` (default version is still ``0``).
+  Version ``1`` allows the RPC to output ``attestation``, ``preattestation``,
+  ``double_attestation_evidence`` and ``double_preattestation_evidence`` kinds
+  in the JSON result. (MR :gl:`!8949`)
+
+- The error message when the local injection of an operation fails now
+  begins with ``Error while validating injected operation`` instead of
+  ``Error while applying operation``. (MR :gl:`!8857`)
+
+- Updated the description of the ``ban_operation`` RPC to better
+  reflect its behavior, which is unchanged. (More precisely, removed
+  the "reverting its effect if it was applied" part since operations
+  are never applied.) (MR :gl:`!8857`)
+
+- Added version ``1`` to RPC ``GET ../mempool/monitor_operations``. It can be
+  used by calling the RPC with the parameter ``?version=1`` (default version is
+  still ``0``). Version ``1`` allows the RPC to output ``attestation``,
+  ``preattestation``, ``double_attestation_evidence`` and
+  ``double_preattestation_evidence`` kinds in the JSON result. (MR :gl:`!8980`)
+
+- Improved the performances of JSON RPC calls by optimizing the
+  serialization to JSON. (MR :gl:`!9072`)
+
+- Fixed the ``validation_pass`` argument usage of ``monitor_operations`` RPC.
+  Only operation that were in the mempool before the RPC call were filtered by
+  validation passes. (MR :gl:`!9012`)
+
+- **Breaking change** Removed the ``octez_mempool_pending_applied``
+  metric, and renamed the ``octez_mempool_pending_prechecked`` one to
+  ``octez_mempool_pending_validated``. (MR :gl:`!9137`)
+
+- Added version ``1`` to RPC ``POST ../helpers/preapply/operations``. It can be
+  used by calling the RPC with the parameter ``?version=1`` (default version is
+  still ``0``). Version ``1`` allows the RPC to output ``attestation``,
+  ``preattestation``, ``double_attestation_evidence`` and
+  ``double_preattestation_evidence`` kinds in the JSON result. (MR :gl:`!8891`)
+
+- Changed default stdout logs by adding simple coloration. The log header
+  header is now bold and warning and errors are highlighted. The
+  ``--log-coloring`` command line argument can be used to enable or
+  disable logs coloration on default stdout logs; it is enabled by
+  default. (MR :gl:`!8685`)
+
+- Improved the performance of block validation: the block validation time has
+  been reduced by half on average, resulting in a reduced propagation time
+  through the network. (MR :gl:`!9100`)
+
+- Added ``validated`` argument for ``GET ../mempool/monitor_operations`` and
+  ``GET ../mempool/pending_operations``. ``applied`` argument of these RPCs is
+  deprecated. (MR :gl:`!9143`)
+
+- Added version ``1`` to RPCs ``GET ../blocks/<block>``, and ``GET
+  ../blocks/<blocks>/operations``. It can be used by calling the RPC with the
+  parameter ``?version=1`` (default version is still ``0``). Version ``1``
+  allows the RPC to output ``attestation``, ``preattestation``,
+  ``double_attestation_evidence`` and ``double_preattestation_evidence`` kinds
+  in the JSON result. (MR :gl:`!9008`)
+
+- When an operation in the mempool gets replaced with a better
+  conflicting operation (e.g. an operation from the same manager with
+  higher fees), the replaced operation is now reclassified as
+  ``branch_delayed`` instead of ``outdated``. The associated error
+  ``prevalidation.operation_replacement`` is otherwise unchanged. This
+  makes it consistent with the reverse situation: when the new
+  operation is worse than the old conflicting one, the new operation
+  is classified as ``branch_delayed`` with the
+  ``prevalidation.operation_conflict`` error. (MR :gl:`!9314`)
+
+- In RPC ``/protocol_data``, ``"per_block_votes"`` replaces ``"liquidity_baking_toggle_vote"``;
+  ``"per_block_votes"`` has two properties ``"liquidity_baking_vote"`` and ``"adaptive_issuance_vote"``.
+  A vote is one of ``"on"``, ``"off"``, ``"pass"``.
+
+- Added version ``1`` to RPC ``GET ../blocks/<blocks>/metadata``. It can be used
+  by calling the RPC with the parameter ``?version=1`` (default version is still
+  ``0``). Version ``1`` of this RPC and ``GET ../blocks/<block>`` allow the RPC
+  to output ``attesting rewards`` and ``lost attesting rewards`` kinds in the
+  JSON result. (MR :gl:`!9253`)
+
+- Fixed a behavior where each time a new data was received from a
+  peer, a new p2p request would be triggered instead of waiting for
+  the delayed retry. (MR :gl:`!9470`)
+
+- Renamed RPC server events: Added section ``rpc_server`` and changed
+  names from ``legacy_logging_event-rpc_http_event-<level>`` into
+  ``rpc_http_event_<level>``.
+
+- Reduced the workload of the mempool by preventing unnecessary worker
+  requests to be made and fixed a data-race that would request a
+  resource that was already received. (MR :gl:`!9520`)
+
+- Event ``block.validation.protocol_filter_not_found`` renamed to
+  ``block.validation.validation_plugin_not_found`` with updated
+  message ``no validation plugin found for protocol
+  <protocol_hash>``. (MR :gl:`!9583`)
+
+- Added RPC to get smart rollup's balance of ticket with specified ticketer, content type, and content:
+  ``POST chains/<chain>/blocks/<block>/context/smart_rollups/smart_rollup/<smart_rollup_address>/ticket_balance``
+  (MR :gl:`!9535`)
+
+- **Breaking change** Removed ``mumbainet`` network alias. (MR :gl:`!9694`)
+
+- Removed Mumbai mempool plugin. (MR :gl:`!9696`)
+
+Client
+------
+
+- Added client commands to generate, open and verify a time-lock.
+
+- The ``typecheck script`` command can now be used to typecheck several scripts.
+
+- From protocol ``Oxford`` operation receipts output ``attestation`` instead of
+  ``endorsement``. For example ``double preendorsement evidence`` becomes
+  ``double preattesation evidence``, ``lost endorsing rewards`` becomes ``lost
+  attesting rewards``. (MR :gl:`!9232`)
+
+- Add ``attest for`` and ``preattest for`` commands. ``endorse for`` and
+  ``preendorse for`` are now deprecated. (MR :gl:`!9494`)
+
+- **Breaking change** Removed read-write commands specific to Mumbai (MR :gl:`!9695`)
+
+- Added new client commands related to the new staking mechanisms:
+  ``stake``, ``unstake``, ``finalize unstake``, ``set delegate parameters``,
+  ``get full balance`` and ``get staked balance``. (MR :gl:`!9642`)
+
+- Fixed a concurrency issue in the logging infrastructure
+  which can cause the node to become temporarily unresponsive. (MR :gl:`!9527`)
+
+Baker
+-----
+
+- Changed the baker liquidity baking vote file
+  ``per_block_votes.json`` lookup so that it also considers its client
+  data directory when searching an existing file. The previous
+  semantics, which looks for this file in the current working
+  directory, takes precedence.
+
+- Bakers are now asked (but not required) to set their votes for the adoption of the
+  adaptive issuance feature. They may use the CLI option ``--adaptive-issuance-vote``
+  or the per-block votes file (which is re-read at each block, and overrides the CLI option).
+  Absence of vote is equivalent to voting "pass".
+
+- **Breaking change** Renamed ``liquidity_baking_toggle_vote`` into
+  ``read_liquidity_baking_toggle_vote`` (MR :gl:`!9464`)
+  and ``reading_per_block`` into ``reading_per_block_votes`` (MR :gl:`!8661`),
+  for baker events.
+
+- **Breaking change** Renamed ``endorsement`` into ``attestation`` for baker errors and events.
+  (MR :gl:`!9195`)
+
+- Cached costly RPC calls made when checking if nonces need to be
+  revealed. (MR :gl:`!9601`)
+
+Accuser
+-------
+
+- **Breaking change** Renamed ``endorsement`` into ``attestation`` for accuser errors and events.
+  (MR :gl:`!9196`)
+
+Proxy Server
+------------
+
+- Redirected not found replies (HTTP 404 answers) to the underlying
+  octez-node itself. Public visibility of the node is not required
+  anymore.
+
+Protocol Compiler And Environment
+---------------------------------
+
+- Added a new version of the protocol environment (V10)
+
+  - Exposed a limited API to manipulate an Irmin binary tree within the
+    protocol.
+
+  - Exposed encoding with legacy attestation name. (MR :gl:`!8620`)
+
+Docker Images
+-------------
+
+-  Bumped up base image to ``alpine:3.17``. In particular, this changes Rust
+   version to 1.64.0.
+
+Smart Rollup node
+-----------------
+
+- Faster bootstrapping process. (MR :gl:`!8618`, MR :gl:`!8767`)
+
+- Single, protocol-agnostic, rollup node binary. The rollup node
+  ``octez-smart-rollup-node`` works with any protocol and supports protocol
+  upgrades. The other protocol specific rollup nodes still exist but will be
+  deprecated. (MR :gl:`!9105`)
+
+- Added a new metrics ``head_inbox_process_time`` to report the time the rollup
+  node spent to process a new Layer 1 head. (MR :gl:`!8971`)
+
+- **Breaking change** Field ``"messages"`` of RPC ``/global/block/{block_id}``
+  now contains *serialized* messages (external messages start with ``01`` and
+  internal start with ``00``). (MR :gl:`!8876`)
+
+- **Breaking change** RPC ``/global/helpers/proof/outbox`` is moved to
+  ``/global/block/head/helpers/proof/outbox``. (MR :gl:`!9233`)
+
+- Fixed an issue with level association which could allow the rollup node
+  to publish invalid commitments. (MR :gl:`!9652`)
+
+Smart Rollup WASM Debugger
+--------------------------
+
+- Changed the syntax for the ``octez-smart-rollup-wasm-debugger`` to prefix the
+  the kernel file by ``--kernel``. (MR :gl:`!9318`)
+
+- ``profile`` commands now profiles the time spent in each steps of a PVM
+  execution. It can be disabled with the option ``--without-time`` (MR
+  :gl:`!9335`).
+
+- Added option ``--no-reboot`` to the ``profile`` command to profile a single
+  ``kernel_run``.
+
+- Improved profiling output for consecutive kernel runs.
+
+- Allow serialized messages in inputs: ``{ "serialized": "01..." }``, instead
+  of only external and internal transfers. This allows to inject arbitrary
+  messages in the rollup. (MR :gl:`!9613`)
+
+Data Availability Committee (DAC)
+---------------------------------
+
+- Released experimental Data Availability Committee executables which include ``octez-dac-node``
+  and ``octez-dac-client``. Users can thus experiment
+  with operating and using DAC in their Smart Rollup workflow to achieve higher data
+  throughput. It is not recommended to use DAC on Mainnet but instead on testnets
+  and lower environments.
+
+Miscellaneous
+-------------
+
+- Updated and re-enabled the time-lock Michelson commands.
+
+- New Recommended Rust version 1.64.0 instead of 1.60.0.
+
+- Sapling parameters files are now installed by ``make build-deps`` via Opam
+
+- Removed binaries of Mumbai (MR :gl:`!9693`)
+
+Version 17.3
+============
+
+- Operations posting invalid WASM proofs are now discarded earlier by the
+  Nairobi mempool plugin. (MR :gl:`!9768`)
+
+Version 17.2
+============
+
+Node
+----
+
+- Removed the warning ``no prevalidator filter found for protocol
+  ProtoGenesisGenesisGenesisGenesisGenesisGenesk612im`` that was
+  emitted at node start-up, because it is normal for ``Genesis`` not
+  to have a prevalidator filter. The warning will still be issued if
+  no prevalidator filter is found later on for a different
+  protocol. (MR :gl:`!9261`)
+
+- Renamed ``no prevalidator filter found for protocol {protocol_hash}``
+  to ``no protocol filter found for protocol {protocol_hash}``.
+
+- Added a syntactic operation filter in the protocol's plugins.
+
+Version 17.1
+============
+
+Node
+----
+
+- Improved performances of RPC responses on request for older blocks by
+  caching the archived metadata accesses. (MR :gl:`!8976`)
+
+Miscellaneous
+-------------
+
+- Prevent cohttp-lwt.5.1.0 incompatibility with Resto,
+  which causes leakage of file descriptors for streamed RPCs. (MR :gl:`!9059`)
+
+Version 17.0
+============
+
+Node
+----
+
+- Fixed a bug where the node could freeze when an old block was
+  requested during a store merge. (MR :gl:`!8952`)
+
+Version 17.0-rc1
+================
+
+Node
+----
+
+- **Breaking Change**: Shortened a few lib_shell log messages at the default level by
+   displaying only the completion time instead of the full status of the operation.
+
+- Added an option ``daily-logs`` to file-descriptor sinks, enabling
+  log rotation based on a daily frequency.
+
+- Fixed a bug manifested while reconstructing the storage after a snapshot import
+  that would result in wrong context hash mapping for some blocks.
+
+- Added an option ``create-dirs`` to file-descriptor sinks to allow
+  the node to create the log directory and its parents if they don't exist.
+
+- Added a default node configuration that enables disk logs as a
+  file-descriptor-sink in the data directory of the node with a 7 days rotation.
+
+- **Breaking Change**: Removed section in stdout logs lines
+
+- Removed the ``indexing-strategy`` option from the ``TEZOS_CONTEXT``
+  environment variable to prevent the usage of the ``always``
+  indexing strategy. For now, only the ``minimal`` indexing strategy
+  is allowed.
+
+- **Breaking Change** Removed the ``--network limanet``
+  built-in network alias.
+
+- Fixed a issue that may trigger unknown keys errors while reading the
+  context on a read-only instance.
+
+- Added query parameter ``protocol`` to RPC ``/monitor/heads/<chain_id>`` (which can be
+  repeated) in order to monitor new heads of one or several given protocols only.
+
+- **Breaking Change** Reworked some node logs. While bootstrapping,
+  the node will log one message every 50 validated blocks to indicate
+  the current head's level and how old it is, giving an indication on
+  how long it will take to be synchronized. Also, gracefully indicates
+  peer disconnection instead of spurious "worker crashed" messages.
+
+- Fixed an issue where a node lagging behind would end up freezing and
+  never be able to catch up.
+
+Client
+------
+
+- **Breaking Changes**: an alias must be provided when originating a
+  smart rollup. That alias can be used in other smart rollup commands
+  instead of the address. This is similar to what is done for smart
+  contracts.
+
+  Smart rollup origination command::
+
+    ./octez-client originate smart rollup <alias> from <source contract> of kind <smart rollup kind> of type <michelson type> with kernel <kernel>
+
+  Other example command::
+
+    ./octez-client recover bond of <implicit contrat> for smart rollup <alias or address> from <source contract>
+
+- Similarly to smart contract, the client now has functions to manage the set of known smart rollups::
+
+    ./octez-client remember smart rollup <alias> <smart rollup address>
+
+    ./octez-client forget smart rollup <alias>
+
+    ./octez-client forget all smart rollups
+
+    ./octez-client show known smart rollup <alias>
+
+    ./octez-client list smart rollups
+
+- For the protocols that support it, added an ``operation_with_attestation`` and
+  ``operation_with_attestation.unsigned`` registered encodings that support
+  ``attestation`` kind instead of ``endorsement``. (MR :gl:`!8563`)
+
+Baker
+-----
+
+- Consensus operations that do not use the minimal slot of the delegate are
+  not counted for the (pre)quorums. (MR :gl:`!8175`)
+
+- Consensus operations with identical consensus-related contents but different
+  ``branch`` fields are counted only once in the (pre)quorums. (MR :gl:`!8175`)
+
+- Improved efficiency to solve the anti-spam Proof-of-Work challenge.
+
+- Made the baker capable of running in a RPC-only mode through a newly
+  introduced command: ``octez-baker-<protocol> run remotely
+  [delegates] [options]``. This mode does not require the octez node's
+  storage to be directly accessible by the baker and will reduce
+  memory consumption. However, this mode is less performant and may
+  result in noticable slower baking times. (MR :gl:`!8607`)
+
+- Added a default configuration for that enables disk logs as a
+  file-descriptor-sink in the base directory with a 7 days rotation.
+
+Accuser
+-------
+
+- Fixed a bug that made the accuser start without waiting for its
+  corresponding protocol.
+
+- The accuser now denounces double consensus operations that have the same
+  level, round, and delegate, but different slots. (MR :gl:`!8084`)
+
+Signer
+------
+
+- Reordered the display of ``octez-client list connected ledgers``
+  command. It is now ``Ed25519``, ``Secp256k1``, ``Secp256r1`` and
+  ``Bip32_ed25519``.
+
+Smart Rollup node
+-----------------
+
+- Fixed inverted logic for playing a timeout move in a refutation game (MR
+  :gl:`!7929`).
+
+- Stopped the node when the operator deposit is slashed (MR :gl:`!7579`).
+
+- Improved computations of refutation games’ dissections (MRs :gl:`!6948`,
+  :gl:`!7751`, :gl:`!8059`, :gl:`!8382`).
+
+- Improved WASM runtime performances (MR :gl:`!8252`).
+
+- Made the Fast Execution aware of the newly introduced WASM PVM versionning
+  (MR :gl:`!8079`).
+
+- Fixed UX issues related to the rollup node configuration (MRs :gl:`!8148`,
+  :gl:`!8254`, :gl:`!8156`).
+
+- Quality of life improvements in the Layer 1 injector (MRs :gl:`!7579`, :gl:`!7673`, :gl:`!7675`, :gl:`!7685`, :gl:`!7681`, :gl:`!7846`, :gl:`!8106`).
+
+- Fixed logs for kernel debug messages (MR :gl:`!7773`).
+
+- New argument ``--boot-sector-file`` to specify a path to the boot sector used
+  for the rollup. This is an optional argument that is required *only* if the
+  smart rollup was bootstrapped and not originated (MR :gl:`!8556`).
+
+- Fixed legacy run command (MR :gl:`!8547`).
+
+- Fixed missing commitment for genesis by using local computation instead of
+  RPC (MR :gl:`!8617`).
+
+- Fixed issue where rollup node believed it disagreed with L1 regarding cemented
+  commitments (MR :gl:`!8615`).
+
+- **Breaking Change** Made the simulation RPC take serialized inbox messages
+  as inputs instead of external message payloads. It can be used to simulate
+  internal messages as well. It means that previously used format of inputs
+  needs to be adapted, i.e. they need to be wrapped in external messages. (MR :gl:`!8888`).
+
+Smart Rollup client
+-------------------
+
+- Fixed a JSON decoding error for the command ``get proof for message ...`` (MR
+  :gl:`!8000`).
+
+Smart Rollup WASM Debugger
+--------------------------
+
+- Let the user select the initial version of the WASM PVM (MR :gl:`!8078`).
+
+- Added commands to decode the contents of the memory and the durable storage
+  (MRs :gl:`!7464`, :gl:`!7709`, :gl:`!8303`).
+
+- Added the ``bench`` command (MR :gl:`!7551`).
+
+- Added commands to inspect the structure of the durable storage (MRs
+  :gl:`!7707`, :gl:`!8304`).
+
+- Automatically ``load inputs`` when ``step inbox`` is called. (MR :gl:`!8444`)
+
+- Added a command ``show function symbols`` to inspect the custom section
+  ``name`` of unstripped kernels. (MR :gl:`!8522`)
+
+- Added a command ``profile`` that runs a full ``kernel_run`` and produces a
+  flamegraph of the execution (MR :gl:`!8510`).
+
+Miscellaneous
+-------------
+
+- Removed binaries and mempool RPCs of Lima.
+
+Version 16.1
+============
+
+Baker
+-----
+
+- Fixed a bug where the baker could count a (pre)endorsement twice
+  while waiting for a (pre)quorum.
+
+- Fixed an implementation bug where upon observing a pre-quorum on an
+  earlier round, the baker would reach a state where it could not
+  endorse anymore. This could lead to a slow consensus scenario
+  affecting network liveness.
+
+Version 16.0
+============
+
+Node
+----
+
+- Updated the built-in network alias for Mumbainet (``--network mumbainet``).
+  The new alias matches the relaunch of Mumbainet with the protocol ``PtMumbai2``.
+
+
+Version 16.0-rc3
+================
+
+General
+-------
+
+- Fixed an issue that prevented building on MacOS.
+
+- Fixed an issue that caused the launch of Octez binaries to take several seconds (because of ``zcash`` initialization)
+
+Node
+----
+
+- Fixed a issue that might trigger unknown keys errors while reading the
+  context on a read-only instance.
+
+- Added an RPC ``POST
+  /chains/main/blocks/head/context/smart_rollups/all/origination_proof``
+  with input ``{"kind":"<smart rollup kind>", "kernel"="<smart rollup
+  kernel>"}`` to produce the origination proof needed to originate a
+  smart rollup.
+
+- Deprecated the RPC ``GET /monitor/valid_blocks`` and introduced
+  ``GET /monitor/validated_blocks`` and ``GET /monitor/applied_blocks``
+  respectively returning validated blocks which are not yet applied
+  nor stored, and applied blocks which are fully applied and stored by
+  the node. (MR :gl:`!7513`)
+
+- Replaced some "precheck" occurrences with "validate" in event and
+  error identifiers and messages. (MR :gl:`!7513`)
+
+- Document the usage of "Yay" as a deprecated synonym for "Yea", to encourage
+  using the correct value in the future. (MR :gl:`!7960`)
+
+Baker
+-----
+
+- Changed the baker default semantics so that it performs a light
+  validation of operations to classify them instead of fully applying
+  them. Hence, the block production is now more
+  time/cpu/disk-efficient. In this mode, application-dependent checks
+  are disabled. Setting the ``--force-apply`` flag on the command line
+  restores the previous behavior. (MR :gl:`!7490`)
+
+- **Breaking Change**: Disabled the verification of signature of
+  operations in the baker when baking a block. The baker must always
+  be provided operations with a valid signature, otherwise produced
+  blocks will be invalid and rejected by local nodes during their
+  injection. Default setups are not affected but external mempools
+  should make sure that their operations' signatures are correct.
+  (MR :gl:`!7490`)
+
+- Made the baker discard legacy or corrupted Tenderbake's saved
+  states in order to avoid unexpected crashes when the baker gets
+  updated, or when a new protocol's baker starts. (MR :gl:`!7640`)
+
+- Restored previous behaviour from :gl:`!7490` for blocks at round
+  greater than 0. Application-dependent checks are re-enabled for
+  re-proposal and fresh blocks at round greater than 0.
+
+- Reduced the preendorsement injection delay by making the baker
+  preendorse as soon as the node considers a block as valid instead of
+  waiting for the node to fully apply it. (MR :gl:`!7516`)
+
+- Baker injects preendorsement twice: once the block is considered as
+  valid by the node and once it is fully applied by the node. This is
+  a safety measure in case the early preendorsement is dropped by the
+  mempool. (MR :gl:`!7516`)
+
+
 Version 16.0-rc2
 ================
 
@@ -92,7 +3139,7 @@ Node
   required by the new protocol's semantics and the context's format to
   improve the disk usage footprint while running a context
   pruning. Upgrading to this new version is automatic and
-  irreversible. (MR :gl: `!6835` and :gl: `!6959`)
+  irreversible. (MR :gl:`!6835` and :gl:`!6959`)
 
 - **Breaking change**: bumped the snapshot version to ``5``. This
   version changes internal snapshot file representation to include
@@ -100,7 +3147,7 @@ Node
   improve both import and export speed. Snapshots of version ``4``
   exported with previous versions of Octez can still be
   imported. Snapshots of version ``5`` are not backward compatible.
-  (MR :gl: `!6835` and :gl: `!6961`)
+  (MR :gl:`!6835` and :gl:`!6961`)
 
 - Upon receiving a new non-manager operation that conflicts with a
   previously validated operation, the mempool may now replace the old
@@ -109,17 +3156,17 @@ Node
   and has simply be extended to non-manager operations. It should help
   all mempools converge toward the same set of accepted operations,
   regardless of the order in which the operations were
-  received. (MR :gl: `!6749`)
+  received. (MR :gl:`!6749`)
 
 - Changed the id and message of the error when the mempool rejects a
   new operation because it already contains a preferred conflicting
   operation. Changed the id and message of the error associated with
   an operation that is removed from the mempool to make room for a
-  better conflicting operation. (MR :gl: `!6749`)
+  better conflicting operation. (MR :gl:`!6749`)
 
 - Fixed a minor bug that caused the mempool to accept a manager
   operation that conflicts with an already present ``drain_delegate``
-  operation. (MR :gl: `!6749`)
+  operation. (MR :gl:`!6749`)
 
 - Removed the compatibility with storage snapshots of version ``2``
   and ``3``. These snapshot versions from Octez 12 cannot be imported
@@ -166,12 +3213,19 @@ Baker
   the user directly removes the file
   ``<client-dir>/<chain_id>_baker_state``. On mainnet, this will have
   no effect as when the new protocol activates, previous bakers will
-  be permanently idle. (MR :gl: `!6835`)
+  be permanently idle. (MR :gl:`!6835`)
 
 - Fixed an issue where the baker would keep files opened longer than
   necessary causing unexpected out of space errors making the baker
   crash.
 
+Signer
+------
+
+- **Breaking change**: Versioning of signature module for protocol
+  specific support and future extensibility. Signatures length became
+  variable which changed their binary encoding. This breaks the
+  compatibility with octez-signer <= 15.1 in local and socket modes.
 
 Proxy Server
 ------------
@@ -197,9 +3251,6 @@ Rollups
 
 Miscellaneous
 -------------
-
-- Versioning of signature module for protocol specific support and future
-  extensibility.
 
 - Removed binaries and mempool RPCs of Kathmandu.
 
@@ -313,8 +3364,8 @@ Node
   backend. It is activated by default for all nodes running with a
   full or rolling history mode.
 
-- Add a `/chains/<chain>/blocks/<block>/merkle_tree_v2` RPC. This is an
-  evolution of the `../merkle_tree` RPC, using a simpler implementation of the
+- Add a ``/chains/<chain>/blocks/<block>/merkle_tree_v2`` RPC. This is an
+  evolution of the ``../merkle_tree`` RPC, using a simpler implementation of the
   Merkle tree/proof features that works with Irmin trees and proofs underneath
   instead of proof code internal to Octez, and is planned to eventually replace
   the old one in a future release.
@@ -354,8 +3405,8 @@ Node
 Client
 ------
 
-- The light client (`tezos-client --mode light`) now uses the
-  `../block/<block_id>/merkle_tree_v2` RPC introduced in this version, removing
+- The light client (``tezos-client --mode light``) now uses the
+  ``../block/<block_id>/merkle_tree_v2`` RPC introduced in this version, removing
   a lot of delicate verification code and relying on Irmin instead. The client
   for this version will thus not work with older node versions that do not have
   this RPC.
@@ -992,7 +4043,7 @@ Node
 
 - Manager operations do no longer need to be executed before being
   propagated over the network. This feature will be available from
-  protocol `I`, provided the latter is activated. The aim is to
+  protocol ``I``, provided the latter is activated. The aim is to
   increase the throughput of transactions gossiped over the network,
   while reducing the load on the Octez node's prevalidator
   (aka the mempool).
@@ -1690,13 +4741,10 @@ Proxy server
 
 -  Added a new binary: ``octez-proxy-server``, a read-only frontend to a node.
    It is designed to lower the load of nodes, by being capable
-   of serving `protocol RPCs <https://tezos.gitlab.io/alpha/rpc.html>`__.
+   of serving :doc:`protocol RPCs <alpha/rpc>`.
    An instance of a proxy server is protocol-specific: it automatically picks
    up the protocol from the backing node when it starts. Proxy servers
    can be started and destroyed at will, making them easy to deploy.
-
-   Please refer to the `online documentation <https://tezos.gitlab.io/user/proxy-server.html>`__
-   for further details.
 
 Version 9.7
 ===========
@@ -2163,8 +5211,7 @@ Node
 -  Added new RPC ``/config`` to query the configuration of a node.
 
 -  Changed signal handling and exit codes for most binaries. The codes’
-   significance are detailed in `the user
-   documentation <http://tezos.gitlab.io/user/various.html#tezos_binaries_signals_and_exit_codes>`__.
+   significance are detailed in :doc:`the user documentation <user/exits>`.
 
 -  Command ``octez-node --version`` now exits with exit code 0 instead
    of 1.
@@ -2300,6 +5347,20 @@ Node
 -  Fixed the node which sent too many “get current branch” messages to
    its peers on testchain activation.
 
+- **Breaking change** Bumped the node’s storage version to
+  ``3.2``. This new version changes the store’s representation,
+  allowing the storage to scale to the increasing number of blocks per
+  cycles, thus paving the way to reducing even more the block
+  time. Upgrading to this new version must be done manually (using the
+  ``octez-node upgrade storage`` command) and is irreversible. (MR
+  :gl:`!14211`)
+
+- **Breaking change** Bumped the snapshot version from ``7`` to ``8``,
+  in order to support the changes introduced by the ``3.2`` storage
+  version. Snapshots of version ``7`` exported with previous versions
+  of Octez (``v20``) can still be imported. Snapshots of version ``8``
+  are not retro-compatible with previous octez versions (MR
+  :gl:`!14398`).
 
 Client
 ------
@@ -2536,7 +5597,7 @@ Multinetwork
 
 -  The network name is printed in the logs on startup.
 
-For more information, see: http://tezos.gitlab.io/user/multinetwork.html
+For more information, see :doc:`user/multinetwork`.
 
 
 Node

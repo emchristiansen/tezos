@@ -2,6 +2,7 @@
 (*                                                                           *)
 (* Open Source License                                                       *)
 (* Copyright (c) 2018 Dynamic Ledger Solutions, Inc. <contact@tezos.com>     *)
+(* Copyright (c) 2024 TriliTech <contact@trili.tech>                         *)
 (*                                                                           *)
 (* Permission is hereby granted, free of charge, to any person obtaining a   *)
 (* copy of this software and associated documentation files (the "Software"),*)
@@ -77,11 +78,12 @@ val register_global_constant :
   ?dry_run:bool ->
   ?verbose_signing:bool ->
   ?simulation:bool ->
-  ?fee:Tez.tez ->
+  ?fee:Tez.t ->
   ?gas_limit:Gas.Arith.integral ->
+  ?safety_guard:Gas.Arith.integral ->
   ?storage_limit:Z.t ->
   ?counter:Manager_counter.t ->
-  source:Signature.public_key_hash ->
+  source:Implicit_account_repr.t ->
   src_pk:Signature.public_key ->
   src_sk:Client_keys.sk_uri ->
   fee_parameter:Injection.fee_parameter ->
@@ -108,7 +110,7 @@ val get_script :
   unparsing_mode:Script_ir_unparser.unparsing_mode ->
   normalize_types:bool ->
   Contract_hash.t ->
-  Script.t option tzresult Lwt.t
+  Script.michelson_with_storage option tzresult Lwt.t
 
 (** Calls {!Tezos_protocol_alpha.Protocol.Contract_services.script_opt}. *)
 val get_script_hash :
@@ -120,6 +122,22 @@ val get_script_hash :
 
 (** Calls {!Tezos_protocol_alpha.Protocol.Contract_services.val-balance}. *)
 val get_balance :
+  #Protocol_client_context.rpc_context ->
+  chain:Shell_services.chain ->
+  block:Shell_services.block ->
+  Contract.t ->
+  Tez.t tzresult Lwt.t
+
+(** Calls {!Tezos_protocol_alpha.Protocol.Contract_services.val-staked_balance}. *)
+val get_staked_balance :
+  #Protocol_client_context.rpc_context ->
+  chain:Shell_services.chain ->
+  block:Shell_services.block ->
+  Contract.t ->
+  Tez.t option tzresult Lwt.t
+
+(** Calls {!Tezos_protocol_alpha.Protocol.Contract_services.val-full_balance}. *)
+val get_full_balance :
   #Protocol_client_context.rpc_context ->
   chain:Shell_services.chain ->
   block:Shell_services.block ->
@@ -151,7 +169,22 @@ val get_frozen_deposits_limit :
   #Protocol_client_context.rpc_context ->
   chain:Shell_services.chain ->
   block:Shell_services.block ->
-  Signature.Public_key_hash.t ->
+  Implicit_account_repr.t ->
+  Tez.t option tzresult Lwt.t
+
+(** [simulated_staked_amount rpc ~chain ~block ~source ~amount] returns the tez
+    amount that a ["stake"] of [amount] by [source] would actually credit, given
+    the delegate's current staking pseudotoken rate. Since minting rounds down,
+    the credited amount is at most [amount]. Returns [None] when the notion does
+    not apply or the operation would fail anyway: [source] has no delegate,
+    [source] is its own delegate (self-stake, no pseudotokens), or the
+    delegate's staked pool is empty (fully slashed). *)
+val simulated_staked_amount :
+  #Protocol_client_context.rpc_context ->
+  chain:Shell_services.chain ->
+  block:Shell_services.block ->
+  source:Signature.public_key_hash ->
+  amount:Tez.t ->
   Tez.t option tzresult Lwt.t
 
 (** Calls {!Injection.prepare_manager_operation}
@@ -160,7 +193,7 @@ val build_delegate_operation :
   ?fee:Tez.t ->
   ?gas_limit:Gas.Arith.integral ->
   ?storage_limit:Z.t ->
-  public_key_hash option ->
+  Implicit_account_repr.t option ->
   Kind.delegation Annotated_manager_operation.t
 
 (** Calls {!Injection.inject_manager_operation}
@@ -174,13 +207,18 @@ val set_delegate :
   ?dry_run:bool ->
   ?verbose_signing:bool ->
   ?simulation:bool ->
-  ?fee:Tez.tez ->
-  public_key_hash ->
+  ?fee:Tez.t ->
+  ?amount:Tez.t ->
+  Implicit_account_repr.t ->
   src_pk:public_key ->
   manager_sk:Client_keys.sk_uri ->
   fee_parameter:Injection.fee_parameter ->
-  public_key_hash option ->
-  Kind.delegation Kind.manager Injection.result tzresult Lwt.t
+  Implicit_account_repr.t option ->
+  (Operation_hash.t
+  * packed_contents_list
+  * Apply_results.packed_contents_result list)
+  tzresult
+  Lwt.t
 
 val update_consensus_key :
   #Protocol_client_context.full ->
@@ -190,8 +228,27 @@ val update_consensus_key :
   ?dry_run:bool ->
   ?verbose_signing:bool ->
   ?simulation:bool ->
-  ?fee:Tez.tez ->
-  consensus_pk:Signature.public_key ->
+  ?fee:Tez.t ->
+  ?pop_material:
+    (Bls12_381_signature.MinPk.signature, Client_keys.sk_uri) Either.t ->
+  public_key:Signature.public_key ->
+  manager_sk:Client_keys.sk_uri ->
+  fee_parameter:Injection.fee_parameter ->
+  Signature.public_key ->
+  Kind.update_consensus_key Kind.manager Injection.result tzresult Lwt.t
+
+val update_companion_key :
+  #Protocol_client_context.full ->
+  chain:Shell_services.chain ->
+  block:Shell_services.block ->
+  ?confirmations:int ->
+  ?dry_run:bool ->
+  ?verbose_signing:bool ->
+  ?simulation:bool ->
+  ?fee:Tez.t ->
+  ?pop_material:
+    (Bls12_381_signature.MinPk.signature, Client_keys.sk_uri) Either.t ->
+  public_key:Signature.public_key ->
   manager_sk:Client_keys.sk_uri ->
   fee_parameter:Injection.fee_parameter ->
   Signature.public_key ->
@@ -207,8 +264,8 @@ val drain_delegate :
   ?simulation:bool ->
   consensus_sk:Client_keys.sk_uri ->
   consensus_pkh:Signature.public_key_hash ->
-  ?destination:Signature.public_key_hash ->
-  delegate:Signature.public_key_hash ->
+  destination:Implicit_account_repr.t ->
+  delegate:Implicit_account_repr.t ->
   unit ->
   Kind.drain_delegate Injection.result tzresult Lwt.t
 
@@ -223,8 +280,8 @@ val set_deposits_limit :
   ?dry_run:bool ->
   ?verbose_signing:bool ->
   ?simulation:bool ->
-  ?fee:Tez.tez ->
-  public_key_hash ->
+  ?fee:Tez.t ->
+  Implicit_account_repr.t ->
   src_pk:public_key ->
   manager_sk:Client_keys.sk_uri ->
   fee_parameter:Injection.fee_parameter ->
@@ -241,10 +298,10 @@ val increase_paid_storage :
   ?force:bool ->
   ?dry_run:bool ->
   ?verbose_signing:bool ->
-  ?fee:Tez.tez ->
+  ?fee:Tez.t ->
   ?confirmations:int ->
   ?simulation:bool ->
-  source:public_key_hash ->
+  source:Implicit_account_repr.t ->
   destination:Contract_hash.t ->
   src_pk:public_key ->
   manager_sk:Client_keys.sk_uri ->
@@ -262,19 +319,24 @@ val register_as_delegate :
   ?confirmations:int ->
   ?dry_run:bool ->
   ?verbose_signing:bool ->
-  ?fee:Tez.tez ->
+  ?fee:Tez.t ->
   manager_sk:Client_keys.sk_uri ->
   fee_parameter:Injection.fee_parameter ->
-  ?consensus_pk:public_key ->
+  ?consensus_keys:
+    public_key
+    * (Bls12_381_signature.MinPk.signature, Client_keys.sk_uri) Either.t option ->
+  ?companion_keys:
+    public_key
+    * (Bls12_381_signature.MinPk.signature, Client_keys.sk_uri) Either.t option ->
+  ?amount:Tez.t ->
   public_key ->
-  (Kind.delegation Kind.manager Injection.result
-  * (Kind.update_consensus_key Kind.manager contents
-    * Kind.update_consensus_key Kind.manager Apply_results.contents_result)
-    option)
+  (Operation_hash.t
+  * packed_contents_list
+  * Apply_results.packed_contents_result list)
   tzresult
   Lwt.t
 
-(** Calls {!RawContractAlias.add}. *)
+(** Calls {!Raw_contract_alias.add}. *)
 val save_contract :
   force:bool ->
   #Protocol_client_context.full ->
@@ -295,11 +357,12 @@ val originate_contract :
   ?branch:int ->
   ?fee:Tez.t ->
   ?gas_limit:Gas.Arith.integral ->
+  ?safety_guard:Gas.Arith.integral ->
   ?storage_limit:Z.t ->
-  delegate:public_key_hash option ->
+  delegate:Implicit_account_repr.t option ->
   initial_storage:string ->
   balance:Tez.t ->
-  source:public_key_hash ->
+  source:Implicit_account_repr.t ->
   src_pk:public_key ->
   src_sk:Client_keys.sk_uri ->
   code:Script.expr ->
@@ -337,7 +400,7 @@ val transfer_with_script :
   ?force:bool ->
   ?branch:int ->
   ?successor_level:bool ->
-  source:public_key_hash ->
+  source:Implicit_account_repr.t ->
   src_pk:public_key ->
   src_sk:Client_keys.sk_uri ->
   destination:Contract.t ->
@@ -346,6 +409,7 @@ val transfer_with_script :
   amount:Tez.t ->
   ?fee:Tez.t ->
   ?gas_limit:Gas.Arith.integral ->
+  ?safety_guard:Gas.Arith.integral ->
   ?storage_limit:Z.t ->
   ?counter:Manager_counter.t ->
   fee_parameter:Injection.fee_parameter ->
@@ -371,7 +435,7 @@ val transfer :
   ?force:bool ->
   ?branch:int ->
   ?successor_level:bool ->
-  source:public_key_hash ->
+  source:Implicit_account_repr.t ->
   src_pk:public_key ->
   src_sk:Client_keys.sk_uri ->
   destination:Contract.t ->
@@ -380,6 +444,7 @@ val transfer :
   amount:Tez.t ->
   ?fee:Tez.t ->
   ?gas_limit:Gas.Arith.integral ->
+  ?safety_guard:Gas.Arith.integral ->
   ?storage_limit:Z.t ->
   ?counter:Manager_counter.t ->
   fee_parameter:Injection.fee_parameter ->
@@ -391,11 +456,13 @@ val transfer :
 
 (** Calls {!Injection.prepare_manager_operation} with [Reveal pk] as [operation] *)
 val build_reveal_operation :
+  #Protocol_client_context.full ->
   ?fee:Tez.t ->
   ?gas_limit:Gas.Arith.integral ->
   ?storage_limit:Z.t ->
+  src_sk:Client_keys.sk_uri ->
   public_key ->
-  Kind.reveal Annotated_manager_operation.t
+  Kind.reveal Annotated_manager_operation.t tzresult Lwt.t
 
 (** Calls {!Injection.inject_manager_operation}
     with {!Annotated_manager_operation.Single_manager}
@@ -409,7 +476,7 @@ val reveal :
   ?dry_run:bool ->
   ?verbose_signing:bool ->
   ?branch:int ->
-  source:public_key_hash ->
+  source:Implicit_account_repr.t ->
   src_pk:public_key ->
   src_sk:Client_keys.sk_uri ->
   ?fee:Tez.t ->
@@ -522,7 +589,7 @@ val submit_proposals :
   block:Shell_services.block ->
   ?confirmations:int ->
   src_sk:Client_keys.sk_uri ->
-  public_key_hash ->
+  Implicit_account_repr.t ->
   Protocol_hash.t list ->
   Kind.proposals Injection.result_list tzresult Lwt.t
 
@@ -537,7 +604,7 @@ val submit_ballot :
   block:Shell_services.block ->
   ?confirmations:int ->
   src_sk:Client_keys.sk_uri ->
-  public_key_hash ->
+  Implicit_account_repr.t ->
   Protocol_hash.t ->
   Vote.ballot ->
   Kind.ballot Injection.result_list tzresult Lwt.t
@@ -588,11 +655,12 @@ val transfer_ticket :
   ?dry_run:bool ->
   ?verbose_signing:bool ->
   ?simulation:bool ->
-  ?fee:Tez.tez ->
+  ?fee:Tez.t ->
   ?gas_limit:Gas.Arith.integral ->
+  ?safety_guard:Gas.Arith.integral ->
   ?storage_limit:Z.t ->
   ?counter:Manager_counter.t ->
-  source:Signature.public_key_hash ->
+  source:Implicit_account_repr.t ->
   src_pk:Signature.public_key ->
   src_sk:Client_keys.sk_uri ->
   fee_parameter:Injection.fee_parameter ->
@@ -628,9 +696,11 @@ val sc_rollup_originate :
   ?simulation:bool ->
   ?fee:Tez.t ->
   ?gas_limit:Gas.Arith.integral ->
+  ?safety_guard:Gas.Arith.integral ->
   ?storage_limit:Z.t ->
   ?counter:Manager_counter.t ->
-  source:public_key_hash ->
+  ?whitelist:Sc_rollup.Whitelist.t ->
+  source:Implicit_account_repr.t ->
   kind:Sc_rollup.Kind.t ->
   boot_sector:string ->
   parameters_ty:Script.lazy_expr ->
@@ -660,9 +730,10 @@ val sc_rollup_add_messages :
   ?simulation:bool ->
   ?fee:Tez.t ->
   ?gas_limit:Gas.Arith.integral ->
+  ?safety_guard:Gas.Arith.integral ->
   ?storage_limit:Z.t ->
   ?counter:Manager_counter.t ->
-  source:public_key_hash ->
+  source:Implicit_account_repr.t ->
   messages:string list ->
   src_pk:public_key ->
   src_sk:Client_keys.sk_uri ->
@@ -691,11 +762,11 @@ val sc_rollup_cement :
   ?simulation:bool ->
   ?fee:Tez.t ->
   ?gas_limit:Gas.Arith.integral ->
+  ?safety_guard:Gas.Arith.integral ->
   ?storage_limit:Z.t ->
   ?counter:Manager_counter.t ->
-  source:public_key_hash ->
+  source:Implicit_account_repr.t ->
   rollup:Alpha_context.Sc_rollup.t ->
-  commitment:Alpha_context.Sc_rollup.Commitment.Hash.t ->
   src_pk:public_key ->
   src_sk:Client_keys.sk_uri ->
   fee_parameter:Injection.fee_parameter ->
@@ -724,9 +795,10 @@ val sc_rollup_publish :
   ?simulation:bool ->
   ?fee:Tez.t ->
   ?gas_limit:Gas.Arith.integral ->
+  ?safety_guard:Gas.Arith.integral ->
   ?storage_limit:Z.t ->
   ?counter:Manager_counter.t ->
-  source:public_key_hash ->
+  source:Implicit_account_repr.t ->
   rollup:Alpha_context.Sc_rollup.t ->
   commitment:Alpha_context.Sc_rollup.Commitment.t ->
   src_pk:public_key ->
@@ -755,9 +827,10 @@ val sc_rollup_execute_outbox_message :
   ?simulation:bool ->
   ?fee:Tez.t ->
   ?gas_limit:Gas.Arith.integral ->
+  ?safety_guard:Gas.Arith.integral ->
   ?storage_limit:Z.t ->
   ?counter:Manager_counter.t ->
-  source:public_key_hash ->
+  source:Implicit_account_repr.t ->
   rollup:Sc_rollup.t ->
   cemented_commitment:Sc_rollup.Commitment.Hash.t ->
   output_proof:string ->
@@ -786,16 +859,17 @@ val sc_rollup_recover_bond :
   ?dry_run:bool ->
   ?verbose_signing:bool ->
   ?simulation:bool ->
-  ?fee:Tez.tez ->
+  ?fee:Tez.t ->
   ?gas_limit:Gas.Arith.integral ->
+  ?safety_guard:Gas.Arith.integral ->
   ?storage_limit:Z.t ->
   ?counter:Manager_counter.t ->
-  source:Signature.public_key_hash ->
+  source:Implicit_account_repr.t ->
   src_pk:Signature.public_key ->
   src_sk:Client_keys.sk_uri ->
   fee_parameter:Injection.fee_parameter ->
   sc_rollup:Sc_rollup.t ->
-  staker:public_key_hash ->
+  staker:Implicit_account_repr.t ->
   unit ->
   (Operation_hash.t
   * Kind.sc_rollup_recover_bond Kind.manager contents
@@ -819,9 +893,10 @@ val sc_rollup_refute :
   ?simulation:bool ->
   ?fee:Tez.t ->
   ?gas_limit:Gas.Arith.integral ->
+  ?safety_guard:Gas.Arith.integral ->
   ?storage_limit:Z.t ->
   ?counter:Manager_counter.t ->
-  source:public_key_hash ->
+  source:Implicit_account_repr.t ->
   rollup:Alpha_context.Sc_rollup.t ->
   refutation:Alpha_context.Sc_rollup.Game.refutation ->
   opponent:Alpha_context.Sc_rollup.Staker.t ->
@@ -851,9 +926,10 @@ val sc_rollup_timeout :
   ?simulation:bool ->
   ?fee:Tez.t ->
   ?gas_limit:Gas.Arith.integral ->
+  ?safety_guard:Gas.Arith.integral ->
   ?storage_limit:Z.t ->
   ?counter:Manager_counter.t ->
-  source:public_key_hash ->
+  source:Implicit_account_repr.t ->
   rollup:Alpha_context.Sc_rollup.t ->
   alice:Alpha_context.Sc_rollup.Staker.t ->
   bob:Alpha_context.Sc_rollup.Staker.t ->
@@ -867,6 +943,15 @@ val sc_rollup_timeout :
   tzresult
   Lwt.t
 
+(** Calls {!Tezos_protocol_plugin_alpha.Plugin.RPC.Sc_rollup.get_ticket_balance}. *)
+val get_smart_rollup_ticket_balance :
+  #Protocol_client_context.rpc_context ->
+  chain:Shell_services.chain ->
+  block:Shell_services.block ->
+  Sc_rollup.t ->
+  Ticket_token.unparsed_token ->
+  Z.t tzresult Lwt.t
+
 val zk_rollup_originate :
   #Protocol_client_context.full ->
   chain:Chain_services.chain ->
@@ -877,9 +962,10 @@ val zk_rollup_originate :
   ?simulation:bool ->
   ?fee:Tez.t ->
   ?gas_limit:Gas.Arith.integral ->
+  ?safety_guard:Gas.Arith.integral ->
   ?storage_limit:Z.t ->
   ?counter:Manager_counter.t ->
-  source:public_key_hash ->
+  source:Implicit_account_repr.t ->
   public_parameters:Environment.Plonk.public_parameters ->
   circuits_info:[`Fee | `Private | `Public] Zk_rollup.Account.SMap.t ->
   init_state:Bls12_381.Fr.t array ->
@@ -905,9 +991,10 @@ val zk_rollup_publish :
   ?simulation:bool ->
   ?fee:Tez.t ->
   ?gas_limit:Gas.Arith.integral ->
+  ?safety_guard:Gas.Arith.integral ->
   ?storage_limit:Z.t ->
   ?counter:Manager_counter.t ->
-  source:public_key_hash ->
+  source:Implicit_account_repr.t ->
   zk_rollup:Zk_rollup.t ->
   ops:(Zk_rollup.Operation.t * Zk_rollup.Ticket.t option) list ->
   src_pk:public_key ->
@@ -931,9 +1018,10 @@ val zk_rollup_update :
   ?simulation:bool ->
   ?fee:Tez.t ->
   ?gas_limit:Gas.Arith.integral ->
+  ?safety_guard:Gas.Arith.integral ->
   ?storage_limit:Z.t ->
   ?counter:Manager_counter.t ->
-  source:public_key_hash ->
+  source:Implicit_account_repr.t ->
   zk_rollup:Zk_rollup.t ->
   update:Zk_rollup.Update.t ->
   src_pk:public_key ->
@@ -946,3 +1034,65 @@ val zk_rollup_update :
     tztrace )
   result
   Lwt.t
+
+(** Injects a DAL publish commitment operation using
+    {!Injection.inject_operation}.
+*)
+val dal_publish :
+  #Protocol_client_context.full ->
+  chain:Chain_services.chain ->
+  block:Block_services.block ->
+  ?confirmations:int ->
+  ?dry_run:bool ->
+  ?verbose_signing:bool ->
+  ?simulation:bool ->
+  ?fee:Tez.t ->
+  ?gas_limit:Gas.Arith.integral ->
+  ?safety_guard:Gas.Arith.integral ->
+  ?storage_limit:Z.t ->
+  ?counter:Manager_counter.t ->
+  source:Implicit_account_repr.t ->
+  slot_header:Alpha_context.Dal.Operations.Publish_commitment.t ->
+  src_pk:public_key ->
+  src_sk:Client_keys.sk_uri ->
+  fee_parameter:Injection.fee_parameter ->
+  unit ->
+  (Operation_hash.t
+  * Kind.dal_publish_commitment Kind.manager contents
+  * Kind.dal_publish_commitment Kind.manager Apply_results.contents_result)
+  tzresult
+  Lwt.t
+
+val get_pending_staking_parameters :
+  #Protocol_client_context.full ->
+  ?chain:Chain_services.chain ->
+  ?block:Block_services.block ->
+  Implicit_account_repr.t ->
+  (Cycle.t * Staking_parameters_repr.t) list tzresult Lwt.t
+
+val get_active_staking_parameters :
+  #Protocol_client_context.full ->
+  ?chain:Chain_services.chain ->
+  ?block:Block_services.block ->
+  Implicit_account_repr.t ->
+  Staking_parameters_repr.t tzresult Lwt.t
+
+val get_latest_staking_parameters :
+  #Protocol_client_context.full ->
+  ?chain:Chain_services.chain ->
+  ?block:Block_services.block ->
+  Implicit_account_repr.t ->
+  Staking_parameters_repr.t tzresult Lwt.t
+
+val is_delegate :
+  #Protocol_client_context.full ->
+  ?chain:Chain_services.chain ->
+  ?block:Block_services.block ->
+  Implicit_account_repr.t ->
+  bool tzresult Lwt.t
+
+val get_stez_contract_hash :
+  #Protocol_client_context.rpc_context ->
+  chain:Shell_services.chain ->
+  block:Shell_services.block ->
+  Contract_hash.t tzresult Lwt.t

@@ -2,8 +2,8 @@ Synchronisation heuristic
 =========================
 
 When a new node joins the network, it must **bootstrap**: fetch and
-validate the chain before starting to bake or endorse new blocks. A
-bootstrapping node cannot bake or endorse new blocks, so for
+validate the chain before starting to bake or attest new blocks. A
+bootstrapping node cannot bake or attest new blocks, so for
 efficiency it should not bother to track a **mempool**: a pool of
 active operations.
 
@@ -86,7 +86,7 @@ Other values are acceptable for ``threshold``, but a small
 probably best: performances and accuracy may degrade for values much
 higher than ``10``.
 
-The default value for ``latency`` is ``150`` seconds. Whatever you
+The default value for ``latency`` is ``50`` seconds. Whatever you
 change it to, it should be at least long enough to include a few
 blocks' worth of the protocol's baking rate plus some network latency,
 but not so long that the node considers itself bootstrapped even
@@ -94,7 +94,7 @@ though it is many blocks away from the chain's head.
 
 A good value for ``latency`` is ``2`` to ``5`` times the time between
 blocks, plus a small delta for network delays. At the time of
-writing, the time between two consecutive blocks is ``30`` seconds
+writing, the time between two consecutive blocks is ``10`` seconds
 when the chain is healthy (see :doc:`the consensus algorithm
 <../active/consensus>`).
 

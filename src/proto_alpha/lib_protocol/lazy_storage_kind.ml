@@ -207,8 +207,8 @@ end
 *)
 type ('id, 'alloc, 'updates) t =
   | Big_map : (Big_map.Id.t, Big_map.alloc, Big_map.updates) t
-  | Sapling_state
-      : (Sapling_state.Id.t, Sapling_state.alloc, Sapling_state.updates) t
+  | Sapling_state :
+      (Sapling_state.Id.t, Sapling_state.alloc, Sapling_state.updates) t
 
 type ex = Ex_Kind : (_, _, _) t -> ex
 
@@ -217,8 +217,7 @@ let all = [(0, Ex_Kind Big_map); (1, Ex_Kind Sapling_state)]
 
 type (_, _) cmp = Eq : ('a, 'a) cmp | Neq
 
-let equal :
-    type i1 a1 u1 i2 a2 u2.
+let equal : type i1 a1 u1 i2 a2 u2.
     (i1, a1, u1) t -> (i2, a2, u2) t -> (i1 * a1 * u1, i2 * a2 * u2) cmp =
  fun k1 k2 ->
   match (k1, k2) with
@@ -249,28 +248,30 @@ module Temp_ids = struct
         ( {temp_ids with sapling_state},
           (temp_ids.sapling_state :> Sapling_state.Id.t) )
 
-  let fold_s :
-      type i a u.
+  let fold_s : type i a u.
       (i, a, u) kind -> ('acc -> i -> 'acc Lwt.t) -> t -> 'acc -> 'acc Lwt.t =
-   fun kind f temp_ids acc ->
-    let helper (type j) (module Temp_id : TEMP_ID with type t = j) ~last f =
-      let rec aux acc id =
-        if Temp_id.equal id last then Lwt.return acc
-        else f acc id >>= fun acc -> aux acc (Temp_id.next id)
+    let open Lwt_syntax in
+    fun kind f temp_ids acc ->
+      let helper (type j) (module Temp_id : TEMP_ID with type t = j) ~last f =
+        let rec aux acc id =
+          if Temp_id.equal id last then Lwt.return acc
+          else
+            let* acc = f acc id in
+            aux acc (Temp_id.next id)
+        in
+        aux acc Temp_id.init
       in
-      aux acc Temp_id.init
-    in
-    match kind with
-    | Big_map ->
-        helper
-          (module Big_map.Temp_id)
-          ~last:temp_ids.big_map
-          (fun acc temp_id -> f acc (temp_id :> i))
-    | Sapling_state ->
-        helper
-          (module Sapling_state.Temp_id)
-          ~last:temp_ids.sapling_state
-          (fun acc temp_id -> f acc (temp_id :> i))
+      match kind with
+      | Big_map ->
+          helper
+            (module Big_map.Temp_id)
+            ~last:temp_ids.big_map
+            (fun acc temp_id -> f acc (temp_id :> i))
+      | Sapling_state ->
+          helper
+            (module Sapling_state.Temp_id)
+            ~last:temp_ids.sapling_state
+            (fun acc temp_id -> f acc (temp_id :> i))
 end
 
 module IdSet = struct

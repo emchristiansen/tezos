@@ -6,22 +6,24 @@
  (instrumentation (backend bisect_ppx))
  (libraries
   tezt.core
-  tezos-base
-  tezos-micheline
-  tezos-client-alpha
-  tezos-protocol-alpha
-  tezos-context.merkle_proof_encoding
-  tezos-test-helpers
-  tezos-alpha-test-helpers
+  bls12-381.archive
+  octez-libs.base
+  octez-libs.micheline
+  octez-protocol-alpha-libs.client
+  tezos-protocol-alpha.protocol
+  octez-libs.tezos-context.merkle_proof_encoding
+  octez-libs.test-helpers
+  octez-protocol-alpha-libs.test-helpers
   octez-alcotezt
   qcheck-alcotest
   tezos-benchmark
   tezos-benchmark-alpha
   tezos-benchmark-type-inference-alpha
-  tezos-smart-rollup-alpha
-  tezos-crypto-dal
-  tezos-base-test-helpers
-  tezos-protocol-alpha.parameters)
+  octez-protocol-alpha-libs.smart-rollup
+  octez-libs.crypto-dal
+  octez-libs.base-test-helpers
+  tezos-protocol-alpha.parameters
+  octez-protocol-alpha-libs.plugin)
  (library_flags (:standard -linkall))
  (flags
   (:standard)
@@ -39,29 +41,34 @@
   -open Tezos_smart_rollup_alpha
   -open Tezos_crypto_dal
   -open Tezos_base_test_helpers
-  -open Tezos_protocol_alpha_parameters)
+  -open Tezos_protocol_alpha_parameters
+  -open Tezos_protocol_plugin_alpha)
  (modules
   liquidity_baking_pbt
   saturation_fuzzing
-  test_merkle_list
   test_gas_properties
   test_sampler
   test_script_comparison
+  test_script_roundtrip
+  test_script_normalization
   test_tez_repr
-  test_bitset
   test_sc_rollup_tick_repr
   test_sc_rollup_encoding
+  test_sc_rollup_inbox
   test_refutation_game
   test_carbonated_map
   test_zk_rollup_encoding
   test_dal_slot_proof
   test_compare_operations
   test_operation_encoding
+  test_balance_updates_encoding
   test_bytes_conversion))
 
 (executable
  (name main)
+ (instrumentation (backend bisect_ppx --bisect-sigterm))
  (libraries
+  octez-rust-deps
   src_proto_alpha_lib_protocol_test_pbt_tezt_lib
   tezt)
  (link_flags
@@ -70,9 +77,10 @@
  (modules main))
 
 (rule
- (alias runtezt)
+ (alias runtest)
  (package tezos-protocol-alpha-tests)
- (action (run %{dep:./main.exe})))
+ (enabled_if (<> false %{env:RUNTEZTALIAS=true}))
+ (action (run %{dep:./main.exe} /flaky /ci_disabled)))
 
 (rule
  (targets main.ml)

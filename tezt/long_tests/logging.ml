@@ -27,8 +27,10 @@
    -------
    Component: Client
    Invocation: dune exec tezt/long_tests/main.exe -- --file logging.ml
-   Subject: check regressions in the duration it takes for the client to load.
+   Subject: check regressions in the duration it takes to emit log events.
 *)
+
+let team = Team.infrastructure
 
 open Internal_event
 
@@ -58,13 +60,7 @@ let event_i = simple_event "info" Info
 
 let event_n = simple_event "notice" Notice
 
-module Legacy_logging_test = Legacy_logging.Make (struct
-  let name = "legacy-test"
-end)
-
 let id = "TEST"
-
-let num = 52
 
 (* This should take around 1s per test *)
 let nb_repeat = 10_000_000
@@ -75,20 +71,17 @@ let test_simple_event_logging_time ~executors title simple_event =
     ~title
     ~tags:["simple"; "event"; "logging"; "time"; title]
     ~timeout:(Seconds 10)
+    ~uses_node:true
+    ~uses_admin_client:true
+    ~uses_client:true
+    ~team
     ~executors
   @@ fun () ->
-  Long_test.time_lwt title @@ fun () ->
+  (* Even with [nb_repeat = 10_000_000], the measurements are not very precise:
+     we observed some alerts where the duration was up to 33% longer than the average.
+     We thus use a threshold of [margin = 0.5] to avoid alert fatigue. *)
+  Long_test.time_and_check_regression_lwt title ~margin:0.5 @@ fun () ->
   repeat nb_repeat @@ fun () -> Simple.emit simple_event (id, 52)
-
-let test_legacy_event_logging_time ~executors title f =
-  Long_test.register
-    ~__FILE__
-    ~title
-    ~tags:["legacy"; "event"; "logging"; "time"; title]
-    ~timeout:(Seconds 10)
-    ~executors
-  @@ fun () ->
-  Long_test.time_lwt title @@ fun () -> repeat nb_repeat f
 
 module Test_sink : SINK = struct
   type t = unit
@@ -112,18 +105,10 @@ let () =
   @@ let* x = All_sinks.activate (Uri.of_string "test://") in
      match x with Error _ -> assert false | Ok () -> unit
 
-let sei, sen, lei, len =
-  ( "simple_event_info",
-    "simple_event_notice",
-    "legacy_event_info",
-    "legacy_event_notice" )
+let sei, sen = ("simple_event_info", "simple_event_notice")
 
-let grafana_panels = grafana_panels [sei; sen; lei; len]
+let grafana_panels = grafana_panels [sei; sen]
 
 let register ~executors () =
   test_simple_event_logging_time ~executors sei event_i ;
-  test_simple_event_logging_time ~executors sen event_n ;
-  test_legacy_event_logging_time ~executors lei (fun () ->
-      Legacy_logging_test.lwt_log_info "legacy_event") ;
-  test_legacy_event_logging_time ~executors len (fun () ->
-      Legacy_logging_test.lwt_log_notice "legacy_event")
+  test_simple_event_logging_time ~executors sen event_n

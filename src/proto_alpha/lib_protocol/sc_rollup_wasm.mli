@@ -52,8 +52,11 @@ module V2_0_0 : sig
       | Waiting_for_input_message
       | Waiting_for_reveal of Sc_rollup_PVM_sig.reveal
 
-    (** [get_status state] gives you the current execution status for the PVM. *)
-    val get_status : state -> status Lwt.t
+    (** [get_status ~is_reveal_enabled state] gives you the current execution status for the PVM. *)
+    val get_status :
+      is_reveal_enabled:Sc_rollup_PVM_sig.is_reveal_enabled ->
+      state ->
+      status Lwt.t
 
     (** [get_outbox outbox_level state] returns the outbox in [state]
        for a given [outbox_level]. *)
@@ -61,48 +64,29 @@ module V2_0_0 : sig
       Raw_level_repr.t -> state -> Sc_rollup_PVM_sig.output list Lwt.t
   end
 
-  module type P = sig
-    module Tree :
-      Context.TREE with type key = string list and type value = bytes
-
-    type tree = Tree.tree
-
-    type proof
-
-    val proof_encoding : proof Data_encoding.t
-
-    val proof_before : proof -> Sc_rollup_repr.State_hash.t
-
-    val proof_after : proof -> Sc_rollup_repr.State_hash.t
-
-    val verify_proof :
-      proof -> (tree -> (tree * 'a) Lwt.t) -> (tree * 'a) option Lwt.t
+  module type WASM_PVM_MACHINE = sig
+    include Wasm_2_0_0.WASM_PVM_MACHINE
 
     val produce_proof :
-      Tree.t -> tree -> (tree -> (tree * 'a) Lwt.t) -> (proof * 'a) option Lwt.t
+      context ->
+      state ->
+      (state -> (state * 'a) Lwt.t) ->
+      (proof * 'a) option Lwt.t
   end
 
-  module type Make_wasm = module type of Wasm_2_0_0.Make
-
-  (** Build a WebAssembly PVM using the given proof-supporting context. *)
-  module Make (Lib_scoru_Wasm : Make_wasm) (Context : P) :
+  module Make_pvm (WASM_machine : WASM_PVM_MACHINE) :
     S
-      with type context = Context.Tree.t
-       and type state = Context.tree
-       and type proof = Context.proof
+      with type context = WASM_machine.context
+       and type state = WASM_machine.state
+       and type proof = WASM_machine.proof
 
   (** This PVM is used for verification in the Protocol. [produce_proof] always returns [None]. *)
-  module Protocol_implementation :
-    S
-      with type context = Context.t
-       and type state = Context.tree
-       and type proof = Context.Proof.tree Context.Proof.t
-
-  (** This is the state hash of reference that both the prover of the
-      node and the verifier of the protocol {!Protocol_implementation}
-      have to agree on (if they do, it means they are using the same
-      tree structure). *)
-  val reference_initial_state_hash : Sc_rollup_repr.State_hash.t
+  val protocol_implementation :
+    config:Wasm_2_0_0.config ->
+    (module Sc_rollup_PVM_sig.PROTO_VERIFICATION
+       with type context = Wasm_2_0_0.wasm_pvm_machine_context
+        and type state = Wasm_2_0_0.wasm_pvm_machine_state
+        and type proof = Wasm_2_0_0.wasm_pvm_machine_proof)
 
   (** Number of ticks between snapshotable states, chosen low enough
       to maintain refutability.
@@ -119,9 +103,14 @@ module V2_0_0 : sig
       see #3590 for more pointers *)
   val ticks_per_snapshot : Z.t
 
-  (* The number of outboxes to keep, which is for a period of two weeks. For a
-     block time of 30 seconds, this equals to 2 * 60 * 24 * 14 = 40_320
-     blocks. *)
+  (* The number of outboxes to keep, which is for a period of two
+     weeks. For a block time of 5 seconds, this equals to (60 * 60 *
+     24 * 14) / 5 = 241_920 blocks. We choose to consider 5 seconds
+     instead of 10 proposed in protocol P to remove the need to
+     introduce a new PVM version every time the block time is
+     modified. We believe 5 seconds is small enough to be "safe" for
+     multiple months. It does not create a critical issue, we will just keep
+     more outboxes than expected. *)
   val outbox_validity_period : int32
 
   (* Maximum number of outbox messages per level.
@@ -136,4 +125,11 @@ module V2_0_0 : sig
 
   (** The preimage of {!well_known_reveal_hash}. *)
   val well_known_reveal_preimage : string
+
+  (** Convert a raw reveal request of the WASM PVM into a typed reveal as
+      defined by the protocol.
+
+      If the decoding fails, fallback to requesting the preimage of the
+      {!well_known_reveal_hash}. *)
+  val decode_reveal : Wasm_2_0_0.reveal -> Sc_rollup_PVM_sig.reveal
 end

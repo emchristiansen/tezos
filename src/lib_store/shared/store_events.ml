@@ -29,6 +29,25 @@ include Internal_event.Simple
 let section = ["node"; "store"]
 
 (* Info *)
+let init_store =
+  declare_2
+    ~section
+    ~level:Info
+    ~name:"init_store"
+    ~msg:
+      "initializing the store (readonly: {ro}, disable context pruning: \
+       {disable_context_pruning})"
+    ("ro", Data_encoding.bool)
+    ("disable_context_pruning", Data_encoding.bool)
+
+let end_init_store =
+  declare_0
+    ~section
+    ~level:Info
+    ~name:"end_init_store"
+    ~msg:"store initialized"
+    ()
+
 let set_head =
   declare_1
     ~section
@@ -100,12 +119,33 @@ let start_updating_floating_stores =
     ~msg:"updating floating stores"
     ()
 
+let cementing_block_ranges =
+  declare_1
+    ~section
+    ~level:Info
+    ~name:"cementing_block_ranges"
+    ~msg:"cementing block ranges: {ranges}."
+    ~pp1:
+      (Format.pp_print_list
+         ~pp_sep:(fun ppf () -> Format.pp_print_string ppf "; ")
+         (fun ppf (s, e) -> Format.fprintf ppf "[ %ld, %ld ]" s e))
+    ("ranges", Data_encoding.(list (tup2 int32 int32)))
+
 let start_cementing_blocks =
-  declare_0
+  declare_2
     ~section
     ~level:Info
     ~name:"start_cementing_blocks"
-    ~msg:"cementing blocks"
+    ~msg:"cementing blocks between level {start} and {stop}"
+    ("start", Data_encoding.int32)
+    ("stop", Data_encoding.int32)
+
+let end_cementing_blocks =
+  declare_0
+    ~section
+    ~level:Info
+    ~name:"end_cementing_blocks"
+    ~msg:"successful cementing"
     ()
 
 let start_cementing_blocks_metadata =
@@ -164,6 +204,22 @@ let start_retreiving_cycles =
     ~msg:"retrieving cycles from floating store"
     ()
 
+let load_block_store_status =
+  declare_0
+    ~section
+    ~level:Info
+    ~name:"load_block_store_status"
+    ~msg:"loading using legacy block_store_status encoding"
+    ()
+
+let fixed_block_store_status =
+  declare_0
+    ~section
+    ~level:Info
+    ~name:"fixed_block_store_status"
+    ~msg:"loading of block store status was successful"
+    ()
+
 let store_is_consistent =
   declare_0
     ~section
@@ -171,6 +227,15 @@ let store_is_consistent =
     ~name:"store_is_consistent"
     ~msg:"the store is consistent"
     ()
+
+let metadata_read_error =
+  declare_1
+    ~section
+    ~level:Debug
+    ~name:"error_while_reading_cemented_metadata"
+    ~msg:"unexpected error while reading cemented metadata: {exc}"
+    ~pp1:Format.pp_print_string
+    ("exc", Data_encoding.string)
 
 (* Notice *)
 let fork_testchain =
@@ -195,21 +260,50 @@ let pp_int32 fmt i = Format.fprintf fmt "%ld" i
 
 let start_merging_stores =
   declare_1
+    ~alternative_color:Internal_event.Cyan
     ~section
     ~level:Notice
     ~name:"start_merging_stores"
-    ~msg:"merging store up to block level {lafl}"
+    ~msg:"merging store up to block level {lpbl}"
     ~pp1:pp_int32
-    ("lafl", Data_encoding.int32)
+    ("lpbl", Data_encoding.int32)
 
 let end_merging_stores =
   declare_1
+    ~alternative_color:Internal_event.Cyan
     ~section
     ~level:Notice
     ~name:"end_merging_stores"
     ~msg:"store was successfully merged in {time}"
     ~pp1:Time.System.Span.pp_hum
     ("time", Time.System.Span.encoding)
+
+let maintenance_status =
+  declare_1
+    ~section
+    ~level:Info
+    ~name:"delayed_maintenance_status"
+    ~msg:"delayed storage maintenance set to {mode}"
+    ~pp1:Storage_maintenance.pp_delay
+    ("mode", Storage_maintenance.delay_encoding)
+
+let delay_store_merging =
+  declare_2
+    ~section
+    ~level:Info
+    ~name:"start_delayed_maintenance"
+    ~msg:"delaying storage ({mode}) maintenance (target {level})"
+    ~pp1:Storage_maintenance.pp_delay
+    ("mode", Storage_maintenance.delay_encoding)
+    ("level", Data_encoding.int32)
+
+let delayed_store_merging_countdown =
+  declare_1
+    ~section
+    ~level:Debug
+    ~name:"delayed_store_merging_countdown"
+    ~msg:"merging storage after {count} blocks scheduled delay"
+    ("count", Data_encoding.int32)
 
 let start_context_gc =
   declare_1
@@ -228,6 +322,47 @@ let start_context_split =
     ~msg:"splitting context into a new chunk at level {level}"
     ~pp1:pp_int32
     ("level", Data_encoding.int32)
+
+let start_store_sync =
+  declare_0
+    ~section
+    ~level:Info
+    ~name:"start_store_sync"
+    ~msg:"starting store sync"
+    ()
+
+let store_already_sync =
+  declare_0
+    ~section
+    ~level:Info
+    ~name:"store_already_sync"
+    ~msg:"store already in sync"
+    ()
+
+let store_quick_sync =
+  declare_0
+    ~section
+    ~level:Info
+    ~name:"store_quick_sync"
+    ~msg:"store quick sync"
+    ()
+
+let store_full_sync =
+  declare_0
+    ~section
+    ~level:Info
+    ~name:"store_full_sync"
+    ~msg:"store full sync"
+    ()
+
+let end_store_sync =
+  declare_1
+    ~section
+    ~level:Info
+    ~name:"end_store_sync"
+    ~msg:"store was successfully synced in {time}"
+    ~pp1:Time.System.Span.pp_hum
+    ("time", Time.System.Span.encoding)
 
 let context_gc_is_not_allowed =
   declare_0
@@ -372,6 +507,7 @@ let store_was_fixed =
 
 let recover_merge =
   declare_0
+    ~alternative_color:Internal_event.Cyan
     ~section
     ~level:Notice
     ~name:"recovering_merge"
@@ -399,6 +535,7 @@ let restore_protocol_activation =
 let update_protocol_table =
   declare_4
     ~section
+    ~alternative_color:Internal_event.Blue
     ~level:Notice
     ~name:"update_protocol_table"
     ~msg:
@@ -476,13 +613,12 @@ let notify_merge_error =
     ("errs", Error_monad.trace_encoding)
 
 let upgrade_store_failed =
-  declare_1
+  declare_0
     ~section
     ~level:Error
     ~name:"upgrade_store_failed"
-    ~msg:"store upgrade failed, cleaning up temporary files: {errs}"
-    ~pp1:(fun ppf -> Format.fprintf ppf "%a" Error_monad.pp_print_trace)
-    ("errs", Error_monad.trace_encoding)
+    ~msg:"store upgrade failed, cleaning up temporary files"
+    ()
 
 let upgrade_store_started =
   declare_0
@@ -491,3 +627,20 @@ let upgrade_store_started =
     ~name:"upgrade_store_started"
     ~msg:"upgrading the store"
     ()
+
+let upgrade_cemented_file_skip =
+  declare_1
+    ~section
+    ~level:Info
+    ~name:"upgrade_cemented_file_skip"
+    ~msg:"File {path} does not have 32-bit offsets, skipping upgrade"
+    ~pp1:Format.pp_print_string
+    ("path", Data_encoding.string)
+
+let import_legacy_snapshot_version =
+  declare_1
+    ~section
+    ~level:Notice
+    ~name:"import_legacy_snapshot_version"
+    ~msg:"Importing a legacy snapshot version: {legacy_version}."
+    ("legacy_version", Data_encoding.int31)

@@ -1,0 +1,58 @@
+ARG DOCKER_VERSION=null
+ARG DOCKER_DIGEST=null
+ARG HADOLINT_VERSION=null
+ARG GCLOUD_VERSION=null
+ARG REGCTL_VERSION=null
+FROM gcr.io/google.com/cloudsdktool/google-cloud-cli:${GCLOUD_VERSION}-alpine AS gcloud
+FROM hadolint/hadolint:${HADOLINT_VERSION}-alpine AS hadolint
+FROM ghcr.io/regclient/regctl:${REGCTL_VERSION} AS regctl
+
+ARG DOCKER_VERSION=null
+ARG DOCKER_DIGEST=null
+# Pin the upstream docker image by digest (passed from Tezos_ci.docker_digest)
+# so the bundled docker CLI + buildx plugin are reproducible across rebuilds.
+# The docker:<v> tag is otherwise republished over time with newer plugins,
+# which made buildx behaviour drift (e.g. the bake fs.read entitlement check).
+FROM docker:${DOCKER_VERSION}@${DOCKER_DIGEST}
+
+SHELL ["/bin/sh", "-eu", "-c"]
+
+ENV LANG=C.UTF-8 LC_ALL=C.UTF-8
+
+# Upgrade base image and install tools
+# py3-crcmod is needed to run gcloud
+# hadolint ignore=DL3018,DL3019
+RUN apk update && \
+    apk add --no-cache \
+    bash \
+    ca-certificates \
+    curl \
+    git \
+    jq \
+    moreutils \
+    python3 \
+    libc6-compat \
+    openssh-client \
+    gnupg \
+    py3-crcmod \
+    docker-credential-ecr-login \
+ && rm -rf /var/cache/apk/*
+
+COPY --from=hadolint /bin/hadolint /usr/local/bin/hadolint
+COPY --from=regctl /regctl /usr/local/bin/regctl
+
+# Install datadog-ci static binary (Alpine/musl-native since v5.18.0).
+# This replaces the previous npm-based installation, removing the need
+# for Node.js and npm in this image.
+COPY images/scripts/install_datadog_static.sh /tmp/install_datadog_static.sh
+RUN /tmp/install_datadog_static.sh && rm /tmp/install_datadog_static.sh
+
+ARG GCLOUD_VERSION
+
+# install gcloud to setup GOOGLE_APPLICATION_CREDENTIALS easily
+# hadolint ignore=DL3022
+COPY --from=gcloud /google-cloud-sdk/ /usr/local/gcloud/google-cloud-sdk/
+ENV PATH=$PATH:/usr/local/gcloud/google-cloud-sdk/bin
+
+# Initialize the Google Cloud SDK
+RUN gcloud components install --quiet core gsutil kubectl local-extract

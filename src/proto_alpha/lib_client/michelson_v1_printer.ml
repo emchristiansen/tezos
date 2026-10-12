@@ -31,15 +31,23 @@ open Micheline_printer
 
 let anon = {comment = None}
 
-let print_expr ppf expr =
+let node_of_expr loc expr =
   expr |> Michelson_v1_primitives.strings_of_prims
-  |> Micheline.inject_locations (fun _ -> anon)
-  |> print_expr ppf
+  |> Micheline.inject_locations (fun _ -> loc)
+
+let node_of_stack_elt loc (ty, x) =
+  let ty = node_of_expr loc ty in
+  let x = node_of_expr loc x in
+  Micheline.Prim (loc, "Stack_elt", [ty; x], [])
+
+let unparse_stack loc l = Micheline.Seq (loc, List.map (node_of_stack_elt loc) l)
+
+let print_typed_stack out l = print_expr out (unparse_stack anon l)
+
+let print_expr ppf expr = print_expr ppf (node_of_expr anon expr)
 
 let print_expr_unwrapped ppf expr =
-  expr |> Michelson_v1_primitives.strings_of_prims
-  |> Micheline.inject_locations (fun _ -> anon)
-  |> print_expr_unwrapped ppf
+  print_expr_unwrapped ppf (node_of_expr anon expr)
 
 let print_stack ppf = function
   | [] -> Format.fprintf ppf "[]"
@@ -80,34 +88,33 @@ let print_big_map_diff ppf lazy_storage_diff =
     ppf
     "@[<v 0>%a@]"
     (Format.pp_print_list ~pp_sep:Format.pp_print_space (fun ppf -> function
-       | Contract.Legacy_big_map_diff.Clear id ->
-           Format.fprintf ppf "Clear %a" pp_map id
-       | Contract.Legacy_big_map_diff.Alloc {big_map; key_type; value_type} ->
-           Format.fprintf
-             ppf
-             "New %a of type (big_map %a %a)"
-             pp_map
-             big_map
-             print_expr
-             key_type
-             print_expr
-             value_type
-       | Contract.Legacy_big_map_diff.Copy {src; dst} ->
-           Format.fprintf ppf "Copy %a to %a" pp_map src pp_map dst
-       | Contract.Legacy_big_map_diff.Update {big_map; diff_key; diff_value; _}
-         ->
-           Format.fprintf
-             ppf
-             "%s %a[%a]%a"
-             (match diff_value with None -> "Unset" | Some _ -> "Set")
-             pp_map
-             big_map
-             print_expr
-             diff_key
-             (fun ppf -> function
-               | None -> ()
-               | Some x -> Format.fprintf ppf " to %a" print_expr x)
-             diff_value))
+      | Contract.Legacy_big_map_diff.Clear id ->
+          Format.fprintf ppf "Clear %a" pp_map id
+      | Contract.Legacy_big_map_diff.Alloc {big_map; key_type; value_type} ->
+          Format.fprintf
+            ppf
+            "New %a of type (big_map %a %a)"
+            pp_map
+            big_map
+            print_expr
+            key_type
+            print_expr
+            value_type
+      | Contract.Legacy_big_map_diff.Copy {src; dst} ->
+          Format.fprintf ppf "Copy %a to %a" pp_map src pp_map dst
+      | Contract.Legacy_big_map_diff.Update {big_map; diff_key; diff_value; _}
+        ->
+          Format.fprintf
+            ppf
+            "%s %a[%a]%a"
+            (match diff_value with None -> "Unset" | Some _ -> "Set")
+            pp_map
+            big_map
+            print_expr
+            diff_key
+            (fun ppf -> function
+              | None -> () | Some x -> Format.fprintf ppf " to %a" print_expr x)
+            diff_value))
     (diff :> Contract.Legacy_big_map_diff.item list)
 
 let inject_types type_map parsed =
@@ -185,7 +192,7 @@ let unparse_invalid expanded =
     |> Micheline_printer.printable (fun n -> n)
     |> Format.asprintf "%a" Micheline_printer.print_expr_unwrapped
   in
-  fst (Michelson_v1_parser.parse_toplevel source)
+  fst (Michelson_v1_parser.expand_toplevel source)
 
 let ocaml_constructor_of_prim prim =
   (* Assuming all the prim constructor prefixes match the

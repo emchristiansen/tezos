@@ -26,8 +26,7 @@
 (** Testing
     -------
     Component:    Test
-    Invocation:   dune exec  src/lib_scoru_wasm/test/test_scoru_wasm.exe \
-                    -- test "^Host functions ticks$"
+    Invocation:   dune exec src/lib_scoru_wasm/test/main.exe -- --file test_host_functions_ticks.ml
     Subject:      Tickification of host functions tests for the \
                   tezos-scoru-wasm library
 *)
@@ -39,7 +38,7 @@ open Tztest_helper
 (* This function return a function to modifiy `write_debug` in the registry, and
    a function to revert the change. Due to how the registry works right now (a
    mutable global), this in necessary otherwise the next tests might fail. *)
-let register_new_write_debug added_ticks =
+let register_new_write_debug ~version added_ticks =
   let open Lwt_syntax in
   let name =
     match Host_funcs.Internal_for_tests.write_debug with
@@ -49,7 +48,15 @@ let register_new_write_debug added_ticks =
   let current_write_debug =
     Tezos_webassembly_interpreter.Host_funcs.lookup
       ~global_name:name
-      Host_funcs.all
+      (* [Wasm_utils.Config.config] is [Wasm_pvm_config.empty], which
+         leaves [nds_host_functions_enabled] [false] at runtime. We
+         match that here so the install/revert pattern mutates the
+         same cached singleton the kernel evaluation will later
+         dispatch through. *)
+      (Host_funcs.registry
+         ~version
+         ~nds_host_functions_enabled:false
+         ~write_debug:Noop)
   in
   let alternative_write_debug =
     match current_write_debug with
@@ -59,13 +66,17 @@ let register_new_write_debug added_ticks =
           return (durable, res, Z.add ticks (Z.of_int added_ticks))
         in
         Tezos_webassembly_interpreter.Host_funcs.Host_func write_debug
-    | Reveal_func _ -> Stdlib.failwith "write_debug is not a reveal function"
+    | Nds_host_func _ | Reveal_func _ ->
+        Stdlib.failwith "write_debug is not a durable host function"
   in
   let register impl () =
     Tezos_webassembly_interpreter.Host_funcs.register
       ~global_name:name
       impl
-      Host_funcs.all
+      (Host_funcs.registry
+         ~version
+         ~nds_host_functions_enabled:false
+         ~write_debug:Noop)
   in
   (register alternative_write_debug, register current_write_debug)
 
@@ -94,7 +105,7 @@ let test_tickified_host_function ~version () =
  )
 |}
     in
-    let* tree = initial_tree ~version ~from_binary:false module_ in
+    let* tree = initial_state ~version ~from_binary:false module_ in
     (* Feeding it with one input *)
     let* tree = set_empty_inbox_step 0l tree in
     (* running until waiting for input *)
@@ -102,7 +113,9 @@ let test_tickified_host_function ~version () =
     return elapsed_ticks
   in
   let* elapsed_tick_before = run_until_result () in
-  let update_registry, revert_registry = register_new_write_debug 100 in
+  let update_registry, revert_registry =
+    register_new_write_debug ~version 100
+  in
   update_registry () ;
   let* elapsed_tick_with_alt_write_debug = run_until_result () in
   assert (Int64.add elapsed_tick_before 100L = elapsed_tick_with_alt_write_debug) ;
@@ -110,6 +123,12 @@ let test_tickified_host_function ~version () =
   return_ok_unit
 
 let tests =
-  tztests_with_pvm
-    ~versions:[V0; V1]
+  tztests_with_all_pvms
     [("Test tickified host function", `Quick, test_tickified_host_function)]
+
+let () =
+  Alcotest_lwt.run
+    ~__FILE__
+    "test lib scoru wasm"
+    [("Host functions ticks", tests)]
+  |> Lwt_main.run

@@ -24,8 +24,13 @@
 (* DEALINGS IN THE SOFTWARE.                                                 *)
 (*                                                                           *)
 (*****************************************************************************)
+val version_value : string
+
+val version : string
 
 val mainnet_id : Chain_id.t
+
+val shadownet_id : Chain_id.t
 
 val fitness_version_number : string
 
@@ -74,6 +79,59 @@ val max_allowed_global_constant_depth : int
  *)
 val michelson_maximum_type_size : int
 
+(** The number of **full cycles** after a misbehaviour during which it
+    can still be denounced.
+
+    More precisely, the window for denouncing a misbehaviour that
+    happens during cycle [n] spans from the misbehaviour itself until
+    the end of cycle [n + denunciation_period]. So it indeed lasts
+    [denunciation_period] full cycles plus part of cycle [n].
+
+    (Technically, denunciations of the misbehaviour are actually
+    allowed from the beginning of cycle [n], even on earlier levels
+    than the misbehaviour's. But this is only relevant if someone
+    crafts double blocks or consensus operations in the future for some
+    reason. In practice, we expect misbehaviours to only happen around
+    the time when the chain reaches their level, which is why we don't
+    count cycle [n] itself as a full cycle for denouncing.)
+
+    Note that we must have [denunciation_period >= 1], otherwise if a
+    misbehaviour happens at the very last block of a cycle, there is no
+    time frame to denounce it.
+
+    Currently [denunciation_period = 1] which is considered enough
+    time for all misbehaviours to be denounced.
+
+    /!\ Several parts of the codebase may assume that
+    [denunciation_period = 1] **without being parametrized using this
+    constant**. So if it is ever modified, the codebase needs to be
+    examined extensively; searching for places that use this constant
+    is not enough. *)
+val denunciation_period : int
+
+(** The number of **full cycles** between a misbehaviour and its
+    slashing (assuming that it has been denounced).
+
+    That is, a misbehaviour that happens during cycle [n] is always
+    slashed at the end of cycle [n + slashing_delay], regardless of
+    when it has been denounced (and if it has not been denounced by
+    then, then it is too late and it will never be slashed).
+
+    Note that we must have [slashing_delay >= denunciation_period],
+    otherwise the chain would accept denunciations for which the
+    slashing can no longer happen because it is too late.
+
+    Also note that to make the slashing possible, information on
+    baking rights for cycle [n] needs to be kept in the context until
+    the end of cycle [n + slashing_delay].
+
+    /!\ Several parts of the codebase may assume that
+    [slashing_delay = 1] **without being parametrized using this
+    constant**. So if it is ever modified, the codebase needs to be
+    examined extensively; searching for places that use this constant
+    is not enough. *)
+val slashing_delay : int
+
 (** A size limit for {!Sc_rollups.wrapped_proof} binary encoding. *)
 val sc_max_wrapped_proof_binary_size : int
 
@@ -90,12 +148,6 @@ type fixed
 
 val fixed_encoding : fixed Data_encoding.encoding
 
-type t = private {fixed : fixed; parametric : Constants_parametric_repr.t}
-
-val all_of_parametric : Constants_parametric_repr.t -> t
-
-val encoding : t Data_encoding.encoding
-
 type error += (* `Permanent *) Invalid_protocol_constants of string
 
 (** performs some consistency checks on the protocol parameters *)
@@ -103,18 +155,48 @@ val check_constants : Constants_parametric_repr.t -> unit tzresult
 
 module Generated : sig
   type t = {
-    consensus_threshold : int;
-    baking_reward_fixed_portion : Tez_repr.t;
-    baking_reward_bonus_per_slot : Tez_repr.t;
-    endorsing_reward_per_slot : Tez_repr.t;
-    liquidity_baking_subsidy : Tez_repr.t;
+    consensus_threshold_size : int;
+    issuance_weights : Constants_parametric_repr.issuance_weights;
   }
 
   (* This function is meant to be used just in lib_parameters and in the
      migration code to be sure that the parameters are consistent. *)
-  val generate :
-    consensus_committee_size:int -> blocks_per_minute:Ratio_repr.t -> t
+  val generate : consensus_committee_size:int -> dal_rewards_ratio:Q.t -> t
 end
+
+(** Pseudo-constants that are neither fixed as the ones defined above,
+    nor protocol parameters from {!Constants_parametric_repr}. Instead,
+    they are derived from the protocol parameters. *)
+module Derived : sig
+  type t = {
+    issuance_modification_delay : int;
+    consensus_key_activation_delay : int;
+    unstake_finalization_delay : int;
+  }
+
+  val encoding : t Data_encoding.t
+
+  (* The descriptions of these pseudo-constants are in the .ml, to
+     keep them more easily synchronized with the implementation. *)
+
+  val issuance_modification_delay :
+    parametric:Constants_parametric_repr.t -> int
+
+  val consensus_key_activation_delay :
+    parametric:Constants_parametric_repr.t -> int
+
+  val unstake_finalization_delay : parametric:Constants_parametric_repr.t -> int
+end
+
+type t = private {
+  fixed : fixed;
+  parametric : Constants_parametric_repr.t;
+  derived : Derived.t;
+}
+
+val all_of_parametric : Constants_parametric_repr.t -> t
+
+val encoding : t Data_encoding.encoding
 
 (** For each subcache, a size limit needs to be declared once. However,
     depending how the protocol will be instantiated (sandboxed mode,

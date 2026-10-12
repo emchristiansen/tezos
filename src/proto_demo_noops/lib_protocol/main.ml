@@ -138,21 +138,24 @@ let finalize_application application_state _shell_header =
         context = application_state.context;
         fitness = application_state.fitness;
         max_operations_ttl = 0;
-        last_allowed_fork_level = 0l;
+        last_preserved_block_level = 0l;
+        last_finalized_block_level = 0l ;
       },
       () )
 
 let init _chain_id context block_header =
+  let open Lwt_result_syntax in
   let open Block_header in
   let fitness = block_header.fitness in
-  Context.Cache.set_cache_layout context [] >>= fun context ->
+  let*! context = Context.Cache.set_cache_layout context [] in
   return
     {
       Updater.message = None;
       context;
       fitness;
       max_operations_ttl = 0;
-      last_allowed_fork_level = 0l;
+      last_finalized_block_level = 0l;
+      last_preserved_block_level = 0l;
     }
 
 let value_of_key ~chain_id:_ ~predecessor_context:_ ~predecessor_timestamp:_
@@ -194,6 +197,10 @@ module Mempool = struct
   let init _ _ ~head_hash:_ ~head:_  = Lwt.return_ok ((), ())
 
   let encoding = Data_encoding.unit
+
+  let partial_op_validation ?check_signature:_ _ _ = Lwt.return_ok []
+
+  let add_valid_operation ?conflict_handler:_ _ _  = Ok ((), Unchanged)
 
   let add_operation ?check_signature:_ ?conflict_handler:_ _ _ _ =
     Lwt.return_ok ((), Unchanged)

@@ -25,7 +25,7 @@
 
 open Protocol
 open Alpha_context
-open Protocol_client_context
+open Baking_errors
 
 type block_info = {
   hash : Block_hash.t;
@@ -41,10 +41,12 @@ type block_info = {
 }
 
 let raw_info cctxt ?(chain = `Main) hash shell_header =
+  let open Lwt_result_syntax in
   let block = `Hash (hash, 0) in
-  Shell_services.Chain.chain_id cctxt ~chain () >>=? fun chain_id ->
-  Shell_services.Blocks.protocols cctxt ~chain ~block ()
-  >>=? fun {current_protocol = protocol; next_protocol} ->
+  let* chain_id = Node_rpc.chain_id cctxt ~chain in
+  let* {current_protocol = protocol; next_protocol} =
+    Node_rpc.protocols cctxt ~chain ~block ()
+  in
   let {
     Tezos_base.Block_header.predecessor;
     fitness;
@@ -74,9 +76,10 @@ let raw_info cctxt ?(chain = `Main) hash shell_header =
   | Error _ -> failwith "Cannot convert level into int32"
 
 let info cctxt ?(chain = `Main) block =
-  Shell_services.Blocks.hash cctxt ~chain ~block () >>=? fun hash ->
-  Shell_services.Blocks.Header.shell_header cctxt ~chain ~block ()
-  >>=? fun shell_header -> raw_info cctxt ~chain hash shell_header
+  let open Lwt_result_syntax in
+  let* hash = Node_rpc.block_hash cctxt ~chain ~block in
+  let* shell_header = Node_rpc.shell_header cctxt ~chain ~block () in
+  raw_info cctxt ~chain hash shell_header
 
 module Block_seen_event = struct
   type t = {
@@ -91,6 +94,8 @@ module Block_seen_event = struct
     let section = None
 
     let name = "block-seen-" ^ Protocol.name
+
+    let simple_name = name
 
     type nonrec t = t
 
@@ -138,20 +143,25 @@ module Block_seen_event = struct
     let doc = "Block observed while monitoring a blockchain."
 
     let level = Internal_event.Info
+
+    let alternative_color = None
   end
 
   module Event = Internal_event.Make (Definition)
 end
 
 let monitor_applied_blocks cctxt ?chains ?protocols ~next_protocols () =
-  Monitor_services.applied_blocks cctxt ?chains ?protocols ?next_protocols ()
-  >>=? fun (block_stream, stop) ->
+  let open Lwt_result_syntax in
+  let* block_stream, stop =
+    Monitor_services.applied_blocks cctxt ?chains ?protocols ?next_protocols ()
+  in
   return
     ( Lwt_stream.map_s
         (fun (chain, block, header, _ops) ->
-          Block_seen_event.(
-            Event.emit (make block header (`Valid_blocks chain)))
-          >>=? fun () ->
+          let* () =
+            Block_seen_event.(
+              Event.emit (make block header (`Valid_blocks chain)))
+          in
           raw_info
             cctxt
             ~chain:(`Hash chain)
@@ -161,71 +171,41 @@ let monitor_applied_blocks cctxt ?chains ?protocols ~next_protocols () =
       stop )
 
 let monitor_heads cctxt ~next_protocols chain =
-  Monitor_services.heads cctxt ?next_protocols chain
-  >>=? fun (block_stream, _stop) ->
+  let open Lwt_result_syntax in
+  let* block_stream, stop =
+    Monitor_services.heads cctxt ?next_protocols chain
+  in
   return
-    (Lwt_stream.map_s
-       (fun (block, ({Tezos_base.Block_header.shell; _} as header)) ->
-         Block_seen_event.(Event.emit (make block header `Heads)) >>=? fun () ->
-         raw_info cctxt ~chain block shell)
-       block_stream)
-
-type error +=
-  | Unexpected_empty_block_list of {
-      chain : string;
-      block_hash : Block_hash.t;
-      length : int;
-    }
-
-let () =
-  register_error_kind
-    `Permanent
-    ~id:"Client_baking_blocks.unexpected_empty_block_list"
-    ~title:"Unexpected empty blocklist"
-    ~description:
-      "The block list retrieved by Shell_services.Blocks.list is empty"
-    ~pp:(fun ppf (chain, block_hash, length) ->
-      Format.fprintf
-        ppf
-        "Unexpected empty block list retrieved from chain %s at block %a, \
-         length %d"
-        chain
-        Block_hash.pp
-        block_hash
-        length)
-    Data_encoding.(
-      obj3
-        (req "chain" string)
-        (req "block_hash" Block_hash.encoding)
-        (req "length" int31))
-    (function
-      | Unexpected_empty_block_list {chain; block_hash; length} ->
-          Some (chain, block_hash, length)
-      | _ -> None)
-    (fun (chain, block_hash, length) ->
-      Unexpected_empty_block_list {chain; block_hash; length})
+    ( Lwt_stream.map_s
+        (fun (block, ({Tezos_base.Block_header.shell; _} as header)) ->
+          let* () = Block_seen_event.(Event.emit (make block header `Heads)) in
+          raw_info cctxt ~chain block shell)
+        block_stream,
+      stop )
 
 let blocks_from_current_cycle cctxt ?(chain = `Main) block ?(offset = 0l) () =
-  Shell_services.Blocks.hash cctxt ~chain ~block () >>=? fun hash ->
-  Shell_services.Blocks.Header.shell_header cctxt ~chain ~block ()
-  >>=? fun {level; _} ->
-  Plugin.RPC.levels_in_current_cycle cctxt ~offset (chain, block) >>= function
+  let open Lwt_result_syntax in
+  let* hash = Node_rpc.block_hash cctxt ~chain ~block in
+  let* {level; _} = Node_rpc.shell_header cctxt ~chain ~block () in
+  let*! result = Node_rpc.levels_in_current_cycle cctxt ~offset ~chain ~block in
+  match result with
   | Error (Tezos_rpc.Context.Not_found _ :: _) -> return_nil
   | Error _ as err -> Lwt.return err
   | Ok (first, last) ->
       let length = Int32.to_int (Int32.sub level (Raw_level.to_int32 first)) in
-      (Shell_services.Blocks.list cctxt ~chain ~heads:[hash] ~length ()
-       >>=? function
-       | hd :: _ -> return hd
-       | [] ->
-           fail
-             (Unexpected_empty_block_list
-                {
-                  chain = Block_services.chain_to_string chain;
-                  block_hash = hash;
-                  length;
-                }))
-      >>=? fun head ->
+      let* head =
+        let* list = Node_rpc.blocks cctxt ~chain ~heads:[hash] ~length in
+        match list with
+        | hd :: _ -> return hd
+        | [] ->
+            tzfail
+              (Unexpected_empty_block_list
+                 {
+                   chain = Block_services.chain_to_string chain;
+                   block_hash = hash;
+                   length;
+                 })
+      in
       let blocks =
         List.drop_n (length - Int32.to_int (Raw_level.diff last first)) head
       in

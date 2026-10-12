@@ -63,23 +63,6 @@ module S = struct
       ~output:P2p_peer.Id.encoding
       Tezos_rpc.Path.(root / "network" / "self")
 
-  (* DEPRECATED: use [version] from "lib_shell_services/version_services"
-     instead. *)
-  let version =
-    Tezos_rpc.Service.get_service
-      ~description:"DEPRECATED: use `version` instead."
-      ~query:Tezos_rpc.Query.empty
-      ~output:Network_version.encoding
-      Tezos_rpc.Path.(root / "network" / "version")
-
-  (* DEPRECATED: use [version] instead. *)
-  let versions =
-    Tezos_rpc.Service.get_service
-      ~description:"DEPRECATED: use `version` instead."
-      ~query:Tezos_rpc.Query.empty
-      ~output:(Data_encoding.list Network_version.encoding)
-      Tezos_rpc.Path.(root / "network" / "versions")
-
   let stat =
     Tezos_rpc.Service.get_service
       ~description:"Global network bandwidth statistics in B/s."
@@ -108,12 +91,6 @@ open Tezos_rpc.Context
 let self ctxt = make_call S.self ctxt () () ()
 
 let stat ctxt = make_call S.stat ctxt () () ()
-
-let version ctxt = make_call S.version ctxt () () ()
-
-let versions ctxt = make_call S.versions ctxt () () ()
-
-(* DEPRECATED: use [version] instead. *)
 
 let events ctxt = make_streamed_call S.events ctxt () () ()
 
@@ -234,49 +211,6 @@ module Points = struct
            connections."
         Tezos_rpc.Path.(root / "network" / "points")
 
-    let ban =
-      Tezos_rpc.Service.get_service
-        ~query:Tezos_rpc.Query.empty
-        ~output:Data_encoding.empty
-        ~description:
-          "DEPRECATED: Blacklist the given address and remove it from the \
-           whitelist if present. Use PATCH `/network/point/<point_id>` \
-           instead."
-        Tezos_rpc.Path.(
-          root / "network" / "points" /: P2p_point.Id.rpc_arg / "ban")
-
-    let unban =
-      Tezos_rpc.Service.get_service
-        ~query:Tezos_rpc.Query.empty
-        ~output:Data_encoding.empty
-        ~description:
-          "DEPRECATED: Remove an address from the blacklist. Use PATCH \
-           `/network/point/<point_id>` instead."
-        Tezos_rpc.Path.(
-          root / "network" / "points" /: P2p_point.Id.rpc_arg / "unban")
-
-    let trust =
-      Tezos_rpc.Service.get_service
-        ~query:Tezos_rpc.Query.empty
-        ~output:Data_encoding.empty
-        ~description:
-          "DEPRECATED: Trust a given address permanently and remove it from \
-           the blacklist if present. Connections from this address can still \
-           be closed on authentication if the peer is greylisted. Use \
-           PATCH`/network/point/<point_id>` instead."
-        Tezos_rpc.Path.(
-          root / "network" / "points" /: P2p_point.Id.rpc_arg / "trust")
-
-    let untrust =
-      Tezos_rpc.Service.get_service
-        ~query:Tezos_rpc.Query.empty
-        ~output:Data_encoding.empty
-        ~description:
-          "DEPRECATED: Remove an address from the whitelist. Use PATCH \
-           `/network/point/<point_id>` instead."
-        Tezos_rpc.Path.(
-          root / "network" / "points" /: P2p_point.Id.rpc_arg / "untrust")
-
     let banned =
       Tezos_rpc.Service.get_service
         ~query:Tezos_rpc.Query.empty
@@ -384,47 +318,6 @@ module Peers = struct
            cannot be blocked (but its host IP still can)."
         Tezos_rpc.Path.(root / "network" / "peers" /: P2p_peer.Id.rpc_arg)
 
-    let ban =
-      Tezos_rpc.Service.get_service
-        ~query:Tezos_rpc.Query.empty
-        ~output:Data_encoding.empty
-        ~description:
-          "DEPRECATED: Blacklist the given peer and remove it from the \
-           whitelist if present. Use PATCH `network/peers/<peer_id>` instead."
-        Tezos_rpc.Path.(
-          root / "network" / "peers" /: P2p_peer.Id.rpc_arg / "ban")
-
-    let unban =
-      Tezos_rpc.Service.get_service
-        ~query:Tezos_rpc.Query.empty
-        ~output:Data_encoding.empty
-        ~description:
-          "DEPRECATED: Remove the given peer from the blacklist. Use PATCH \
-           `network/peers/<peer_id>` instead."
-        Tezos_rpc.Path.(
-          root / "network" / "peers" /: P2p_peer.Id.rpc_arg / "unban")
-
-    let trust =
-      Tezos_rpc.Service.get_service
-        ~query:Tezos_rpc.Query.empty
-        ~output:Data_encoding.empty
-        ~description:
-          "DEPRECATED: Whitelist a given peer permanently and remove it from \
-           the blacklist if present. The peer cannot be blocked (but its host \
-           IP still can). Use PATCH `network/peers/<peer_id>` instead."
-        Tezos_rpc.Path.(
-          root / "network" / "peers" /: P2p_peer.Id.rpc_arg / "trust")
-
-    let untrust =
-      Tezos_rpc.Service.get_service
-        ~query:Tezos_rpc.Query.empty
-        ~output:Data_encoding.empty
-        ~description:
-          "DEPRECATED: Remove a given peer from the whitelist. Use PATCH \
-           `network/peers/<peer_id>` instead."
-        Tezos_rpc.Path.(
-          root / "network" / "peers" /: P2p_peer.Id.rpc_arg / "untrust")
-
     let banned =
       Tezos_rpc.Service.get_service
         ~query:Tezos_rpc.Query.empty
@@ -461,20 +354,170 @@ module Peers = struct
   let banned ctxt peer_id = make_call1 S.banned ctxt peer_id () ()
 end
 
+module Full_stat = struct
+  type t = {
+    stat : P2p_stat.t;
+    incoming_connections : Connection_metadata.t P2p_connection.Info.t list;
+    outgoing_connections : Connection_metadata.t P2p_connection.Info.t list;
+    peers :
+      (P2p_peer.Id.t * (Peer_metadata.t, Connection_metadata.t) P2p_peer.Info.t)
+      list;
+    points : (P2p_point.Id.t * P2p_point.Info.t) list;
+  }
+
+  let encoding =
+    let open Data_encoding in
+    def
+      "client_p2p_stat"
+      ~description:"Stored statistics about the p2p network."
+    @@ conv
+         (fun {stat; incoming_connections; outgoing_connections; peers; points}
+            ->
+           (stat, incoming_connections, outgoing_connections, peers, points))
+         (fun (stat, incoming_connections, outgoing_connections, peers, points)
+            ->
+           {stat; incoming_connections; outgoing_connections; peers; points})
+         (obj5
+            (req "stat" P2p_stat.encoding)
+            (req
+               "incoming_connections"
+               (list
+                  (P2p_connection.Info.encoding Connection_metadata.encoding)))
+            (req
+               "outgoing_connections"
+               (list
+                  (P2p_connection.Info.encoding Connection_metadata.encoding)))
+            (req
+               "peers"
+               (list
+                  (tup2
+                     P2p_peer.Id.encoding
+                     (P2p_peer.Info.encoding
+                        Peer_metadata.encoding
+                        Connection_metadata.encoding))))
+            (req
+               "points"
+               (list (tup2 P2p_point.Id.encoding P2p_point.Info.encoding))))
+
+  let pp_list pp ppf l =
+    match l with
+    | [] -> ()
+    | l ->
+        Format.fprintf ppf "@," ;
+        Format.(pp_print_list ~pp_sep:pp_print_cut pp ppf) l
+
+  let pp_peer ppf (p, pi) =
+    Format.fprintf
+      ppf
+      "%a   %.0f  %a %a %s"
+      P2p_peer.State.pp_digram
+      pi.P2p_peer.Info.state
+      pi.score
+      P2p_peer.Id.pp
+      p
+      P2p_stat.pp
+      pi.stat
+      (if pi.trusted then "★" else " ")
+
+  let pp_peers ppf peers =
+    Format.fprintf
+      ppf
+      "@,@[<v 0>@{<bold; underline; fg_cyan>St Sc %a%a%a Tr@}%a@]"
+      (Tezos_stdlib.Pretty_printing.pp_centered 30)
+      "Peer Id"
+      (Tezos_stdlib.Pretty_printing.pp_centered 30)
+      "Upload"
+      (Tezos_stdlib.Pretty_printing.pp_centered 30)
+      "Download"
+      (pp_list pp_peer)
+      peers
+
+  let pp_point ppf (p, pi) =
+    match pi.P2p_point.Info.state with
+    | Running peer_id ->
+        Format.fprintf
+          ppf
+          "%a  %a %a %s"
+          P2p_point.State.pp_digram
+          pi.state
+          P2p_point.Id.pp
+          p
+          P2p_peer.Id.pp
+          peer_id
+          (if pi.trusted then "★" else " ")
+    | _ -> (
+        match pi.last_seen with
+        | Some (peer_id, ts) ->
+            Format.fprintf
+              ppf
+              "%a  %a (last seen: %a %a) %s"
+              P2p_point.State.pp_digram
+              pi.state
+              P2p_point.Id.pp
+              p
+              P2p_peer.Id.pp
+              peer_id
+              Time.System.pp_hum
+              ts
+              (if pi.trusted then "★" else " ")
+        | None ->
+            Format.fprintf
+              ppf
+              "%a  %a %s"
+              P2p_point.State.pp_digram
+              pi.state
+              P2p_point.Id.pp
+              p
+              (if pi.trusted then "★" else " "))
+
+  let pp_connection_info ppf conn =
+    P2p_connection.Info.pp (fun _ _ -> ()) ppf conn
+
+  let to_string ~colorize
+      {stat; incoming_connections; outgoing_connections; peers; points} =
+    let reset =
+      if colorize then
+        Tezos_stdlib.Pretty_printing.add_ansi_marking Format.str_formatter
+      else fun () -> ()
+    in
+    Format.fprintf
+      Format.str_formatter
+      "@[<v 2>GLOBAL STATS@,\
+       %a@]@,\
+       @[<v 1>CONNECTIONS@,\
+       @[<v 1>INCOMING%a@]@,\
+       @[<v 1>OUTGOING%a@]@]@,\
+       @[<v 2>KNOWN PEERS%a@]@,\
+       @[<v 2>KNOWN POINTS%a@."
+      P2p_stat.pp
+      stat
+      (pp_list pp_connection_info)
+      incoming_connections
+      (pp_list pp_connection_info)
+      outgoing_connections
+      pp_peers
+      peers
+      (pp_list pp_point)
+      points ;
+    reset () ;
+    Format.flush_str_formatter ()
+
+  module S = struct
+    let full_stat =
+      Tezos_rpc.Service.get_service
+        ~description:"Full network statistics."
+        ~query:Tezos_rpc.Query.empty
+        ~output:encoding
+        Tezos_rpc.Path.(root / "network" / "full_stat")
+  end
+
+  let full_stat ctxt = make_call S.full_stat ctxt () () ()
+end
+
 module ACL = struct
   type ip_list = {ips : Ipaddr.V6.t list; not_reliable_since : Ptime.t option}
 
   module S = struct
-    let clear =
-      Tezos_rpc.Service.get_service
-        ~query:Tezos_rpc.Query.empty
-        ~output:Data_encoding.empty
-        ~description:
-          "DEPRECATED: Clear all greylists tables. This will unban all \
-           addresses and peers automatically greylisted by the system. Use \
-           DELETE `/network/greylist` instead"
-        Tezos_rpc.Path.(root / "network" / "greylist" / "clear")
-
     let clear_delete =
       Tezos_rpc.Service.delete_service
         ~query:Tezos_rpc.Query.empty

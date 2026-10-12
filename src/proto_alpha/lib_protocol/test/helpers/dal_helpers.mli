@@ -26,7 +26,7 @@
 open Protocol
 
 (** Returns an object of type {!Cryptobox.t} from the given DAL paramters. *)
-val mk_cryptobox : Cryptobox.parameters -> Cryptobox.t tzresult
+val mk_cryptobox : Cryptobox.parameters -> Cryptobox.t tzresult Lwt.t
 
 (** Derive new DAL parameters from the given ones by:
     - setting the given redundancy factor ;
@@ -38,10 +38,26 @@ val derive_dal_parameters :
   constants_divider:int ->
   Cryptobox.parameters
 
+(** Returns the slot id of the given cell's content . *)
+val content_slot_id :
+  Dal_slot_repr.History.cell_content -> Dal_slot_repr.Header.id
+
+(** Builds a DAL attestation bitset containing the provided slot indexes. *)
+val dal_attestations :
+  Alpha_context.Dal.Slot_index.t list -> Alpha_context.Dal.Attestations.t
+
+(** Returns [true] iff the given delegate has at least one assigned shard at the
+    given level. *)
+val has_assigned_shards :
+  Context.t ->
+  ?level:Protocol.Alpha_context.Raw_level.t ->
+  Implicit_account_repr.t ->
+  bool tzresult Lwt.t
+
 module Make (P : sig
   val dal_parameters : Alpha_context.Constants.Parametric.dal
 
-  val cryptobox : Cryptobox.t
+  val cryptobox : Cryptobox.t tzresult Lwt.t Lazy.t
 end) : sig
   (** Some global constants. *)
 
@@ -62,7 +78,7 @@ end) : sig
     Dal_slot_repr.History.t option Lwt.t
 
   (** Returns the slot's polynomial from the given slot's data. *)
-  val dal_mk_polynomial_from_slot : bytes -> Cryptobox.polynomial tzresult
+  val dal_mk_polynomial_from_slot : bytes -> Cryptobox.polynomial tzresult Lwt.t
 
   (* Commits to the given polynomial. *)
   val dal_commit :
@@ -75,7 +91,7 @@ end) : sig
   val dal_mk_prove_page :
     Cryptobox.polynomial ->
     Dal_slot_repr.Page.t ->
-    Cryptobox.page_proof tzresult
+    Cryptobox.page_proof tzresult Lwt.t
 
   (** Constructs a slot whose ID is defined from the given level and given
       index, and whose data are built using the given fill function. The function
@@ -86,7 +102,7 @@ end) : sig
     ?index:Dal_slot_index_repr.t ->
     ?fill_function:(int -> char) ->
     unit ->
-    (bytes * Cryptobox.polynomial * Dal_slot_repr.Header.t) tzresult
+    (bytes * Cryptobox.polynomial * Dal_slot_repr.Header.t) tzresult Lwt.t
 
   (** Constructs a record value of type Page.id. *)
   val mk_page_id :
@@ -103,6 +119,7 @@ end) : sig
   val mk_page_info :
     ?default_char:char ->
     ?level:Raw_level_repr.t ->
+    ?slot_index:Dal_slot_index_repr.t ->
     ?page_index:int ->
     ?custom_data:(default_char:char -> int -> bytes option) option ->
     Dal_slot_repr.Header.t ->
@@ -110,6 +127,7 @@ end) : sig
     ( (bytes * Cryptobox.page_proof) option * Dal_slot_repr.Page.t,
       error trace )
     result
+    Lwt.t
 
   (** Returns the char after [c]. Restarts from the char whose code is 0 if [c]'s
       code is 255. *)
@@ -174,4 +192,43 @@ end) : sig
     'a tzresult ->
     'b ->
     unit tzresult Lwt.t
+
+  (** Helper for the case where produce_proof is expected to fail because some
+      cells are missing in the history cache. *)
+  val bad_history_cache :
+    __LOC__:string -> 'a tzresult -> 'b -> unit tzresult Lwt.t
 end
+
+(** Builds a {!Alpha_context.type-dal_content} from its {!Z.t}
+    representation, that is, the sum of powers of two of the indexes
+    of attested slots.
+
+    Raises an exception when the given argument is negative. *)
+val dal_content_of_z : Z.t -> Alpha_context.dal_content tzresult Lwt.t
+
+(** Builds a {!Alpha_context.type-dal_content} from a list of attested
+    slots.
+
+    @param [number_of_slots] defaults to
+      {!Default_parameters.constants_test.dal.number_of_slots}.
+
+    Fails when any of the attested slots is negative or greater than
+    or equal to [number_of_slots]. *)
+val dal_content_of_int_list :
+  ?number_of_slots:int -> int list -> Alpha_context.dal_content
+
+(** A list of varied dal_content options, for tests where we want to
+    build attestations with different dal contents. *)
+val various_dal_contents : Alpha_context.dal_content option list
+
+(** Transform a list of committee members into a list of [(member,
+    dal)] where [dal] is picked successively from
+    {!various_dal_contents} (going back to the beginning of
+    {!various_dal_contents} if it is shorter than the provided
+    committee.
+
+    Depending on when this function is called, ['a] may be e.g. the
+    {!Signature.public_key_hash} of delegates or their consensus key,
+    or {!Op.attesting_slot}. *)
+val committee_with_various_dal_contents :
+  'a list -> ('a * Alpha_context.dal_content option) list

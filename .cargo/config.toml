@@ -1,0 +1,16 @@
+[env]
+CC_wasm32_unknown_unknown = "clang"
+CC_riscv64gc_unknown_hermit = "clang"
+CC_riscv64gc_unknown_linux_musl = "riscv64-unknown-linux-musl-cc"
+
+[target.riscv64gc-unknown-linux-musl]
+linker = "riscv64-unknown-linux-musl-gcc"
+rustflags = [
+  "-C",
+  "target-feature=+crt-static",
+  "-C",
+  "default-linker-libraries",
+]
+
+[profile.release]
+lto = "off"

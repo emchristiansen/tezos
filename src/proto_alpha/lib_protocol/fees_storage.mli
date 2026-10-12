@@ -31,6 +31,8 @@ type error += Operation_quota_exceeded (* `Temporary *)
 
 type error += Storage_limit_too_high (* `Permanent *)
 
+type error += Storage_increase_amount_overflow of Z.t (* `Permanent *)
+
 (** [record_global_constant_storage_space ctxt size] records
     paid storage space for registering a new global constant.
     Cost is <size> in bytes + 65 additional bytes for the key
@@ -67,7 +69,7 @@ val burn_storage_fees :
   ?origin:Receipt_repr.update_origin ->
   Raw_context.t ->
   storage_limit:Z.t ->
-  payer:Token.source ->
+  payer:Token.giver ->
   Z.t ->
   (Raw_context.t * Z.t * Receipt_repr.balance_updates) tzresult Lwt.t
 
@@ -77,12 +79,14 @@ val burn_storage_fees :
     balance updates (by default the parameter is set to [Block_application]).
     Returns an updated context and the relevant balance updates.
     Raises the [Negative_storage_input] error if the amount_in_bytes is null or negative.
+    Raises the [Storage_increase_amount_overflow] error if the amount_in_bytes
+    does not fit in an [int64] (the burn is computed on an [int64]).
     Raises the [Cannot_pay_storage_fee] error if the funds from the [payer] are
     not sufficient to pay the storage fees. *)
 val burn_storage_increase_fees :
   ?origin:Receipt_repr.update_origin ->
   Raw_context.t ->
-  payer:Token.source ->
+  payer:Token.giver ->
   Z.t ->
   (Raw_context.t * Receipt_repr.balance_updates) tzresult Lwt.t
 
@@ -92,16 +96,7 @@ val burn_origination_fees :
   ?origin:Receipt_repr.update_origin ->
   Raw_context.t ->
   storage_limit:Z.t ->
-  payer:Token.source ->
-  (Raw_context.t * Z.t * Receipt_repr.balance_updates) tzresult Lwt.t
-
-(** Calls [burn_storage_fees] with the parameter [consumed] mapped to the
-    constant [tx_rollup_origination_size]. *)
-val burn_tx_rollup_origination_fees :
-  ?origin:Receipt_repr.update_origin ->
-  Raw_context.t ->
-  storage_limit:Z.t ->
-  payer:Token.source ->
+  payer:Token.giver ->
   (Raw_context.t * Z.t * Receipt_repr.balance_updates) tzresult Lwt.t
 
 (** [burn_sc_rollup_origination_fees ~origin ctxt ~storage_limit ~payer consumed]
@@ -110,7 +105,7 @@ val burn_sc_rollup_origination_fees :
   ?origin:Receipt_repr.update_origin ->
   Raw_context.t ->
   storage_limit:Z.t ->
-  payer:Token.source ->
+  payer:Token.giver ->
   Z.t ->
   (Raw_context.t * Z.t * Receipt_repr.balance_updates) tzresult Lwt.t
 
@@ -120,6 +115,6 @@ val burn_zk_rollup_origination_fees :
   ?origin:Receipt_repr.update_origin ->
   Raw_context.t ->
   storage_limit:Z.t ->
-  payer:Token.source ->
+  payer:Token.giver ->
   Z.t ->
   (Raw_context.t * Z.t * Receipt_repr.balance_updates) tzresult Lwt.t

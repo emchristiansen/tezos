@@ -99,41 +99,13 @@ let () =
     (fun () -> Inbox_level_reached_messages_limit)
 
 module Int64_map = Map.Make (Int64)
-
-(* 32 *)
-let hash_prefix = "\003\255\138\145\110" (* srib1(55) *)
-
-module Hash = struct
-  let prefix = "srib1"
-
-  let encoded_size = 55
-
-  module H =
-    Blake2B.Make
-      (Base58)
-      (struct
-        let name = "Smart_rollup_inbox_hash"
-
-        let title = "The hash of an inbox of a smart rollup"
-
-        let b58check_prefix = hash_prefix
-
-        (* defaults to 32 *)
-        let size = None
-      end)
-
-  include H
-
-  let () = Base58.check_encoded_prefix b58check_encoding prefix encoded_size
-
-  include Path_encoding.Make_hex (H)
-end
+module Hash = Smart_rollup.Inbox_hash
 
 module Skip_list_parameters = struct
   let basis = 4
 end
 
-module Skip_list = Skip_list_repr.Make (Skip_list_parameters)
+module Skip_list = Skip_list.Make (Skip_list_parameters)
 
 module V1 = struct
   type level_proof = {
@@ -300,6 +272,11 @@ let add_protocol_internal_message payload payloads_history witness =
     witness
     payload
 
+let add_protocol_internal_message_no_history payload witness =
+  Sc_rollup_inbox_merkelized_payload_hashes_repr.add_payload_no_history
+    witness
+    payload
+
 let add_message payload payloads_history witness =
   let open Result_syntax in
   let message_counter =
@@ -317,12 +294,6 @@ let add_message payload payloads_history witness =
     payloads_history
     witness
     payload
-
-(** [no_history] creates an empty history with [capacity] set to
-    zero---this makes the [remember] function a no-op. We want this
-    behaviour in the protocol because we don't want to store
-    previous levels of the inbox. *)
-let no_history = History.empty ~capacity:0L
 
 let take_snapshot inbox = inbox.old_levels_messages
 
@@ -348,6 +319,20 @@ let archive history inbox witness =
   let* history, old_levels_messages = form_history_proof history inbox in
   let inbox = {inbox with old_levels_messages} in
   return (history, inbox)
+
+(** [archive_no_history inbox witness] archives the current inbox level. Updates
+    the [inbox.current_level] and [inbox.old_levels_messages]. *)
+let archive_no_history inbox witness =
+  let old_levels_messages =
+    let prev_cell = inbox.old_levels_messages in
+    let prev_cell_ptr = hash_history_proof prev_cell in
+    let current_level_proof =
+      let hash = Sc_rollup_inbox_merkelized_payload_hashes_repr.hash witness in
+      {hash; level = inbox.level}
+    in
+    Skip_list.next ~prev_cell ~prev_cell_ptr current_level_proof
+  in
+  {inbox with old_levels_messages}
 
 let add_messages payloads_history payloads witness =
   let open Result_syntax in
@@ -565,9 +550,9 @@ let produce_payloads_proof get_payloads_history head_cell_hash ~index =
         head_cell_hash
         payloads_history
     with
-    | Some {merkelized = head_cell; payload = _} -> ok head_cell
+    | Some {merkelized = head_cell; payload = _} -> Ok head_cell
     | None ->
-        error
+        Result_syntax.tzfail
           (Inbox_proof_error "could not find head_cell in the payloads_history")
   in
   let head_cell_max_index =
@@ -601,7 +586,7 @@ let verify_inclusion_proof inclusion_proof snapshot_history_proof =
         let target_ptr = hash_history_proof target in
         let hash_map = Hash.Map.add target_ptr target hash_map in
         let ptr_list = target_ptr :: ptr_list in
-        ok (hash_map, List.rev ptr_list, target, target_ptr)
+        return (hash_map, List.rev ptr_list, target, target_ptr)
     | history_proof :: tail ->
         let ptr = hash_history_proof history_proof in
         aux (Hash.Map.add ptr history_proof hash_map, ptr :: ptr_list) tail
@@ -644,8 +629,8 @@ let produce_inclusion_proof deref inbox_snapshot l =
               result)
 
 let verify_proof (l, n) inbox_snapshot {inclusion_proof; message_proof} =
-  assert (Z.(geq n zero)) ;
   let open Result_syntax in
+  assert (Z.(geq n zero)) ;
   let* history_proof = verify_inclusion_proof inclusion_proof inbox_snapshot in
   let level_proof = Skip_list.content history_proof in
   let* payload_opt = verify_payloads_proof message_proof level_proof.hash n in
@@ -706,43 +691,25 @@ let init_witness payloads_history =
   return (payloads_history, witness)
 
 let init_witness_no_history =
-  let no_payloads_history =
-    Sc_rollup_inbox_merkelized_payload_hashes_repr.History.no_history
-  in
-  let res = init_witness no_payloads_history in
-  match res with
-  | Ok (_payloads_history, witness) -> witness
-  | Error _ ->
-      (* We extract the [witness] from the result monad so the caller does
-         not have to deal with the error case. This is a top-level declaration,
-         this will fail at compile-time. *)
-      (* TODO: https://gitlab.com/tezos/tezos/-/issues/4359
-
-         Adding [SOL] without the history could remove the result monad here. *)
-      assert false
+  let sol = Sc_rollup_inbox_message_repr.start_of_level_serialized in
+  Sc_rollup_inbox_merkelized_payload_hashes_repr.genesis_no_history sol
 
 let add_info_per_level ~predecessor_timestamp ~predecessor payloads_history
     witness =
-  let open Result_syntax in
-  let* info_per_level =
-    Sc_rollup_inbox_message_repr.(
-      serialize (Internal (Info_per_level {predecessor_timestamp; predecessor})))
+  let info_per_level =
+    Sc_rollup_inbox_message_repr.info_per_level_serialized
+      ~predecessor_timestamp
+      ~predecessor
   in
   add_protocol_internal_message info_per_level payloads_history witness
 
 let add_info_per_level_no_history ~predecessor_timestamp ~predecessor witness =
-  let open Result_syntax in
-  let no_payloads_history =
-    Sc_rollup_inbox_merkelized_payload_hashes_repr.History.no_history
-  in
-  let* _payloads_history, witness =
-    add_info_per_level
+  let info_per_level =
+    Sc_rollup_inbox_message_repr.info_per_level_serialized
       ~predecessor_timestamp
       ~predecessor
-      no_payloads_history
-      witness
   in
-  return witness
+  add_protocol_internal_message_no_history info_per_level witness
 
 let finalize_inbox_level payloads_history history inbox witness =
   let open Result_syntax in
@@ -755,32 +722,39 @@ let finalize_inbox_level payloads_history history inbox witness =
   return (payloads_history, history, witness, inbox)
 
 let finalize_inbox_level_no_history inbox witness =
-  let open Result_syntax in
-  let* _payloads_history, _history, _witness, inbox =
-    finalize_inbox_level
-      Sc_rollup_inbox_merkelized_payload_hashes_repr.History.no_history
-      no_history
-      inbox
-      witness
-  in
-  return inbox
+  let inbox = {inbox with level = Raw_level_repr.succ inbox.level} in
+  let eol = Sc_rollup_inbox_message_repr.end_of_level_serialized in
+  let witness = add_protocol_internal_message_no_history eol witness in
+  archive_no_history inbox witness
 
-let add_all_messages ~protocol_migration_message ~predecessor_timestamp
-    ~predecessor history inbox messages =
+let add_all_messages ~protocol_migration_message ~dal_attested_slots_messages
+    ~predecessor_timestamp ~predecessor history inbox messages =
   let open Result_syntax in
   let* payloads = List.map_e Sc_rollup_inbox_message_repr.serialize messages in
   let is_first_block = Option.is_some protocol_migration_message in
   let payloads_history =
     (* Must remember every [payloads] and internal messages pushed by the
-       protocol: SOL/Info_per_level/EOL. *)
+       protocol: SOL/Info_per_level/EOL and optionally Protocol_migration
+       and Dal_attested_slots. *)
     let capacity =
-      (List.length payloads + 3 + if is_first_block then 1 else 0)
+      List.length payloads + 3
+      + (if is_first_block then 1 else 0)
+      + List.length dal_attested_slots_messages
       |> Int64.of_int
     in
     Sc_rollup_inbox_merkelized_payload_hashes_repr.History.empty ~capacity
   in
-  (* Add [SOL], possibly [Protocol_migration], and [Info_per_level]. *)
+  (* Add [SOL], [Info_per_level], and possibly [Protocol_migration]. *)
   let* payloads_history, witness = init_witness payloads_history in
+
+  let* payloads_history, witness =
+    add_info_per_level
+      ~predecessor_timestamp
+      ~predecessor
+      payloads_history
+      witness
+  in
+
   let* payloads_history, witness =
     match protocol_migration_message with
     | Some protocol_migration_message ->
@@ -793,18 +767,23 @@ let add_all_messages ~protocol_migration_message ~predecessor_timestamp
   in
 
   let* payloads_history, witness =
-    add_info_per_level
-      ~predecessor_timestamp
-      ~predecessor
-      payloads_history
-      witness
-  in
-
-  let* payloads_history, witness =
     match payloads with
     | [] -> return (payloads_history, witness)
     | payloads -> add_messages payloads_history payloads witness
   in
+
+  (* Add [Dal_attested_slots] if present, before finalization (EOL). *)
+  let* payloads_history, witness =
+    List.fold_left_e
+      (fun (payloads_history, witness) dal_message ->
+        let* message =
+          Sc_rollup_inbox_message_repr.serialize (Internal dal_message)
+        in
+        add_message message payloads_history witness)
+      (payloads_history, witness)
+      dal_attested_slots_messages
+  in
+
   let* payloads_history, history, witness, inbox =
     finalize_inbox_level payloads_history history inbox witness
   in
@@ -814,51 +793,45 @@ let add_all_messages ~protocol_migration_message ~predecessor_timestamp
   let messages =
     let open Sc_rollup_inbox_message_repr in
     let sol = Internal Start_of_level in
+    let info_per_level =
+      Internal (Info_per_level {predecessor_timestamp; predecessor})
+    in
     let migration =
       Option.fold
         ~none:[]
         ~some:(fun x -> [Internal x])
         protocol_migration_message
     in
-    let info_per_level =
-      Internal (Info_per_level {predecessor_timestamp; predecessor})
+    let dal_slots =
+      List.map (fun x -> Internal x) dal_attested_slots_messages
     in
     let eol = Internal End_of_level in
-    [sol] @ migration @ [info_per_level] @ messages @ [eol]
+    [sol] @ [info_per_level] @ migration @ messages @ dal_slots @ [eol]
   in
 
   return (payloads_history, history, inbox, witness, messages)
 
 let genesis ~protocol_migration_message ~predecessor_timestamp ~predecessor
     level =
-  let open Result_syntax in
-  let no_payloads_history =
-    Sc_rollup_inbox_merkelized_payload_hashes_repr.History.no_history
-  in
-  (* 1. Add [SOL], [Protocol_migration], and [Info_per_level]. *)
+  (* 1. Add [SOL], [Info_per_level] and [Protocol_migration]. *)
   let witness = init_witness_no_history in
-  let* protocol_migration =
-    Sc_rollup_inbox_message_repr.serialize (Internal protocol_migration_message)
-  in
-  let* _payloads_history, witness =
-    add_protocol_internal_message protocol_migration no_payloads_history witness
-  in
-  let* witness =
+  let witness =
     add_info_per_level_no_history ~predecessor_timestamp ~predecessor witness
+  in
+  let witness =
+    add_protocol_internal_message_no_history protocol_migration_message witness
   in
 
   (* 2. Add [EOL]. *)
   let eol = Sc_rollup_inbox_message_repr.end_of_level_serialized in
-  let* _payloads_history, witness =
-    add_protocol_internal_message eol no_payloads_history witness
-  in
+  let witness = add_protocol_internal_message_no_history eol witness in
 
   let level_proof =
     let hash = Sc_rollup_inbox_merkelized_payload_hashes_repr.hash witness in
     {hash; level}
   in
 
-  return {level; old_levels_messages = Skip_list.genesis level_proof}
+  {level; old_levels_messages = Skip_list.genesis level_proof}
 
 module Internal_for_tests = struct
   type nonrec inclusion_proof = inclusion_proof

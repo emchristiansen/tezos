@@ -34,12 +34,14 @@ type repr = t
 
 type t = Tez_tag of repr [@@ocaml.unboxed]
 
+let wrap t = Tez_tag t [@@ocaml.inline always]
+
 type error +=
   | Addition_overflow of t * t (* `Temporary *)
   | Subtraction_underflow of t * t (* `Temporary *)
-  | Multiplication_overflow of t * int64 (* `Temporary *)
-  | Negative_multiplicator of t * int64 (* `Temporary *)
-  | Invalid_divisor of t * int64
+  | Multiplication_overflow of t * Z.t (* `Temporary *)
+  | Negative_multiplicator of t * Z.t (* `Temporary *)
+  | Invalid_divisor of t * Z.t
 
 (* `Temporary *)
 
@@ -79,7 +81,7 @@ let of_string s =
       String.init 6 (fun i -> if Compare.Int.(i < len) then s.[i] else '0')
     in
     let prepared = remove_commas left ^ pad_to_six (remove_commas right) in
-    Option.map (fun i -> Tez_tag i) (Int64.of_string_opt prepared)
+    Option.map wrap (Int64.of_string_opt prepared)
   in
   match String.split_on_char '.' s with
   | [left; right] ->
@@ -98,8 +100,8 @@ let of_string s =
 let pp ppf (Tez_tag amount) =
   let mult_int = 1_000_000L in
   let rec left ppf amount =
-    let d, r = (Int64.(div amount 1000L), Int64.(rem amount 1000L)) in
-    if d > 0L then Format.fprintf ppf "%a%03Ld" left d r
+    let d, r = (Int64.div amount 1000L, Int64.rem amount 1000L) in
+    if Compare.Int64.(d > 0L) then Format.fprintf ppf "%a%03Ld" left d r
     else Format.fprintf ppf "%Ld" r
   in
   let right ppf amount =
@@ -113,7 +115,7 @@ let pp ppf (Tez_tag amount) =
     else Format.fprintf ppf "%03d%a" hi triplet lo
   in
   let ints, decs =
-    (Int64.(div amount mult_int), Int64.(to_int (rem amount mult_int)))
+    (Int64.div amount mult_int, Int64.(to_int (rem amount mult_int)))
   in
   left ppf ints ;
   if Compare.Int.(decs > 0) then Format.fprintf ppf ".%a" right decs
@@ -121,42 +123,70 @@ let pp ppf (Tez_tag amount) =
 let to_string t = Format.asprintf "%a" pp t
 
 let ( -? ) tez1 tez2 =
+  let open Result_syntax in
   let (Tez_tag t1) = tez1 in
   let (Tez_tag t2) = tez2 in
-  if t2 <= t1 then ok (Tez_tag (Int64.sub t1 t2))
-  else error (Subtraction_underflow (tez1, tez2))
+  if t2 <= t1 then return (Tez_tag (Int64.sub t1 t2))
+  else tzfail (Subtraction_underflow (tez1, tez2))
 
 let sub_opt (Tez_tag t1) (Tez_tag t2) =
   if t2 <= t1 then Some (Tez_tag (Int64.sub t1 t2)) else None
 
 let ( +? ) tez1 tez2 =
+  let open Result_syntax in
   let (Tez_tag t1) = tez1 in
   let (Tez_tag t2) = tez2 in
   let t = Int64.add t1 t2 in
-  if t < t1 then error (Addition_overflow (tez1, tez2)) else ok (Tez_tag t)
+  if t < t1 then tzfail (Addition_overflow (tez1, tez2)) else return (Tez_tag t)
 
 let ( *? ) tez m =
+  let open Result_syntax in
   let (Tez_tag t) = tez in
-  if m < 0L then error (Negative_multiplicator (tez, m))
-  else if m = 0L then ok (Tez_tag 0L)
+  if m < 0L then tzfail (Negative_multiplicator (tez, Z.of_int64 m))
+  else if m = 0L then return (Tez_tag 0L)
   else if t > Int64.(div max_int m) then
-    error (Multiplication_overflow (tez, m))
-  else ok (Tez_tag (Int64.mul t m))
+    tzfail (Multiplication_overflow (tez, Z.of_int64 m))
+  else return (Tez_tag (Int64.mul t m))
 
 let ( /? ) tez d =
+  let open Result_syntax in
   let (Tez_tag t) = tez in
-  if d <= 0L then error (Invalid_divisor (tez, d))
-  else ok (Tez_tag (Int64.div t d))
+  if d <= 0L then tzfail (Invalid_divisor (tez, Z.of_int64 d))
+  else return (Tez_tag (Int64.div t d))
+
+let div2 (Tez_tag t) = Tez_tag (Int64.div t 2L)
 
 let mul_exn t m =
-  match t *? Int64.(of_int m) with
-  | Ok v -> v
-  | Error _ -> invalid_arg "mul_exn"
+  match t *? Int64.of_int m with Ok v -> v | Error _ -> invalid_arg "mul_exn"
 
 let div_exn t d =
-  match t /? Int64.(of_int d) with
-  | Ok v -> v
-  | Error _ -> invalid_arg "div_exn"
+  match t /? Int64.of_int d with Ok v -> v | Error _ -> invalid_arg "div_exn"
+
+let mul_ratio_z ~rounding tez ~num ~den =
+  let open Result_syntax in
+  let (Tez_tag t) = tez in
+  if Z.(lt num zero) then tzfail (Negative_multiplicator (tez, num))
+  else if Z.(leq den zero) then tzfail (Invalid_divisor (tez, den))
+  else
+    let numerator = Z.(mul (of_int64 t) num) in
+    let z =
+      match rounding with
+      | `Down -> Z.div numerator den
+      | `Up -> Z.cdiv numerator den
+    in
+    if Z.fits_int64 z then return (Tez_tag (Z.to_int64 z))
+    else tzfail (Multiplication_overflow (tez, num))
+
+let mul_ratio ~rounding tez ~num ~den =
+  mul_ratio_z ~rounding tez ~num:(Z.of_int64 num) ~den:(Z.of_int64 den)
+
+let mul_q ~rounding tez {Q.num; den} = mul_ratio_z ~rounding tez ~num ~den
+
+let mul_percentage ~rounding (Tez_tag t) (percentage : Percentage.t) =
+  let {Q.num; den} = Percentage.to_q percentage in
+  (* Guaranteed to produce no errors by the invariants on {!Percentage.t}. *)
+  let div' = match rounding with `Down -> Z.div | `Up -> Z.cdiv in
+  Tez_tag Z.(to_int64 (div' (mul (of_int64 t) num) den))
 
 let of_mutez t = if t < 0L then None else Some (Tez_tag t)
 
@@ -170,6 +200,16 @@ let encoding =
   let decode (Tez_tag t) = Z.of_int64 t in
   let encode = Json.wrap_error (fun i -> Tez_tag (Z.to_int64 i)) in
   Data_encoding.def name (check_size 10 (conv decode encode n))
+
+let balance_update_encoding =
+  let open Data_encoding in
+  conv
+    (function
+      | `Credited v -> to_mutez v | `Debited v -> Int64.neg (to_mutez v))
+    ( Json.wrap_error @@ fun v ->
+      if Compare.Int64.(v < 0L) then `Debited (Tez_tag (Int64.neg v))
+      else `Credited (Tez_tag v) )
+    int64
 
 let () =
   let open Data_encoding in
@@ -218,14 +258,15 @@ let () =
     ~pp:(fun ppf (opa, opb) ->
       Format.fprintf
         ppf
-        "Overflowing multiplication of %a %s and %Ld"
+        "Overflowing multiplication of %a %s and %a"
         pp
         opa
         id
+        Z.pp_print
         opb)
     ~description:
       ("A multiplication of a " ^ id ^ " amount by an integer overflowed")
-    (obj2 (req "amount" encoding) (req "multiplicator" int64))
+    (obj2 (req "amount" encoding) (req "multiplicator" z))
     (function Multiplication_overflow (a, b) -> Some (a, b) | _ -> None)
     (fun (a, b) -> Multiplication_overflow (a, b)) ;
   register_error_kind
@@ -235,13 +276,14 @@ let () =
     ~pp:(fun ppf (opa, opb) ->
       Format.fprintf
         ppf
-        "Multiplication of %a %s by negative integer %Ld"
+        "Multiplication of %a %s by negative integer %a"
         pp
         opa
         id
+        Z.pp_print
         opb)
     ~description:("Multiplication of a " ^ id ^ " amount by a negative integer")
-    (obj2 (req "amount" encoding) (req "multiplicator" int64))
+    (obj2 (req "amount" encoding) (req "multiplicator" z))
     (function Negative_multiplicator (a, b) -> Some (a, b) | _ -> None)
     (fun (a, b) -> Negative_multiplicator (a, b)) ;
   register_error_kind
@@ -251,18 +293,17 @@ let () =
     ~pp:(fun ppf (opa, opb) ->
       Format.fprintf
         ppf
-        "Division of %a %s by non positive integer %Ld"
+        "Division of %a %s by non positive integer %a"
         pp
         opa
         id
+        Z.pp_print
         opb)
     ~description:
       ("Multiplication of a " ^ id ^ " amount by a non positive integer")
-    (obj2 (req "amount" encoding) (req "divisor" int64))
+    (obj2 (req "amount" encoding) (req "divisor" z))
     (function Invalid_divisor (a, b) -> Some (a, b) | _ -> None)
     (fun (a, b) -> Invalid_divisor (a, b))
-
-type tez = t
 
 let compare (Tez_tag x) (Tez_tag y) = compare x y
 

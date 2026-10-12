@@ -103,7 +103,8 @@ let options_encoding =
            reduced_plot_verbosity;
            plot_raw_workload;
            empirical_plot;
-         } ->
+         }
+       ->
       ( save_directory,
         point_size,
         qt_target_pixel_size,
@@ -117,7 +118,8 @@ let options_encoding =
            pdf_target_cm_size,
            reduced_plot_verbosity,
            plot_raw_workload,
-           empirical_plot ) ->
+           empirical_plot )
+       ->
       {
         save_directory;
         point_size;
@@ -234,10 +236,10 @@ let plot_scatter opts title input_columns outputs =
   let open Result_syntax in
   match input_columns with
   | [] ->
-      Format.kasprintf
-        Result.error
-        "Display.plot_scatter (%s): empty scatter data"
-        (Str.global_replace (Str.regexp {|\\n|}) " " title)
+      let rows = Array.length @@ Stdlib.List.hd outputs in
+      let column = ("constant axis", Array.init rows (fun _ -> 0.)) in
+      let plot = scatterplot_2d opts title column outputs in
+      return [plot]
   | [column] ->
       let plot = scatterplot_2d opts title column outputs in
       return [plot]
@@ -245,7 +247,7 @@ let plot_scatter opts title input_columns outputs =
       let plot = scatterplot_3d opts title column1 column2 outputs in
       return [plot]
   | _ ->
-      if opts.reduced_plot_verbosity then return []
+      if opts.reduced_plot_verbosity then return_nil
       else
         let subsets = Stats.Combi.enumerate_subsets 2 input_columns in
         let plots =
@@ -309,7 +311,7 @@ let empirical_data opts
   let samples = convert_workload_data workload_data in
   (* Extract name of variables and check well-formedness *)
   let variables =
-    List.rev_map (fun {workload; _} -> List.rev_map fst workload) samples
+    List.rev_map (fun {workload; _} -> List.map fst workload) samples
   in
   let variables = List.sort_uniq Stdlib.compare variables in
   match variables with
@@ -333,7 +335,8 @@ let empirical_data opts
       let columns = Array.to_list columns in
       let named_columns =
         List.combine ~when_different_lengths:() vars columns
-        |> (* [columns = Array.to_list (Array.init (List.length vars))] *)
+        |>
+        (* [columns = Array.to_list (Array.init (List.length vars))] *)
         WithExceptions.Result.get_ok ~loc:__LOC__
       in
       Ok (named_columns, timings)
@@ -357,7 +360,8 @@ let prune_problem input nmap : (Free_variable.t * Maths.vector) list =
         let name = Inference.NMap.nth_exn nmap c in
         let col = Maths.Matrix.col input c in
         (name, col))
-    |> (* column count cannot be negative *)
+    |>
+    (* column count cannot be negative *)
     WithExceptions.Result.get_ok ~loc:__LOC__
   in
   List.filter (fun (_, col) -> not (column_is_constant col)) named_columns
@@ -370,13 +374,26 @@ let column_to_array (m : Maths.matrix) =
 
 let vector_to_array = Maths.vector_to_array
 
-let scores_to_string scores =
-  Format.sprintf
-    "R2-score = %s, RMSE-score = %.3f"
-    (match scores.Inference.r2_score with
-    | None -> "None"
-    | Some f -> Format.sprintf "%3f" f)
-    scores.Inference.rmse_score
+let scores_to_string =
+  let pp_tvalues =
+    Format.pp_print_list
+      ~pp_sep:(fun fmt () -> Format.fprintf fmt ", ")
+      (fun fmt (v, f) ->
+        Format.fprintf
+          fmt
+          "%s = %.1f"
+          (Free_variable.to_namespace v
+          |> Namespace.basename |> underscore_to_dash)
+          f)
+  in
+  fun scores ->
+    let Inference.{r2_score; rmse_score; tvalues} = scores in
+    Format.asprintf
+      "R2-score = %s, RMSE-score = %.3f\\nT-values: %a"
+      (match r2_score with None -> "None" | Some f -> Format.sprintf "%3f" f)
+      rmse_score
+      pp_tvalues
+      tvalues
 
 let validator opts (problem : Inference.problem) (solution : Inference.solution)
     =
@@ -418,7 +435,7 @@ let is_trivial_workload workload = Array.for_all (fun x -> x = 1.0) workload
 
 let empirical opts (workload_data : (Sparse_vec.String.t * float array) list) =
   let open Result_syntax in
-  if opts.reduced_plot_verbosity then return []
+  if opts.reduced_plot_verbosity then return_nil
   else
     let* columns, timings = empirical_data opts workload_data in
     (* If the data is non-trivial, we produce a scatter plot.
@@ -507,25 +524,42 @@ let raw_workload (workload_data : (Sparse_vec.String.t * float array) list) =
         [Histogram.hist ~binwidth:50.0 ~points ()])
     workload_data
 
-let perform_plot ~measure ~model_name ~problem ~solution ~plot_target ~options =
+let perform_plot ~measure ~local_model_name ~problem ~solution ~plot_target
+    ~options =
   let (Measure.Measurement ((module Bench), measurement)) = measure in
-  let filename ?index kind =
+  let filename_prefix ?index kind =
     let dir = options.save_directory in
     let kind =
       match index with None -> kind | Some i -> Format.asprintf "%s-%d" kind i
     in
+    (*
+      Expect the name is one of:
+      <instr_name>
+      <instr_name>/time
+      <instr_name>/alloc
+    *)
+    let rec body = function
+      | [] -> assert false
+      | "alloc" :: tl -> body tl ^ "_alloc"
+      | "time" :: tl -> body tl ^ "_time"
+      | s :: _ -> s
+    in
+    let bench_name =
+      match List.rev (Namespace.to_list Bench.name) with
+      | "intercept" :: tl -> body tl ^ "__intercept"
+      | tl -> body tl
+    in
     Filename.Infix.(
       dir
       // Format.asprintf
-           "%a_%s_%s.pdf"
-           Namespace.pp_short
-           Bench.name
-           model_name
+           "%s_%s_%s"
+           bench_name
+           (Benchmark_helpers.filename_of_local_model_name local_model_name)
            kind)
   in
   let workload_data =
     List.map
-      (fun {Measure.workload; measures} ->
+      (fun {Measure.workload; measures; _} ->
         (Bench.workload_to_vector workload, Maths.vector_to_array measures))
       measurement.workload_data
   in
@@ -547,9 +581,10 @@ let perform_plot ~measure ~model_name ~problem ~solution ~plot_target ~options =
         | Save ->
             List.mapi
               (fun i plot ->
-                let pdf_file = filename ~index:i kind in
+                let prefix = filename_prefix ~index:i kind in
+                let pdf_file = prefix ^ ".pdf" in
                 let target = pdf ?cm_size:(pdf_cm_size options) ~pdf_file () in
-                Plot.run ~target exec_detach plot ;
+                Plot.run ~target ~detach:true plot ;
                 pdf_file)
               plots
         | Show ->
@@ -570,7 +605,8 @@ let perform_plot ~measure ~model_name ~problem ~solution ~plot_target ~options =
                     x11)
             in
             let plots = Array.of_list (List.map (fun x -> [|Some x|]) plots) in
-            Plot.run_matrix ~target exec_detach plots ;
+            let plot_file = filename_prefix kind ^ ".plot" in
+            Plot.run_matrix ~target ~detach:true plots ~filename:plot_file ;
             [])
     | Error msg ->
         Format.eprintf "Failed performing plot: %s@." msg ;

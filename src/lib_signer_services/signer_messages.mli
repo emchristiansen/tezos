@@ -23,9 +23,29 @@
 (*                                                                           *)
 (*****************************************************************************)
 
-module type Authenticated_request = sig
+type pkh =
+  | Pkh_with_version of
+      Tezos_crypto.Signature.Public_key_hash.t * Tezos_crypto.Signature.version
+  | Pkh of Tezos_crypto.Signature.Public_key_hash.t
+
+(** [request_pkh ?version pkh] builds the [pkh] field of a signing request,
+    tagging it with [version] only when the signature version changes how
+    [pkh] signs.
+
+    BLS is the only scheme for which it does, and {!type-pkh} is encoded
+    accordingly: it has a versioned case for BLS only. The other schemes
+    either sign identically in every version, or exist in a single one
+    (Mldsa44 was introduced by version 3). A scheme whose signature starts to
+    depend on the version needs both a branch here and a versioned case in
+    the encoding. *)
+val request_pkh :
+  ?version:Tezos_crypto.Signature.version ->
+  Tezos_crypto.Signature.Public_key_hash.t ->
+  pkh
+
+module type Authenticated_signing_request = sig
   type t = {
-    pkh : Tezos_crypto.Signature.Public_key_hash.t;
+    pkh : pkh;
     data : Bytes.t;
     signature : Tezos_crypto.Signature.t option;
   }
@@ -37,13 +57,26 @@ module type Authenticated_request = sig
 end
 
 module Sign : sig
-  module Request : Authenticated_request
+  module Request : Authenticated_signing_request
 
   module Response : sig
     type t = Tezos_crypto.Signature.t
 
     val encoding : t Data_encoding.t
   end
+end
+
+module type Authenticated_request = sig
+  type t = {
+    pkh : Tezos_crypto.Signature.Public_key_hash.t;
+    data : Bytes.t;
+    signature : Tezos_crypto.Signature.t option;
+  }
+
+  val to_sign :
+    pkh:Tezos_crypto.Signature.Public_key_hash.t -> data:Bytes.t -> Bytes.t
+
+  val encoding : t Data_encoding.t
 end
 
 module Deterministic_nonce : sig
@@ -104,6 +137,42 @@ module Authorized_keys : sig
   end
 end
 
+module Known_keys : sig
+  module Response : sig
+    type t = Tezos_crypto.Signature.Public_key_hash.t list
+
+    val encoding : t Data_encoding.t
+  end
+end
+
+module Bls_prove_possession : sig
+  module Request : sig
+    type t = {
+      pkh : Tezos_crypto.Signature.Public_key_hash.t;
+      override_pk : Tezos_crypto.Signature.Bls.Public_key.t option;
+      signature : Tezos_crypto.Signature.t option;
+    }
+
+    (** [to_sign ~pkh ~override_pk] is the payload that an authorized key must
+        sign to authenticate a proof-of-possession request for [pkh] over
+        [override_pk]. It binds both, and uses a request tag of its own, so
+        that an authentication signature is not replayable on another request
+        kind nor on another overridden public key. *)
+    val to_sign :
+      pkh:Tezos_crypto.Signature.Public_key_hash.t ->
+      override_pk:Tezos_crypto.Signature.Bls.Public_key.t option ->
+      Bytes.t
+
+    val encoding : t Data_encoding.t
+  end
+
+  module Response : sig
+    type t = Tezos_crypto.Signature.Bls.t
+
+    val encoding : t Data_encoding.t
+  end
+end
+
 module Request : sig
   type t =
     | Sign of Sign.Request.t
@@ -112,6 +181,8 @@ module Request : sig
     | Deterministic_nonce of Deterministic_nonce.Request.t
     | Deterministic_nonce_hash of Deterministic_nonce_hash.Request.t
     | Supports_deterministic_nonces of Supports_deterministic_nonces.Request.t
+    | Known_keys
+    | Bls_prove_possession of Bls_prove_possession.Request.t
 
   val encoding : t Data_encoding.t
 end

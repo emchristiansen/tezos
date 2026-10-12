@@ -61,13 +61,13 @@ let set_ready vdf_baker =
   trigger_ready vdf_baker (Some ())
 
 let handle_raw_stdout vdf_baker line =
-  if line =~ rex "^VDF daemon v.+ for .+ started.$" then set_ready vdf_baker
+  if line =~ rex "^VDF daemon .+ for .+ started.$" then set_ready vdf_baker
 
 let create ~protocol ?name ?color ?event_pipe ?runner node =
   let name = match name with None -> fresh_name () | Some name -> name in
   let vdf_baker =
     create
-      ~path:(Protocol.baker protocol)
+      ~path:(Uses.path Constant.octez_agnostic_baker)
       ?name:(Some name)
       ?color
       ?event_pipe
@@ -121,3 +121,10 @@ let restart vdf_baker =
   let* () = terminate vdf_baker in
   let* () = run vdf_baker in
   wait_for_ready vdf_baker
+
+module Helpers = struct
+  let is_in_nonce_revelation_stage ~nonce_revelation_threshold
+      ~(level : RPC.level) =
+    let cycle_position = Int32.of_int level.cycle_position in
+    Int32.compare cycle_position nonce_revelation_threshold < 0
+end

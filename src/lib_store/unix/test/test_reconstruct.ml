@@ -24,7 +24,14 @@
 (*                                                                           *)
 (*****************************************************************************)
 
-module Assert_lib = Lib_test_extra.Assert_lib
+(** Testing
+    _______
+
+    Component: Store
+    Invocation: dune exec src/lib_store/unix/test/main.exe -- --match construct
+    Subject: Store tests ( reconstruct )
+*)
+
 open Test_utils
 
 (* Export mode used to export snapshot. Tar is seleceted by
@@ -52,7 +59,7 @@ let check_flags descr store expected_head =
     History_mode.Archive ;
   let*! checkpoint = Store.Chain.checkpoint chain_store in
   let* metadata = Store.Block.get_block_metadata chain_store expected_head in
-  let expected_checkpoint = Store.Block.last_allowed_fork_level metadata in
+  let expected_checkpoint = Store.Block.last_preserved_block_level metadata in
   Assert.Int32.equal
     ~msg:("checkpoint consistency: " ^ descr)
     expected_checkpoint
@@ -66,8 +73,8 @@ let check_flags descr store expected_head =
     (snd caboose) ;
   return_unit
 
-let test_from_bootstrapped ~descr (store_dir, context_dir) store
-    ~nb_blocks_to_bake ~patch_context =
+let test_from_bootstrapped ~descr (store_dir, data_dir) store ~nb_blocks_to_bake
+    ~patch_context =
   let open Lwt_result_syntax in
   let chain_store = Store.main_chain_store store in
   let genesis = Store.Chain.genesis chain_store in
@@ -84,7 +91,7 @@ let test_from_bootstrapped ~descr (store_dir, context_dir) store
           Reconstruction.reconstruct
             ~patch_context
             ~store_dir
-            ~context_dir
+            ~data_dir
             genesis
             ~user_activated_upgrades:[]
             ~user_activated_protocol_overrides:[]
@@ -123,7 +130,7 @@ let test_from_bootstrapped ~descr (store_dir, context_dir) store
       Store.init
         ~patch_context
         ~store_dir
-        ~context_dir
+        ~data_dir
         ~allow_testchains:false
         genesis
     in
@@ -167,6 +174,7 @@ let make_tests_bootstrapped speed patch_context =
           nb_blocks_to_bake
       in
       wrap_simple_store_init_test
+        ~speed
         ~patch_context
         ~history_mode
         ~keep_dir:false
@@ -181,18 +189,18 @@ let make_tests_bootstrapped speed patch_context =
               ~patch_context ))
     permutations
 
-let test_from_snapshot ~descr:_ (store_dir, context_dir) store
-    ~nb_blocks_to_bake ~patch_context =
+let test_from_snapshot ~descr:_ (store_dir, data_dir) store ~nb_blocks_to_bake
+    ~patch_context =
   let open Lwt_result_syntax in
   let chain_store = Store.main_chain_store store in
   let*! genesis_block = Store.Chain.genesis_block chain_store in
   let* baked_blocks, last =
     Alpha_utils.bake_n chain_store nb_blocks_to_bake genesis_block
   in
-  let*! lafl =
+  let*! lpbl =
     let*! o = Store.Block.get_block_metadata_opt chain_store last in
     match o with
-    | Some m -> Lwt.return (Store.Block.last_allowed_fork_level m)
+    | Some m -> Lwt.return (Store.Block.last_preserved_block_level m)
     | None -> assert false
   in
   let*! savepoint = Store.Chain.savepoint chain_store in
@@ -200,7 +208,7 @@ let test_from_snapshot ~descr:_ (store_dir, context_dir) store
   let open Filename.Infix in
   let dir = store_dir // "imported_store" in
   let dst_store_dir = dir // "store" in
-  let dst_context_dir = dir // "context" in
+  let dst_data_dir = dir in
   let* expected_to_fail =
     Error_monad.protect
       (fun () ->
@@ -213,7 +221,7 @@ let test_from_snapshot ~descr:_ (store_dir, context_dir) store
             ~rolling:false
             ~block:(`Hash (last_hash, 0))
             ~store_dir
-            ~context_dir
+            ~data_dir
             ~chain_name
             ~snapshot_path
             ~progress_display_mode:Animation.Auto
@@ -225,7 +233,7 @@ let test_from_snapshot ~descr:_ (store_dir, context_dir) store
             ~block:last_hash
             ~snapshot_path
             ~dst_store_dir
-            ~dst_context_dir
+            ~dst_data_dir
             ~chain_name
             ~configured_history_mode:None
             ~user_activated_upgrades:[]
@@ -238,7 +246,7 @@ let test_from_snapshot ~descr:_ (store_dir, context_dir) store
           Reconstruction.reconstruct
             ~patch_context
             ~store_dir:dst_store_dir
-            ~context_dir:dst_context_dir
+            ~data_dir:dst_data_dir
             genesis
             ~user_activated_upgrades:[]
             ~user_activated_protocol_overrides:[]
@@ -249,7 +257,7 @@ let test_from_snapshot ~descr:_ (store_dir, context_dir) store
       ~on_error:(function
         | [Reconstruction.(Reconstruction_failure Nothing_to_reconstruct)] as e
           ->
-            if Compare.Int32.(lafl = 0l) || snd savepoint = 0l then
+            if Compare.Int32.(lpbl = 0l) || snd savepoint = 0l then
               (* It is expected as nothing was pruned *)
               return_true
             else (
@@ -276,7 +284,7 @@ let test_from_snapshot ~descr:_ (store_dir, context_dir) store
     let* store' =
       Store.init
         ~store_dir:dst_store_dir
-        ~context_dir:dst_context_dir
+        ~data_dir:dst_data_dir
         ~allow_testchains:false
         genesis
     in
@@ -318,6 +326,7 @@ let make_tests_snapshoted speed patch_context =
           nb_blocks_to_bake
       in
       wrap_simple_store_init_test
+        ~speed
         ~patch_context
         ~history_mode
         ~keep_dir:false

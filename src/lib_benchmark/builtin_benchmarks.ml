@@ -29,7 +29,7 @@
 
 let ns = Builtin_models.ns
 
-module Timer_latency_bench : Benchmark.S = struct
+module Timer_latency_bench : Benchmark.Simple = struct
   type config = unit
 
   let default_config = ()
@@ -40,9 +40,19 @@ module Timer_latency_bench : Benchmark.S = struct
 
   let info = "Measuring timer latency"
 
+  let module_filename = __FILE__
+
+  let purpose =
+    Benchmark.Other_purpose
+      "Measuring the time spent to query the system for the current time. \
+       Indeed, it needs to be deducted from the total benchmark time of a \
+       function."
+
   let tags = ["misc"; "builtin"]
 
-  let models = [("*", Model.(make ~conv:(fun () -> ()) ~model:Model.zero))]
+  let group = Benchmark.Generic
+
+  let model = Model.(make ~conv:(fun () -> ()) Model.zero)
 
   let workload_to_vector () = Sparse_vec.String.of_list [("timer_latency", 1.)]
 
@@ -50,14 +60,10 @@ module Timer_latency_bench : Benchmark.S = struct
 
   let workload_encoding = Data_encoding.unit
 
-  let bench () =
+  let create_benchmark ~rng_state:_ () =
     let closure () = () in
     let workload = () in
     Generator.Plain {workload; closure}
-
-  let create_benchmarks ~rng_state ~bench_num () =
-    ignore rng_state ;
-    List.repeat bench_num bench
 end
 
-let () = Registration.register (module Timer_latency_bench)
+let () = Registration.register_simple (module Timer_latency_bench)

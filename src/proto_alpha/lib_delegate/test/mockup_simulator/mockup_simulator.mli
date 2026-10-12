@@ -126,7 +126,7 @@ module type Hooks = sig
      bakers that were started for this run. *)
   val on_start_baker :
     baker_position:int ->
-    delegates:Baking_state.consensus_key list ->
+    delegates:Baking_state_types.Key.t list ->
     cctxt:Protocol_client_context.full ->
     unit Lwt.t
 
@@ -139,9 +139,6 @@ module Default_hooks : Hooks
 
 (** Simulation configuration. *)
 type config = {
-  debug : bool;
-      (** Whether to initialize the event system in order to display
-        information about the progress of the simulation. *)
   round0 : int64;  (** Duration of the round 0 in seconds. *)
   round1 : int64;  (** Duration of the round 1 in seconds. *)
   timeout : int;
@@ -154,7 +151,7 @@ type config = {
       (** Optional initial seed for protocol (used to control delegate selection) *)
   consensus_committee_size : int;
       (** Size of the committee for tenderbake in number of slots *)
-  consensus_threshold : int;
+  consensus_threshold_size : int;
       (** Threshold, in number of slots, for the quorum to be considered
      reached. Should be [2 * consensus_committee_size / 3 + 1] in
      usual setting for tenderbake. *)
@@ -189,6 +186,12 @@ val bootstrap3 : Signature.public_key
 val bootstrap4 : Signature.public_key
 
 val bootstrap5 : Signature.public_key
+
+(** Create a baking delegate key from a bootstrap account and its secret. *)
+val make_baking_delegate :
+  Protocol.Alpha_context.Parameters.bootstrap_account
+  * Tezos_mockup_commands.Mockup_wallet.bootstrap_secret ->
+  Baking_state_types.Key.t
 
 (** Check if a block header is signed by a given delegate. *)
 val check_block_signature :
@@ -226,11 +229,11 @@ val mempool_has_op_ref :
 (** Check if an operation is signed by the given delegate. *)
 val op_is_signed_by : public_key:Signature.public_key -> op_predicate
 
-(** Check that an operation is a preendorsement. *)
-val op_is_preendorsement : ?level:int32 -> ?round:int32 -> op_predicate
+(** Check that an operation is a preattestation. *)
+val op_is_preattestation : ?level:int32 -> ?round:int32 -> op_predicate
 
-(** Check that an operation is an endorsement. *)
-val op_is_endorsement : ?level:int32 -> ?round:int32 -> op_predicate
+(** Check that an operation is an attestation. *)
+val op_is_attestation : ?level:int32 -> ?round:int32 -> op_predicate
 
 (** Combine two predicates. *)
 val op_is_both : op_predicate -> op_predicate -> op_predicate
@@ -254,3 +257,70 @@ val parse_protocol_data :
 
 (** Get round of a block. *)
 val get_block_round : block -> int32 tzresult Lwt.t
+
+(** {2 Additional helpers for integration testing} *)
+
+(** Get default protocol parametric constants from mockup parameters. *)
+val get_default_constants :
+  unit -> Protocol.Alpha_context.Constants.Parametric.t
+
+(** Chain ID used by the mockup simulator. *)
+val get_chain_id : unit -> Chain_id.t
+
+(** Get bootstrap accounts from mockup parameters. *)
+val get_bootstrap_accounts :
+  unit -> Protocol.Alpha_context.Parameters.bootstrap_account list
+
+(** {2 Forge Worker Test Infrastructure} *)
+
+(** Result type for [create_baker_test_env]. Contains everything needed
+    to test baker components like the forge worker. *)
+type baker_test_env = {
+  cctxt : Protocol_client_context.full;
+  hooks : Faked_services.hooks;
+  delegates : Baking_state_types.Key.t list;
+  global_state : Baking_state.global_state;
+  automaton_state : Baking_state.automaton_state;
+  genesis_block_info : Baking_state_types.block_info;
+}
+
+(** Create a test environment for baker component testing.
+
+    This function reuses the same setup as [baker_process] in [run]:
+    - Creates a fake node state with genesis block
+    - Creates a client context with mocked RPC services
+    - Registers delegates in the wallet
+    - Creates the global_state needed for forge worker
+
+    @param config Optional simulation config (defaults to [default_config])
+    @param num_delegates Number of bootstrap delegates to use (max 5)
+    @return A [baker_test_env] with all components needed for testing
+*)
+val create_baker_test_env :
+  ?config:config -> num_delegates:int -> unit -> baker_test_env tzresult Lwt.t
+
+(** Create a batch_content for consensus vote testing. *)
+val create_batch_content :
+  block_info:Baking_state_types.block_info -> Baking_state.batch_content
+
+(** {2 Multi-Node Forge Worker Test Infrastructure} *)
+
+(** [wrap_hooks_with_delay ~delay hooks] wraps [hooks] so that the RPCs
+    used by [prepare_unsigned_block] ([rpc_context_callback],
+    [resulting_context_hash], [live_blocks]) sleep for [delay] seconds
+    before delegating to the original implementation.
+
+    Returns the wrapped hooks and a promise that resolves once the last
+    delayed RPC ([live_blocks]) has completed, signalling that the slow
+    node's block preparation is done. *)
+val wrap_hooks_with_delay :
+  delay:float -> Faked_services.hooks -> Faked_services.hooks * unit Lwt.t
+
+(** [create_cctxt ~hooks env] creates a fresh [Protocol_client_context.full]
+    from [hooks], with all delegates from [env] registered in its wallet.
+    Use the returned [cctxt] with [Baking_automaton.create_automaton_state]
+    to build an automaton that simulates an additional node. *)
+val create_cctxt :
+  hooks:Faked_services.hooks ->
+  baker_test_env ->
+  Protocol_client_context.full tzresult Lwt.t

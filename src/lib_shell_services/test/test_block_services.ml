@@ -26,7 +26,8 @@
 (** Testing
     -------
     Component:    Block_services
-    Invocation:   dune build @src/lib_shell_services/test/runtest
+    Invocation:   dune exec src/lib_shell_services/test/main.exe \
+                  -- --file test_block_services.ml
     Subject:      Unit tests for [Block_services]
 *)
 
@@ -41,16 +42,14 @@ let make_directory n f =
 
 (** Check that JSON-encoding for a large directory never stack-overflows.
     This test fails for json-data-encoding.0.9.1 and older. *)
-let test_json_encoding_of_large_directory () =
+let () =
+  Test.register
+    ~__FILE__
+    ~title:"json-encoding of large directory"
+    ~tags:Tezos_test_helpers.Tag.[layer1; shell; services; encodings]
+  @@ fun () ->
   let dir = make_directory 1_000_000 (fun _ -> Proof.Cut) in
   let _ =
     Data_encoding.Json.construct Block_services.raw_context_encoding dir
   in
-  ()
-
-let tests : (string * _) list =
-  [("json-encoding of large directory", test_json_encoding_of_large_directory)]
-
-let tests = List.map (fun (s, f) -> Alcotest.test_case s `Quick f) tests
-
-let () = Alcotest.run "tezos-lib-shell-services" [("block-services", tests)]
+  unit

@@ -1,0 +1,3682 @@
+// SPDX-FileCopyrightText: [2023] Serokell <hi@serokell.io>
+//
+// SPDX-License-Identifier: MIT
+
+//! AST definitions for raw ([Micheline]) and typed representations of
+//! Michelson.
+
+pub mod annotations;
+pub mod big_map;
+pub mod byte_repr_trait;
+mod comparable;
+pub mod micheline;
+pub mod michelson_address;
+pub mod michelson_lambda;
+pub mod michelson_list;
+pub mod michelson_operation;
+pub mod or;
+pub mod overloads;
+
+pub use micheline::Micheline;
+use num_bigint::{BigInt, BigUint};
+use rpds::{RedBlackTreeMap, RedBlackTreeSet};
+use std::collections::HashMap;
+use std::rc::Rc;
+use tezos_crypto_rs::public_key::PublicKey;
+/// Reexported from [tezos_crypto_rs::hash]. Typechecked values of the Michelson
+/// type `chain_id`.
+pub use tezos_crypto_rs::{hash::ChainId, public_key_hash::PublicKeyHash};
+pub use tezos_data_encoding::enc::BinWriter;
+use typed_arena::Arena;
+
+use crate::{
+    gas::{Gas, OutOfGas},
+    lexer::Prim,
+    typechecker::type_props::TypeProperty,
+};
+
+#[cfg(feature = "bls")]
+use crate::bls;
+
+pub use annotations::{Annotation, Annotations, FieldAnnotation, NO_ANNS};
+pub use big_map::BigMap;
+pub use byte_repr_trait::{ByteReprError, ByteReprTrait};
+pub use micheline::IntoMicheline;
+pub use michelson_address::*;
+pub use michelson_lambda::{AppliedCapture, Closure, Lambda};
+pub use michelson_list::MichelsonList;
+pub use michelson_operation::{
+    CreateContract, Emit, Operation, OperationInfo, SetDelegate, TransferTokens,
+};
+pub use or::Or;
+pub use tezos_crypto_rs::signature::Signature;
+
+/// Representation for values of the Michelson `ticket` type.
+#[derive(Debug, Clone, Eq, PartialEq)]
+pub struct Ticket<'a> {
+    /// Ticketer, the address of the contract that issued the ticket.
+    pub ticketer: AddressHash,
+    /// Type of the payload.
+    pub content_type: Type,
+    /// Ticket payload.
+    pub content: TypedValue<'a>,
+    /// Ticket amount.
+    pub amount: BigUint,
+}
+
+/// Cheap placeholder ticket (default ticketer/type, `Unit` content, zero
+/// amount), used when moving a `Ticket` out of a `&mut` field without cloning.
+impl Default for Ticket<'_> {
+    fn default() -> Self {
+        Ticket {
+            ticketer: AddressHash::default(),
+            content_type: Type::Unit,
+            content: TypedValue::Unit,
+            amount: BigUint::default(),
+        }
+    }
+}
+
+/// Representation for a Michelson type. Used primarily in the typechecker. Note
+/// this representation doesn't store annotations, as annotations are mostly
+/// deprecated and ingored. For entrypoints, see
+/// [crate::ast::michelson_address::entrypoint].
+///
+/// Indirection that owns a shared pair of values via `Rc<(T, T)>`, with
+/// the inner Rc held in an [`Option`] so the iterative [`Type::drop`]
+/// can extract it via [`Option::take`] without by move destructuring.
+/// Outside of that drop the option is always `Some`.
+#[derive(Debug)]
+pub struct PairBox<T> {
+    inner: Option<Rc<(T, T)>>,
+}
+
+impl<T> PairBox<T> {
+    /// Build a fresh pair box around `(l, r)`.
+    pub fn new(l: T, r: T) -> Self {
+        PairBox {
+            inner: Some(Rc::new((l, r))),
+        }
+    }
+    /// Take the Rc out, leaving `None`. Used by the iterative drop.
+    fn take(&mut self) -> Option<Rc<(T, T)>> {
+        self.inner.take()
+    }
+}
+
+impl<T> AsRef<(T, T)> for PairBox<T> {
+    /// View the inner pair.
+    fn as_ref(&self) -> &(T, T) {
+        self.inner
+            .as_ref()
+            .expect("PairBox always Some outside iterative Drop")
+            .as_ref()
+    }
+}
+
+impl<T: Clone> PairBox<T> {
+    /// Mutable access to the inner pair, cloning the Rc body if shared.
+    pub fn make_mut(&mut self) -> &mut (T, T) {
+        let rc = self
+            .inner
+            .as_mut()
+            .expect("PairBox always Some outside iterative Drop");
+        Rc::make_mut(rc)
+    }
+}
+
+impl<T> Clone for PairBox<T> {
+    fn clone(&self) -> Self {
+        PairBox {
+            inner: self.inner.clone(),
+        }
+    }
+}
+
+impl<T: PartialEq> PartialEq for PairBox<T> {
+    fn eq(&self, other: &Self) -> bool {
+        self.as_ref() == other.as_ref()
+    }
+}
+
+impl<T: Eq> Eq for PairBox<T> {}
+
+impl<T> std::ops::Deref for PairBox<T> {
+    type Target = (T, T);
+    fn deref(&self) -> &(T, T) {
+        self.as_ref()
+    }
+}
+
+/// Indirection that owns a shared single value via `Rc<T>`. Same role
+/// as [`PairBox`] but for single child variants.
+#[derive(Debug)]
+pub struct SingleBox<T> {
+    inner: Option<Rc<T>>,
+}
+
+impl<T> SingleBox<T> {
+    /// Build a fresh single box around `v`.
+    pub fn new(v: T) -> Self {
+        SingleBox {
+            inner: Some(Rc::new(v)),
+        }
+    }
+    /// Wrap an existing Rc into a SingleBox without cloning the contents.
+    pub fn from_rc(rc: Rc<T>) -> Self {
+        SingleBox { inner: Some(rc) }
+    }
+    /// Clone the inner Rc (cheap, just bumps refcount).
+    pub fn clone_rc(&self) -> Rc<T> {
+        Rc::clone(
+            self.inner
+                .as_ref()
+                .expect("SingleBox always Some outside iterative Drop"),
+        )
+    }
+    /// Take the Rc out, leaving `None`. Used by the iterative drop.
+    fn take(&mut self) -> Option<Rc<T>> {
+        self.inner.take()
+    }
+}
+
+impl<T> AsRef<T> for SingleBox<T> {
+    /// View the inner value.
+    fn as_ref(&self) -> &T {
+        self.inner
+            .as_ref()
+            .expect("SingleBox always Some outside iterative Drop")
+            .as_ref()
+    }
+}
+
+impl<T> Clone for SingleBox<T> {
+    fn clone(&self) -> Self {
+        SingleBox {
+            inner: self.inner.clone(),
+        }
+    }
+}
+
+impl<T: PartialEq> PartialEq for SingleBox<T> {
+    fn eq(&self, other: &Self) -> bool {
+        self.as_ref() == other.as_ref()
+    }
+}
+
+impl<T: Eq> Eq for SingleBox<T> {}
+
+impl<T> std::ops::Deref for SingleBox<T> {
+    type Target = T;
+    fn deref(&self) -> &T {
+        self.as_ref()
+    }
+}
+
+impl<T> From<Rc<T>> for SingleBox<T> {
+    fn from(rc: Rc<T>) -> Self {
+        SingleBox { inner: Some(rc) }
+    }
+}
+
+impl<T> From<T> for SingleBox<T> {
+    fn from(v: T) -> Self {
+        SingleBox::new(v)
+    }
+}
+
+/// The names of the variants correspond to the names of Michelson types, but
+/// snake_case is converted to PascalCase.
+///
+/// `PartialEq` and `Debug` are implemented manually as iterative tree walks so
+/// deeply nested types do not blow the WASM call stack on equality checks or
+/// on error message formatting (TcError variants embed `Type` via `{0:?}`,
+/// and the kernel formats those errors via `err.to_string()` outside MIR's
+/// gas accounting). `Eq` is a marker and stays derived.
+#[derive(Clone, Eq)]
+#[allow(missing_docs)]
+pub enum Type {
+    Nat,
+    Int,
+    Bool,
+    Mutez,
+    String,
+    Unit,
+    Never,
+    Pair(PairBox<Type>),
+    Option(SingleBox<Type>),
+    List(SingleBox<Type>),
+    Operation,
+    Set(SingleBox<Type>),
+    Map(PairBox<Type>),
+    BigMap(PairBox<Type>),
+    Or(PairBox<Type>),
+    Contract(SingleBox<Type>),
+    Address,
+    ChainId,
+    Bytes,
+    Key,
+    Signature,
+    KeyHash,
+    Lambda(PairBox<Type>),
+    Ticket(SingleBox<Type>),
+    Timestamp,
+    #[cfg(feature = "bls")]
+    Bls12381Fr,
+    #[cfg(feature = "bls")]
+    Bls12381G1,
+    #[cfg(feature = "bls")]
+    Bls12381G2,
+}
+
+impl Type {
+    /// Returns abstract size of the type representation. Used for gas cost
+    /// estimation. Iterative tree walk so it does not blow the WASM call
+    /// stack on deeply nested types.
+    pub fn size_for_gas(&self) -> usize {
+        use Type::*;
+        let mut total: usize = 0;
+        // SmallVec keeps the worklist on the stack for shallow types (the
+        // hot case: this runs per gas charge), spilling to the heap only for
+        // deep ones — avoiding a per-call heap allocation a `Vec` would force.
+        let mut stack: smallvec::SmallVec<[&Type; 8]> = smallvec::smallvec![self];
+        while let Some(t) = stack.pop() {
+            total += 1;
+            match t {
+                Nat | Int | Bool | Mutez | String | Unit | Never | Operation
+                | Address | ChainId | Bytes | Key | Signature | KeyHash | Timestamp => {}
+                #[cfg(feature = "bls")]
+                Bls12381Fr | Bls12381G1 | Bls12381G2 => {}
+                Pair(p) | Or(p) | Map(p) | BigMap(p) | Lambda(p) => {
+                    stack.push(&p.0);
+                    stack.push(&p.1);
+                }
+                Option(x) | List(x) | Set(x) | Contract(x) | Ticket(x) => {
+                    stack.push(x);
+                }
+            }
+        }
+        total
+    }
+
+    /// Convenience function to construct a new [Self::Pair]. Allocates a new [Rc].
+    pub fn new_pair(l: Self, r: Self) -> Self {
+        Self::Pair(PairBox::new(l, r))
+    }
+
+    /// Convenience function to construct a new [Self::Option]. Allocates a new [Rc].
+    pub fn new_option(x: Self) -> Self {
+        Self::Option(SingleBox::new(x))
+    }
+
+    /// Convenience function to construct a new [Self::List]. Allocates a new [Rc].
+    pub fn new_list(x: Self) -> Self {
+        Self::List(SingleBox::new(x))
+    }
+
+    /// Convenience function to construct a new [Self::Set]. Allocates a new [Rc].
+    pub fn new_set(v: Self) -> Self {
+        Self::Set(SingleBox::new(v))
+    }
+
+    /// Convenience function to construct a new [Self::Map]. Allocates a new [Rc].
+    pub fn new_map(k: Self, v: Self) -> Self {
+        Self::Map(PairBox::new(k, v))
+    }
+
+    /// Convenience function to construct a new [Self::BigMap]. Allocates a new [Rc].
+    pub fn new_big_map(k: Self, v: Self) -> Self {
+        Self::BigMap(PairBox::new(k, v))
+    }
+
+    /// Convenience function to construct a new [Self::Or]. Allocates a new [Rc].
+    pub fn new_or(l: Self, r: Self) -> Self {
+        Self::Or(PairBox::new(l, r))
+    }
+
+    /// Convenience function to construct a new [Self::Contract]. Allocates a new [Rc].
+    pub fn new_contract(ty: Self) -> Self {
+        Self::Contract(SingleBox::new(ty))
+    }
+
+    /// Convenience function to construct a new [Self::Ticket]. Allocates a new [Rc].
+    pub fn new_ticket(ty: Self) -> Self {
+        Self::Ticket(SingleBox::new(ty))
+    }
+
+    /// Convenience function to construct a new [Self::Lambda]. Allocates a new [Rc].
+    pub fn new_lambda(ty1: Self, ty2: Self) -> Self {
+        Self::Lambda(PairBox::new(ty1, ty2))
+    }
+}
+
+/// Iterative `PartialEq` so that comparing two deeply nested types (e.g.
+/// the two arms of an IF whose unify_stacks runs ensure_ty_eq on a 100k
+/// deep pair type) does not blow the WASM call stack. Semantics match
+/// what `#[derive(PartialEq)]` would produce: structural equality, with
+/// `PairBox` and `SingleBox` compared by their inner values.
+impl PartialEq for Type {
+    fn eq(&self, other: &Self) -> bool {
+        use Type::*;
+        // SmallVec to avoid a per-call heap allocation on shallow types —
+        // this runs per control-flow stack-merge (IF/LOOP/MAP/ITER); deep
+        // types spill to the heap as before.
+        let mut stack: smallvec::SmallVec<[(&Type, &Type); 8]> =
+            smallvec::smallvec![(self, other)];
+        while let Some((a, b)) = stack.pop() {
+            match (a, b) {
+                (Nat, Nat)
+                | (Int, Int)
+                | (Bool, Bool)
+                | (Mutez, Mutez)
+                | (String, String)
+                | (Unit, Unit)
+                | (Never, Never)
+                | (Operation, Operation)
+                | (Address, Address)
+                | (ChainId, ChainId)
+                | (Bytes, Bytes)
+                | (Key, Key)
+                | (Signature, Signature)
+                | (KeyHash, KeyHash)
+                | (Timestamp, Timestamp) => {}
+                #[cfg(feature = "bls")]
+                (Bls12381Fr, Bls12381Fr)
+                | (Bls12381G1, Bls12381G1)
+                | (Bls12381G2, Bls12381G2) => {}
+                (Pair(p), Pair(q))
+                | (Or(p), Or(q))
+                | (Map(p), Map(q))
+                | (BigMap(p), BigMap(q))
+                | (Lambda(p), Lambda(q)) => {
+                    stack.push((&p.0, &q.0));
+                    stack.push((&p.1, &q.1));
+                }
+                (Option(p), Option(q))
+                | (List(p), List(q))
+                | (Set(p), Set(q))
+                | (Contract(p), Contract(q))
+                | (Ticket(p), Ticket(q)) => {
+                    stack.push((p, q));
+                }
+                _ => return false,
+            }
+        }
+        true
+    }
+}
+
+/// Walk an owned tree iteratively. Used by the three manual `Drop` /
+/// drain impls below: each extracts the node's children into a heap
+/// worklist, leaving the leftover node trivial; this driver then keeps
+/// pulling from the worklist until empty so the recursion happens on
+/// the heap rather than the WASM call stack.
+fn drain_iteratively<T>(root: &mut T, mut extract: impl FnMut(&mut T, &mut Vec<T>)) {
+    let mut stack: Vec<T> = Vec::new();
+    extract(root, &mut stack);
+    while let Some(mut node) = stack.pop() {
+        extract(&mut node, &mut stack);
+    }
+}
+
+/// Manual `Drop` to avoid the recursive destructor that would otherwise
+/// blow the call stack on a deeply nested type. Walks an explicit
+/// worklist and uses [`Option::take`] on the wrapper's inner `Rc` so the
+/// leftover `Type` drops trivially without re entering this function.
+impl Drop for Type {
+    fn drop(&mut self) {
+        drain_iteratively(self, extract_type_children);
+    }
+}
+
+/// Trivial leaf default, used as a cheap placeholder when moving a [`Type`] out
+/// of a `&mut` field; the drained-out parent then drops without recursing.
+impl Default for Type {
+    fn default() -> Self {
+        Type::Unit
+    }
+}
+
+/// Frame for the iterative `Debug for Type` driver.
+enum TypeDebugFrame<'a> {
+    Visit(&'a Type),
+    Str(&'static str),
+}
+
+/// Emits `Name(<left>, <right>)`. Pushes closer, right, separator, left
+/// in reverse so LIFO popping yields the lexical order.
+fn push_pair_debug<'a>(
+    f: &mut std::fmt::Formatter<'_>,
+    stack: &mut Vec<TypeDebugFrame<'a>>,
+    open: &'static str,
+    p: &'a PairBox<Type>,
+) -> std::fmt::Result {
+    f.write_str(open)?;
+    stack.push(TypeDebugFrame::Str(")"));
+    stack.push(TypeDebugFrame::Visit(&p.1));
+    stack.push(TypeDebugFrame::Str(", "));
+    stack.push(TypeDebugFrame::Visit(&p.0));
+    Ok(())
+}
+
+/// Emits `Name(<child>)`.
+fn push_single_debug<'a>(
+    f: &mut std::fmt::Formatter<'_>,
+    stack: &mut Vec<TypeDebugFrame<'a>>,
+    open: &'static str,
+    s: &'a SingleBox<Type>,
+) -> std::fmt::Result {
+    f.write_str(open)?;
+    stack.push(TypeDebugFrame::Str(")"));
+    stack.push(TypeDebugFrame::Visit(s));
+    Ok(())
+}
+
+/// Iterative `Debug` so deeply nested types do not blow the WASM call
+/// stack when formatted for error output. `TcError` variants embed
+/// `Type` via `{0:?}` and the kernel formats those errors with
+/// `err.to_string()` (see
+/// `etherlink/kernel_latest/tezos/src/operation_result.rs:218`) outside
+/// MIR's gas accounting, so a deep parameter type carried by a clean
+/// rejection (wrong argument type, etc.) would otherwise trap the PVM.
+///
+/// Output format is the simplified shape that would result if `PairBox`
+/// and `SingleBox` were transparent wrappers, e.g. `Pair(Int, Int)`
+/// rather than the auto derived `Pair(PairBox { inner: Some((Int, Int)) })`.
+impl std::fmt::Debug for Type {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        let mut stack: Vec<TypeDebugFrame> = vec![TypeDebugFrame::Visit(self)];
+        while let Some(frame) = stack.pop() {
+            let t = match frame {
+                TypeDebugFrame::Str(s) => {
+                    f.write_str(s)?;
+                    continue;
+                }
+                TypeDebugFrame::Visit(t) => t,
+            };
+            match t {
+                Type::Nat => f.write_str("Nat")?,
+                Type::Int => f.write_str("Int")?,
+                Type::Bool => f.write_str("Bool")?,
+                Type::Mutez => f.write_str("Mutez")?,
+                Type::String => f.write_str("String")?,
+                Type::Unit => f.write_str("Unit")?,
+                Type::Never => f.write_str("Never")?,
+                Type::Operation => f.write_str("Operation")?,
+                Type::Address => f.write_str("Address")?,
+                Type::ChainId => f.write_str("ChainId")?,
+                Type::Bytes => f.write_str("Bytes")?,
+                Type::Key => f.write_str("Key")?,
+                Type::Signature => f.write_str("Signature")?,
+                Type::KeyHash => f.write_str("KeyHash")?,
+                Type::Timestamp => f.write_str("Timestamp")?,
+                #[cfg(feature = "bls")]
+                Type::Bls12381Fr => f.write_str("Bls12381Fr")?,
+                #[cfg(feature = "bls")]
+                Type::Bls12381G1 => f.write_str("Bls12381G1")?,
+                #[cfg(feature = "bls")]
+                Type::Bls12381G2 => f.write_str("Bls12381G2")?,
+                Type::Pair(p) => push_pair_debug(f, &mut stack, "Pair(", p)?,
+                Type::Or(p) => push_pair_debug(f, &mut stack, "Or(", p)?,
+                Type::Map(p) => push_pair_debug(f, &mut stack, "Map(", p)?,
+                Type::BigMap(p) => push_pair_debug(f, &mut stack, "BigMap(", p)?,
+                Type::Lambda(p) => push_pair_debug(f, &mut stack, "Lambda(", p)?,
+                Type::Option(s) => push_single_debug(f, &mut stack, "Option(", s)?,
+                Type::List(s) => push_single_debug(f, &mut stack, "List(", s)?,
+                Type::Set(s) => push_single_debug(f, &mut stack, "Set(", s)?,
+                Type::Contract(s) => push_single_debug(f, &mut stack, "Contract(", s)?,
+                Type::Ticket(s) => push_single_debug(f, &mut stack, "Ticket(", s)?,
+            }
+        }
+        Ok(())
+    }
+}
+
+fn extract_type_children(node: &mut Type, stack: &mut Vec<Type>) {
+    match node {
+        Type::Pair(rcb)
+        | Type::Or(rcb)
+        | Type::Lambda(rcb)
+        | Type::Map(rcb)
+        | Type::BigMap(rcb) => {
+            if let Some(rc) = rcb.take() {
+                if let Ok((l, r)) = Rc::try_unwrap(rc) {
+                    stack.push(l);
+                    stack.push(r);
+                }
+            }
+        }
+        Type::Option(sb)
+        | Type::List(sb)
+        | Type::Set(sb)
+        | Type::Contract(sb)
+        | Type::Ticket(sb) => {
+            if let Some(rc) = sb.take() {
+                if let Ok(inner) = Rc::try_unwrap(rc) {
+                    stack.push(inner);
+                }
+            }
+        }
+        _ => {}
+    }
+}
+
+impl<'a> IntoMicheline<'a> for &'_ Type {
+    /// Iterative tree fold over the input `Type`. Right leaning `Pair` combs
+    /// are linearized via `LinearizePairIter` so they emit a single flat
+    /// `App(pair, [...])`, matching the reference implementation. All other
+    /// branching variants (`Or`, `Map`, `BigMap`, `Lambda`) and the single
+    /// child variants (`Option`, `List`, `Set`, `Contract`, `Ticket`) flow
+    /// through a `frames: Vec<TyImFrame>` worklist so deeply nested input
+    /// does not blow the WASM call stack.
+    fn into_micheline_optimized_legacy(
+        self,
+        arena: &'a Arena<Micheline<'a>>,
+        gas: &mut Gas,
+    ) -> Result<Micheline<'a>, OutOfGas> {
+        use Type::*;
+
+        struct LinearizePairIter<'b>(std::option::Option<&'b Type>);
+
+        impl<'b> Iterator for LinearizePairIter<'b> {
+            type Item = &'b Type;
+            fn next(&mut self) -> std::option::Option<Self::Item> {
+                match self.0 {
+                    Some(Type::Pair(x)) => {
+                        self.0 = Some(&x.1);
+                        Some(&x.0)
+                    }
+                    ty => {
+                        self.0 = None;
+                        ty
+                    }
+                }
+            }
+
+            fn size_hint(&self) -> (usize, std::option::Option<usize>) {
+                let Some(mut ty) = self.0 else {
+                    return (0, Some(0));
+                };
+                let mut size: usize = 1;
+                while let Type::Pair(x) = ty {
+                    ty = &x.1;
+                    size += 1;
+                }
+                (size, Some(size))
+            }
+        }
+
+        impl ExactSizeIterator for LinearizePairIter<'_> {}
+
+        // Worklist-driver invariant: every `Build*` frame pops exactly the
+        // number of `results` its construction site pushed `Visit` frames
+        // for (1 for `BuildPrim1`, 2 for `BuildPrim2`, `count` for
+        // `BuildPairChain`). The `.expect`s / `results.len() - count`
+        // arithmetic below are therefore unreachable on any well-formed
+        // input — a panic here would indicate a frame-state-machine bug
+        // in the `Visit` arm above, not an attacker-triggerable PVM trap.
+        // (A typed `IntoMichelineError::Invariant(_)` variant could replace
+        // the `.expect`s; tracked as a follow-up since it widens the
+        // trait's error type across every caller.)
+        enum TyImFrame<'b> {
+            Visit(&'b Type),
+            BuildPrim1(Prim),
+            BuildPrim2(Prim),
+            BuildPairChain { count: usize },
+        }
+
+        let mut frames: Vec<TyImFrame<'_>> = vec![TyImFrame::Visit(self)];
+        let mut results: Vec<Micheline<'a>> = Vec::new();
+
+        while let Some(frame) = frames.pop() {
+            match frame {
+                TyImFrame::Visit(ty) => match ty {
+                    Nat => results.push(Micheline::prim0(Prim::nat, gas)?),
+                    Int => results.push(Micheline::prim0(Prim::int, gas)?),
+                    Bool => results.push(Micheline::prim0(Prim::bool, gas)?),
+                    Mutez => results.push(Micheline::prim0(Prim::mutez, gas)?),
+                    String => results.push(Micheline::prim0(Prim::string, gas)?),
+                    Unit => results.push(Micheline::prim0(Prim::unit, gas)?),
+                    Operation => results.push(Micheline::prim0(Prim::operation, gas)?),
+                    Address => results.push(Micheline::prim0(Prim::address, gas)?),
+                    ChainId => results.push(Micheline::prim0(Prim::chain_id, gas)?),
+                    Bytes => results.push(Micheline::prim0(Prim::bytes, gas)?),
+                    Key => results.push(Micheline::prim0(Prim::key, gas)?),
+                    Signature => results.push(Micheline::prim0(Prim::signature, gas)?),
+                    Timestamp => results.push(Micheline::prim0(Prim::timestamp, gas)?),
+                    KeyHash => results.push(Micheline::prim0(Prim::key_hash, gas)?),
+                    Never => results.push(Micheline::prim0(Prim::never, gas)?),
+                    #[cfg(feature = "bls")]
+                    Bls12381Fr => {
+                        results.push(Micheline::prim0(Prim::bls12_381_fr, gas)?)
+                    }
+                    #[cfg(feature = "bls")]
+                    Bls12381G1 => {
+                        results.push(Micheline::prim0(Prim::bls12_381_g1, gas)?)
+                    }
+                    #[cfg(feature = "bls")]
+                    Bls12381G2 => {
+                        results.push(Micheline::prim0(Prim::bls12_381_g2, gas)?)
+                    }
+
+                    Option(x) => {
+                        frames.push(TyImFrame::BuildPrim1(Prim::option));
+                        frames.push(TyImFrame::Visit(x));
+                    }
+                    List(x) => {
+                        frames.push(TyImFrame::BuildPrim1(Prim::list));
+                        frames.push(TyImFrame::Visit(x));
+                    }
+                    Set(x) => {
+                        frames.push(TyImFrame::BuildPrim1(Prim::set));
+                        frames.push(TyImFrame::Visit(x));
+                    }
+                    Contract(x) => {
+                        frames.push(TyImFrame::BuildPrim1(Prim::contract));
+                        frames.push(TyImFrame::Visit(x));
+                    }
+                    Ticket(x) => {
+                        frames.push(TyImFrame::BuildPrim1(Prim::ticket));
+                        frames.push(TyImFrame::Visit(x));
+                    }
+
+                    Pair(_) => {
+                        let children: Vec<&Type> = LinearizePairIter(Some(ty)).collect();
+                        let count = children.len();
+                        frames.push(TyImFrame::BuildPairChain { count });
+                        for child in children.into_iter().rev() {
+                            frames.push(TyImFrame::Visit(child));
+                        }
+                    }
+                    Map(x) => {
+                        frames.push(TyImFrame::BuildPrim2(Prim::map));
+                        frames.push(TyImFrame::Visit(&x.1));
+                        frames.push(TyImFrame::Visit(&x.0));
+                    }
+                    BigMap(x) => {
+                        frames.push(TyImFrame::BuildPrim2(Prim::big_map));
+                        frames.push(TyImFrame::Visit(&x.1));
+                        frames.push(TyImFrame::Visit(&x.0));
+                    }
+                    Or(x) => {
+                        frames.push(TyImFrame::BuildPrim2(Prim::or));
+                        frames.push(TyImFrame::Visit(&x.1));
+                        frames.push(TyImFrame::Visit(&x.0));
+                    }
+                    Lambda(x) => {
+                        frames.push(TyImFrame::BuildPrim2(Prim::lambda));
+                        frames.push(TyImFrame::Visit(&x.1));
+                        frames.push(TyImFrame::Visit(&x.0));
+                    }
+                },
+
+                TyImFrame::BuildPrim1(prim) => {
+                    let arg = results.pop().expect("BuildPrim1: missing result");
+                    results.push(Micheline::prim1(arena, prim, arg, gas)?);
+                }
+                TyImFrame::BuildPrim2(prim) => {
+                    let arg2 = results.pop().expect("BuildPrim2: missing arg2");
+                    let arg1 = results.pop().expect("BuildPrim2: missing arg1");
+                    results.push(Micheline::prim2(arena, prim, arg1, arg2, gas)?);
+                }
+                TyImFrame::BuildPairChain { count } => {
+                    let start = results.len() - count;
+                    // The drain iterator does not allocate in the arena, so
+                    // the alloc_extend pothole does not apply here.
+                    #[allow(clippy::disallowed_methods)]
+                    let slice = arena.alloc_extend(results.drain(start..));
+                    results.push(Micheline::prim_n(Prim::pair, slice, gas)?);
+                }
+            }
+        }
+
+        Ok(results.pop().expect("final result"))
+    }
+}
+
+/// Enum representing an arbitrary typed Michelson value. The name of the
+/// variant corresponds to the name of the type, with snake_case converted to
+/// PascalCase.
+///
+/// This is used primarily by the interpreter. It should be noted the type has a
+/// few quirks related to ordering and equality:
+///
+/// 1. Comparing two `TypedValue`s for equality is only well-defined if both are
+///    known to have the same type. `TypedValue` itself does not carry its type,
+///    so, for instance two empty lists with elements of different types will
+///    compare equal.
+/// 2. The [Ord] instance can panic if values being compared are of different
+///    types and/or are incomparable. This is fine for the interpreter, as the
+///    typechecker has verified this invariant holds. However, be mindful of
+///    this when comparing `TypedValue` in client code. [PartialOrd] is safe to
+///    use, it'll just return [None] for incomparable values.
+/// 3. `Debug` is implemented manually as an iterative tree walk so deeply
+///    nested values do not blow the WASM call stack when they appear in an
+///    error message. `InterpretError::FailedWith` carries a `TypedValue`
+///    via `{1:?}`, and the kernel formats those errors via
+///    `err.to_string()` outside MIR's gas accounting.
+#[derive(Clone, Eq, PartialEq)]
+#[allow(missing_docs)]
+pub enum TypedValue<'a> {
+    Int(BigInt),
+    Nat(BigUint),
+    Mutez(i64),
+    Bool(bool),
+    String(String),
+    Unit,
+    Pair(RcTypedValue<'a>, RcTypedValue<'a>),
+    Option(Option<RcTypedValue<'a>>),
+    List(MichelsonList<RcTypedValue<'a>>),
+    Set(RedBlackTreeSet<RcTypedValue<'a>>),
+    Map(RedBlackTreeMap<RcTypedValue<'a>, RcTypedValue<'a>>),
+    BigMap(BigMap<'a>),
+    Or(Or<RcTypedValue<'a>, RcTypedValue<'a>>),
+    Address(Address),
+    ChainId(ChainId),
+    Contract(Address),
+    Bytes(Vec<u8>),
+    Key(PublicKey),
+    Signature(Signature),
+    Lambda(Closure<'a>),
+    KeyHash(PublicKeyHash),
+    Operation(Box<OperationInfo<'a>>),
+    Ticket(Box<Ticket<'a>>),
+    Timestamp(BigInt),
+    #[cfg(feature = "bls")]
+    Bls12381Fr(bls::Fr),
+    // G1 and G2 are a bit too large to lug them about on-stack
+    #[cfg(feature = "bls")]
+    Bls12381G1(Box<bls::G1>),
+    #[cfg(feature = "bls")]
+    Bls12381G2(Box<bls::G2>),
+}
+
+/// Trivial leaf default (`Unit`), used as a cheap placeholder when moving a
+/// payload out of a `&mut TypedValue` field; the drained-out parent then drops
+/// without recursing.
+impl Default for TypedValue<'_> {
+    fn default() -> Self {
+        TypedValue::Unit
+    }
+}
+
+/// A [TypedValue] shared behind an [Rc]. This is the type everything outside
+/// this module uses to handle Michelson values: cloning is a reference-count
+/// bump, reading goes through [Deref](std::ops::Deref) (or
+/// [RcTypedValue::as_ref]), and ownership is recovered with
+/// [RcTypedValue::unwrap_or_clone] (move when unique, deep clone otherwise) or
+/// obtained in place with [RcTypedValue::make_mut] (clone-on-write).
+///
+/// The wrapped `Rc` is deliberately private: keeping every sharing decision
+/// behind this one type means the move-when-unique optimizations cannot be
+/// bypassed by accident at call sites.
+#[derive(Clone, PartialEq, Eq, PartialOrd, Ord)]
+pub struct RcTypedValue<'a>(Rc<TypedValue<'a>>);
+
+impl<'a> RcTypedValue<'a> {
+    /// Wrap a value, making it shareable.
+    pub fn new(v: TypedValue<'a>) -> Self {
+        RcTypedValue(Rc::new(v))
+    }
+
+    /// Mutably borrow the shared value, cloning it first if it is shared
+    /// (clone-on-write, see [Rc::make_mut]). Prefer this over
+    /// [RcTypedValue::unwrap_or_clone] when editing in place: a unique value
+    /// is mutated directly with no move.
+    pub fn make_mut(&mut self) -> &mut TypedValue<'a> {
+        Rc::make_mut(&mut self.0)
+    }
+
+    /// Take ownership of the shared value: moves it out when this is the last
+    /// reference, clones it otherwise. Prefer keeping the `RcTypedValue` when
+    /// the value is only read or forwarded — the clone is a deep copy of every
+    /// inline payload, and those are unbounded.
+    pub fn unwrap_or_clone(self) -> TypedValue<'a> {
+        Rc::unwrap_or_clone(self.0)
+    }
+
+    /// Take ownership of the shared value only when this is the last
+    /// reference, returning the untouched `self` otherwise. Prefer
+    /// [RcTypedValue::unwrap_or_clone] unless the shared case genuinely takes
+    /// a different path (e.g. the iterative drop drain, which leaves shared
+    /// values to their remaining owners).
+    pub fn try_unwrap(self) -> Result<TypedValue<'a>, Self> {
+        Rc::try_unwrap(self.0).map_err(RcTypedValue)
+    }
+
+    /// Whether two handles share the same allocation (see [Rc::ptr_eq]).
+    pub fn ptr_eq(&self, other: &Self) -> bool {
+        Rc::ptr_eq(&self.0, &other.0)
+    }
+
+    /// The allocation's address, as a sharing identity (see [Rc::as_ptr]).
+    /// Prefer [RcTypedValue::ptr_eq] for pairwise checks; this exists for
+    /// identity sets keyed by more than two handles.
+    pub fn as_ptr(&self) -> *const TypedValue<'a> {
+        Rc::as_ptr(&self.0)
+    }
+
+    /// Number of handles sharing the value (see [Rc::strong_count]). Useful
+    /// mostly for asserting sharing behavior in tests.
+    pub fn strong_count(&self) -> usize {
+        Rc::strong_count(&self.0)
+    }
+
+    /// Drain the value's (possibly deep) children onto an iterative worklist
+    /// when this is the last reference, leaving the shallow husk to drop
+    /// trivially; a still-shared value is left to its remaining owners. Used
+    /// on teardown paths that release values before they fall out of scope.
+    pub(crate) fn drain_if_unique(&mut self) {
+        if let Some(inner) = Rc::get_mut(&mut self.0) {
+            drain_deep_typed_value(inner);
+        }
+    }
+}
+
+/// Borrow the shared value for reading (typically to match on it).
+impl<'a> AsRef<TypedValue<'a>> for RcTypedValue<'a> {
+    fn as_ref(&self) -> &TypedValue<'a> {
+        &self.0
+    }
+}
+
+/// Lets collections keyed by [RcTypedValue] (interpreter maps and sets) be
+/// probed with a plain borrowed [TypedValue]. The [Eq]/[Ord] forwarding impls
+/// keep the two views consistent, as [std::borrow::Borrow] requires.
+impl<'a> std::borrow::Borrow<TypedValue<'a>> for RcTypedValue<'a> {
+    fn borrow(&self) -> &TypedValue<'a> {
+        &self.0
+    }
+}
+
+impl<'a> From<TypedValue<'a>> for RcTypedValue<'a> {
+    fn from(v: TypedValue<'a>) -> Self {
+        RcTypedValue::new(v)
+    }
+}
+
+impl<'a> std::ops::Deref for RcTypedValue<'a> {
+    type Target = TypedValue<'a>;
+
+    fn deref(&self) -> &TypedValue<'a> {
+        &self.0
+    }
+}
+
+/// Shared `Unit` placeholder, mirroring [TypedValue]'s [Default]; used when
+/// moving a value out of a `&mut RcTypedValue` field so the drained-out parent
+/// drops without recursing.
+impl Default for RcTypedValue<'_> {
+    fn default() -> Self {
+        RcTypedValue::new(TypedValue::Unit)
+    }
+}
+
+/// Forwards to the wrapped value's iterative [TypedValue] `Debug`; the `Rc`
+/// indirection is implementation detail and is elided.
+impl std::fmt::Debug for RcTypedValue<'_> {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        self.0.fmt(f)
+    }
+}
+
+#[cfg(test)]
+mod test_rc_typed_value {
+    use super::*;
+
+    #[test]
+    fn make_mut_unique_edits_in_place() {
+        let mut v = RcTypedValue::new(TypedValue::int(1));
+        *v.make_mut() = TypedValue::int(2);
+        assert_eq!(v.as_ref(), &TypedValue::int(2));
+    }
+
+    #[test]
+    fn make_mut_shared_clones_first() {
+        let mut v = RcTypedValue::new(TypedValue::int(1));
+        let shared = v.clone();
+        *v.make_mut() = TypedValue::int(2);
+        assert_eq!(v.as_ref(), &TypedValue::int(2));
+        assert_eq!(shared.as_ref(), &TypedValue::int(1));
+    }
+
+    #[test]
+    fn unwrap_or_clone_shared_clones() {
+        let v = RcTypedValue::new(TypedValue::int(1));
+        let shared = v.clone();
+        assert_eq!(v.unwrap_or_clone(), TypedValue::int(1));
+        assert_eq!(shared.as_ref(), &TypedValue::int(1));
+    }
+
+    #[test]
+    fn comparisons_and_debug_forward_to_the_value() {
+        let one = RcTypedValue::new(TypedValue::int(1));
+        let two = RcTypedValue::new(TypedValue::int(2));
+        assert_eq!(one, RcTypedValue::new(TypedValue::int(1)));
+        assert!(one < two);
+        assert_eq!(format!("{one:?}"), format!("{:?}", TypedValue::int(1)));
+    }
+
+    #[test]
+    fn default_is_unit() {
+        assert_eq!(RcTypedValue::default().as_ref(), &TypedValue::Unit);
+    }
+}
+
+/// Iterative `Debug` so deeply nested values do not blow the WASM call
+/// stack when formatted for error output. `InterpretError::FailedWith`
+/// embeds a `TypedValue` via `{1:?}` and the kernel formats those errors
+/// with `err.to_string()` outside MIR's gas accounting.
+///
+/// Leaf variants delegate to the underlying type's `Debug` (`BigInt`,
+/// `BigUint`, `bool`, `String`, etc., none of which are recursive in the
+/// MIR type graph). Recursive variants (`Pair`, `Or`, `Option`, `List`,
+/// `Set`, `Map`, `Lambda`, `Ticket`) emit a clean form like
+/// `Pair(<l>, <r>)` driven by a `Vec<Frame>` worklist.
+///
+/// The output intentionally diverges from the derived `Debug`: the
+/// `PairBox` / `SingleBox` / `MichelsonList` indirection wrappers are
+/// elided (they are implementation detail), and `Map` prints `k -> v`
+/// rather than the derived `k: v`. This Debug appears only in
+/// error messages; no consumer parses it.
+impl<'a> std::fmt::Debug for TypedValue<'a> {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        debug_fmt_walk(DebugFrame::VisitTv(self), f)
+    }
+}
+
+/// Frames shared between [`TypedValue::fmt`] and [`Closure::fmt`].
+///
+/// `VisitTv` and `VisitCl` are pushed onto the same worklist so that the
+/// alternating `TypedValue::Lambda(Closure)` /
+/// `Closure::Apply { capture: AppliedCapture, .. }` cycle is unwound on the
+/// heap instead of the call stack. An attacker can chain
+/// `Lambda(Apply { arg_val: Lambda(Apply { arg_val: … }), .. })` to any
+/// depth (via repeated `APPLY` of lambda values), and a recursive Debug
+/// would burn two real frames per nesting level. Routing both sides
+/// through a single loop bounds the real stack to a constant.
+pub(crate) enum DebugFrame<'b, 'a: 'b> {
+    VisitTv(&'b TypedValue<'a>),
+    VisitCl(&'b Closure<'a>),
+    Str(&'static str),
+    // Iterate over a Map's (key, value) pairs without recursing
+    // into the map's auto Debug (which would walk values
+    // recursively).
+    // The `bool` is `first`: whether the next entry is the first in
+    // the container, so the ", " separator is emitted *before* every
+    // non-first entry (no trailing comma).
+    MapEntries(
+        std::vec::IntoIter<(&'b RcTypedValue<'a>, &'b RcTypedValue<'a>)>,
+        bool,
+    ),
+    SetEntries(std::vec::IntoIter<&'b RcTypedValue<'a>>, bool),
+    ListEntries(crate::ast::michelson_list::Iter<'b, RcTypedValue<'a>>, bool),
+}
+
+pub(crate) fn debug_fmt_walk<'a, 'b>(
+    seed: DebugFrame<'b, 'a>,
+    f: &mut std::fmt::Formatter<'_>,
+) -> std::fmt::Result {
+    use TypedValue as TV;
+    let mut stack: Vec<DebugFrame<'b, 'a>> = vec![seed];
+    while let Some(frame) = stack.pop() {
+        match frame {
+            DebugFrame::Str(s) => f.write_str(s)?,
+            DebugFrame::MapEntries(mut it, first) => {
+                if let Some((k, v)) = it.next() {
+                    // Re-push the iterator so further entries follow this
+                    // key/value pair; emit ", " before this pair unless it
+                    // is the first (so there is no trailing comma).
+                    stack.push(DebugFrame::MapEntries(it, false));
+                    stack.push(DebugFrame::VisitTv(v.as_ref()));
+                    stack.push(DebugFrame::Str(" -> "));
+                    stack.push(DebugFrame::VisitTv(k.as_ref()));
+                    if !first {
+                        stack.push(DebugFrame::Str(", "));
+                    }
+                }
+            }
+            DebugFrame::SetEntries(mut it, first) => {
+                if let Some(e) = it.next() {
+                    stack.push(DebugFrame::SetEntries(it, false));
+                    stack.push(DebugFrame::VisitTv(e.as_ref()));
+                    if !first {
+                        stack.push(DebugFrame::Str(", "));
+                    }
+                }
+            }
+            DebugFrame::ListEntries(mut it, first) => {
+                if let Some(e) = it.next() {
+                    stack.push(DebugFrame::ListEntries(it, false));
+                    stack.push(DebugFrame::VisitTv(e.as_ref()));
+                    if !first {
+                        stack.push(DebugFrame::Str(", "));
+                    }
+                }
+            }
+            DebugFrame::VisitCl(c) => match c {
+                Closure::Lambda(lam) => {
+                    // Terminal Lambda: emit inline. `micheline_code` goes
+                    // through the iterative `Micheline` Debug; the
+                    // typechecked `code` is elided as `code: ..` (its
+                    // `Instruction` Debug is still recursive). `in_ty` /
+                    // `out_ty` use `Type`'s iterative Debug. None of these
+                    // walks any further `TypedValue`/`Closure`.
+                    f.write_str("Lambda(")?;
+                    match lam {
+                        Lambda::Lambda { micheline_code, .. } => {
+                            write!(
+                                f,
+                                "Lambda {{ micheline_code: {micheline_code:?}, code: .. }}"
+                            )?;
+                        }
+                        Lambda::LambdaRec {
+                            in_ty,
+                            out_ty,
+                            micheline_code,
+                            ..
+                        } => {
+                            write!(
+                                f,
+                                "LambdaRec {{ in_ty: {in_ty:?}, out_ty: {out_ty:?}, \
+                                 micheline_code: {micheline_code:?}, code: .. }}"
+                            )?;
+                        }
+                    }
+                    f.write_str(")")?;
+                }
+                Closure::Apply { capture, closure } => {
+                    // `arg_ty` is rendered inline (iterative `Type` Debug).
+                    // `arg_val` may itself be `Lambda(Apply { … })`, and
+                    // `closure` may chain further `Apply` spines — both go
+                    // back through the worklist so neither path burns a
+                    // real stack frame.
+                    write!(f, "Apply {{ arg_ty: {:?}, arg_val: ", capture.arg_ty())?;
+                    stack.push(DebugFrame::Str(" }"));
+                    stack.push(DebugFrame::VisitCl(closure.as_ref()));
+                    stack.push(DebugFrame::Str(", closure: "));
+                    stack.push(DebugFrame::VisitTv(capture.arg_val().as_ref()));
+                }
+            },
+            DebugFrame::VisitTv(v) => match v {
+                // Leaves: format directly. None of these inner Debug
+                // impls walk a `TypedValue` themselves, so they are
+                // iteratively safe.
+                TV::Int(n) => write!(f, "Int({n:?})")?,
+                TV::Nat(n) => write!(f, "Nat({n:?})")?,
+                TV::Mutez(m) => write!(f, "Mutez({m:?})")?,
+                TV::Bool(b) => write!(f, "Bool({b:?})")?,
+                TV::String(s) => write!(f, "String({s:?})")?,
+                TV::Unit => f.write_str("Unit")?,
+                TV::Bytes(b) => write!(f, "Bytes({b:?})")?,
+                TV::Address(a) => write!(f, "Address({a:?})")?,
+                TV::ChainId(c) => write!(f, "ChainId({c:?})")?,
+                TV::Contract(a) => write!(f, "Contract({a:?})")?,
+                TV::Key(k) => write!(f, "Key({k:?})")?,
+                TV::Signature(s) => write!(f, "Signature({s:?})")?,
+                TV::KeyHash(h) => write!(f, "KeyHash({h:?})")?,
+                TV::Timestamp(t) => write!(f, "Timestamp({t:?})")?,
+                TV::Operation(op) => write!(f, "Operation({op:?})")?,
+                TV::BigMap(bm) => write!(f, "BigMap({bm:?})")?,
+                #[cfg(feature = "bls")]
+                TV::Bls12381Fr(x) => write!(f, "Bls12381Fr({x:?})")?,
+                #[cfg(feature = "bls")]
+                TV::Bls12381G1(x) => write!(f, "Bls12381G1({x:?})")?,
+                #[cfg(feature = "bls")]
+                TV::Bls12381G2(x) => write!(f, "Bls12381G2({x:?})")?,
+                // Lambda: enqueue the closure on the shared worklist so the
+                // alternating `arg_val: TypedValue` / `closure: Closure`
+                // chain (reachable via `APPLY` of lambda values) never
+                // burns a real stack frame.
+                TV::Lambda(c) => {
+                    f.write_str("Lambda(")?;
+                    stack.push(DebugFrame::Str(")"));
+                    stack.push(DebugFrame::VisitCl(c));
+                }
+                // Ticket: payload's type and content can be deep.
+                // Format manually so the inner TypedValue goes through
+                // this iterative walker.
+                TV::Ticket(t) => {
+                    // Re-push the closer and an enumerated visit for
+                    // the ticket content. Ticketer/amount/content_type
+                    // are leaves and can be formatted inline up front.
+                    f.write_str("Ticket(")?;
+                    write!(
+                        f,
+                        "ticketer: {:?}, content_type: {:?}, amount: {:?}, content: ",
+                        t.ticketer, t.content_type, t.amount
+                    )?;
+                    stack.push(DebugFrame::Str(")"));
+                    stack.push(DebugFrame::VisitTv(&t.content));
+                }
+                // Recursive variants.
+                TV::Pair(l, r) => {
+                    f.write_str("Pair(")?;
+                    stack.push(DebugFrame::Str(")"));
+                    stack.push(DebugFrame::VisitTv(r.as_ref()));
+                    stack.push(DebugFrame::Str(", "));
+                    stack.push(DebugFrame::VisitTv(l.as_ref()));
+                }
+                TV::Option(opt) => match opt {
+                    None => f.write_str("Option(None)")?,
+                    Some(inner) => {
+                        f.write_str("Option(Some(")?;
+                        stack.push(DebugFrame::Str("))"));
+                        stack.push(DebugFrame::VisitTv(inner.as_ref()));
+                    }
+                },
+                TV::Or(or) => match or {
+                    Or::Left(x) => {
+                        f.write_str("Or(Left(")?;
+                        stack.push(DebugFrame::Str("))"));
+                        stack.push(DebugFrame::VisitTv(x.as_ref()));
+                    }
+                    Or::Right(x) => {
+                        f.write_str("Or(Right(")?;
+                        stack.push(DebugFrame::Str("))"));
+                        stack.push(DebugFrame::VisitTv(x.as_ref()));
+                    }
+                },
+                TV::List(lst) => {
+                    f.write_str("List([")?;
+                    stack.push(DebugFrame::Str("])"));
+                    stack.push(DebugFrame::ListEntries(lst.iter(), true));
+                }
+                TV::Set(set) => {
+                    f.write_str("Set({")?;
+                    stack.push(DebugFrame::Str("})"));
+                    stack.push(DebugFrame::SetEntries(
+                        set.iter().collect::<Vec<_>>().into_iter(),
+                        true,
+                    ));
+                }
+                TV::Map(map) => {
+                    f.write_str("Map({")?;
+                    stack.push(DebugFrame::Str("})"));
+                    stack.push(DebugFrame::MapEntries(
+                        map.iter().collect::<Vec<_>>().into_iter(),
+                        true,
+                    ));
+                }
+            },
+        }
+    }
+    Ok(())
+}
+
+/// Unparse a [`Closure`] (an `APPLY` spine ending in a terminal lambda) to its
+/// optimized-legacy Micheline. Shared by the owned and borrowed `TypedValue`
+/// unparsers so the two cannot diverge on the closure encoding or its gas.
+///
+/// No worklist and no recursion: the spine is walked by reference (no per-level
+/// clone) and each captured argument's type/value are taken verbatim from the
+/// cache built once at `APPLY` ([`AppliedCapture::clone_unparsed`]), so a
+/// captured value's own (possibly deep) structure is never re-walked here. Only
+/// the terminal lambda body is cloned.
+fn unparse_closure<'a>(
+    closure: &Closure<'a>,
+    arena: &'a Arena<Micheline<'a>>,
+    gas: &mut Gas,
+) -> Result<Micheline<'a>, OutOfGas> {
+    use Micheline as V;
+
+    // Walk the spine outer-to-inner, collecting captures and stopping at the
+    // terminal lambda.
+    let mut captures = Vec::new();
+    let mut cur = closure;
+    let terminal = loop {
+        match cur {
+            Closure::Apply { capture, closure } => {
+                captures.push(capture);
+                cur = closure;
+            }
+            Closure::Lambda(lambda) => break lambda,
+        }
+    };
+
+    // A bare lambda (no captures) unparses to its stored Micheline.
+    if captures.is_empty() {
+        return Ok(match terminal {
+            Lambda::Lambda { micheline_code, .. } => {
+                micheline_code.charge_unparsing_cost(gas)?;
+                micheline_code.clone()
+            }
+            Lambda::LambdaRec { micheline_code, .. } => {
+                micheline_code.charge_unparsing_cost(gas)?;
+                V::prim1(arena, Prim::Lambda_rec, micheline_code.clone(), gas)?
+            }
+        });
+    }
+
+    // Otherwise the closure unparses to nested `seq[PUSH arg_ty arg_val; PAIR;
+    // ..]` ending in `inner_tail`: the lambda body, or `LAMBDA_REC; SWAP; EXEC`
+    // for a `LambdaRec`.
+    let inner_tail: Vec<V<'a>> = match terminal {
+        Lambda::Lambda { micheline_code, .. } => {
+            micheline_code.charge_unparsing_cost(gas)?;
+            vec![micheline_code.clone()]
+        }
+        Lambda::LambdaRec {
+            in_ty,
+            out_ty,
+            micheline_code,
+            ..
+        } => {
+            micheline_code.charge_unparsing_cost(gas)?;
+            vec![
+                V::prim3(
+                    arena,
+                    Prim::LAMBDA_REC,
+                    in_ty.into_micheline_optimized_legacy(arena, gas)?,
+                    out_ty.into_micheline_optimized_legacy(arena, gas)?,
+                    micheline_code.clone(),
+                    gas,
+                )?,
+                V::prim0(Prim::SWAP, gas)?,
+                V::prim0(Prim::EXEC, gas)?,
+            ]
+        }
+    };
+
+    // Reuse the unparsing built at `APPLY` verbatim, charging the cached cost
+    // on every reuse before cloning the cached Micheline (PACK will traverse
+    // and copy these again). `captures` is outer-to-inner.
+    let mut arg_ty_michs = Vec::with_capacity(captures.len());
+    let mut arg_val_michs = Vec::with_capacity(captures.len());
+    for capture in captures {
+        let (arg_ty_mich, arg_val_mich) = capture.clone_unparsed(gas)?;
+        arg_ty_michs.push(arg_ty_mich);
+        arg_val_michs.push(arg_val_mich);
+    }
+
+    // Assemble inner-to-outer: the innermost (last) capture wraps `inner_tail`,
+    // then each outer capture wraps the accumulator.
+    let arg_ty = arg_ty_michs.pop().expect("captures is non-empty");
+    let arg_val = arg_val_michs.pop().expect("captures is non-empty");
+    let mut inner = Vec::with_capacity(2 + inner_tail.len());
+    inner.push(V::prim2(arena, Prim::PUSH, arg_ty, arg_val, gas)?);
+    inner.push(V::prim0(Prim::PAIR, gas)?);
+    inner.extend(inner_tail);
+    #[allow(clippy::disallowed_methods)]
+    let mut acc = V::seq(arena.alloc_extend(inner), gas)?;
+    while let (Some(arg_ty), Some(arg_val)) = (arg_ty_michs.pop(), arg_val_michs.pop()) {
+        let push = V::prim2(arena, Prim::PUSH, arg_ty, arg_val, gas)?;
+        let pair = V::prim0(Prim::PAIR, gas)?;
+        acc = V::seq_arr(arena, [push, pair, acc], gas)?;
+    }
+    Ok(acc)
+}
+
+impl<'a> IntoMicheline<'a> for TypedValue<'a> {
+    /// Iterative tree fold over the input [`TypedValue`] driven by a
+    /// `frames: Vec<TvImFrame>` worklist plus a `results: Vec<Micheline>`
+    /// output stack. Replaces the previous recursive `go` / `go_rc`
+    /// closures so deeply nested values (e.g. a comb of `Pair … (Pair x y)`
+    /// built dynamically through `UNIT ; PAIR` and then passed to `PACK`)
+    /// do not blow the WASM call stack.
+    fn into_micheline_optimized_legacy(
+        self,
+        arena: &'a Arena<Micheline<'a>>,
+        gas: &mut Gas,
+    ) -> Result<Micheline<'a>, OutOfGas> {
+        use Micheline as V;
+        use TypedValue as TV;
+
+        // Worklist-driver invariant: every `Build*` frame pops exactly the
+        // number of `results` its construction site pushed `Visit` frames
+        // for (per-variant pop counts are documented inline below). The
+        // `.expect`s / `results.len() - count` arithmetic in the `Build*`
+        // arms are therefore unreachable on any well-formed input — a panic
+        // here would indicate a frame-state-machine bug in the `Visit` arm
+        // above, not an attacker-triggerable PVM trap. (A typed
+        // `IntoMichelineError::Invariant(_)` variant could replace the
+        // `.expect`s; tracked as a follow-up since it widens the trait's
+        // error type across every caller.)
+        enum TvImFrame<'b> {
+            /// Owned input to process; produces one `Micheline` on `results`.
+            Visit(TypedValue<'b>),
+            /// Emit a precomputed `Micheline` directly (used for the `None`
+            /// arm of a `BigMap` `FromId` overlay value).
+            Leaf(Micheline<'b>),
+            /// Pops 1: `prim1(prim, x)`. Covers Some / Left / Right.
+            BuildPrim1(Prim),
+            /// Pops 2: `prim2(prim, left, right)`. Covers Pair / Elt.
+            BuildPrim2(Prim),
+            /// Pops `count`: `Seq([..])`.
+            BuildSeqOf { count: usize },
+            /// Pops 3: `prim3(Transfer_tokens, param, addr, mutez)`.
+            BuildTransferTokens,
+            /// Pops 1: `prim_n(Emit, [value, arg_ty_mich])`, then annotates
+            /// with the field tag (so the annotation gas charge is applied).
+            BuildEmit {
+                arg_ty_mich: Micheline<'b>,
+                tag: Option<FieldAnnotation<'b>>,
+            },
+            /// Pops 1: `App(Create_contract, [code, delegate, mutez, storage], no_anns)`.
+            BuildCreateContract {
+                code_mich: Micheline<'b>,
+                delegate_mich: Micheline<'b>,
+                mutez_mich: Micheline<'b>,
+            },
+            /// Pops `count`: assembles `BigMap` `FromId` final result as
+            /// `prim2(Pair, id_part, Seq([elts]))`.
+            BuildBigMapFromId {
+                id_part: Micheline<'b>,
+                count: usize,
+            },
+        }
+
+        let mut frames: Vec<TvImFrame<'a>> = vec![TvImFrame::Visit(self)];
+        let mut results: Vec<Micheline<'a>> = Vec::new();
+
+        while let Some(frame) = frames.pop() {
+            match frame {
+                TvImFrame::Leaf(m) => results.push(m),
+                // `v` is matched by `&mut` (not by move): `TypedValue`'s
+                // iterative `Drop` forbids moving payloads out by pattern
+                // (E0509). Each arm moves the payload it needs out with
+                // `std::mem::take` (leaf crypto payloads, which have no
+                // `Default`, are cloned), leaving `v` shallow to drop trivially.
+                TvImFrame::Visit(mut v) => match &mut v {
+                    TV::Int(i) => results.push(V::int(std::mem::take(i), gas)?),
+                    TV::Nat(u) => results.push(V::int(std::mem::take(u).into(), gas)?),
+                    TV::Mutez(u) => results.push(V::int((*u).into(), gas)?),
+                    TV::Bool(true) => results.push(V::prim0(Prim::True, gas)?),
+                    TV::Bool(false) => results.push(V::prim0(Prim::False, gas)?),
+                    TV::String(s) => results.push(V::string(std::mem::take(s), gas)?),
+                    TV::Unit => results.push(V::prim0(Prim::Unit, gas)?),
+                    TV::Address(x) => results.push(V::bytes(x.to_bytes_vec(), gas)?),
+                    TV::ChainId(x) => {
+                        results.push(V::bytes(std::mem::take(x).into(), gas)?)
+                    }
+                    TV::Bytes(x) => results.push(V::bytes(std::mem::take(x), gas)?),
+                    // to_bytes() cannot fail for a well-formed key.
+                    TV::Key(k) => results.push(V::bytes(k.to_bytes().unwrap(), gas)?),
+                    TV::Signature(s) => results.push(V::bytes(s.clone().into(), gas)?),
+                    // to_bytes() cannot fail for a well-formed key hash.
+                    TV::KeyHash(s) => results.push(V::bytes(s.to_bytes().unwrap(), gas)?),
+                    TV::Timestamp(s) => results.push(V::int(std::mem::take(s), gas)?),
+                    TV::Contract(x) => results.push(V::bytes(x.to_bytes_vec(), gas)?),
+                    // The closure is unparsed by reference; `v` (and its
+                    // possibly-deep spine) then drops via the iterative `Drop`.
+                    TV::Lambda(closure) => {
+                        results.push(unparse_closure(closure, arena, gas)?)
+                    }
+                    #[cfg(feature = "bls")]
+                    TV::Bls12381Fr(x) => {
+                        results.push(V::bytes(x.to_bytes().to_vec(), gas)?)
+                    }
+                    #[cfg(feature = "bls")]
+                    TV::Bls12381G1(x) => {
+                        results.push(V::bytes(x.to_bytes().to_vec(), gas)?)
+                    }
+                    #[cfg(feature = "bls")]
+                    TV::Bls12381G2(x) => {
+                        results.push(V::bytes(x.to_bytes().to_vec(), gas)?)
+                    }
+
+                    // This transformation for pairs deviates from the optimized
+                    // representation of the reference implementation, because
+                    // reference implementation optimizes the size of combs and uses
+                    // an untyped representation that is the shortest.
+                    TV::Pair(l, r) => {
+                        frames.push(TvImFrame::BuildPrim2(Prim::Pair));
+                        frames
+                            .push(TvImFrame::Visit(std::mem::take(r).unwrap_or_clone()));
+                        frames
+                            .push(TvImFrame::Visit(std::mem::take(l).unwrap_or_clone()));
+                    }
+                    TV::Option(None) => results.push(V::prim0(Prim::None, gas)?),
+                    TV::Option(Some(rc)) => {
+                        frames.push(TvImFrame::BuildPrim1(Prim::Some));
+                        frames
+                            .push(TvImFrame::Visit(std::mem::take(rc).unwrap_or_clone()));
+                    }
+                    TV::Or(or) => match std::mem::take(or) {
+                        Or::Left(x) => {
+                            frames.push(TvImFrame::BuildPrim1(Prim::Left));
+                            frames.push(TvImFrame::Visit(x.unwrap_or_clone()));
+                        }
+                        Or::Right(x) => {
+                            frames.push(TvImFrame::BuildPrim1(Prim::Right));
+                            frames.push(TvImFrame::Visit(x.unwrap_or_clone()));
+                        }
+                    },
+                    TV::List(l) => {
+                        let mut elems: Vec<TypedValue<'a>> = std::mem::take(l)
+                            .into_iter()
+                            .map(RcTypedValue::unwrap_or_clone)
+                            .collect();
+                        frames.push(TvImFrame::BuildSeqOf { count: elems.len() });
+                        while let Some(elem) = elems.pop() {
+                            frames.push(TvImFrame::Visit(elem));
+                        }
+                    }
+                    TV::Set(s) => {
+                        let mut elems: Vec<TypedValue<'a>> =
+                            rb_set_into_vec(std::mem::take(s))
+                                .into_iter()
+                                .map(RcTypedValue::unwrap_or_clone)
+                                .collect();
+                        frames.push(TvImFrame::BuildSeqOf { count: elems.len() });
+                        while let Some(elem) = elems.pop() {
+                            frames.push(TvImFrame::Visit(elem));
+                        }
+                    }
+                    TV::Map(m) => {
+                        let mut entries: Vec<(RcTypedValue<'a>, RcTypedValue<'a>)> =
+                            rb_map_into_vec(std::mem::take(m));
+                        frames.push(TvImFrame::BuildSeqOf {
+                            count: entries.len(),
+                        });
+                        while let Some((key, val)) = entries.pop() {
+                            frames.push(TvImFrame::BuildPrim2(Prim::Elt));
+                            frames.push(TvImFrame::Visit(val.unwrap_or_clone()));
+                            frames.push(TvImFrame::Visit(key.unwrap_or_clone()));
+                        }
+                    }
+                    TV::BigMap(m) => match std::mem::take(&mut m.content) {
+                        big_map::BigMapContent::InMemory(m) => {
+                            let mut entries: Vec<(RcTypedValue<'a>, RcTypedValue<'a>)> =
+                                rb_map_into_vec(m);
+                            frames.push(TvImFrame::BuildSeqOf {
+                                count: entries.len(),
+                            });
+                            while let Some((key, val)) = entries.pop() {
+                                frames.push(TvImFrame::BuildPrim2(Prim::Elt));
+                                frames.push(TvImFrame::Visit(val.unwrap_or_clone()));
+                                frames.push(TvImFrame::Visit(key.unwrap_or_clone()));
+                            }
+                        }
+                        big_map::BigMapContent::FromId(m) => {
+                            let id_part = V::int(m.id.value.into(), gas)?;
+                            if m.overlay.is_empty() {
+                                results.push(id_part);
+                            } else {
+                                let mut overlay: Vec<(
+                                    RcTypedValue<'a>,
+                                    Option<RcTypedValue<'a>>,
+                                )> = rb_map_into_vec(m.overlay);
+                                frames.push(TvImFrame::BuildBigMapFromId {
+                                    id_part,
+                                    count: overlay.len(),
+                                });
+                                while let Some((key, val)) = overlay.pop() {
+                                    frames.push(TvImFrame::BuildPrim2(Prim::Elt));
+                                    match val {
+                                        Some(v) => {
+                                            frames
+                                                .push(TvImFrame::BuildPrim1(Prim::Some));
+                                            frames.push(TvImFrame::Visit(
+                                                v.unwrap_or_clone(),
+                                            ));
+                                        }
+                                        None => {
+                                            frames.push(TvImFrame::Leaf(V::prim0(
+                                                Prim::None,
+                                                gas,
+                                            )?));
+                                        }
+                                    }
+                                    frames.push(TvImFrame::Visit(key.unwrap_or_clone()));
+                                }
+                            }
+                        }
+                    },
+                    TV::Ticket(t) => {
+                        // unwrap_ticket builds a (small) Pair chain; let it flow through Visit.
+                        // Move the ticket out (it is about to be dropped) rather
+                        // than cloning its (possibly deep) content.
+                        frames.push(TvImFrame::Visit(unwrap_ticket(*std::mem::take(t))));
+                    }
+                    TV::Operation(operation_info) => {
+                        match std::mem::take(operation_info).operation {
+                            Operation::TransferTokens(tt) => {
+                                frames.push(TvImFrame::BuildTransferTokens);
+                                frames.push(TvImFrame::Visit(TV::Mutez(tt.amount)));
+                                frames.push(TvImFrame::Visit(TV::Address(
+                                    tt.destination_address,
+                                )));
+                                frames.push(TvImFrame::Visit(tt.param.unwrap_or_clone()));
+                            }
+                            Operation::SetDelegate(sd) => {
+                                // Inner value is a leaf (`Some(KeyHash)` or `None`) so this
+                                // is fully eager; no Visit needed.
+                                let inner = match sd.0 {
+                                    Some(kh) => V::prim1(
+                                        arena,
+                                        Prim::Some,
+                                        V::bytes(kh.to_bytes().unwrap(), gas)?,
+                                        gas,
+                                    )?,
+                                    None => V::prim0(Prim::None, gas)?,
+                                };
+                                results.push(V::prim1(
+                                    arena,
+                                    Prim::Set_delegate,
+                                    inner,
+                                    gas,
+                                )?);
+                            }
+                            Operation::Emit(em) => {
+                                let arg_ty_mich = match em.arg_ty {
+                                    Or::Right(mich) => mich,
+                                    Or::Left(typ) => (&typ)
+                                        .into_micheline_optimized_legacy(arena, gas)?,
+                                };
+                                frames.push(TvImFrame::BuildEmit {
+                                    arg_ty_mich,
+                                    tag: em.tag,
+                                });
+                                frames.push(TvImFrame::Visit(em.value.unwrap_or_clone()));
+                            }
+                            Operation::CreateContract(cc) => {
+                                let delegate_mich = match cc.delegate {
+                                    Some(kh) => {
+                                        let addr = Address {
+                                            hash: AddressHash::from(kh),
+                                            entrypoint: Entrypoint::default(),
+                                        };
+                                        V::prim1(
+                                            arena,
+                                            Prim::Some,
+                                            V::bytes(addr.to_bytes_vec(), gas)?,
+                                            gas,
+                                        )?
+                                    }
+                                    None => V::prim0(Prim::None, gas)?,
+                                };
+                                let mutez_mich = V::int(cc.amount.into(), gas)?;
+                                let code_mich = cc.micheline_code.clone();
+                                frames.push(TvImFrame::BuildCreateContract {
+                                    code_mich,
+                                    delegate_mich,
+                                    mutez_mich,
+                                });
+                                frames
+                                    .push(TvImFrame::Visit(cc.storage.unwrap_or_clone()));
+                            }
+                        }
+                    }
+                },
+
+                TvImFrame::BuildPrim1(prim) => {
+                    let inner = results.pop().expect("BuildPrim1: missing inner");
+                    results.push(V::prim1(arena, prim, inner, gas)?);
+                }
+                TvImFrame::BuildPrim2(prim) => {
+                    let right = results.pop().expect("BuildPrim2: missing right");
+                    let left = results.pop().expect("BuildPrim2: missing left");
+                    results.push(V::prim2(arena, prim, left, right, gas)?);
+                }
+                TvImFrame::BuildSeqOf { count } => {
+                    let start = results.len() - count;
+                    // The drain iterator does not allocate in the arena.
+                    #[allow(clippy::disallowed_methods)]
+                    let slice = arena.alloc_extend(results.drain(start..));
+                    results.push(V::seq(slice, gas)?);
+                }
+                TvImFrame::BuildTransferTokens => {
+                    let mutez =
+                        results.pop().expect("BuildTransferTokens: missing mutez");
+                    let addr = results.pop().expect("BuildTransferTokens: missing addr");
+                    let param =
+                        results.pop().expect("BuildTransferTokens: missing param");
+                    results.push(V::prim3(
+                        arena,
+                        Prim::Transfer_tokens,
+                        param,
+                        addr,
+                        mutez,
+                        gas,
+                    )?);
+                }
+                TvImFrame::BuildEmit { arg_ty_mich, tag } => {
+                    let value_mich = results.pop().expect("BuildEmit: missing value");
+                    let mut node = Micheline::prim_n_arr(
+                        arena,
+                        Prim::Emit,
+                        [value_mich, arg_ty_mich],
+                        gas,
+                    )?;
+                    // Use `annotate` (not a raw stamp-on) so the field-tag
+                    // annotation is charged `unparsing_cost::annotation`.
+                    if let Some(tag) = tag {
+                        node.annotate(Annotation::Field(tag.into_cow()), gas)?;
+                    }
+                    results.push(node);
+                }
+                TvImFrame::BuildCreateContract {
+                    code_mich,
+                    delegate_mich,
+                    mutez_mich,
+                } => {
+                    let storage_mich =
+                        results.pop().expect("BuildCreateContract: missing storage");
+                    results.push(Micheline::prim_n_arr(
+                        arena,
+                        Prim::Create_contract,
+                        [code_mich, delegate_mich, mutez_mich, storage_mich],
+                        gas,
+                    )?);
+                }
+                TvImFrame::BuildBigMapFromId { id_part, count } => {
+                    let start = results.len() - count;
+                    #[allow(clippy::disallowed_methods)]
+                    let slice = arena.alloc_extend(results.drain(start..));
+                    let map_part = V::seq(slice, gas)?;
+                    results.push(V::prim2(arena, Prim::Pair, id_part, map_part, gas)?);
+                }
+            }
+        }
+
+        Ok(results.pop().expect("final result"))
+    }
+}
+
+impl<'a> TypedValue<'a> {
+    /// Whether this value's own outermost constructor is admissible under
+    /// `prop`.
+    fn head_admits_prop(&self, prop: TypeProperty) -> bool {
+        use TypeProperty as P;
+        use TypedValue::*;
+        match self {
+            Int(_) | Nat(_) | Mutez(_) | Bool(_) | String(_) | Unit | Bytes(_)
+            | Address(_) | ChainId(_) | Key(_) | Signature(_) | KeyHash(_)
+            | Timestamp(_) => true,
+            // Transparent: the walk checks the children on their own frames.
+            Pair(_, _) | Option(_) | Or(_) => true,
+            #[cfg(feature = "bls")]
+            Bls12381Fr(_) | Bls12381G1(_) | Bls12381G2(_) => prop != P::Comparable,
+            List(_) | Set(_) | Map(_) | Lambda(_) => prop != P::Comparable,
+            Ticket(_) => matches!(prop, P::Passable | P::Storable | P::BigMapValue),
+            Contract(_) => matches!(
+                prop,
+                P::Passable | P::Packable | P::Duplicable | P::ViewOutput | P::ViewInput
+            ),
+            BigMap(_) => match prop {
+                P::Duplicable | P::Storable => true,
+                #[cfg(feature = "allow_lazy_storage_transfer")]
+                P::Passable => true,
+                #[cfg(not(feature = "allow_lazy_storage_transfer"))]
+                P::Passable => false,
+                P::Comparable
+                | P::BigMapValue
+                | P::Packable
+                | P::Pushable
+                | P::ViewOutput
+                | P::ViewInput => false,
+            },
+            // `operation` is only ever duplicable — and this walk refuses it
+            // outright regardless, see [BorrowedUnparseError::UnsupportedUnparsing].
+            Operation(_) => prop == P::Duplicable,
+        }
+    }
+
+    /// Unparse a value while retaining the typed value, charging before cloning
+    /// any size-dependent leaf payload.
+    ///
+    /// `APPLY` needs both representations of its capture: the typed value for
+    /// `EXEC`, and Micheline for later `PACK`s. Cloning the whole value before
+    /// calling the consuming [`IntoMicheline`] implementation would copy
+    /// arbitrarily large integers and collection structure before their
+    /// unparsing gas was charged. This borrowed worklist walks collections in
+    /// place and only clones leaf payloads through charged constructors.
+    ///
+    /// `restrict_to` optionally holds the walk to a [TypeProperty]: every
+    /// sub-value reached is checked against it, and the walk fails with
+    /// [BorrowedUnparseError::UnsatisfiedProperty] on the first offending
+    /// sub-part — before that sub-part is cloned. Pass `None` to unparse
+    /// whatever the value happens to hold. Value should already have been
+    /// constrained at typecheck time, so this is a defence in depth rather
+    /// than the primary check.
+    pub fn clone_into_micheline_optimized_legacy(
+        &self,
+        arena: &'a Arena<Micheline<'a>>,
+        gas: &mut Gas,
+        restrict_to: Option<TypeProperty>,
+    ) -> Result<Micheline<'a>, BorrowedUnparseError> {
+        use Micheline as V;
+        use TypedValue as TV;
+
+        enum Frame<'v, 'a> {
+            Visit(&'v TypedValue<'a>),
+            ListNext(michelson_list::Iter<'v, RcTypedValue<'a>>),
+            SetNext(std::vec::IntoIter<&'v RcTypedValue<'a>>),
+            MapNext(std::vec::IntoIter<(&'v RcTypedValue<'a>, &'v RcTypedValue<'a>)>),
+            /// A big map's in-memory entries. Distinct from [Frame::MapNext]
+            /// only in the container it drains; both hold `Rc`-shared entries.
+            BigMapEltNext(
+                std::vec::IntoIter<(&'v RcTypedValue<'a>, &'v RcTypedValue<'a>)>,
+            ),
+            /// A `FromId` big map's pending overlay; a `None` value marks a
+            /// removal.
+            OverlayNext(
+                std::vec::IntoIter<(&'v RcTypedValue<'a>, &'v Option<RcTypedValue<'a>>)>,
+            ),
+            /// Emit an already-built node (the `None` arm of an overlay entry).
+            Leaf(Micheline<'a>),
+            BuildPrim1(Prim),
+            BuildPrim2(Prim),
+            BuildSeqOf {
+                count: usize,
+            },
+            /// Pops `count`: assembles `prim2(Pair, id_part, Seq([elts]))`.
+            BuildBigMapFromId {
+                id_part: Micheline<'a>,
+                count: usize,
+            },
+        }
+
+        let mut frames = vec![Frame::Visit(self)];
+        let mut results = Vec::new();
+
+        while let Some(frame) = frames.pop() {
+            if let (Some(prop), Frame::Visit(value)) = (restrict_to, &frame) {
+                if !value.head_admits_prop(prop) {
+                    return Err(BorrowedUnparseError::UnsatisfiedProperty(prop));
+                }
+            }
+
+            match frame {
+                Frame::ListNext(mut iter) => {
+                    if let Some(value) = iter.next() {
+                        frames.push(Frame::ListNext(iter));
+                        frames.push(Frame::Visit(value));
+                    }
+                }
+                Frame::SetNext(mut iter) => {
+                    if let Some(value) = iter.next() {
+                        frames.push(Frame::SetNext(iter));
+                        frames.push(Frame::Visit(value));
+                    }
+                }
+                Frame::MapNext(mut iter) => {
+                    if let Some((key, value)) = iter.next() {
+                        frames.push(Frame::MapNext(iter));
+                        frames.push(Frame::BuildPrim2(Prim::Elt));
+                        frames.push(Frame::Visit(value));
+                        frames.push(Frame::Visit(key));
+                    }
+                }
+                Frame::BigMapEltNext(mut iter) => {
+                    if let Some((key, value)) = iter.next() {
+                        frames.push(Frame::BigMapEltNext(iter));
+                        frames.push(Frame::BuildPrim2(Prim::Elt));
+                        frames.push(Frame::Visit(value));
+                        frames.push(Frame::Visit(key));
+                    }
+                }
+                Frame::OverlayNext(mut iter) => {
+                    if let Some((key, value)) = iter.next() {
+                        frames.push(Frame::OverlayNext(iter));
+                        frames.push(Frame::BuildPrim2(Prim::Elt));
+                        match value {
+                            Some(value) => {
+                                frames.push(Frame::BuildPrim1(Prim::Some));
+                                frames.push(Frame::Visit(value));
+                            }
+                            None => frames.push(Frame::Leaf(V::prim0(Prim::None, gas)?)),
+                        }
+                        frames.push(Frame::Visit(key));
+                    }
+                }
+                Frame::Leaf(node) => results.push(node),
+                Frame::Visit(value) => match value {
+                    TV::Int(i) | TV::Timestamp(i) => results.push(V::int_cloned(i, gas)?),
+                    TV::Nat(i) => results.push(V::nat_cloned(i, gas)?),
+                    TV::Mutez(i) => results.push(V::int((*i).into(), gas)?),
+                    TV::Bool(true) => results.push(V::prim0(Prim::True, gas)?),
+                    TV::Bool(false) => results.push(V::prim0(Prim::False, gas)?),
+                    TV::String(s) => results.push(V::string_cloned(s, gas)?),
+                    TV::Bytes(bytes) => results.push(V::bytes_cloned(bytes, gas)?),
+                    TV::Unit => results.push(V::prim0(Prim::Unit, gas)?),
+                    TV::Address(address) => {
+                        results.push(V::bytes(address.to_bytes_vec(), gas)?)
+                    }
+                    TV::ChainId(chain_id) => {
+                        results.push(V::bytes(chain_id.clone().into(), gas)?)
+                    }
+                    TV::Contract(address) => {
+                        results.push(V::bytes(address.to_bytes_vec(), gas)?)
+                    }
+                    TV::Key(key) => results.push(V::bytes(key.to_bytes().unwrap(), gas)?),
+                    TV::Signature(signature) => {
+                        results.push(V::bytes(signature.clone().into(), gas)?)
+                    }
+                    TV::KeyHash(key_hash) => {
+                        results.push(V::bytes(key_hash.to_bytes().unwrap(), gas)?)
+                    }
+                    TV::Lambda(closure) => {
+                        results.push(unparse_closure(closure, arena, gas)?)
+                    }
+                    #[cfg(feature = "bls")]
+                    TV::Bls12381Fr(x) => {
+                        results.push(V::bytes(x.to_bytes().to_vec(), gas)?)
+                    }
+                    #[cfg(feature = "bls")]
+                    TV::Bls12381G1(x) => {
+                        results.push(V::bytes(x.to_bytes().to_vec(), gas)?)
+                    }
+                    #[cfg(feature = "bls")]
+                    TV::Bls12381G2(x) => {
+                        results.push(V::bytes(x.to_bytes().to_vec(), gas)?)
+                    }
+                    TV::Pair(left, right) => {
+                        frames.push(Frame::BuildPrim2(Prim::Pair));
+                        frames.push(Frame::Visit(right));
+                        frames.push(Frame::Visit(left));
+                    }
+                    TV::Option(None) => results.push(V::prim0(Prim::None, gas)?),
+                    TV::Option(Some(value)) => {
+                        frames.push(Frame::BuildPrim1(Prim::Some));
+                        frames.push(Frame::Visit(value));
+                    }
+                    TV::Or(Or::Left(value)) => {
+                        frames.push(Frame::BuildPrim1(Prim::Left));
+                        frames.push(Frame::Visit(value));
+                    }
+                    TV::Or(Or::Right(value)) => {
+                        frames.push(Frame::BuildPrim1(Prim::Right));
+                        frames.push(Frame::Visit(value));
+                    }
+                    TV::List(values) => {
+                        frames.push(Frame::BuildSeqOf {
+                            count: values.len(),
+                        });
+                        frames.push(Frame::ListNext(values.iter()));
+                    }
+                    TV::Set(values) => {
+                        frames.push(Frame::BuildSeqOf {
+                            count: values.size(),
+                        });
+                        frames.push(Frame::SetNext(
+                            values.iter().collect::<Vec<_>>().into_iter(),
+                        ));
+                    }
+                    TV::Map(values) => {
+                        frames.push(Frame::BuildSeqOf {
+                            count: values.size(),
+                        });
+                        frames.push(Frame::MapNext(
+                            values.iter().collect::<Vec<_>>().into_iter(),
+                        ));
+                    }
+                    TV::BigMap(map) => match &map.content {
+                        big_map::BigMapContent::InMemory(entries) => {
+                            frames.push(Frame::BuildSeqOf {
+                                count: entries.size(),
+                            });
+                            frames.push(Frame::BigMapEltNext(
+                                entries.iter().collect::<Vec<_>>().into_iter(),
+                            ));
+                        }
+                        big_map::BigMapContent::FromId(from_id) => {
+                            let id_part = V::int_cloned(&from_id.id.value.0, gas)?;
+                            if from_id.overlay.is_empty() {
+                                results.push(id_part);
+                            } else {
+                                frames.push(Frame::BuildBigMapFromId {
+                                    id_part,
+                                    count: from_id.overlay.size(),
+                                });
+                                frames.push(Frame::OverlayNext(
+                                    from_id
+                                        .overlay
+                                        .iter()
+                                        .collect::<Vec<_>>()
+                                        .into_iter(),
+                                ));
+                            }
+                        }
+                    },
+                    TV::Ticket(ticket) => {
+                        // Mirrors `unwrap_ticket`: Pair(ticketer, Pair(content,
+                        // amount)). The two leaves are charged eagerly; only
+                        // the content is walked, so it is never copied whole.
+                        let ticketer = V::bytes(
+                            Address {
+                                hash: ticket.ticketer.clone(),
+                                entrypoint: Entrypoint::default(),
+                            }
+                            .to_bytes_vec(),
+                            gas,
+                        )?;
+                        let amount = V::nat_cloned(&ticket.amount, gas)?;
+                        frames.push(Frame::BuildPrim2(Prim::Pair));
+                        frames.push(Frame::BuildPrim2(Prim::Pair));
+                        frames.push(Frame::Leaf(amount));
+                        frames.push(Frame::Visit(&ticket.content));
+                        frames.push(Frame::Leaf(ticketer));
+                    }
+                    // `operation` has a Micheline form (the consuming
+                    // `IntoMicheline` builds it), but this walk deliberately does
+                    // not: `operation` is neither pushable, packable nor storable,
+                    // so no caller can hand one over, and mirroring the arm would
+                    // be untested dead code kept in lock-step for nothing.
+                    TV::Operation(_) => {
+                        return Err(BorrowedUnparseError::UnsupportedUnparsing);
+                    }
+                },
+                Frame::BuildPrim1(prim) => {
+                    let inner = results.pop().expect("BuildPrim1: missing inner");
+                    results.push(V::prim1(arena, prim, inner, gas)?);
+                }
+                Frame::BuildPrim2(prim) => {
+                    let right = results.pop().expect("BuildPrim2: missing right");
+                    let left = results.pop().expect("BuildPrim2: missing left");
+                    results.push(V::prim2(arena, prim, left, right, gas)?);
+                }
+                Frame::BuildSeqOf { count } => {
+                    let start = results.len() - count;
+                    #[allow(clippy::disallowed_methods)]
+                    let values = arena.alloc_extend(results.drain(start..));
+                    results.push(V::seq(values, gas)?);
+                }
+                Frame::BuildBigMapFromId { id_part, count } => {
+                    let start = results.len() - count;
+                    #[allow(clippy::disallowed_methods)]
+                    let values = arena.alloc_extend(results.drain(start..));
+                    let map_part = V::seq(values, gas)?;
+                    results.push(V::prim2(arena, Prim::Pair, id_part, map_part, gas)?);
+                }
+            }
+        }
+
+        Ok(results.pop().expect("final result"))
+    }
+}
+
+/// Why [TypedValue::clone_into_micheline_optimized_legacy] could not produce a
+/// [Micheline].
+#[derive(Debug, Clone, Copy, Eq, PartialEq)]
+pub enum BorrowedUnparseError {
+    /// The unparsing gas charged along the way exceeded the budget. Because
+    /// this walk charges *before* cloning a leaf payload, running out here
+    /// means the copy was never attempted.
+    OutOfGas,
+    /// The walk does not cover the submitted typed value. Limited to the
+    /// [Operation] value.
+    UnsupportedUnparsing,
+    /// A sub-value does not satisfy the [TypeProperty] the caller restricted
+    /// the walk to. Carries the property rather than the offending sub-value so
+    /// the error stays `Copy`; the value itself was not cloned.
+    ///
+    /// Unreachable in practice: each caller passes the property its value was
+    /// already checked against at typecheck time.
+    UnsatisfiedProperty(TypeProperty),
+}
+
+impl From<OutOfGas> for BorrowedUnparseError {
+    fn from(_: OutOfGas) -> Self {
+        Self::OutOfGas
+    }
+}
+
+/// Drain a persistent [RedBlackTreeSet] into a `Vec`. rpds exposes no owning
+/// iterator, so we clone the element handles (cheap `Rc` bumps); when the set
+/// was unique a later [RcTypedValue::unwrap_or_clone] then moves rather than clones.
+pub(crate) fn rb_set_into_vec<T: Ord + Clone>(s: RedBlackTreeSet<T>) -> Vec<T> {
+    s.iter().cloned().collect()
+}
+
+/// Drain a persistent [RedBlackTreeMap] into a `Vec`. See [rb_set_into_vec].
+pub(crate) fn rb_map_into_vec<K: Ord + Clone, V: Clone>(
+    m: RedBlackTreeMap<K, V>,
+) -> Vec<(K, V)> {
+    m.iter().map(|(k, v)| (k.clone(), v.clone())).collect()
+}
+
+pub(crate) fn unwrap_ticket(t: Ticket) -> TypedValue {
+    use TypedValue as TV;
+    TV::new_pair(
+        TV::Address(Address {
+            hash: t.ticketer,
+            entrypoint: Entrypoint::default(),
+        }),
+        TV::new_pair(t.content, TV::Nat(t.amount)),
+    )
+}
+
+impl<'a> TypedValue<'a> {
+    /// Convenience function to construct a new [Self::Pair].
+    pub fn new_pair(l: Self, r: Self) -> Self {
+        Self::Pair(RcTypedValue::new(l), RcTypedValue::new(r))
+    }
+
+    /// Convenience function to construct a new [Self::Pair] from already-shared
+    /// values.
+    pub fn new_pair_rc(l: RcTypedValue<'a>, r: RcTypedValue<'a>) -> Self {
+        Self::Pair(l, r)
+    }
+
+    /// Convenience function to construct a new [Self::Option].
+    pub fn new_option(x: Option<Self>) -> Self {
+        Self::Option(x.map(RcTypedValue::new))
+    }
+
+    /// Convenience function to construct a new [Self::Option] from an
+    /// already-shared value.
+    pub fn new_option_rc(x: Option<RcTypedValue<'a>>) -> Self {
+        Self::Option(x)
+    }
+
+    /// Convenience function to construct a new [Self::Or].
+    pub fn new_or(x: Or<Self, Self>) -> Self {
+        Self::Or(match x {
+            Or::Left(v) => Or::Left(RcTypedValue::new(v)),
+            Or::Right(v) => Or::Right(RcTypedValue::new(v)),
+        })
+    }
+
+    /// Convenience function to construct a new [Self::Or] from an
+    /// already-shared value.
+    pub fn new_or_rc(x: Or<RcTypedValue<'a>, RcTypedValue<'a>>) -> Self {
+        Self::Or(x)
+    }
+
+    /// Convenience function to construct a new [Self::Operation]. Allocates a new [Box].
+    pub fn new_operation(o: Operation<'a>, c: u128) -> Self {
+        Self::Operation(Box::new(OperationInfo {
+            operation: o,
+            counter: c,
+        }))
+    }
+
+    /// Helper for more easily constructing `Int` variant with literals. Mostly
+    /// useful in tests.
+    pub fn int(n: impl Into<BigInt>) -> Self {
+        Self::Int(n.into())
+    }
+
+    /// Helper for more easily constructing `Nat` variant with literals. Mostly
+    /// useful in tests.
+    pub fn nat(n: u64) -> Self {
+        Self::Nat(n.into())
+    }
+
+    /// Helper for more easily constructing `Timestamp` variant with literals. Mostly
+    /// useful in tests.
+    pub fn timestamp(n: impl Into<BigInt>) -> Self {
+        Self::Timestamp(n.into())
+    }
+
+    /// Convenience function to construct a new [Self::Ticket]. Allocates a new [Box].
+    pub fn new_ticket(t: Ticket<'a>) -> Self {
+        Self::Ticket(Box::new(t))
+    }
+
+    /// Convenience function to construct a new [Self::Bls12381G1]. Allocates a new [Box].
+    #[cfg(feature = "bls")]
+    pub fn new_bls12381_g1(x: bls::G1) -> Self {
+        Self::Bls12381G1(Box::new(x))
+    }
+
+    /// Convenience function to construct a new [Self::Bls12381G2]. Allocates a new [Box].
+    #[cfg(feature = "bls")]
+    pub fn new_bls12381_g2(x: bls::G2) -> Self {
+        Self::Bls12381G2(Box::new(x))
+    }
+}
+
+/// Drains nested `RcTypedValue` children iteratively, so the recursive
+/// `RcTypedValue` destructor chain of a potentially deep value (e.g. a comb
+/// of `Pair (Pair (... (Pair Int Int)))`) does not blow the WASM stack.
+///
+/// Since L2-1672, [`TypedValue`] has an `impl Drop` that runs exactly this
+/// drain, so *any* drop of a deep value is already safe and this function is
+/// no longer required for stack safety. It is retained for callers that want
+/// to drain a value early (while it is still borrowed), rather than waiting
+/// for it to fall out of scope.
+///
+/// `pub(crate)`: the sentinel `replace` it performs assumes the caller is
+/// about to drop `v`, so it must not be exposed to callers that might hold the
+/// value aliased.
+/// A node on the unified drop worklist. Dropping a [`TypedValue`] and dropping
+/// an [`Instruction`] are mutually recursive across the `TypedValue` <->
+/// `Instruction` boundary: a `Closure::Lambda`'s body is `Rc<[Instruction]>`,
+/// and an `Instruction::Push` carries an `RcTypedValue`. Draining each kind
+/// on its own worklist still crosses that boundary on the native stack — an
+/// alternating `Pair … (lambda { PUSH (pair … (lambda …)) … ; DROP })` value
+/// (which the iterative typecheck of L2-1663 now accepts up to the 10000-deep
+/// guard) overflows the kernel's WASM stack on drop. Holding both kinds on one
+/// worklist lets the drain span the boundary (L2-1672).
+enum DropNode<'a> {
+    Value(TypedValue<'a>),
+    Instr(Instruction<'a>),
+}
+
+/// Drain everything reachable from a seeded worklist of [`DropNode`]s on the
+/// heap, spanning the `TypedValue` <-> `Instruction` boundary so neither the
+/// value spine, the instruction spine, nor the alternation between them
+/// recurses on the native stack (L2-1672). Each popped node has its children
+/// extracted onto the shared worklist and then drops shallow — its remaining
+/// payload is either trivial or a `Type`, whose own iterative `Drop` is
+/// stack-safe — so the shallow drop neither recurses nor re-enters this drain
+/// with work to do.
+fn drain_value_and_instructions(mut stack: Vec<DropNode<'_>>) {
+    while let Some(node) = stack.pop() {
+        match node {
+            DropNode::Value(mut v) => extract_tv_children(&mut v, &mut stack),
+            DropNode::Instr(mut i) => extract_instr_children(&mut i, &mut stack),
+        }
+    }
+}
+
+pub(crate) fn drain_deep_typed_value(v: &mut TypedValue<'_>) {
+    let mut stack = Vec::new();
+    extract_tv_children(v, &mut stack);
+    drain_value_and_instructions(stack);
+}
+
+/// Iterative `Drop` so dropping a deeply nested value (a comb of
+/// `Pair`/`Or`/`Option`, a long `List`/`Set`/`Map`, an `APPLY` closure spine, a
+/// ticket/operation payload, …) walks an explicit heap worklist instead of
+/// recursing through the derived destructor and overflowing the WASM/PVM call
+/// stack. This makes *every* release site safe — including `DROP`/`DIP n`
+/// (`Stack::drop_top` → `Vec::truncate`) and stack teardown — without each one
+/// having to remember to call [`drain_deep_typed_value`] first (L2-1672,
+/// closing the gap left by L2-1446).
+///
+/// Because of this impl, `TypedValue` can no longer be destructured by move
+/// with a plain `match` (Rust forbids moving fields out of a `Drop` type,
+/// `E0509`). Code that needs to consume a value's payload borrows the field
+/// mutably and moves it out with `std::mem::take` (or [`TakeOut::take_out`] in
+/// the generic `pop!` macros).
+impl Drop for TypedValue<'_> {
+    fn drop(&mut self) {
+        let mut stack = Vec::new();
+        extract_tv_children(self, &mut stack);
+        drain_value_and_instructions(stack);
+    }
+}
+
+/// Moves a payload out of a `&mut` field of a value that implements [`Drop`]
+/// (which forbids moving fields out by pattern match, `E0509`). The caller
+/// borrows the field mutably and calls [`TakeOut::take_out`]; the field is left
+/// holding a cheap placeholder so the parent's `Drop` stays shallow.
+///
+/// Almost every payload now has a [`Default`] placeholder (see the `Default`
+/// impls on `TypedValue` and its owned payloads), so `take_out` is just
+/// `std::mem::take` — no cloning, and recursive spines are moved, not copied.
+/// The only exceptions are the leaf crypto/BLS payloads (`PublicKey`,
+/// `Signature`, `PublicKeyHash`, BLS points), which have no `Default`; they are
+/// cheaply cloned (non-recursive, so this neither deep-copies nor recurses).
+///
+/// This trait exists for the generic `pop!`/`pop_v!` macros, which dispatch on
+/// an arbitrary variant path; code that knows the concrete payload type uses
+/// `std::mem::take` directly instead.
+pub(crate) trait TakeOut {
+    /// Returns the owned payload, leaving a cheap placeholder in `*self`.
+    fn take_out(&mut self) -> Self;
+}
+
+/// `take_out` by swapping in `Default::default()`.
+macro_rules! take_out_via_default {
+    ($($t:ty),* $(,)?) => {
+        $(impl TakeOut for $t {
+            fn take_out(&mut self) -> Self {
+                std::mem::take(self)
+            }
+        })*
+    };
+}
+
+/// `take_out` by cloning. Only used for non-recursive leaf payloads that have
+/// no `Default`, so the clone is shallow and the leftover original drops
+/// trivially.
+macro_rules! take_out_via_clone {
+    ($($(#[$meta:meta])* $t:ty),* $(,)?) => {
+        $($(#[$meta])* impl TakeOut for $t {
+            fn take_out(&mut self) -> Self {
+                self.clone()
+            }
+        })*
+    };
+}
+
+take_out_via_default!(
+    BigInt,
+    BigUint,
+    i64,
+    bool,
+    String,
+    Vec<u8>,
+    ChainId,
+    Address
+);
+take_out_via_clone!(
+    PublicKey,
+    Signature,
+    PublicKeyHash,
+    #[cfg(feature = "bls")]
+    bls::Fr,
+    #[cfg(feature = "bls")]
+    Box<bls::G1>,
+    #[cfg(feature = "bls")]
+    Box<bls::G2>,
+);
+
+/// Recursive payloads. Their `Default` placeholders are cheap (a `Unit`
+/// sentinel / empty collection / empty lambda), so `take_out` moves the
+/// (possibly deep) value out without copying it.
+macro_rules! take_out_via_default_generic {
+    ($($t:ty),* $(,)?) => {
+        $(impl<'a> TakeOut for $t {
+            fn take_out(&mut self) -> Self {
+                std::mem::take(self)
+            }
+        })*
+    };
+}
+
+take_out_via_default_generic!(
+    RcTypedValue<'a>,
+    Option<RcTypedValue<'a>>,
+    MichelsonList<RcTypedValue<'a>>,
+    RedBlackTreeSet<RcTypedValue<'a>>,
+    RedBlackTreeMap<RcTypedValue<'a>, RcTypedValue<'a>>,
+    Or<RcTypedValue<'a>, RcTypedValue<'a>>,
+    Closure<'a>,
+    Box<Ticket<'a>>,
+    Box<OperationInfo<'a>>,
+);
+
+fn extract_tv_children<'a>(node: &mut TypedValue<'a>, stack: &mut Vec<DropNode<'a>>) {
+    use std::mem::{replace, take};
+    use TypedValue as TV;
+    let push_rc = |rc: RcTypedValue<'a>, stack: &mut Vec<DropNode<'a>>| {
+        if let Ok(v) = rc.try_unwrap() {
+            stack.push(DropNode::Value(v));
+        }
+    };
+    match node {
+        TV::Pair(l, r) => {
+            push_rc(take(l), stack);
+            push_rc(take(r), stack);
+        }
+        TV::Option(opt) => {
+            if let Some(rc) = opt.take() {
+                push_rc(rc, stack);
+            }
+        }
+        TV::Or(or) => {
+            let rc = match take(or) {
+                Or::Left(r) | Or::Right(r) => r,
+            };
+            push_rc(rc, stack);
+        }
+        TV::List(l) => {
+            for rc in take(l).drain_owned() {
+                push_rc(rc, stack);
+            }
+        }
+        TV::Set(s) => {
+            for rc in take(s).drain_owned() {
+                push_rc(rc, stack);
+            }
+        }
+        TV::Map(m) => {
+            for (k, v) in take(m).drain_owned() {
+                push_rc(k, stack);
+                push_rc(v, stack);
+            }
+        }
+        TV::Lambda(closure) => {
+            // Walk the `Closure::Apply` spine iteratively so the
+            // `Rc<Closure>` chain (a deep `APPLY` chain) does not recurse on
+            // drop. When we hold the last reference to a captured value, drain
+            // it onto the worklist (it too may be a deep value); when the
+            // capture is still shared, the holder that drops it last reaches
+            // this same path.
+            let dummy = Closure::Lambda(Lambda::Lambda {
+                micheline_code: Micheline::Seq(&[]),
+                code: Vec::new().into(),
+            });
+            let mut cur = replace(closure, dummy);
+            while let Closure::Apply {
+                capture,
+                closure: inner,
+            } = cur
+            {
+                if let Ok(capture) = Rc::try_unwrap(capture) {
+                    push_rc(capture.into_arg_val(), stack);
+                }
+                // Stop at the first co-owned link instead of cloning past it:
+                // everything below is kept alive by that other owner, so there
+                // is nothing to drain, and whoever drops last walks it. Cloning
+                // (as `Closure::unwrap_rc` does) copies one spine level per
+                // iteration and discards each copy.
+                match Rc::try_unwrap(inner) {
+                    Ok(inner) => cur = inner,
+                    Err(_) => return,
+                }
+            }
+            // `cur` is now the terminal `Closure::Lambda`. Its body code is an
+            // `Rc<[Instruction]>` which, on drop, re-enters `Drop for
+            // Instruction` -> `Push` -> a value drain: that boundary crossing
+            // recurses on the native stack one frame per alternating
+            // value/instruction level (L2-1672). Push the body instructions
+            // onto the shared worklist instead, so the alternation stays on the
+            // heap. (When the `Rc` is shared, `get_mut` returns `None` and the
+            // body is left for the other owner — no deep drop happens here.)
+            if let Closure::Lambda(lam) = &mut cur {
+                let code = match lam {
+                    Lambda::Lambda { code, .. } | Lambda::LambdaRec { code, .. } => code,
+                };
+                if let Some(slice) = Rc::get_mut(code) {
+                    for slot in slice.iter_mut() {
+                        stack.push(DropNode::Instr(replace(
+                            slot,
+                            Instruction::Drop(None),
+                        )));
+                    }
+                }
+            }
+        }
+        TV::Ticket(t) => {
+            // Move the ticket payload out so it is drained via the worklist
+            // rather than recursing through the default `TypedValue` destructor.
+            stack.push(DropNode::Value(replace(&mut t.content, TV::Unit)));
+        }
+        TV::Operation(info) => {
+            // Operations carry `TypedValue` payloads (transfer parameter, emit
+            // value, originated storage) that may be deep; drain them. They are
+            // `Rc`-shared, so only the last owner actually drains one.
+            match &mut info.operation {
+                Operation::TransferTokens(tt) => push_rc(take(&mut tt.param), stack),
+                Operation::Emit(e) => push_rc(take(&mut e.value), stack),
+                Operation::CreateContract(c) => push_rc(take(&mut c.storage), stack),
+                Operation::SetDelegate(_) => {}
+            }
+        }
+        TV::BigMap(m) => {
+            // The in-memory keys/values (and the lazy-storage overlay diff) are
+            // held behind `Rc`; push the handles so a deep value drops
+            // iteratively without being cloned first. Same ownership rule as the
+            // container arms above.
+            match &mut m.content {
+                big_map::BigMapContent::InMemory(map) => {
+                    for (k, v) in take(map).drain_owned() {
+                        push_rc(k, stack);
+                        push_rc(v, stack);
+                    }
+                }
+                big_map::BigMapContent::FromId(from_id) => {
+                    for (k, v) in take(&mut from_id.overlay).drain_owned() {
+                        push_rc(k, stack);
+                        if let Some(v) = v {
+                            push_rc(v, stack);
+                        }
+                    }
+                }
+            }
+        }
+        _ => {}
+    }
+}
+
+/// Enum representing typechecked Michelson instructions. Some instructions may
+/// be applied to different input stacks, for those cases the variant carries a
+/// enum specifying the particular version of the instruction (here called
+/// "overload"). See [overloads].
+///
+/// The name of the variant corresponds to the name of the instruction, but with
+/// UPPER_SNAKE_CASE converted to PascalCase.
+#[derive(Debug, Eq, PartialEq, Clone)]
+#[allow(missing_docs)]
+pub enum Instruction<'a> {
+    Add(overloads::Add),
+    Sub(overloads::Sub),
+    Mul(overloads::Mul),
+    EDiv(overloads::EDiv),
+    Neg(overloads::Neg),
+    Lsl(overloads::Lsl),
+    Lsr(overloads::Lsr),
+    SubMutez,
+    Dip(Option<u16>, Vec<Self>),
+    Drop(Option<u16>),
+    Dup(Option<u16>),
+    Dig(u16),
+    Dug(u16),
+    Gt,
+    Ge,
+    Eq,
+    Neq,
+    Lt,
+    Le,
+    If(Vec<Self>, Vec<Self>),
+    IfNone(Vec<Self>, Vec<Self>),
+    Int(overloads::Int),
+    Nat,
+    Bytes(overloads::Bytes),
+    Abs,
+    IsNat,
+    Loop(Vec<Self>),
+    /// `PUSH ty v`. The literal is shared as an [`RcTypedValue`] so the hot path of the
+    /// interpreter is a refcount bump rather than a deep clone of the value
+    /// (which can be expensive for big-num literals like `PUSH nat 10^18`).
+    Push(RcTypedValue<'a>),
+    Swap,
+    Failwith(Type),
+    Never,
+    Unit,
+    Car,
+    Cdr,
+    Pair,
+    PairN(u16),
+    /// `ISome` because `Some` is already taken
+    ISome,
+    None,
+    Compare,
+    Amount,
+    Nil,
+    EmptySet,
+    EmptyMap,
+    EmptyBigMap(Type, Type),
+    Mem(overloads::Mem),
+    Get(overloads::Get),
+    GetN(u16),
+    Update(overloads::Update),
+    GetAndUpdate(overloads::GetAndUpdate),
+    Concat(overloads::Concat),
+    Size(overloads::Size),
+    UpdateN(u16),
+    Seq(Vec<Self>),
+    Unpair,
+    UnpairN(u16),
+    Cons,
+    And(overloads::And),
+    Or(overloads::Or),
+    Xor(overloads::Xor),
+    Not(overloads::Not),
+    IfCons(Vec<Self>, Vec<Self>),
+    Iter(overloads::Iter, Vec<Self>),
+    IfLeft(Vec<Self>, Vec<Self>),
+    ChainId,
+    /// `ISelf` because `Self` is a reserved keyword
+    ISelf(Entrypoint),
+    Pack,
+    Unpack(Type),
+    CheckSignature,
+    TransferTokens,
+    SetDelegate,
+    Address,
+    Slice(overloads::Slice),
+    Left,
+    Right,
+    Lambda(Lambda<'a>),
+    Exec,
+    Ticket(Type),
+    HashKey,
+    Apply {
+        arg_ty: Type,
+    },
+    ReadTicket,
+    SplitTicket,
+    JoinTickets,
+    LoopLeft(Vec<Self>),
+    Blake2b,
+    Keccak,
+    Sha256,
+    Sha3,
+    Sha512,
+    Balance,
+    Level,
+    MinBlockTime,
+    SelfAddress,
+    Sender,
+    Source,
+    Now,
+    ImplicitAccount,
+    IsImplicitAccount,
+    IndexAddress,
+    GetAddressIndex,
+    TotalVotingPower,
+    VotingPower,
+    /// Here entrypoint is not an optional value because explicit default entrypoints are forbidden
+    /// in concrete syntax, so we can assume that if the entrypoint is the default entrypoint, then
+    /// no explicit entrypoint was specified in the instruction.
+    Contract(Type, Entrypoint),
+    #[cfg(feature = "bls")]
+    PairingCheck,
+    Emit {
+        tag: Option<FieldAnnotation<'a>>,
+        arg_ty: Or<Type, Micheline<'a>>,
+    },
+    CreateContract(Rc<ContractScript<'a>>, &'a Micheline<'a>),
+    Map(overloads::Map, Vec<Self>),
+    IView {
+        name: String,
+        arg_type: Type,
+        return_type: Type,
+    },
+}
+
+/// Manual `Drop` to avoid the recursive destructor on deeply nested
+/// instruction trees (DIP, IF, IF_*, LOOP, LOOP_LEFT, ITER, MAP, SEQ).
+/// Uses an explicit worklist; nested bodies are extracted via
+/// [`std::mem::take`] on each `Vec<Self>` field so the leftover variant
+/// drops trivially without re entering this function.
+impl<'a> Drop for Instruction<'a> {
+    fn drop(&mut self) {
+        let mut stack = Vec::new();
+        extract_instr_children(self, &mut stack);
+        drain_value_and_instructions(stack);
+    }
+}
+
+fn extract_instr_children<'a>(node: &mut Instruction<'a>, stack: &mut Vec<DropNode<'a>>) {
+    use std::mem::{replace, take};
+    match node {
+        Instruction::Dip(_, body)
+        | Instruction::Loop(body)
+        | Instruction::LoopLeft(body)
+        | Instruction::Iter(_, body)
+        | Instruction::Map(_, body)
+        | Instruction::Seq(body) => {
+            for instr in take(body) {
+                stack.push(DropNode::Instr(instr));
+            }
+        }
+        Instruction::If(t, f)
+        | Instruction::IfNone(t, f)
+        | Instruction::IfCons(t, f)
+        | Instruction::IfLeft(t, f) => {
+            for instr in take(t) {
+                stack.push(DropNode::Instr(instr));
+            }
+            for instr in take(f) {
+                stack.push(DropNode::Instr(instr));
+            }
+        }
+        Instruction::Push(rc) => {
+            // The pushed constant is a (possibly deep) `TypedValue`. Push it
+            // onto the shared worklist as a value node instead of draining it
+            // with a nested call, so an alternating value/instruction nesting
+            // stays on the heap rather than recursing across the boundary one
+            // native frame per level (L2-1672). Only owned when the `Rc` is not
+            // shared.
+            if let Ok(tv) = take(rc).try_unwrap() {
+                stack.push(DropNode::Value(tv));
+            }
+        }
+        Instruction::Lambda(lambda) => {
+            // Push the lambda body's instructions onto the worklist so a
+            // lexically nested `LAMBDA { LAMBDA { … } }` does not recurse one
+            // frame per nesting level through the body `Rc<[Instruction]>`.
+            let code = match lambda {
+                Lambda::Lambda { code, .. } | Lambda::LambdaRec { code, .. } => code,
+            };
+            if let Some(slice) = Rc::get_mut(code) {
+                for slot in slice.iter_mut() {
+                    stack.push(DropNode::Instr(replace(slot, Instruction::Drop(None))));
+                }
+            }
+        }
+        _ => {}
+    }
+}
+
+/// An untyped view, as it appears in a script
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct View<'a> {
+    /// Input type of the view
+    pub input_type: Type,
+    /// Output type of the view
+    pub output_type: Type,
+    /// Code of the view
+    pub code: Micheline<'a>,
+}
+
+/// A full typechecked contract script.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ContractScript<'a> {
+    /// Parameter type. Corresponds to the script's `parameter` field.
+    pub parameter: Type,
+    /// Storage type. Corresponds to the script's `storage` field.
+    pub storage: Type,
+    /// Script code. Corresponds to the script's `code` field.
+    pub code: Instruction<'a>,
+    /// Script entrypoints.
+    pub annotations: HashMap<FieldAnnotation<'a>, (Vec<Direction>, Type)>,
+    /// Views. Corresponds to the script's `view` fields.
+    pub views: HashMap<String, View<'a>>,
+}
+
+/// Enum representing each layer to achieve a given entrypoint
+#[derive(Debug, Clone, Eq, PartialEq)]
+pub enum Direction {
+    /// Left
+    Left,
+    /// Right
+    Right,
+}
+
+/// A structure mapping from entrypoints to their types. This is simply an alias
+/// for a [HashMap].
+pub type Entrypoints = HashMap<Entrypoint, Type>;
+
+#[cfg(test)]
+#[allow(missing_docs)]
+pub mod test_strategies {
+    use proptest::prelude::*;
+
+    use crate::{gas::Gas, typechecker::type_props::TypeProperty};
+
+    use super::*;
+
+    /// Generates any type except lambda, big_map, contract, never and operation.
+    fn input_ty() -> impl Strategy<Value = Type> {
+        // TODO: https://gitlab.com/tezos/tezos/-/issues/6755
+        // Produce all types.
+        use Type::*;
+        #[cfg(feature = "bls")]
+        let prim = prop_oneof![
+            // Cases that we want to see in tests in the first place - go first
+            Just(Int),
+            Just(Nat),
+            Just(Mutez),
+            Just(Timestamp),
+            Just(String),
+            Just(Bytes),
+            Just(Unit),
+            Just(Bool),
+            Just(Address),
+            Just(ChainId),
+            Just(Key),
+            Just(Signature),
+            Just(KeyHash),
+            Just(Bls12381Fr),
+            Just(Bls12381G1),
+            Just(Bls12381G2),
+        ];
+        #[cfg(not(feature = "bls"))]
+        let prim = prop_oneof![
+            // Cases that we want to see in tests in the first place - go first
+            Just(Int),
+            Just(Nat),
+            Just(Mutez),
+            Just(Timestamp),
+            Just(String),
+            Just(Bytes),
+            Just(Unit),
+            Just(Bool),
+            Just(Address),
+            Just(ChainId),
+            Just(Key),
+            Just(Signature),
+            Just(KeyHash),
+        ];
+        prim.prop_recursive(5, 16, 2, |inner| {
+            prop_oneof![
+                inner.clone().prop_map(Type::new_option),
+                inner.clone().prop_map(Type::new_list),
+                (inner.clone(), inner.clone()).prop_map(|(l, r)| Type::new_pair(l, r)),
+                (inner.clone(), inner.clone()).prop_map(|(l, r)| Type::new_or(l, r)),
+                inner
+                    .clone()
+                    .prop_filter("Elt must be comparable", |elt| elt
+                        .ensure_prop(&mut Gas::default(), TypeProperty::Comparable)
+                        .is_ok())
+                    .prop_map(Type::new_set),
+                inner
+                    .clone()
+                    .prop_filter("Payload must be comparable", |payload| payload
+                        .ensure_prop(&mut Gas::default(), TypeProperty::Comparable)
+                        .is_ok())
+                    .prop_map(Type::new_ticket),
+                (inner.clone(), inner.clone())
+                    .prop_filter("Key must be comparable", |(k, _)| k
+                        .ensure_prop(&mut Gas::default(), TypeProperty::Comparable)
+                        .is_ok())
+                    .prop_map(|(k, v)| Type::new_map(k, v)),
+                (inner.clone(), inner)
+                    .prop_filter("Key must be comparable", |(k, _)| k
+                        .ensure_prop(&mut Gas::default(), TypeProperty::Comparable)
+                        .is_ok())
+                    .prop_map(|(k, v)| Type::new_big_map(k, v)),
+            ]
+        })
+    }
+
+    #[derive(Debug, Clone)]
+    pub struct TypedValueAndType<'a> {
+        pub ty: Type,
+        pub val: TypedValue<'a>,
+    }
+
+    pub fn typed_value_and_type<'a>() -> impl Strategy<Value = TypedValueAndType<'a>> {
+        input_ty().prop_flat_map(|ty| {
+            (Just(ty.clone()), typed_value_by_type(&ty))
+                .prop_map(|(ty, val)| TypedValueAndType { ty, val })
+        })
+    }
+
+    pub fn typed_value_by_type(t: &Type) -> impl Strategy<Value = TypedValue<'static>> {
+        use Type as T;
+        use TypedValue as V;
+
+        match t {
+            // TODO: https://gitlab.com/tezos/tezos/-/issues/6755
+            // Sometimes generate really large numbers (should take at least several `u64`s)
+            T::Int => (-100..100i128).prop_map(V::int).boxed(),
+            T::Nat => (0..100u64).prop_map(V::nat).boxed(),
+            T::Mutez => (0..100i64).prop_map(V::Mutez).boxed(),
+            T::Timestamp => (-100i128..100i128).prop_map(V::timestamp).boxed(),
+            T::Bool => any::<bool>().prop_map(V::Bool).boxed(),
+            // TODO: https://gitlab.com/tezos/tezos/-/issues/6755
+            // Allow all Michelson strings
+            T::String => "[A-Za-z0-9]".prop_map(V::String).boxed(),
+            T::Bytes => prop::collection::vec(any::<u8>(), 0..=3)
+                .prop_map(V::Bytes)
+                .boxed(),
+            T::Unit => Just(V::Unit).boxed(),
+            T::Pair(t) => {
+                let (lt, rt) = t.as_ref();
+                (typed_value_by_type(lt), typed_value_by_type(rt))
+                    .prop_map(|(l, r)| V::new_pair(l, r))
+                    .boxed()
+            }
+            T::Ticket(t) => {
+                (Just(t.as_ref().clone()), typed_value_by_type(t), (1u64..100u64))
+                    .prop_map(|(content_type, content, amount)|
+                              V::new_ticket(Ticket {
+                                  ticketer: AddressHash::from_base58_check("KT1BRd2ka5q2cPRdXALtXD1QZ38CPam2j1ye").unwrap(),
+                                  content_type,
+                                  content,
+                                  amount: amount.into(),
+                              }
+                              ))
+                    .boxed()
+            }
+            T::Option(t) => prop_oneof![
+                Just(V::new_option(None)),
+                typed_value_by_type(t).prop_map(|v| V::new_option(Some(v)))
+            ]
+            .boxed(),
+            T::Or(t) => {
+                let (lt, rt) = t.as_ref();
+                prop_oneof![
+                    typed_value_by_type(lt).prop_map(|v| V::new_or(Or::Left(v))),
+                    typed_value_by_type(rt).prop_map(|v| V::new_or(Or::Right(v)))
+                ]
+                .boxed()
+            }
+            T::List(t) => prop::collection::vec(typed_value_by_type(t), 0..=3)
+                .prop_map(|x| {
+                    V::List(MichelsonList::from(
+                        x.into_iter().map(RcTypedValue::new).collect::<Vec<_>>(),
+                    ))
+                })
+                .boxed(),
+            T::Set(elt) => prop::collection::btree_set(typed_value_by_type(elt), 0..=3)
+                .prop_map(|set| V::Set(set.into_iter().map(RcTypedValue::new).collect()))
+                .boxed(),
+            T::Map(m) => {
+                let (key_ty, val_ty) = m.as_ref();
+                prop::collection::btree_map(
+                    typed_value_by_type(key_ty),
+                    typed_value_by_type(val_ty),
+                    0..=3,
+                )
+                .prop_map(|map| {
+                    V::Map(
+                        map.into_iter()
+                            .map(|(k, v)| (RcTypedValue::new(k), RcTypedValue::new(v)))
+                            .collect(),
+                    )
+                })
+                .boxed()
+            }
+            // We don't generate all the allowed syntaxes for big maps
+            // but only id-free ones because these are the only ones
+            // which can be typechecked in any context.
+            T::BigMap(m) => {
+                let (key_ty, val_ty) = m.as_ref();
+                (Just(key_ty.clone()), Just(val_ty.clone()), prop::collection::btree_map(
+                    typed_value_by_type(key_ty),
+                    typed_value_by_type(val_ty),
+                    0..=3,
+                ))
+                    .prop_map(|(key_type, value_type, map)|
+                              {
+                                  let content =
+                                      big_map::BigMapContent::InMemory(big_map::in_memory_entries(map));
+                                  V::BigMap(BigMap {
+                                      content,
+                                      key_type,
+                                      value_type,
+                                  })}).boxed()
+            }
+            T::Address => prop_oneof![
+                Just(V::Address(
+                    Address::from_base58_check("tz1Nw5nr152qddEjKT2dKBH8XcBMDAg72iLw").unwrap()
+                )),
+                Just(V::Address(
+                    Address::from_base58_check("tz1SNL5w4RFRbCWRMB4yDWvoRQrPQxZmNzeQ").unwrap()
+                )),
+                Just(V::Address(
+                    Address::from_base58_check("KT1BRd2ka5q2cPRdXALtXD1QZ38CPam2j1ye").unwrap()
+                )),
+                Just(V::Address(
+                    Address::from_base58_check("KT1BRd2ka5q2cPRdXALtXD1QZ38CPam2j1ye%foo").unwrap()
+                )),
+                Just(V::Address(
+                    Address::from_base58_check("sr1RYurGZtN8KNSpkMcCt9CgWeUaNkzsAfXf").unwrap()
+                )),
+                Just(V::Address(
+                    Address::from_base58_check("sr1RYurGZtN8KNSpkMcCt9CgWeUaNkzsAfXf%foo").unwrap()
+                )),
+            ]
+            .boxed(),
+            T::ChainId => prop_oneof![
+                Just(V::ChainId(
+                    ChainId::from_base58_check("NetXgtSLGNJvNye").unwrap()
+                )),
+                Just(V::ChainId(
+                    ChainId::from_base58_check("NetXjD3HPJJjmcd").unwrap()
+                )),
+            ]
+            .boxed(),
+            T::Key => prop_oneof![
+                Just(V::Key(
+                    PublicKey::from_b58check("edpkupxHveP7SFVnBq4X9Dkad5smzLcSxpRx9tpR7US8DPN5bLPFwu").unwrap()
+                )),
+                Just(V::Key(
+                    PublicKey::from_b58check("edpkupH22qrz1sNQt5HSvWfRJFfyJ9dhNbZLptE6GR4JbMoBcACZZH").unwrap()
+                )),
+                Just(V::Key(
+                    PublicKey::from_b58check("edpkuwTWKgQNnhR5v17H2DYHbfcxYepARyrPGbf1tbMoGQAj8Ljr3V").unwrap()
+                )),
+                Just(V::Key(
+                    PublicKey::from_b58check("sppk7cdA7Afj8MvuBFrP6KsTLfbM5DtH9GwYaRZwCf5tBVCz6UKGQFR").unwrap()
+                )),
+                Just(V::Key(
+                    PublicKey::from_b58check("sppk7Ze7NMs6EHF2uB8qq8GrEgJvE9PWYkUijN3LcesafzQuGyniHBD").unwrap()
+                )),
+                Just(V::Key(
+                    PublicKey::from_b58check("p2pk67K1dwkDFPB63RZU5H3SoMCvmJdKZDZszc7U4FiGKN2YypKdDCB").unwrap()
+                )),
+                Just(V::Key(
+                    PublicKey::from_b58check("p2pk68C6tJr7pNLvgBH63K3hBVoztCPCA36zcWhXFUGywQJTjYBfpxk").unwrap()
+                )),
+                Just(V::Key(
+                    PublicKey::from_b58check("BLpk1yoPpFtFF3jGUSn2GrGzgHVcj1cm5o6HTMwiqSjiTNFSJskXFady9nrdhoZzrG6ybXiTSK5G").unwrap()
+                )),
+            ]
+                .boxed(),
+            T::Signature =>
+                Just(V::Signature( Signature::from_base58_check("BLsigAmLKnuw12tethjMmotFPaQ6u4XCKrVk6c15dkRXKkjDDjHywbhS3nd4rBT31yrCvvQrS2HntWhDRu7sX8Vvek53zBUwQHqfcHRiVKVj1ehq8CBYs1Z7XW2rkL2XkVNHua4cnvxY7F").unwrap())).boxed(),
+            T::KeyHash =>
+                Just(V::KeyHash(
+                    PublicKeyHash::from_b58check("tz1Nw5nr152qddEjKT2dKBH8XcBMDAg72iLw").unwrap()
+                )).boxed(),
+            #[cfg(feature = "bls")]
+            T::Bls12381Fr =>
+                Just(V::Bls12381Fr(bls::fr::Fr::from_big_int(&0.into()))).boxed(),
+            #[cfg(feature = "bls")]
+            T::Bls12381G1 =>
+                Just(V::Bls12381G1(Box::new(bls::g1::G1::zero()))).boxed(),
+            #[cfg(feature = "bls")]
+            T::Bls12381G2 =>
+                Just(V::Bls12381G2(Box::new(bls::g2::G2::zero()))).boxed(),
+            T::Contract(_) => panic!("Cannot generate typed value for contract"),
+            T::Operation => panic!("Cannot generate typed value for operation"),
+            T::Lambda(_) => panic!("Cannot generate typed value for lambda"),
+            T::Never =>  panic!("Cannot generate typed value for never"),
+            // NOTE: if you append clauses here, you likely need to update other generators too
+        }
+    }
+}
+
+#[cfg(test)]
+mod test_untypers {
+    use proptest::prelude::*;
+
+    use super::*;
+    use crate::{
+        ast::test_strategies as TS,
+        context::Ctx,
+        typechecker::{
+            type_props::TypeProperty, typecheck_value, AllowForgedLazyStorageId,
+        },
+    };
+
+    fn assert_borrowed_owned_unparse_match(value: &TypedValue<'_>) {
+        let owned_arena = Arena::new();
+        let borrowed_arena = Arena::new();
+        let mut owned_gas = Gas::default();
+        let mut borrowed_gas = Gas::default();
+        let owned = value
+            .clone()
+            .into_micheline_optimized_legacy(&owned_arena, &mut owned_gas)
+            .unwrap();
+        let borrowed = value
+            .clone_into_micheline_optimized_legacy(
+                &borrowed_arena,
+                &mut borrowed_gas,
+                None,
+            )
+            .unwrap();
+
+        assert_eq!(borrowed, owned);
+        assert_eq!(borrowed_gas.milligas(), owned_gas.milligas());
+    }
+
+    proptest! {
+        #[test]
+        fn value_typecheck_untype_roundtrip(typed in TS::typed_value_and_type()) {
+            let arena = Arena::new();
+            let mut ctx = Ctx::default();
+            let untyped = typed.val.clone().into_micheline_optimized_legacy(&arena, &mut ctx.gas).unwrap();
+            // The generator produces trusted values that may include forged
+            // big_map ids, so allow them when round-tripping.
+            let typed_ =
+                typecheck_value(&untyped, &mut ctx, &typed.ty, AllowForgedLazyStorageId::Yes);
+            assert_eq!(typed_, Ok(typed.val))
+        }
+
+        #[test]
+        fn borrowed_and_owned_unparsers_match(typed in TS::typed_value_and_type()) {
+            assert_borrowed_owned_unparse_match(&typed.val);
+        }
+    }
+
+    #[test]
+    fn borrowed_and_owned_lambda_unparsers_match() {
+        // The owned (PACK) and borrowed (APPLY) unparsers share
+        // `unparse_closure`, so this exercises every closure shape — bare
+        // `Lambda`/`LambdaRec`, an `APPLY` spine, and a recursive terminal —
+        // through both entry points and guards against a future re-divergence.
+        let arena = Arena::new();
+        let body = || {
+            Micheline::Seq(Micheline::alloc_seq(
+                &arena,
+                [
+                    Micheline::prim0_uncarbonated(Prim::DROP),
+                    Micheline::prim0_uncarbonated(Prim::UNIT),
+                ],
+            ))
+        };
+        let lambda = || {
+            Closure::Lambda(Lambda::Lambda {
+                micheline_code: body(),
+                code: vec![Instruction::Drop(None), Instruction::Unit].into(),
+            })
+        };
+        let lambda_rec = || {
+            Closure::Lambda(Lambda::LambdaRec {
+                in_ty: Type::Unit,
+                out_ty: Type::Unit,
+                micheline_code: body(),
+                code: vec![Instruction::Drop(None), Instruction::Unit].into(),
+            })
+        };
+
+        // A capture carrying a real cached unparsing of `Int 7`.
+        let mut gas = Gas::default();
+        let arg_ty_mich = (&Type::Int)
+            .into_micheline_optimized_legacy(&arena, &mut gas)
+            .unwrap();
+        let arg_val_mich = TypedValue::int(7)
+            .into_micheline_optimized_legacy(&arena, &mut gas)
+            .unwrap();
+        let cost = Gas::default().milligas().unwrap() - gas.milligas().unwrap();
+        let capture = Rc::new(AppliedCapture::new(
+            Type::Int,
+            RcTypedValue::new(TypedValue::int(7)),
+            arg_ty_mich,
+            arg_val_mich,
+            cost,
+        ));
+        fn applied<'a>(
+            capture: &Rc<AppliedCapture<'a>>,
+            terminal: Closure<'a>,
+            levels: usize,
+        ) -> TypedValue<'a> {
+            let mut c = terminal;
+            for _ in 0..levels {
+                c = Closure::Apply {
+                    capture: Rc::clone(capture),
+                    closure: Rc::new(c),
+                };
+            }
+            TypedValue::Lambda(c)
+        }
+
+        assert_borrowed_owned_unparse_match(&applied(&capture, lambda(), 0));
+        assert_borrowed_owned_unparse_match(&applied(&capture, lambda_rec(), 0));
+        assert_borrowed_owned_unparse_match(&applied(&capture, lambda(), 1));
+        assert_borrowed_owned_unparse_match(&applied(&capture, lambda(), 3));
+        assert_borrowed_owned_unparse_match(&applied(&capture, lambda_rec(), 2));
+        assert_borrowed_owned_unparse_match(&TypedValue::new_pair(
+            applied(&capture, lambda(), 1),
+            TypedValue::new_option(Some(TypedValue::Unit)),
+        ));
+    }
+
+    #[test]
+    fn borrowed_unparser_rejects_non_pushable_values_without_panicking() {
+        // `operation` is the only variant the borrowed walk refuses. A caller
+        // that restricts the walk is told so through the property check, which
+        // fires before the arm is reached; under `restrict_to: None` the arm
+        // itself answers `UnsupportedUnparsing`. `big_map` and `ticket` are the
+        // converse case: refused outright until the returned storage started
+        // being unparsed through here (L2-1840) — see
+        // `borrowed_unparser_matches_owned_on_storage_values`.
+        let arena = Arena::new();
+        let value = TypedValue::new_operation(
+            Operation::SetDelegate(michelson_operation::SetDelegate(None)),
+            0,
+        );
+
+        assert_eq!(
+            value.clone_into_micheline_optimized_legacy(
+                &arena,
+                &mut Gas::default(),
+                Some(TypeProperty::Pushable)
+            ),
+            Err(BorrowedUnparseError::UnsatisfiedProperty(
+                TypeProperty::Pushable
+            ))
+        );
+    }
+
+    /// The borrowed unparser must agree with the consuming one on every shape
+    /// the *returned storage* can hold, not just the pushable ones it was
+    /// originally written for. `assert_borrowed_owned_unparse_match` compares
+    /// both the Micheline and the gas charged, so a divergence in either the
+    /// node order or the cost of the new `BigMap` / `Ticket` arms fails here.
+    ///
+    /// Storage is now unparsed through the borrowed walk so that a shared
+    /// child is not deep-copied before its cost is charged (L2-1840).
+    #[test]
+    fn borrowed_unparser_matches_owned_on_storage_values() {
+        let in_memory = |entries: Vec<(TypedValue<'static>, TypedValue<'static>)>| {
+            TypedValue::BigMap(BigMap::new(
+                Type::Nat,
+                Type::Unit,
+                big_map::in_memory_entries(entries),
+            ))
+        };
+        // `InMemory`: empty, one entry, several entries.
+        assert_borrowed_owned_unparse_match(&in_memory(vec![]));
+        assert_borrowed_owned_unparse_match(&in_memory(vec![(
+            TypedValue::nat(1u64),
+            TypedValue::Unit,
+        )]));
+        assert_borrowed_owned_unparse_match(&in_memory(vec![
+            (TypedValue::nat(2u64), TypedValue::Unit),
+            (TypedValue::nat(1u64), TypedValue::Unit),
+            (TypedValue::nat(3u64), TypedValue::Unit),
+        ]));
+
+        // `FromId`: bare id, and an overlay carrying both an update and a
+        // removal — the `None` arm is the one that needs its own frame.
+        let from_id =
+            |overlay: Vec<(TypedValue<'static>, Option<TypedValue<'static>>)>| {
+                TypedValue::BigMap(BigMap {
+                    content: big_map::BigMapContent::FromId(big_map::BigMapFromId {
+                        id: 4i64.into(),
+                        overlay: big_map::overlay_entries(overlay),
+                    }),
+                    key_type: Type::Nat,
+                    value_type: Type::Unit,
+                })
+            };
+        assert_borrowed_owned_unparse_match(&from_id(vec![]));
+        assert_borrowed_owned_unparse_match(&from_id(vec![
+            (TypedValue::nat(1u64), Some(TypedValue::Unit)),
+            (TypedValue::nat(2u64), None),
+        ]));
+
+        // Nested under containers, and beside a shared leaf — the shape the
+        // fix exists for.
+        let shared = RcTypedValue::new(TypedValue::Bytes(vec![0xab; 32]));
+        assert_borrowed_owned_unparse_match(&TypedValue::new_pair_rc(
+            shared.clone(),
+            shared.clone(),
+        ));
+        assert_borrowed_owned_unparse_match(&TypedValue::new_pair(
+            in_memory(vec![(TypedValue::nat(1u64), TypedValue::Unit)]),
+            TypedValue::List(MichelsonList::from(vec![
+                RcTypedValue::new(from_id(vec![])),
+                shared.clone(),
+            ])),
+        ));
+    }
+
+    // We used to have a bug in which a panic was raised in the
+    // following case, this test is there to avoid a regression.
+    #[test]
+    fn test_big_map_without_id() {
+        let arena = Arena::new();
+        let mut gas = Gas::default();
+        let mut m = BigMap::empty(Type::Nat, Type::Unit);
+        m.update(RcTypedValue::new(TypedValue::Nat(0u32.into())), None);
+        TypedValue::BigMap(m)
+            .into_micheline_optimized_legacy(&arena, &mut gas)
+            .unwrap();
+    }
+
+    // Test that converting a deeply Rc-shared TypedValue (constant_dup-shape)
+    // to Micheline returns OutOfGas with limited gas, BEFORE allocating
+    // significant memory. This prevents OOM in the WASM runtime.
+    #[test]
+    fn test_constant_dup_shape_gas_bounded() {
+        let arena = Arena::new();
+        let mut gas = Gas::default();
+
+        // Build a constant_dup-shape value: (list (list (list unit)))
+        // where each inner list is shared via Rc.
+        // With depth d and width w, this creates w^d virtual entries but only
+        // O(w*d) actual allocations due to Rc sharing.
+        let unit_list = RcTypedValue::new(TypedValue::List(MichelsonList::from(
+            vec![] as Vec<RcTypedValue>
+        )));
+
+        // Build (list unit) with 1000 shared references to the same empty list
+        let inner_lists: Vec<RcTypedValue> =
+            (0..1000).map(|_| unit_list.clone()).collect();
+        let inner_list =
+            RcTypedValue::new(TypedValue::List(MichelsonList::from(inner_lists)));
+
+        // Build (list (list unit)) with 1000 shared references to the same (list unit)
+        let middle_lists: Vec<RcTypedValue> =
+            (0..1000).map(|_| inner_list.clone()).collect();
+        let middle_list =
+            RcTypedValue::new(TypedValue::List(MichelsonList::from(middle_lists)));
+
+        // Build (list (list (list unit))) with 1000 shared references
+        let outer_lists: Vec<RcTypedValue> =
+            (0..1000).map(|_| middle_list.clone()).collect();
+        let outer_list = TypedValue::List(MichelsonList::from(outer_lists));
+
+        // This structure has 1000 * 1000 * 1000 = 1,000,000,000 virtual entries to traverse
+        // if unshared, but only 1000 + 1000 + 1000 = 3000 actual Rc nodes.
+
+        // Conversion should fail with OutOfGas before allocating
+        // significant memory. The per-node charge (100 milligas each)
+        // should be triggered during traversal, not only after.
+        let result = outer_list.into_micheline_optimized_legacy(&arena, &mut gas);
+        assert_eq!(result, Err(OutOfGas));
+    }
+
+    /// Unparsing an `EMIT` value with a field tag must charge
+    /// `unparsing_cost::annotation` for the tag — the old `*a = annots`
+    /// stamp-on skipped it, under-charging tagged emits.
+    #[test]
+    fn emit_with_tag_charges_annotation_gas() {
+        use crate::gas::unparsing_cost;
+
+        fn emit(tag: Option<FieldAnnotation<'static>>) -> TypedValue<'static> {
+            TypedValue::Operation(Box::new(OperationInfo {
+                operation: Operation::Emit(Emit {
+                    tag,
+                    value: RcTypedValue::new(TypedValue::Unit),
+                    arg_ty: Or::Left(Type::Unit),
+                }),
+                counter: 0,
+            }))
+        }
+        fn unparse(tv: TypedValue<'static>) -> u32 {
+            let arena = Arena::new();
+            let mut gas = Gas::default();
+            tv.into_micheline_optimized_legacy(&arena, &mut gas)
+                .unwrap();
+            Gas::default().milligas().unwrap() - gas.milligas().unwrap()
+        }
+
+        let used_no_tag = unparse(emit(None));
+        let used_tag = unparse(emit(Some(FieldAnnotation::from_str_unchecked("foo"))));
+        let expected = unparsing_cost::annotation(&Annotation::Field(
+            FieldAnnotation::from_str_unchecked("foo").into_cow(),
+        ))
+        .unwrap();
+        assert_eq!(
+            used_tag - used_no_tag,
+            expected,
+            "EMIT field tag must charge unparsing_cost::annotation"
+        );
+    }
+}
+
+#[cfg(test)]
+mod drop_safety {
+    //! Regression tests for the iterative `Drop`/drain on deeply nested
+    //! values. Each builds a structure deep enough to overflow a recursive
+    //! destructor and runs on a 1 MiB worker thread (the WASM kernel stack
+    //! budget); completion of the thread is the assertion.
+    use super::*;
+
+    const DEPTH: usize = 100_000;
+
+    fn on_kernel_stack(f: impl FnOnce() + Send + 'static) {
+        std::thread::Builder::new()
+            .stack_size(1024 * 1024)
+            .spawn(f)
+            .unwrap()
+            .join()
+            .expect("worker thread completes without stack overflow");
+    }
+
+    #[test]
+    fn drain_deep_lambda_apply_spine() {
+        // A deep `APPLY` chain nests `Closure::Apply { closure: Rc<Closure> }`;
+        // the `Rc<Closure>` spine must be drained iteratively, not recurse.
+        on_kernel_stack(|| {
+            let mut closure = Closure::Lambda(Lambda::Lambda {
+                micheline_code: Micheline::Seq(&[]),
+                code: Vec::new().into(),
+            });
+            let capture = Rc::new(AppliedCapture::new(
+                Type::Unit,
+                RcTypedValue::new(TypedValue::Unit),
+                Micheline::Seq(&[]),
+                Micheline::Seq(&[]),
+                0,
+            ));
+            for _ in 0..DEPTH {
+                closure = Closure::Apply {
+                    capture: Rc::clone(&capture),
+                    closure: Rc::new(closure),
+                };
+            }
+            let mut tv = TypedValue::Lambda(closure);
+            drain_deep_typed_value(&mut tv);
+        });
+    }
+
+    #[test]
+    fn drain_deep_captured_apply_value() {
+        // Each `APPLY` level captures the *previous* applied closure as its
+        // `arg_val`, building a deep capture-value chain (distinct from the
+        // spine above, which nests via `closure`). Drop must drain the captured
+        // value onto the worklist rather than recurse through a nested
+        // `TypedValue` destructor per captured level.
+        on_kernel_stack(|| {
+            let terminal = || {
+                Closure::Lambda(Lambda::Lambda {
+                    micheline_code: Micheline::Seq(&[]),
+                    code: Vec::new().into(),
+                })
+            };
+            let mut tv = TypedValue::Lambda(terminal());
+            for _ in 0..DEPTH {
+                tv = TypedValue::Lambda(Closure::Apply {
+                    capture: Rc::new(AppliedCapture::new(
+                        Type::new_lambda(Type::Unit, Type::Unit),
+                        RcTypedValue::new(tv),
+                        Micheline::Seq(&[]),
+                        Micheline::Seq(&[]),
+                        0,
+                    )),
+                    closure: Rc::new(terminal()),
+                });
+            }
+            drain_deep_typed_value(&mut tv);
+        });
+    }
+
+    #[test]
+    fn drain_deep_shared_captured_apply_value() {
+        // As above, but the whole closure is cloned first so every capture `Rc`
+        // is shared (refcount 2). Dropping both copies must stay iterative: the
+        // first drop walks the spine without draining (captures still shared),
+        // the second drains each now-unique captured value onto the worklist.
+        on_kernel_stack(|| {
+            let terminal = || {
+                Closure::Lambda(Lambda::Lambda {
+                    micheline_code: Micheline::Seq(&[]),
+                    code: Vec::new().into(),
+                })
+            };
+            let mut tv = TypedValue::Lambda(terminal());
+            for _ in 0..DEPTH {
+                tv = TypedValue::Lambda(Closure::Apply {
+                    capture: Rc::new(AppliedCapture::new(
+                        Type::new_lambda(Type::Unit, Type::Unit),
+                        RcTypedValue::new(tv),
+                        Micheline::Seq(&[]),
+                        Micheline::Seq(&[]),
+                        0,
+                    )),
+                    closure: Rc::new(terminal()),
+                });
+            }
+            // Cloning the top is O(1) (it only bumps the spine's `Rc`s), so the
+            // two values share every capture and inner-closure allocation.
+            let copy = tv.clone();
+            drop(tv);
+            drop(copy);
+        });
+    }
+
+    #[test]
+    fn drain_deep_ticket_content() {
+        // The ticket payload (`content: TypedValue`) must be drained, not left
+        // to recurse through the default destructor.
+        on_kernel_stack(|| {
+            let mut content = TypedValue::Unit;
+            for _ in 0..DEPTH {
+                content = TypedValue::new_pair(TypedValue::Unit, content);
+            }
+            let ticket = Ticket {
+                ticketer: AddressHash::from_base58_check(
+                    "KT1BRd2ka5q2cPRdXALtXD1QZ38CPam2j1ye",
+                )
+                .unwrap(),
+                content_type: Type::Unit,
+                content,
+                amount: 1u32.into(),
+            };
+            let mut tv = TypedValue::new_ticket(ticket);
+            drain_deep_typed_value(&mut tv);
+        });
+    }
+
+    #[test]
+    fn drop_deep_push_constant() {
+        // Dropping `PUSH <deep constant>` must drain the pushed value rather
+        // than recurse through its `RcTypedValue` spine.
+        on_kernel_stack(|| {
+            let mut content = TypedValue::Unit;
+            for _ in 0..DEPTH {
+                content = TypedValue::new_pair(TypedValue::Unit, content);
+            }
+            let instr = Instruction::Push(RcTypedValue::new(content));
+            drop(instr);
+        });
+    }
+
+    #[test]
+    fn drop_deeply_nested_lambda_instruction() {
+        // A lexically nested `LAMBDA { LAMBDA { … } }` must drain its body
+        // instructions onto the worklist, not recurse one frame per level.
+        on_kernel_stack(|| {
+            let mut instr = Instruction::Drop(None);
+            for _ in 0..DEPTH {
+                instr = Instruction::Lambda(Lambda::Lambda {
+                    micheline_code: Micheline::Seq(&[]),
+                    code: vec![instr].into(),
+                });
+            }
+            drop(instr);
+        });
+    }
+
+    #[test]
+    fn drop_shared_deeply_nested_lambda_instruction() {
+        // The common runtime case: the lambda body `Rc` is shared (AST
+        // instruction + a pushed lambda value hold the same code). The first
+        // owner to drop hits `Rc::get_mut` == None and skips draining; the
+        // *last* owner finds each body sole-owned and drains it iteratively.
+        // Neither drop may overflow.
+        on_kernel_stack(|| {
+            let mut instr = Instruction::Drop(None);
+            for _ in 0..DEPTH {
+                instr = Instruction::Lambda(Lambda::Lambda {
+                    micheline_code: Micheline::Seq(&[]),
+                    code: vec![instr].into(),
+                });
+            }
+            let shared = instr.clone(); // top code Rc now refcount 2
+            drop(instr); // get_mut == None at the shared level: skipped
+            drop(shared); // last owner: drains iteratively
+        });
+    }
+
+    fn deep_pair(depth: usize) -> TypedValue<'static> {
+        let mut v = TypedValue::Unit;
+        for _ in 0..depth {
+            v = TypedValue::new_pair(TypedValue::Unit, v);
+        }
+        v
+    }
+
+    #[test]
+    fn drain_deep_operation_value() {
+        // An operation carries a `TypedValue` payload (here an EMIT value) that
+        // may be deep; it must be drained, not recurse on the default destructor.
+        on_kernel_stack(|| {
+            let mut tv = TypedValue::Operation(Box::new(OperationInfo {
+                operation: Operation::Emit(Emit {
+                    tag: None,
+                    value: RcTypedValue::new(deep_pair(DEPTH)),
+                    arg_ty: Or::Left(Type::Unit),
+                }),
+                counter: 0,
+            }));
+            drain_deep_typed_value(&mut tv);
+        });
+    }
+
+    #[test]
+    fn drain_deep_bigmap_value() {
+        // A big_map's in-memory values are owned `TypedValue`s that may be deep.
+        on_kernel_stack(|| {
+            let mut map = RedBlackTreeMap::new();
+            map.insert_mut(
+                RcTypedValue::new(TypedValue::Unit),
+                RcTypedValue::new(deep_pair(DEPTH)),
+            );
+            let mut tv = TypedValue::BigMap(BigMap::new(Type::Unit, Type::Unit, map));
+            drain_deep_typed_value(&mut tv);
+        });
+    }
+
+    #[test]
+    fn pack_deep_apply_arg_lambda() {
+        // Unparsing (PACK) a closure with a deep `Closure::Apply` spine must
+        // walk the `Rc<Closure>` chain iteratively, not recurse one frame per
+        // captured level. Each captured arg's unparsing is taken verbatim from
+        // its `cached_unparsed_arg` (built at `APPLY`), so a trivial shared
+        // cache suffices here — the test exercises the spine walk, not the
+        // per-arg unparse.
+        use crate::ast::{Closure, Lambda};
+        on_kernel_stack(|| {
+            let capture = Rc::new(AppliedCapture::new(
+                Type::Unit,
+                RcTypedValue::new(TypedValue::Unit),
+                Micheline::Seq(&[]),
+                Micheline::Seq(&[]),
+                0,
+            ));
+            let mut closure = Closure::Lambda(Lambda::Lambda {
+                micheline_code: Micheline::Seq(&[]),
+                code: Vec::new().into(),
+            });
+            for _ in 0..DEPTH {
+                closure = Closure::Apply {
+                    capture: Rc::clone(&capture),
+                    closure: Rc::new(closure),
+                };
+            }
+            let tv = TypedValue::Lambda(closure);
+            let arena = Arena::new();
+            let mut gas = Gas::unmetered();
+            tv.into_micheline_optimized_legacy(&arena, &mut gas)
+                .unwrap();
+        });
+    }
+}
+
+#[cfg(test)]
+mod drain_owned {
+    //! The set/map counterparts of the [MichelsonList::drain_owned] tests in
+    //! [michelson_list]: the same ownership rule drives the `TV::Set`,
+    //! `TV::Map` and `TV::BigMap` arms of [extract_tv_children].
+    use super::*;
+
+    /// Long enough that a per-element walk is unmistakable against an
+    /// ownership-bounded one.
+    const N: i32 = 10_000;
+
+    fn set(range: std::ops::Range<i32>) -> RedBlackTreeSet<Rc<i32>> {
+        range.map(Rc::new).collect()
+    }
+
+    fn map(range: std::ops::Range<i32>) -> RedBlackTreeMap<Rc<i32>, Rc<i32>> {
+        range.map(|i| (Rc::new(i), Rc::new(-i))).collect()
+    }
+
+    #[test]
+    fn drain_owned_yields_every_element_of_a_sole_owner_set() {
+        assert_eq!(set(0..N).drain_owned().count(), N as usize);
+    }
+
+    #[test]
+    fn drain_owned_yields_every_entry_of_a_sole_owner_map() {
+        assert_eq!(map(0..N).drain_owned().count(), N as usize);
+    }
+
+    /// The elements come out in an unspecified order, but they all come out,
+    /// and each exactly once.
+    #[test]
+    fn drain_owned_yields_the_elements_themselves() {
+        let mut drained: Vec<Rc<i32>> = set(0..3).drain_owned().collect();
+        drained.sort();
+        assert_eq!(drained, vec![Rc::new(0), Rc::new(1), Rc::new(2)]);
+
+        let mut drained: Vec<(Rc<i32>, Rc<i32>)> = map(0..3).drain_owned().collect();
+        drained.sort();
+        assert_eq!(
+            drained,
+            vec![
+                (Rc::new(0), Rc::new(0)),
+                (Rc::new(1), Rc::new(-1)),
+                (Rc::new(2), Rc::new(-2)),
+            ]
+        );
+    }
+
+    #[test]
+    fn drain_owned_yields_nothing_of_a_shared_set() {
+        let s = set(0..N);
+
+        // Required for the test, even if `s` isn't used, we still need to clone
+        // to show shared.drain_owned does not traverse anything
+        #[allow(clippy::redundant_clone)]
+        let shared = s.clone();
+
+        // Nothing is dying: `s` still holds every element.
+        assert_eq!(shared.drain_owned().count(), 0);
+    }
+
+    #[test]
+    fn drain_owned_yields_nothing_of_a_shared_map() {
+        let m = map(0..N);
+
+        #[allow(clippy::redundant_clone)]
+        let shared = m.clone();
+
+        assert_eq!(shared.drain_owned().count(), 0);
+    }
+
+    /// The drop-path property this whole design exists for, in its `DUP;
+    /// UPDATE` shape: inserting into a copy of a shared set only allocates the
+    /// root-to-leaf path it had to rewrite, and every entry hanging off that
+    /// path is still held by the original. So exactly one element — the one
+    /// just inserted — is dying, whatever `N` is. Before `drain_owned` this
+    /// walk visited all `N` of them.
+    #[test]
+    fn drain_owned_of_a_transient_set_does_not_scale_with_size() {
+        let s = set(0..N);
+
+        let mut transient = s.clone();
+        transient.insert_mut(Rc::new(N));
+
+        assert_eq!(transient.drain_owned().count(), 1);
+        assert_eq!(s.size(), N as usize);
+    }
+
+    /// [drain_owned_of_a_transient_set_does_not_scale_with_size] for maps.
+    #[test]
+    fn drain_owned_of_a_transient_map_does_not_scale_with_size() {
+        let m = map(0..N);
+
+        let mut transient = m.clone();
+        transient.insert_mut(Rc::new(N), Rc::new(-N));
+
+        assert_eq!(transient.drain_owned().count(), 1);
+        assert_eq!(m.size(), N as usize);
+    }
+
+    /// The other half of `UPDATE`: removing from a copy of a shared container
+    /// rewrites a path but kills nothing, because the removed entry — like
+    /// every other — is still held by the original.
+    #[test]
+    fn drain_owned_of_a_removal_transient_yields_nothing() {
+        let s = set(0..N);
+        let mut transient = s.clone();
+        assert!(transient.remove_mut(&Rc::new(N / 2)));
+        assert_eq!(transient.drain_owned().count(), 0);
+        assert_eq!(s.size(), N as usize);
+
+        let m = map(0..N);
+        let mut transient = m.clone();
+        assert!(transient.remove_mut(&Rc::new(N / 2)));
+        assert_eq!(transient.drain_owned().count(), 0);
+        assert_eq!(m.size(), N as usize);
+    }
+}
+
+#[cfg(test)]
+mod debug_tests {
+    use super::*;
+
+    /// `Debug` on a deeply nested `Type` must not overflow the WASM kernel's
+    /// 1 MiB call stack, because `TcError` variants embed `Type` via `{0:?}`
+    /// and the kernel formats errors via `err.to_string()` outside MIR's
+    /// gas accounting (see `etherlink/kernel_latest/tezos/src/operation_result.rs:218`).
+    /// We pin a representative depth on an explicit 1 MiB worker thread so
+    /// the test exercises the same budget as the kernel.
+    #[test]
+    fn deeply_nested_type_debug_format() {
+        use std::thread;
+        const DEPTH: usize = 100_000;
+        let join = thread::Builder::new()
+            .stack_size(1024 * 1024)
+            .spawn(|| {
+                let mut deep = Type::Int;
+                for _ in 0..DEPTH {
+                    deep = Type::new_pair(Type::Int, deep);
+                }
+                let formatted = format!("{deep:?}");
+                assert!(formatted.starts_with("Pair("));
+                assert!(formatted.ends_with(')'));
+            })
+            .unwrap();
+        join.join().expect("worker thread completes");
+    }
+
+    /// Same for `TypedValue`: `InterpretError::FailedWith` embeds a value via
+    /// `{1:?}` and a contract emitting `FAILWITH` with a runtime built deep
+    /// pair would otherwise trap the kernel during error formatting.
+    #[test]
+    fn deeply_nested_typed_value_debug_format() {
+        use std::thread;
+        const DEPTH: usize = 100_000;
+        let join = thread::Builder::new()
+            .stack_size(1024 * 1024)
+            .spawn(|| {
+                let mut deep: TypedValue<'_> = TypedValue::Unit;
+                for _ in 0..DEPTH {
+                    deep = TypedValue::Pair(
+                        RcTypedValue::new(TypedValue::Unit),
+                        RcTypedValue::new(deep),
+                    );
+                }
+                let formatted = format!("{deep:?}");
+                assert!(formatted.starts_with("Pair("));
+                assert!(formatted.ends_with(')'));
+                // Drain so the iterative auto Drop on TypedValue (still a
+                // separately tracked follow up) does not overflow the
+                // worker thread.
+                drain_deep_typed_value(&mut deep);
+            })
+            .unwrap();
+        join.join().expect("worker thread completes");
+    }
+}

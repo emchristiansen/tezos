@@ -25,10 +25,10 @@
 
 (** Parameters of the [Daemon.Make] functor. *)
 module type PARAMETERS = sig
-  (** Data to store whether a daemon is running or not. *)
+  (** User-defined read-only data stored when the daemon is created. *)
   type persistent_state
 
-  (** Data to store when a daemon is running. *)
+  (** User-defined read-only data set when the daemon is run and unset when the daemon terminates. *)
   type session_state
 
   (** Basis for the default value for the [?name] argument of [create].
@@ -78,6 +78,7 @@ module Make : functor (X : PARAMETERS) -> sig
      daemon which would be actually running. *)
   type session_status = {
     process : Process.t;
+    stdin : Lwt_io.output_channel;
     session_state : X.session_state;
     mutable event_loop_promise : unit Lwt.t option;
   }
@@ -104,12 +105,19 @@ module Make : functor (X : PARAMETERS) -> sig
     mutable status : status;
     event_pipe : string;
     mutable stdout_handlers : (string -> unit) list;
+    mutable stderr_handlers : (string -> unit) list;
     mutable persistent_event_handlers : (event -> unit) list;
     mutable one_shot_event_handlers : event_handler list String_map.t;
   }
 
   (** Get the name of a daemon. *)
   val name : t -> string
+
+  (** Get the pid of a process, or none if it is not yet running. *)
+  val pid : t -> int option
+
+  (** Get the executable path of the daemon. *)
+  val path : t -> string
 
   (** Send SIGTERM to a daemon and wait for it to terminate.
 
@@ -118,6 +126,12 @@ module Make : functor (X : PARAMETERS) -> sig
 
   (** Send SIGKILL to a daemon and wait for it to terminate. *)
   val kill : t -> unit Lwt.t
+
+  (** Send SIGSTOP to a daemon. *)
+  val stop : t -> unit Lwt.t
+
+  (** Send SIGCONT to a daemon. *)
+  val continue : t -> unit Lwt.t
 
   (** Generate a fresh indentifier based on [X.base_default_name].
       This function ensures that a same name can't be returned twice. *)
@@ -163,13 +177,19 @@ module Make : functor (X : PARAMETERS) -> sig
       None. *)
   val get_event_from_full_event : JSON.t -> event option
 
-  (** Spawn a daemon. *)
+  (** Spawn a daemon.
+
+      If [capture_stderr] is [true] (default to [false]), then functions like
+      {!Process.check_and_read_stderr} or {!Process.check_error} will not work
+      as expected with the process of the daemon (as stored in its
+      [session_status]). *)
   val run :
     ?env:string String_map.t ->
     ?runner:Runner.t ->
     ?on_terminate:(Unix.process_status -> unit Lwt.t) ->
     ?event_level:Level.default_level ->
     ?event_sections_levels:(string * Level.level) list ->
+    ?capture_stderr:bool ->
     t ->
     X.session_state ->
     string list ->
@@ -196,13 +216,20 @@ module Make : functor (X : PARAMETERS) -> sig
       if the daemon terminates. It should describe the constraint that [filter] applies,
       such as ["field level exists"].
 
+      If [timeout] is provided, stop waiting if [timeout] seconds have passed.
+
       It is advised to register such event handlers before starting the daemon,
       as if they occur before being registered, they will not trigger your handler.
       For instance, you can define a promise with
       [let x_event = wait_for daemon "x" (fun x -> Some x)]
       and bind it later with [let* x = x_event]. *)
   val wait_for_full :
-    ?where:string -> t -> string -> (JSON.t -> 'a option) -> 'a Lwt.t
+    ?timeout:float ->
+    ?where:string ->
+    t ->
+    string ->
+    (JSON.t -> 'a option) ->
+    'a Lwt.t
 
   (** Same as [wait_for_full] but ignore metadata from the file descriptor sink.
 
@@ -214,7 +241,12 @@ module Make : functor (X : PARAMETERS) -> sig
       ignored. See [wait_for_full] to know what the JSON value must
       look like. *)
   val wait_for :
-    ?where:string -> t -> string -> (JSON.t -> 'a option) -> 'a Lwt.t
+    ?timeout:float ->
+    ?where:string ->
+    t ->
+    string ->
+    (JSON.t -> 'a option) ->
+    'a Lwt.t
 
   (** Add a callback to be called whenever the daemon emits an event.
 
@@ -225,13 +257,36 @@ module Make : functor (X : PARAMETERS) -> sig
       the order in which they trigger is unspecified. *)
   val on_event : t -> (event -> unit) -> unit
 
+  (** Add a callback to be called whenever the daemon prints to its stdout.
+
+      Contrary to [wait_for] functions, this callback is never removed.
+
+      Listening to events with [on_stdout] will not prevent [wait_for] promises
+      to be fulfilled. You can also have multiple [on_stdout] handlers,
+      although the order in which they trigger is unspecified. *)
   val on_stdout : t -> (string -> unit) -> unit
+
+  (** Add a callback to be called whenever the daemon prints to its stderr.
+      {!run} must have been called with [capture_stderr] flag set to true,
+      to call callbacks registered this way.
+
+      Contrary to [wait_for] functions, this callback is never removed.
+
+      Listening to events with [on_stderr] will not prevent [wait_for] promises
+      to be fulfilled. You can also have multiple [on_stderr] handlers,
+      although the order in which they trigger is unspecified. *)
+  val on_stderr : t -> (string -> unit) -> unit
 
   (** Register an event handler that logs all events.
 
       Use this when you need to debug or reverse engineer incoming events.
-      Usually you do not want to keep that in the final versions of your tests. *)
-  val log_events : t -> unit
+      Usually you do not want to keep that in the final versions of your tests.
+
+      The [max_length] optional parameter can be used to limit the
+      length of the output of each event; outputs longer than the
+      limit are truncated at the limit and "[...]" is appended to
+      them to mark the truncation. *)
+  val log_events : ?max_length:int -> t -> unit
 
   (** Values returned by {!memory_consumption}. *)
   type observe_memory_consumption = Observe of (unit -> int option Lwt.t)

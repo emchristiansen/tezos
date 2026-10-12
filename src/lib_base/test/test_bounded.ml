@@ -26,7 +26,8 @@
 (* Testing
    -------
    Component:    Base
-   Invocation:   dune exec src/lib_base/test/test_bounded.exe
+   Invocation:   dune exec src/lib_base/test/main.exe \
+                  -- --file test_bounded.ml
    Subject:      Test the [Bounded] module.
 *)
 
@@ -419,6 +420,7 @@ let int32_checks =
 
 let () =
   Alcotest.run
+    ~__FILE__
     "Bounded"
     [
       ("Int32", int32_checks);

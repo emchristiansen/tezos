@@ -23,6 +23,14 @@
 (*                                                                           *)
 (*****************************************************************************)
 
+(* Testing
+   -------
+   Component:    Lazy containers
+   Invocation:   dune exec src/lib_lazy_containers/test/main.exe \
+                  -- --file lazy_vector_tests.ml
+   Subject:      Test lazy vector
+*)
+
 open QCheck_alcotest
 open QCheck2
 open Lazy_vector
@@ -196,7 +204,7 @@ let drop_works =
              && check_dropped_equal_popped)
            (function
              | Bounds -> Lwt.return (IntVector.num_elements map = 0)
-             | _ -> Lwt.return false))
+             | _ -> Lwt.return_false))
 
 let check_overflow () =
   let open Lwt.Syntax in
@@ -205,7 +213,7 @@ let check_overflow () =
       (fun () ->
         let+ () = f () in
         failwith "This test should have overflown, but didn't.")
-      (function SizeOverflow -> Lwt.return_unit | exn -> raise exn)
+      (function SizeOverflow -> Lwt.return_unit | exn -> Lwt.reraise exn)
   in
   (* Creates a vector of the maximum size possible (2^63) *)
   let v = IntVector.create (-1) in
@@ -247,4 +255,4 @@ let tests =
     ("check size overflow", `Quick, check_overflow);
   ]
 
-let () = Alcotest.run "Lazy structs tests" [("Lazy_vector", tests)]
+let () = Alcotest.run ~__FILE__ "Lazy structs tests" [("Lazy_vector", tests)]

@@ -24,6 +24,14 @@
 (*                                                                           *)
 (*****************************************************************************)
 
+(** Testing
+    _______
+
+    Component: Store
+    Invocation: dune exec src/lib_store/unix/test/main.exe -- --match history_mode_switch
+    Subject: Store tests ( history_mode_switch )
+*)
+
 open Test_utils
 open History_mode
 
@@ -42,7 +50,9 @@ let expected_savepoint chain_store current_head blocks_per_cycle ~previous_mode
   let* current_head_metadata =
     Store.Block.get_block_metadata chain_store current_head
   in
-  let head_lafl = Store.Block.last_allowed_fork_level current_head_metadata in
+  let head_lpbl =
+    Store.Block.last_preserved_block_level current_head_metadata
+  in
   let max_op_ttl = Store.Block.max_operations_ttl current_head_metadata in
   match target_mode with
   | Archive when previous_mode <> Archive ->
@@ -58,7 +68,7 @@ let expected_savepoint chain_store current_head blocks_per_cycle ~previous_mode
           (* We can comply to every mode *)
           (* The preserved_level is the level to be kept to be able to
              export snapshots.*)
-          let preserved_level = Int32.(sub head_lafl (of_int max_op_ttl)) in
+          let preserved_level = Int32.(sub head_lpbl (of_int max_op_ttl)) in
           let target_offset_window =
             Int32.(mul blocks_per_cycle (of_int target_offset))
           in
@@ -66,7 +76,7 @@ let expected_savepoint chain_store current_head blocks_per_cycle ~previous_mode
              offset. We take the succ to be on a block of the end of a
              cycle. *)
           let expected_savepoint =
-            Int32.(succ (sub head_lafl target_offset_window))
+            Int32.(succ (sub head_lpbl target_offset_window))
           in
           let preserved_savepoint = min preserved_level expected_savepoint in
           return (max 0l preserved_savepoint)
@@ -78,7 +88,7 @@ let expected_savepoint chain_store current_head blocks_per_cycle ~previous_mode
               .offset
           in
           (* We are limited by the previous savepoint available *)
-          let preserved_level = Int32.(sub head_lafl (of_int max_op_ttl)) in
+          let preserved_level = Int32.(sub head_lpbl (of_int max_op_ttl)) in
           let target_offset_window =
             Int32.(mul blocks_per_cycle (of_int target_offset))
           in
@@ -86,7 +96,7 @@ let expected_savepoint chain_store current_head blocks_per_cycle ~previous_mode
             Int32.(mul blocks_per_cycle (of_int previous_offset))
           in
           let expected_savepoint =
-            Int32.(succ (sub head_lafl target_offset_window))
+            Int32.(succ (sub head_lpbl target_offset_window))
           in
           let preserved_savepoint = min preserved_level expected_savepoint in
           (* The available savepoint is the savepoint available in the
@@ -98,7 +108,7 @@ let expected_savepoint chain_store current_head blocks_per_cycle ~previous_mode
                 0l
                 (min
                    preserved_level
-                   (succ (sub head_lafl previous_offset_window))))
+                   (succ (sub head_lpbl previous_offset_window))))
           in
           return (max available_savepoint preserved_savepoint)
       | Rolling _ -> invalid_history_mode_switch ~previous_mode ~target_mode)
@@ -110,12 +120,12 @@ let expected_savepoint chain_store current_head blocks_per_cycle ~previous_mode
       match previous_mode with
       | Archive ->
           (* We can comply to every mode *)
-          let preserved_level = Int32.(sub head_lafl (of_int max_op_ttl)) in
+          let preserved_level = Int32.(sub head_lpbl (of_int max_op_ttl)) in
           let target_offset_window =
             Int32.(mul blocks_per_cycle (of_int target_offset))
           in
           let expected_savepoint =
-            Int32.(succ (sub head_lafl target_offset_window))
+            Int32.(succ (sub head_lpbl target_offset_window))
           in
           let preserved_savepoint = min preserved_level expected_savepoint in
           return (max 0l preserved_savepoint)
@@ -127,7 +137,7 @@ let expected_savepoint chain_store current_head blocks_per_cycle ~previous_mode
               .offset
           in
           (* We are limited by the previous savepoint available *)
-          let preserved_level = Int32.(sub head_lafl (of_int max_op_ttl)) in
+          let preserved_level = Int32.(sub head_lpbl (of_int max_op_ttl)) in
           let target_offset_window =
             Int32.(mul blocks_per_cycle (of_int target_offset))
           in
@@ -135,7 +145,7 @@ let expected_savepoint chain_store current_head blocks_per_cycle ~previous_mode
             Int32.(mul blocks_per_cycle (of_int previous_offset))
           in
           let expected_savepoint =
-            Int32.(succ (sub head_lafl target_offset_window))
+            Int32.(succ (sub head_lpbl target_offset_window))
           in
           let preserved_savepoint = min preserved_level expected_savepoint in
           let available_savepoint =
@@ -144,7 +154,7 @@ let expected_savepoint chain_store current_head blocks_per_cycle ~previous_mode
                 0l
                 (min
                    preserved_level
-                   (succ (sub head_lafl previous_offset_window))))
+                   (succ (sub head_lpbl previous_offset_window))))
           in
           return (max available_savepoint preserved_savepoint)
       | Rolling offset ->
@@ -155,7 +165,7 @@ let expected_savepoint chain_store current_head blocks_per_cycle ~previous_mode
               .offset
           in
           (* We are limited by the previous savepoint available *)
-          let preserved_level = Int32.(sub head_lafl (of_int max_op_ttl)) in
+          let preserved_level = Int32.(sub head_lpbl (of_int max_op_ttl)) in
           let target_offset_window =
             Int32.(mul blocks_per_cycle (of_int target_offset))
           in
@@ -163,7 +173,7 @@ let expected_savepoint chain_store current_head blocks_per_cycle ~previous_mode
             Int32.(mul blocks_per_cycle (of_int previous_offset))
           in
           let expected_savepoint =
-            Int32.(succ (sub head_lafl target_offset_window))
+            Int32.(succ (sub head_lpbl target_offset_window))
           in
           let preserved_savepoint = min preserved_level expected_savepoint in
           let available_savepoint =
@@ -172,7 +182,7 @@ let expected_savepoint chain_store current_head blocks_per_cycle ~previous_mode
                 0l
                 (min
                    preserved_level
-                   (succ (sub head_lafl previous_offset_window))))
+                   (succ (sub head_lpbl previous_offset_window))))
           in
           return (max available_savepoint preserved_savepoint))
 
@@ -194,11 +204,11 @@ let expected_caboose chain_store current_head blocks_per_cycle ~previous_mode
           let* current_head_metadata =
             Store.Block.get_block_metadata chain_store current_head
           in
-          let head_lafl =
-            Store.Block.last_allowed_fork_level current_head_metadata
+          let head_lpbl =
+            Store.Block.last_preserved_block_level current_head_metadata
           in
           let offset_window =
-            Int32.(sub head_lafl (mul blocks_per_cycle (of_int target_offset)))
+            Int32.(sub head_lpbl (mul blocks_per_cycle (of_int target_offset)))
           in
           let expected_caboose =
             (* When the offset window exceeds the savepoint, we take the
@@ -309,7 +319,7 @@ let check_consistency_after_switch descr chain_store ~previous_mode ~target_mode
   | p, n when History_mode.equal p n -> return_unit
   | _ -> assert false
 
-let test ~test_descr ~from_hm ~to_hm ~nb_blocks_to_bake (store_dir, context_dir)
+let test ~test_descr ~from_hm ~to_hm ~nb_blocks_to_bake (store_dir, data_dir)
     store ~patch_context =
   let open Lwt_result_syntax in
   let chain_store = Store.main_chain_store store in
@@ -328,7 +338,7 @@ let test ~test_descr ~from_hm ~to_hm ~nb_blocks_to_bake (store_dir, context_dir)
         let* () =
           Store.may_switch_history_mode
             ~store_dir
-            ~context_dir
+            ~data_dir
             genesis
             ~new_history_mode:to_hm
         in
@@ -355,7 +365,7 @@ let test ~test_descr ~from_hm ~to_hm ~nb_blocks_to_bake (store_dir, context_dir)
         ~history_mode:to_hm
         ~patch_context
         ~store_dir
-        ~context_dir
+        ~data_dir
         ~allow_testchains:false
         genesis
     in
@@ -377,32 +387,34 @@ let make_tests speed parameters =
       ~json:(Default_parameters.json_of_parameters parameters)
   in
   let history_modes =
-    match speed with
-    | `Slow ->
-        [
-          Archive;
-          Full (Some {offset = 0});
-          Full (Some {offset = 3});
-          default_full;
-          Full (Some {offset = 7});
-          Full (Some {offset = 10});
-          Rolling (Some {offset = 0});
-          Rolling (Some {offset = 3});
-          default_rolling;
-          Rolling (Some {offset = 7});
-          Rolling (Some {offset = 10});
-          default;
-        ]
-    | `Quick ->
-        [
-          Archive;
-          Full (Some {offset = 0});
-          default_full;
-          Rolling (Some {offset = 0});
-          default_rolling;
-          Full (Some {offset = 5});
-          Rolling (Some {offset = 5});
-        ]
+    List.sort_uniq
+      compare
+      (match speed with
+      | `Slow ->
+          [
+            Archive;
+            Full (Some {offset = 0});
+            Full (Some {offset = 3});
+            default_full;
+            Full (Some {offset = 7});
+            Full (Some {offset = 10});
+            Rolling (Some {offset = 0});
+            Rolling (Some {offset = 3});
+            default_rolling;
+            Rolling (Some {offset = 7});
+            Rolling (Some {offset = 10});
+            default;
+          ]
+      | `Quick ->
+          [
+            Archive;
+            Full (Some {offset = 0});
+            default_full;
+            Rolling (Some {offset = 0});
+            default_rolling;
+            Full (Some {offset = 5});
+            Rolling (Some {offset = 5});
+          ])
   in
   let blocks_per_cycle = parameters.constants.blocks_per_cycle in
   let nb_blocks_to_bake = [9 * Int32.to_int blocks_per_cycle] in
@@ -424,6 +436,7 @@ let make_tests speed parameters =
       in
       Some
         (wrap_simple_store_init_test
+           ~speed
            ~with_gc:true
            ~keep_dir:false
            ~history_mode:from_hm
@@ -440,7 +453,7 @@ let make_tests speed parameters =
                  store )))
     permutations
 
-let make_test_drag _speed parameters =
+let make_test_drag speed parameters =
   let patch_context ctxt =
     Alpha_utils.patch_context
       ctxt
@@ -451,6 +464,7 @@ let make_test_drag _speed parameters =
   let test_descr = "Check savepoint drag with cycles bigger that max_op_ttl" in
   let from_hm = default_full in
   wrap_simple_store_init_test
+    ~speed
     ~with_gc:true
     ~keep_dir:false
     ~history_mode:from_hm

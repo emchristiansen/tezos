@@ -23,6 +23,14 @@
 (*                                                                           *)
 (*****************************************************************************)
 
+(* Testing
+   -------
+   Component:    Stdlib
+   Invocation:   dune exec src/lib_lwt_result_stdlib/test/main.exe \
+                  -- --file test_list_basic_lwt.ml
+   Subject:      Test basic properties of lwt list
+*)
+
 open Support.Lib.Monad
 
 let assert_eq_s pa pb =
@@ -312,7 +320,7 @@ module Fold = struct
         list
     in
     assert (Lwt.state p = Lwt.Fail Exit) ;
-    Lwt.return ()
+    Lwt.return_unit
 
   let test_fold_left_map_es _ () =
     let open Lwt_syntax in
@@ -345,6 +353,7 @@ end
 
 let () =
   Alcotest_lwt.run
+    ~__FILE__
     "list-basic-lwt"
     [
       ("init", Init.tests);

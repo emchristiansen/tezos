@@ -3,7 +3,7 @@
 (* Open Source License                                                       *)
 (* Copyright (c) 2018 Nomadic Development. <contact@tezcore.com>             *)
 (* Copyright (c) 2021-2022 Nomadic Labs, <contact@nomadic-labs.com>          *)
-(* Copyright (c) 2022 TriliTech <contact@trili.tech>                         *)
+(* Copyright (c) 2022-2024 TriliTech <contact@trili.tech>                    *)
 (*                                                                           *)
 (* Permission is hereby granted, free of charge, to any person obtaining a   *)
 (* copy of this software and associated documentation files (the "Software"),*)
@@ -28,5 +28,20 @@
 module Mempool = Mempool
 module View_helpers = View_helpers
 module RPC = RPC
+module Contract_services = Contract_services
+module Constants_services = Constants_services
+module Delegate_services = Delegate_services
+module Voting_services = Voting_services
+module Sapling_services = Sapling_services
+module Adaptive_issuance_services = Adaptive_issuance_services
 module Metrics = Metrics_plugin
 module Script_interpreter_logging = Script_interpreter_logging
+module Http_cache_headers = Http_cache_headers
+module Shell_helpers = Shell_helpers
+module Block_validation = Block_validation
+
+module Alpha_services = struct
+  include Alpha_services
+  module Contract = Contract_services
+  module Delegate = Delegate_services
+end

@@ -7,7 +7,7 @@ emitted operations
 big_map diff
   
 trace
-  - location: 25 (just consumed gas: 25.562)
+  - location: 25 (just consumed gas: 24.814)
     [ (Pair (Pair 10 0) None None None None) ]
   - location: 25 (just consumed gas: 0.010)
     [ (Pair 10 0) ]
@@ -22,17 +22,17 @@ trace
     [ 10
       0
       (Pair 10 0) ]
-  - location: 29 (just consumed gas: 0)
+  - location: 29 (just consumed gas: 0.010)
     [ 0
       (Pair 10 0) ]
   - location: 31 (just consumed gas: 0.020)
     [ 0
       (Pair 10 0) ]
-  - location: 29 (just consumed gas: 0.025)
+  - location: 29 (just consumed gas: 0.035)
     [ 10
       0
       (Pair 10 0) ]
-  - location: 32 (just consumed gas: 0.105)
+  - location: 32 (just consumed gas: 0.163)
     [ None
       (Pair 10 0) ]
   - location: 33 (just consumed gas: 0.010)
@@ -52,7 +52,7 @@ trace
       0
       (Pair 10 0)
       None ]
-  - location: 37 (just consumed gas: 0.105)
+  - location: 37 (just consumed gas: 0.163)
     [ None
       (Pair 10 0)
       None ]
@@ -71,7 +71,7 @@ trace
       (Pair 10 0)
       None
       None ]
-  - location: 41 (just consumed gas: 0)
+  - location: 41 (just consumed gas: 0.010)
     [ 0
       (Pair 10 0)
       None
@@ -81,13 +81,13 @@ trace
       (Pair 10 0)
       None
       None ]
-  - location: 41 (just consumed gas: 0.025)
+  - location: 41 (just consumed gas: 0.035)
     [ 10
       0
       (Pair 10 0)
       None
       None ]
-  - location: 44 (just consumed gas: 0.105)
+  - location: 44 (just consumed gas: 0.163)
     [ None
       (Pair 10 0)
       None
@@ -103,33 +103,26 @@ trace
       None
       None
       None ]
-  - location: 47 (just consumed gas: 0.105)
+  - location: 47 (just consumed gas: 0.163)
     [ None
       None
       None
       None ]
-  - location: 49 (just consumed gas: 0)
+  - location: 49 (just consumed gas: 0.023)
     [ None
       None ]
   - location: 52 (just consumed gas: 0.010)
     [ (Pair None None) ]
-  - location: 49 (just consumed gas: 0.025)
-    [ None
-      (Pair None None) ]
-  - location: 49 (just consumed gas: 0.010)
+  - location: 49 (just consumed gas: 0.045)
     [ None
       None
       (Pair None None) ]
-  - location: 49 (just consumed gas: 0)
-    [ None
-      None
-      (Pair None None) ]
-  - location: 53 (just consumed gas: 0)
+  - location: 53 (just consumed gas: 0.010)
     [ None
       (Pair None None) ]
   - location: 55 (just consumed gas: 0.010)
     [ (Pair None None None) ]
-  - location: 53 (just consumed gas: 0.025)
+  - location: 53 (just consumed gas: 0.035)
     [ None
       (Pair None None None) ]
   - location: 56 (just consumed gas: 0.010)

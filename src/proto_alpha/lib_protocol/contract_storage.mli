@@ -28,7 +28,8 @@
 
 type error +=
   | (* `Temporary *)
-      Balance_too_low of Contract_repr.t * Tez_repr.t * Tez_repr.t
+      Balance_too_low of
+      Contract_repr.t * Tez_repr.t * Tez_repr.t
   | (* `Temporary *)
       Counter_in_the_past of {
       contract : Contract_repr.t;
@@ -42,16 +43,18 @@ type error +=
       found : Manager_counter_repr.t;
     }
   | (* `Temporary *)
-      Non_existing_contract of Contract_repr.t
+      Non_existing_contract of
+      Contract_repr.t
   | (* `Permanent *)
       Inconsistent_public_key of
       Signature.Public_key.t * Signature.Public_key.t
   | (* `Permanent *) Failure of string
   | (* `Branch *)
-      Empty_implicit_contract of Signature.Public_key_hash.t
+      Empty_implicit_contract of
+      Implicit_account_repr.t
   | (* `Branch *)
       Empty_implicit_delegated_contract of
-      Signature.Public_key_hash.t
+      Implicit_account_repr.t
 
 (** [allocated ctxt contract] returns [true] if and only if the
    contract is stored in {!Storage.Contract.Spendable_balance}. *)
@@ -77,16 +80,14 @@ val must_exist : Raw_context.t -> Contract_repr.t -> unit tzresult Lwt.t
    contract is implicit. *)
 val must_be_allocated : Raw_context.t -> Contract_repr.t -> unit tzresult Lwt.t
 
-val list : Raw_context.t -> Contract_repr.t list Lwt.t
-
 val check_counter_increment :
   Raw_context.t ->
-  Signature.Public_key_hash.t ->
+  Implicit_account_repr.t ->
   Manager_counter_repr.t ->
   unit tzresult Lwt.t
 
 val increment_counter :
-  Raw_context.t -> Signature.Public_key_hash.t -> Raw_context.t tzresult Lwt.t
+  Raw_context.t -> Implicit_account_repr.t -> Raw_context.t tzresult Lwt.t
 
 (** [get_balance ctxt contract] returns the balance of spendable tez owned by
     [contract] given raw context [ctxt]. This does not include the contract's
@@ -107,22 +108,22 @@ val get_balance_carbonated :
     This function is a fusion of {!must_be_allocated} and
     {!get_balance} for Implicit contracts exclusively. *)
 val check_allocated_and_get_balance :
-  Raw_context.t -> Signature.public_key_hash -> Tez_repr.t tzresult Lwt.t
+  Raw_context.t -> Implicit_account_repr.t -> Tez_repr.t tzresult Lwt.t
 
 val get_counter :
   Raw_context.t ->
-  Signature.Public_key_hash.t ->
+  Implicit_account_repr.t ->
   Manager_counter_repr.t tzresult Lwt.t
 
 val get_script_code :
   Raw_context.t ->
   Contract_hash.t ->
-  (Raw_context.t * Script_repr.lazy_expr option) tzresult Lwt.t
+  (Raw_context.t * Contract_kind_repr.implementation_kind option) tzresult Lwt.t
 
 val get_script :
   Raw_context.t ->
   Contract_hash.t ->
-  (Raw_context.t * Script_repr.t option) tzresult Lwt.t
+  (Raw_context.t * Contract_kind_repr.originated_kind option) tzresult Lwt.t
 
 val get_storage :
   Raw_context.t ->
@@ -182,6 +183,12 @@ val raw_originate :
   script:Script_repr.t * Lazy_storage_diff.diffs option ->
   Raw_context.t tzresult Lwt.t
 
+val native_originate :
+  Raw_context.t ->
+  Contract_hash.t ->
+  script:Script_native_repr.with_storage * Lazy_storage_diff.diffs option ->
+  (Raw_context.t, error trace) result Lwt.t
+
 val fresh_contract_from_current_nonce :
   Raw_context.t -> (Raw_context.t * Contract_hash.t) tzresult
 
@@ -208,16 +215,6 @@ val increase_paid_storage :
   Contract_hash.t ->
   amount_in_bytes:Z.t ->
   Raw_context.t tzresult Lwt.t
-
-(** Increases the balance of a contract. Calling this function directly may
-    break important invariants. Consider calling [credit] instead. *)
-val increase_balance_only_call_from_token :
-  Raw_context.t -> Contract_repr.t -> Tez_repr.t -> Raw_context.t tzresult Lwt.t
-
-(** Decreases the balance of a contract. Calling this function directly may
-    break important invariants. Consider calling [spend] instead. *)
-val decrease_balance_only_call_from_token :
-  Raw_context.t -> Contract_repr.t -> Tez_repr.t -> Raw_context.t tzresult Lwt.t
 
 (** [get_balance_and_frozen_bonds ctxt contract] returns the sum of the
     (spendable) balance and the frozen bonds associated to [contract]. *)
@@ -333,5 +330,30 @@ val simulate_spending :
   Raw_context.t ->
   balance:Tez_repr.t ->
   amount:Tez_repr.t ->
-  Signature.public_key_hash ->
+  Implicit_account_repr.t ->
   (Tez_repr.t * bool) tzresult Lwt.t
+
+val get_total_supply : Raw_context.t -> Tez_repr.t tzresult Lwt.t
+
+module For_RPC : sig
+  val list : Raw_context.t -> Contract_repr.t list Lwt.t
+
+  val fold :
+    Raw_context.t ->
+    order:[`Sorted | `Undefined] ->
+    init:'a ->
+    f:(Contract_repr.t -> 'a -> 'a Lwt.t) ->
+    'a Lwt.t
+
+  val get_staked_balance :
+    Raw_context.t -> Contract_repr.t -> Tez_repr.t option tzresult Lwt.t
+
+  val get_unstaked_frozen_balance :
+    Raw_context.t -> Contract_repr.t -> Tez_repr.t option tzresult Lwt.t
+
+  val get_unstaked_finalizable_balance :
+    Raw_context.t -> Contract_repr.t -> Tez_repr.t option tzresult Lwt.t
+
+  val get_full_balance :
+    Raw_context.t -> Contract_repr.t -> Tez_repr.t tzresult Lwt.t
+end

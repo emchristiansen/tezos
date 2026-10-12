@@ -3,10 +3,10 @@
 
 (library
  (name tezos_protocol_environment_sigs)
- (public_name tezos-protocol-environment.sigs)
+ (public_name octez-proto-libs.protocol-environment.sigs)
  (instrumentation (backend bisect_ppx))
  (libraries
-  tezos-protocol-environment.sigs-internals)
+  octez-proto-libs.protocol-environment.sigs-internals)
  (flags
   (:standard)
   -nostdlib
@@ -81,3 +81,75 @@
  (deps v9.in.ml (glob_files v9/*.mli))
  (action
   (with-stdout-to %{targets} (run %{dep:../ppinclude/ppinclude.exe} v9.in.ml))))
+
+(rule
+ (targets v10.ml)
+ (mode promote)
+ (deps v10.in.ml (glob_files v10/*.mli))
+ (action
+  (with-stdout-to
+   %{targets}
+   (run %{dep:../ppinclude/ppinclude.exe} v10.in.ml))))
+
+(rule
+ (targets v11.ml)
+ (mode promote)
+ (deps v11.in.ml (glob_files v11/*.mli))
+ (action
+  (with-stdout-to
+   %{targets}
+   (run %{dep:../ppinclude/ppinclude.exe} v11.in.ml))))
+
+(rule
+ (targets v12.ml)
+ (mode promote)
+ (deps v12.in.ml (glob_files v12/*.mli))
+ (action
+  (with-stdout-to
+   %{targets}
+   (run %{dep:../ppinclude/ppinclude.exe} v12.in.ml))))
+
+(rule
+ (targets v13.ml)
+ (mode promote)
+ (deps v13.in.ml (glob_files v13/*.mli))
+ (action
+  (with-stdout-to
+   %{targets}
+   (run %{dep:../ppinclude/ppinclude.exe} v13.in.ml))))
+
+(rule
+ (targets v14.ml)
+ (mode promote)
+ (deps v14.in.ml (glob_files v14/*.mli))
+ (action
+  (with-stdout-to
+   %{targets}
+   (run %{dep:../ppinclude/ppinclude.exe} v14.in.ml))))
+
+(rule
+ (targets v15.ml)
+ (mode promote)
+ (deps v15.in.ml (glob_files v15/*.mli))
+ (action
+  (with-stdout-to
+   %{targets}
+   (run %{dep:../ppinclude/ppinclude.exe} v15.in.ml))))
+
+(rule
+ (targets v16.ml)
+ (mode promote)
+ (deps v16.in.ml (glob_files v16/*.mli))
+ (action
+  (with-stdout-to
+   %{targets}
+   (run %{dep:../ppinclude/ppinclude.exe} v16.in.ml))))
+
+(rule
+ (targets v17.ml)
+ (mode promote)
+ (deps v17.in.ml (glob_files v17/*.mli))
+ (action
+  (with-stdout-to
+   %{targets}
+   (run %{dep:../ppinclude/ppinclude.exe} v17.in.ml))))

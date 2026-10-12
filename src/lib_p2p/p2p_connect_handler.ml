@@ -26,6 +26,24 @@
 
 module Events = P2p_events.P2p_connect_handler
 
+type maintenance_bounds = {
+  min_threshold : int;
+  min_target : int;
+  max_target : int;
+  max_threshold : int;
+}
+
+let make_maintenance_bounds ~min ~expected ~max =
+  assert (min <= expected) ;
+  assert (expected <= max) ;
+  let step_min = (expected - min) / 3 and step_max = (max - expected) / 3 in
+  {
+    min_threshold = min + step_min;
+    min_target = min + (2 * step_min);
+    max_target = max - (2 * step_max);
+    max_threshold = max - step_max;
+  }
+
 type config = {
   incoming_app_message_queue_size : int option;
   private_mode : bool;
@@ -42,6 +60,7 @@ type config = {
   proof_of_work_target : Tezos_crypto.Crypto_box.pow_target;
   listening_port : P2p_addr.port option;
   advertised_port : P2p_addr.port option;
+  disable_peer_discovery : bool;
 }
 
 type ('msg, 'peer_meta, 'conn_meta) dependencies = {
@@ -59,9 +78,7 @@ type ('msg, 'peer_meta, 'conn_meta) dependencies = {
     ('msg, 'peer_meta, 'conn_meta) P2p_conn.t P2p_point_state.Info.t -> bool;
       (** [P2p_point_state.Info.trusted] *)
   fd_connect :
-    P2p_fd.t ->
-    Unix.sockaddr ->
-    (unit, [`Unexpected_error of exn | `Connection_refused]) result Lwt.t;
+    P2p_fd.t -> Unix.sockaddr -> (unit, P2p_fd.connect_error) result Lwt.t;
       (** [P2p_fd.connect] *)
   socket_authenticate :
     canceler:Lwt_canceler.t ->
@@ -103,12 +120,16 @@ type ('msg, 'peer_meta, 'conn_meta) t = {
   incoming : Lwt_canceler.t P2p_point.Table.t;
   mutable new_connection_hook :
     (P2p_peer.Id.t -> ('msg, 'peer_meta, 'conn_meta) P2p_conn.t -> unit) list;
+  mutable disconnection_hook : (P2p_peer.Id.t -> unit) list;
   answerer : 'msg P2p_answerer.t Lazy.t;
   dependencies : ('msg, 'peer_meta, 'conn_meta) dependencies;
+  maintenance_bounds : maintenance_bounds;
+  connections_threshold : int;
 }
 
 let create ?(p2p_versions = P2p_version.supported) config pool message_config
-    conn_meta_config io_sched triggers ~log ~answerer =
+    conn_meta_config io_sched triggers ~log ~answerer ~maintenance_bounds
+    ~maintenance_active =
   let dependencies =
     {
       pool_greylist_peer = P2p_pool.greylist_peer;
@@ -135,35 +156,57 @@ let create ?(p2p_versions = P2p_version.supported) config pool message_config
     encoding = P2p_message.encoding message_config.P2p_params.encoding;
     triggers;
     new_connection_hook = [];
+    disconnection_hook = [];
     log;
     pool;
     answerer;
     dependencies;
+    maintenance_bounds;
+    (* [connections_threshold] is defined depending on the maintenance status.
+       If the maintenance is running, we reject a connection if [max_threshold]
+       is reached. This threshold that is lower than [max_connection] allows to
+       be in sync with maintenance behaviour. If no maintenance is running,
+       [max_connection] is used to avoid unexpected bounds. *)
+    connections_threshold =
+      (if maintenance_active then maintenance_bounds.max_threshold
+       else config.max_connections);
   }
 
 let config t = t.config
 
+let get_pool t = t.pool
+
+let maintenance_bounds t = t.maintenance_bounds
+
 let create_connection t p2p_conn id_point point_info peer_info
     negotiated_version =
-  let open Lwt_syntax in
+  let open Lwt_result_syntax in
   let peer_id = P2p_peer_state.Info.peer_id peer_info in
   let canceler = Lwt_canceler.create () in
   let bound =
     Option.map
       (fun qs ->
         ( qs,
-          fun (size, _) ->
-            (Sys.word_size / 8 * 11)
-            + size + Lwt_pipe.Maybe_bounded.push_overhead ))
+          (* The size function returns 1 for every message, making [qs] a cap on
+             the number of decoded application messages buffered per connection
+             (rather than a byte budget). This provides simple, predictable
+             back-pressure: once [qs] messages are queued and waiting to be
+             consumed by the shell, the reader loop stalls until the shell
+             drains the pipe. *)
+          fun _ -> 1 ))
       t.config.incoming_app_message_queue_size
   in
   let messages = Lwt_pipe.Maybe_bounded.create ?bound () in
-  let greylister () =
-    t.dependencies.pool_greylist_peer
-      t.pool
-      (P2p_peer_state.Info.peer_id peer_info)
+  let greylister ~motive =
+    let*! () =
+      Events.(emit greylist) (peer_id, fst id_point, snd id_point, motive)
+    in
+    Lwt.return
+      (t.dependencies.pool_greylist_peer
+         t.pool
+         (P2p_peer_state.Info.peer_id peer_info))
   in
-  let conn =
+  let* conn =
     P2p_conn.create
       ~conn:p2p_conn
       ~point_info
@@ -172,6 +215,7 @@ let create_connection t p2p_conn id_point point_info peer_info
       ~canceler
       ~greylister
       ~callback:(Lazy.force t.answerer)
+      ~disable_peer_discovery:t.config.disable_peer_discovery
       negotiated_version
   in
   let conn_meta = P2p_socket.remote_metadata p2p_conn in
@@ -187,7 +231,7 @@ let create_connection t p2p_conn id_point point_info peer_info
   P2p_pool.Peers.add_connected t.pool peer_id peer_info ;
   P2p_trigger.broadcast_new_connection t.triggers ;
   Lwt_canceler.on_cancel canceler (fun () ->
-      let* () = Events.(emit disconnected) (peer_id, id_point) in
+      let*! () = Events.(emit disconnected) (peer_id, id_point) in
       let timestamp = Time.System.now () in
       Option.iter
         (P2p_point_state.set_disconnected
@@ -196,11 +240,12 @@ let create_connection t p2p_conn id_point point_info peer_info
         point_info ;
       t.log (Disconnection peer_id) ;
       P2p_peer_state.set_disconnected ~timestamp peer_info ;
+      List.iter (fun f -> f peer_id) t.disconnection_hook ;
       Option.iter
         (fun point_info -> P2p_pool.Points.remove_connected t.pool point_info)
         point_info ;
       P2p_pool.Peers.remove_connected t.pool peer_id ;
-      let* () =
+      let*! () =
         if P2p_pool.active_connections t.pool < t.config.min_connections then (
           P2p_trigger.broadcast_too_few_connections t.triggers ;
           Events.(emit trigger_maintenance_too_few_connections)
@@ -208,9 +253,22 @@ let create_connection t p2p_conn id_point point_info peer_info
         else Lwt.return_unit
       in
       Lwt_pipe.Maybe_bounded.close messages ;
-      P2p_conn.close conn) ;
+      let reason =
+        Option.value ~default:Unknown_reason (P2p_conn.disconnect_reason conn)
+      in
+      P2p_conn.close ~reason conn) ;
   List.iter (fun f -> f peer_id conn) t.new_connection_hook ;
-  let* () =
+  let*! () =
+    (* DISCLAIMER: A similar check is also performed in [P2p_worker] before
+       running the maintenance. Thus, it is important that both conditionals
+       be identical to maintain the maintenance triggering consistency.
+       If this comparison needs to be updated for some reason (for example
+       from a strict to a non strict one), please, consider updating also
+       the [P2p_worker]. *)
+    (* TODO: https://gitlab.com/tezos/tezos/-/issues/5291
+       Improve invariant stability using a better encapsulation. *)
+    (* FIXME: https://gitlab.com/tezos/tezos/-/issues/5294
+       Stop triggering the maintenance while performing a connection swap. *)
     if t.config.max_connections <= P2p_pool.active_connections t.pool then (
       P2p_trigger.broadcast_too_many_connections t.triggers ;
       Events.(emit trigger_maintenance_too_many_connections)
@@ -300,6 +358,45 @@ let check_expected_peer_id (point_info : 'a P2p_point_state.Info.t option)
             in
             return_unit)
 
+let may_select_version ~compare accepted_versions remote_version motive =
+  let open Error_monad.Result_syntax in
+  let greatest = function
+    | [] -> raise (Invalid_argument "Network_version.greatest")
+    | h :: t -> List.fold_left max h t
+  in
+  let best_local_version = greatest accepted_versions in
+  if compare best_local_version remote_version <= 0 then
+    return best_local_version
+  else if
+    List.mem
+      ~equal:(fun a b -> compare a b = 0)
+      remote_version
+      accepted_versions
+  then return remote_version
+  else P2p_rejection.rejecting motive
+
+let select ~chain_name ~distributed_db_versions ~p2p_versions remote =
+  let open Error_monad.Result_syntax in
+  assert (distributed_db_versions <> []) ;
+  assert (p2p_versions <> []) ;
+  if chain_name <> remote.Network_version.chain_name then
+    P2p_rejection.rejecting Unknown_chain_name
+  else
+    let+ distributed_db_version =
+      may_select_version
+        ~compare:Distributed_db_version.compare
+        distributed_db_versions
+        remote.distributed_db_version
+        Deprecated_distributed_db_version
+    and+ p2p_version =
+      may_select_version
+        ~compare:P2p_version.compare
+        p2p_versions
+        remote.p2p_version
+        Deprecated_p2p_version
+    in
+    {Network_version.chain_name; distributed_db_version; p2p_version}
+
 let raw_authenticate t ?point_info canceler scheduled_conn point =
   let open Lwt_result_syntax in
   let incoming = point_info = None in
@@ -335,7 +432,7 @@ let raw_authenticate t ?point_info canceler scheduled_conn point =
                   | Tezos_base.Data_encoding_wrapper.Encoding_error _
                   | Tezos_base.Data_encoding_wrapper
                     .Unexpected_size_of_encoded_value
-                  | P2p_errors.Decoding_error _
+                  | Tezos_base.Data_encoding_wrapper.Decoding_error _
                   | P2p_errors.Invalid_chunks_size _ ->
                       P2p_pool.greylist_addr t.pool (fst point)
                   | _ -> ())
@@ -346,16 +443,17 @@ let raw_authenticate t ?point_info canceler scheduled_conn point =
         may_register_my_id_point t.pool err ;
         t.log (Authentication_failed point) ;
         (if not incoming then
-         let timestamp = Time.System.now () in
-         Option.iter
-           (P2p_point_state.set_disconnected
-              ~timestamp
-              t.config.reconnection_config)
-           point_info) ;
+           let timestamp = Time.System.now () in
+           Option.iter
+             (P2p_point_state.set_disconnected
+                ~timestamp
+                t.config.reconnection_config)
+             point_info) ;
         Lwt.return_error err)
   in
   (* Authentication correct! *)
   let*! () = Events.(emit authenticate_status) ("auth", point, info.peer_id) in
+  P2p_io_scheduler.set_peer_id ~peer_id:info.peer_id scheduled_conn ;
   let* () =
     fail_when
       (P2p_pool.Peers.banned t.pool info.peer_id)
@@ -375,7 +473,7 @@ let raw_authenticate t ?point_info canceler scheduled_conn point =
   let acceptable =
     let open Result_syntax in
     let* version =
-      Network_version.select
+      select
         ~chain_name:t.message_config.chain_name
         ~distributed_db_versions:t.message_config.distributed_db_versions
         ~p2p_versions:t.custom_p2p_versions
@@ -383,12 +481,9 @@ let raw_authenticate t ?point_info canceler scheduled_conn point =
     in
     (* we have a common version, checking if there is an available slot *)
     let* () =
-      if
-        (* randomly allow one additional incoming connection *)
-        t.config.max_connections + Random.int 2
-        > P2p_pool.active_connections t.pool
-      then return_unit
-      else P2p_rejection.(rejecting Too_many_connections)
+      if P2p_pool.active_connections t.pool >= t.connections_threshold then
+        P2p_rejection.(rejecting Too_many_connections)
+      else return_unit
     in
     (* we have a slot, checking if point and peer are acceptable *)
     is_acceptable t connection_point_info peer_info incoming version
@@ -414,11 +509,13 @@ let raw_authenticate t ?point_info canceler scheduled_conn point =
       let*! () =
         Events.(emit authenticate_status ("nack", point, info.peer_id))
       in
-      let*! point_list =
-        (* Never send more than 100 points, you would be greylisted *)
-        P2p_pool.list_known_points ~ignore_private:true ~size:50 t.pool
+      let*! nack_point_list =
+        if t.config.disable_peer_discovery then Lwt.return_nil
+        else
+          (* Never send more than 100 points, you would be greylisted *)
+          P2p_pool.list_known_points ~ignore_private:true ~size:50 t.pool
       in
-      let*! () = P2p_socket.nack auth_conn motive point_list in
+      let*! () = P2p_socket.nack auth_conn motive nack_point_list in
       let () =
         if not incoming then
           let timestamp = Time.System.now () in
@@ -501,11 +598,13 @@ let raw_authenticate t ?point_info canceler scheduled_conn point =
                     Events.(emit connection_rejected_by_peers)
                       (point, info.peer_id, motive, points)
                   in
-                  P2p_pool.register_list_of_new_points
-                    ~medium:"Nack"
-                    ~source:info.peer_id
-                    t.pool
-                    points
+                  if t.config.disable_peer_discovery then Lwt.return_unit
+                  else
+                    P2p_pool.register_list_of_new_points
+                      ~medium:"Nack"
+                      ~source:info.peer_id
+                      t.pool
+                      points
               | _ -> Events.(emit connection_error) (point, err)
             in
             let*! () =
@@ -527,7 +626,7 @@ let raw_authenticate t ?point_info canceler scheduled_conn point =
         | (addr, _), Some (_, port) -> (addr, Some port)
         | id_point, None -> id_point
       in
-      let*! conn =
+      let* conn =
         create_connection
           t
           conn
@@ -548,35 +647,56 @@ let authenticate t ?point_info canceler fd point =
   let*! r = raw_authenticate t ?point_info canceler scheduled_conn point in
   match r with
   | Ok connection -> return connection
-  | Error
-      (P2p_errors.Rejected {motive = P2p_rejection.Unknown_chain_name; _} :: _)
-    as err ->
+  | Error (P2p_errors.Rejected_no_common_protocol _ :: _) as result ->
       (* We don't register point that belong to another network.
          They are useless, and we don't want to advertize them.
          They are not greylisted as their might be node from our
          network on the same IP.
       *)
       P2p_pool.unregister_point t.pool point ;
-      let* () = P2p_io_scheduler.close scheduled_conn in
-      Lwt.return err
-  | Error _ as err ->
-      let* () = P2p_io_scheduler.close scheduled_conn in
-      Lwt.return err
+      let* () =
+        P2p_io_scheduler.close
+          ~reason:Authentication_rejected_no_common_protocol
+          scheduled_conn
+      in
+      Lwt.return result
+  | Error (P2p_errors.Rejected {motive; _} :: _) as result ->
+      let* () =
+        P2p_io_scheduler.close
+          ~reason:(Authentication_rejected motive)
+          scheduled_conn
+      in
+      Lwt.return result
+  | Error (P2p_errors.Rejected_by_nack {motive; _} :: _) as result ->
+      let* () =
+        P2p_io_scheduler.close
+          ~reason:(Authentication_rejected_by_peer motive)
+          scheduled_conn
+      in
+      Lwt.return result
+  | Error err as result ->
+      let* () =
+        P2p_io_scheduler.close
+          ~reason:(Authentication_rejected_error err)
+          scheduled_conn
+      in
+      Lwt.return result
 
 let accept t fd point =
   let open Lwt_syntax in
   t.log (Incoming_connection point) ;
-  if
-    t.config.max_incoming_connections <= P2p_point.Table.length t.incoming
-    (* silently ignore banned points *)
-    || P2p_pool.Points.banned t.pool point
-  then
-    Error_monad.dont_wait
-      (fun () -> P2p_fd.close fd)
-      (fun (`Unexpected_error ex) ->
-        Format.eprintf "Uncaught error: %s\n%!" (Printexc.to_string ex))
+  let reject ~reason =
+    Lwt.dont_wait
+      (fun () -> P2p_fd.close ~reason fd)
       (fun exc ->
         Format.eprintf "Uncaught exception: %s\n%!" (Printexc.to_string exc))
+  in
+  if t.config.max_incoming_connections <= P2p_point.Table.length t.incoming then
+    reject ~reason:Incoming_connection_too_many
+  else if
+    (* silently ignore banned points *)
+    P2p_pool.Points.banned t.pool point
+  then reject ~reason:Incoming_connection_banned
   else
     let canceler = Lwt_canceler.create () in
     P2p_point.Table.add t.incoming point canceler ;
@@ -606,7 +726,7 @@ let fail_unless_disconnected_point point_info =
   | Requested _ | Accepted _ -> tzfail P2p_errors.Pending_connection
   | Running _ -> tzfail P2p_errors.Connected
 
-let connect ?timeout t point =
+let connect ?trusted ?expected_peer_id ?timeout t point =
   let open Lwt_result_syntax in
   let* () =
     fail_when
@@ -621,7 +741,9 @@ let connect ?timeout t point =
   in
   let canceler = Lwt_canceler.create () in
   with_timeout ~canceler (Systime_os.sleep timeout) (fun canceler ->
-      let point_info = P2p_pool.register_point t.pool point in
+      let point_info =
+        P2p_pool.register_point ?trusted ?expected_peer_id t.pool point
+      in
       let ((addr, port) as point) = P2p_point_state.Info.point point_info in
       let* () =
         fail_unless
@@ -632,7 +754,9 @@ let connect ?timeout t point =
       let* () = fail_unless_disconnected_point point_info in
       let timestamp = Time.System.now () in
       P2p_point_state.set_requested ~timestamp point_info canceler ;
-      let*! fd = P2p_fd.socket PF_INET6 SOCK_STREAM 0 in
+      let fd_pool = P2p_pool.get_fd_pool t.pool in
+      let* fd = P2p_fd.socket ?fd_pool () in
+      P2p_fd.set_point ~point fd ;
       let uaddr = Lwt_unix.ADDR_INET (Ipaddr_unix.V6.to_inet_addr addr, port) in
       let*! () = Events.(emit connect_status) ("start", point) in
       let* () =
@@ -646,14 +770,7 @@ let connect ?timeout t point =
                   ~timestamp
                   t.config.reconnection_config
                   point_info ;
-                let*! close_res = P2p_fd.close fd in
-                let*! () =
-                  match close_res with
-                  | Ok () -> Lwt.return_unit
-                  | Error (`Unexpected_error ex) ->
-                      Events.(emit connect_close_error)
-                        (point, lazy (Printexc.to_string ex))
-                in
+
                 match err with
                 | `Unexpected_error ex ->
                     let*! () =
@@ -661,12 +778,39 @@ let connect ?timeout t point =
                         (point, lazy (Printexc.to_string ex))
                     in
                     Lwt.return_error (TzTrace.make (error_of_exn ex))
+                | `Connection_unreachable ->
+                    let*! () =
+                      Events.(emit connect_error)
+                        (point, lazy "connection unreachable")
+                    in
+                    tzfail P2p_errors.Connection_failed
+                | `Network_unreachable ->
+                    (* This may happen when we try to reach an ipv6
+                       address and there is no ipv6 interface on the
+                       host. *)
+                    let*! () =
+                      Events.(emit connect_error)
+                        (point, lazy "network unreachable")
+                    in
+                    tzfail P2p_errors.Connection_failed
                 | `Connection_refused ->
                     let*! () =
                       Events.(emit connect_error)
-                        (point, lazy "connection_refused")
+                        (point, lazy "connection refused")
                     in
-                    tzfail P2p_errors.Connection_refused)
+                    tzfail P2p_errors.Connection_failed
+                | `Connection_canceled ->
+                    let*! () =
+                      (* The canceler is set only when we shut down
+                         the P2p. *)
+                      if Lwt_canceler.canceling canceler then
+                        Events.(emit connect_error)
+                          (point, lazy "connection canceled (shutting down)")
+                      else
+                        Events.(emit connect_error)
+                          (point, lazy "connection canceled (timeout)")
+                    in
+                    tzfail P2p_errors.Connection_failed)
               r)
       in
       let*! () = Events.(emit connect_status) ("authenticate", point) in
@@ -675,6 +819,8 @@ let connect ?timeout t point =
 let stat t = P2p_io_scheduler.global_stat t.io_sched
 
 let on_new_connection t f = t.new_connection_hook <- f :: t.new_connection_hook
+
+let on_disconnection t f = t.disconnection_hook <- f :: t.disconnection_hook
 
 let destroy t =
   P2p_point.Table.iter_p
@@ -695,9 +841,7 @@ module Internal_for_tests = struct
     point_state_info_trusted :
       ('msg, 'peer_meta, 'conn_meta) P2p_conn.t P2p_point_state.Info.t -> bool;
     fd_connect :
-      P2p_fd.t ->
-      Unix.sockaddr ->
-      (unit, [`Unexpected_error of exn | `Connection_refused]) result Lwt.t;
+      P2p_fd.t -> Unix.sockaddr -> (unit, P2p_fd.connect_error) result Lwt.t;
     socket_authenticate :
       canceler:Lwt_canceler.t ->
       proof_of_work_target:Tezos_crypto.Crypto_box.pow_target ->
@@ -723,6 +867,7 @@ module Internal_for_tests = struct
   }
 
   let mock_dependencies default_metadata =
+    let open Lwt_result_syntax in
     {
       pool_greylist_peer = (fun _ _ -> ());
       peer_state_info_trusted = (fun _ -> true);
@@ -737,24 +882,24 @@ module Internal_for_tests = struct
              ?advertised_port:_
              _
              _
-             _ ->
+             _
+           ->
           let connection_info =
             P2p_connection.Internal_for_tests.Info.mock default_metadata
           in
-          let authenticated_connection =
+          let* authenticated_connection =
             P2p_socket.Internal_for_tests.mock_authenticated_connection
               default_metadata
           in
-          Lwt.return_ok (connection_info, authenticated_connection));
+          return (connection_info, authenticated_connection));
       socket_accept =
         (fun ?incoming_message_queue_size:_
              ?outgoing_message_queue_size:_
              ?binary_chunks_size:_
              ~canceler:_
              authenticated_connection
-             _encoding ->
-          Lwt.return_ok
-            (P2p_socket.Internal_for_tests.mock authenticated_connection));
+             _encoding
+           -> P2p_socket.Internal_for_tests.mock authenticated_connection);
     }
 
   let dumb_config : config =
@@ -773,6 +918,7 @@ module Internal_for_tests = struct
     let proof_of_work_target = Tezos_crypto.Crypto_box.make_pow_target 0. in
     let listening_port = Some 9732 in
     let advertised_port = None in
+    let disable_peer_discovery = false in
     {
       incoming_app_message_queue_size;
       private_mode;
@@ -789,6 +935,7 @@ module Internal_for_tests = struct
       proof_of_work_target;
       listening_port;
       advertised_port;
+      disable_peer_discovery;
     }
 
   (** An encoding that typechecks for all types, but fails at runtime. This is a placeholder as most tests never go through
@@ -817,18 +964,28 @@ module Internal_for_tests = struct
         distributed_db_versions = [Distributed_db_version.zero];
       }
 
+  let dumb_bounds =
+    {min_threshold = 10; min_target = 10; max_target = 10; max_threshold = 10}
+
   let create ?(config = dumb_config) ?(log = fun _ -> ())
-      ?(triggers = P2p_trigger.create ())
-      ?(io_sched = P2p_io_scheduler.create ~read_buffer_size:(1 lsl 12) ())
+      ?(triggers = P2p_trigger.create ()) ?io_sched
       ?(announced_version = Network_version.Internal_for_tests.mock ())
       ?(conn_meta_config = conn_meta_config_default ())
       ?(message_config = message_config_default ())
       ?(custom_p2p_versions = [P2p_version.zero])
       ?(encoding = make_crashing_encoding ())
       ?(incoming = P2p_point.Table.create ~random:true 53)
-      ?(new_connection_hook = [])
-      ?(answerer = lazy (P2p_protocol.create_private ())) pool dependencies :
-      ('msg, 'peer_meta, 'conn_meta) t =
+      ?(new_connection_hook = []) ?(disconnection_hook = [])
+      ?(answerer = lazy (P2p_protocol.create_private ()))
+      ?(maintenance_bounds = dumb_bounds)
+      ?(connections_threshold = dumb_bounds.max_threshold) pool dependencies :
+      ('msg, 'peer_meta, 'conn_meta) t tzresult Lwt.t =
+    let open Lwt_result_syntax in
+    let* io_sched =
+      match io_sched with
+      | None -> P2p_io_scheduler.create ~read_buffer_size:(1 lsl 12) ()
+      | Some io_sched -> return io_sched
+    in
     let pool =
       match pool with
       | `Pool pool -> pool
@@ -843,20 +1000,24 @@ module Internal_for_tests = struct
       | `Make_default_dependencies default_conn_meta ->
           mock_dependencies default_conn_meta
     in
-    {
-      config;
-      pool;
-      log;
-      triggers;
-      io_sched;
-      announced_version;
-      conn_meta_config;
-      message_config;
-      custom_p2p_versions;
-      encoding;
-      incoming;
-      new_connection_hook;
-      answerer;
-      dependencies;
-    }
+    return
+      {
+        config;
+        pool;
+        log;
+        triggers;
+        io_sched;
+        announced_version;
+        conn_meta_config;
+        message_config;
+        custom_p2p_versions;
+        encoding;
+        incoming;
+        new_connection_hook;
+        disconnection_hook;
+        answerer;
+        dependencies;
+        maintenance_bounds;
+        connections_threshold;
+      }
 end

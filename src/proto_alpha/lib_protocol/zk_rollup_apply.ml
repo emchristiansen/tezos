@@ -85,14 +85,17 @@ let originate ~ctxt_before_op ~ctxt ~public_parameters ~circuits_info
 (** [parse_ticket ~ticketer ~contents ~ty ctxt] reconstructs a ticket from
     individual parts submitted as part of a Zk_rollup_publish operation. *)
 let parse_ticket ~ticketer ~contents ~ty ctxt =
-  Script_ir_translator.parse_comparable_ty ctxt (Micheline.root ty)
-  >>?= fun (Ex_comparable_ty contents_type, ctxt) ->
-  Script_ir_translator.parse_comparable_data
-    ctxt
-    contents_type
-    (Micheline.root contents)
-  >>=? fun (contents, ctxt) ->
-  return @@ (ctxt, Ticket_token.Ex_token {ticketer; contents_type; contents})
+  let open Lwt_result_syntax in
+  let*? Ex_comparable_ty contents_type, ctxt =
+    Script_ir_translator.parse_comparable_ty ctxt (Micheline.root ty)
+  in
+  let* contents, ctxt =
+    Script_ir_translator.parse_comparable_data
+      ctxt
+      contents_type
+      (Micheline.root contents)
+  in
+  return (ctxt, Ticket_token.Ex_token {ticketer; contents_type; contents})
 
 let publish ~ctxt_before_op ~ctxt ~zk_rollup ~l2_ops =
   let open Lwt_result_syntax in
@@ -179,7 +182,7 @@ let transaction_to_zk_rollup ~ctxt ~parameters_ty ~parameters ~dst_rollup ~since
     Zk_rollup_parameters.get_deposit_parameters parameters_ty parameters
   in
   let* ticket_size, ctxt = Ticket_scanner.ex_ticket_size ctxt ex_ticket in
-  let limit = Constants.tx_rollup_max_ticket_payload_size ctxt in
+  let limit = Constants.zk_rollup_max_ticket_payload_size ctxt in
   let*? () =
     error_when
       Saturation_repr.(ticket_size >! limit)
@@ -274,7 +277,8 @@ let collect_pending_ops_inputs ~zk_rollup ~account ~rev_pi_map
   let* rev_pi_map, new_state, fees, rev_exit_validites =
     List.fold_left_es
       (fun (rev_pi_map, old_state, fees, rev_exit_validites)
-           ((l2_op, _ticket_hash_opt), (name, (sent_pi : op_pi))) ->
+           ((l2_op, _ticket_hash_opt), (name, (sent_pi : op_pi)))
+         ->
         let new_state = sent_pi.new_state in
         let*? () =
           error_unless
@@ -413,7 +417,7 @@ let perform_exits ctxt exits =
             let* ctxt, diff =
               Ticket_transfer.transfer_ticket_with_hashes
                 ctxt
-                ~src_hash:op.price.id
+                ~sender_hash:op.price.id
                 ~dst_hash:receiver_ticket_hash
                 amount
             in

@@ -377,7 +377,7 @@ module RPC = struct
           (fun (storage, operations, lazy_storage_diff) ->
             (storage, operations, lazy_storage_diff, lazy_storage_diff))
           (fun (storage, operations, legacy_lazy_storage_diff, lazy_storage_diff)
-               ->
+             ->
             let lazy_storage_diff =
               Option.either lazy_storage_diff legacy_lazy_storage_diff
             in
@@ -408,7 +408,8 @@ module RPC = struct
                  operations,
                  trace,
                  legacy_lazy_storage_diff,
-                 lazy_storage_diff ) ->
+                 lazy_storage_diff )
+             ->
             let lazy_storage_diff =
               Option.either lazy_storage_diff legacy_lazy_storage_diff
             in
@@ -636,8 +637,7 @@ module RPC = struct
       let unparse_stack ctxt (stack, stack_ty) =
         (* We drop the gas limit as this function is only used for debugging/errors. *)
         let ctxt = Gas.set_unlimited ctxt in
-        let rec unparse_stack :
-            type a s.
+        let rec unparse_stack : type a s.
             (a, s) Script_typed_ir.stack_ty * (a * s) ->
             (Script.expr * string option) list tzresult Lwt.t = function
           | Bot_t, (EmptyCell, EmptyCell) -> return_nil
@@ -738,8 +738,7 @@ module RPC = struct
       open Script_ir_annot
       open Script_typed_ir
 
-      let rec unparse_comparable_ty :
-          type a loc.
+      let rec unparse_comparable_ty : type a loc.
           loc:loc -> a comparable_ty -> (loc, Script.prim) Micheline.node =
        fun ~loc -> function
         | Unit_key meta -> Prim (loc, T_unit, [], unparse_type_annot meta.annot)
@@ -784,8 +783,8 @@ module RPC = struct
         let z = Alpha_context.Sapling.Memo_size.unparse_to_z memo_size in
         Int (loc, z)
 
-      let rec unparse_ty :
-          type a loc. loc:loc -> a ty -> (loc, Script.prim) Micheline.node =
+      let rec unparse_ty : type a loc.
+          loc:loc -> a ty -> (loc, Script.prim) Micheline.node =
        fun ~loc ty ->
         let return (name, args, annot) = Prim (loc, name, args, annot) in
         match ty with
@@ -974,15 +973,15 @@ module RPC = struct
             Some (get_current_remaining voting_period)
         | _ -> None
       in
-      ((match user_defined_blocks_before_activation with
-       | None -> blocks_before_activation ctxt
-       | Some block -> return (Some block))
-       >>=? function
-       | Some block
-         when Compare.Int32.(
-                (block >= 0l && block <= time_in_blocks')
-                || blocks_per_voting_period < time_in_blocks') ->
-           (*
+      ( (match user_defined_blocks_before_activation with
+        | None -> blocks_before_activation ctxt
+        | Some block -> return (Some block))
+      >>=? function
+        | Some block
+          when Compare.Int32.(
+                 (block >= 0l && block <= time_in_blocks')
+                 || blocks_per_voting_period < time_in_blocks') ->
+            (*
 
               At each protocol activation, the cache is clear.
 
@@ -1003,11 +1002,12 @@ module RPC = struct
               blocks in the short-term future.
 
            *)
-           return @@ Cache.Admin.clear ctxt
-       | Some _block ->
-           return @@ Cache.Admin.future_cache_expectation ctxt ~time_in_blocks
-       | None ->
-           return @@ Cache.Admin.future_cache_expectation ctxt ~time_in_blocks)
+            return @@ Cache.Admin.clear ctxt
+        | Some _block ->
+            return @@ Cache.Admin.future_cache_expectation ctxt ~time_in_blocks
+        | None ->
+            return @@ Cache.Admin.future_cache_expectation ctxt ~time_in_blocks
+      )
       >>=? fun ctxt -> run_operation_service ctxt () (op, chain_id)
 
     let register () =
@@ -1105,13 +1105,9 @@ module RPC = struct
             ~entrypoint
             ~parameter
             ~internal:true
-          >|=? fun ( {
-                       Script_interpreter.storage;
-                       operations;
-                       lazy_storage_diff;
-                       _;
-                     },
-                     _ ) -> (storage, operations, lazy_storage_diff)) ;
+          >|=?
+          fun ({Script_interpreter.storage; operations; lazy_storage_diff; _}, _)
+            -> (storage, operations, lazy_storage_diff)) ;
       Registration.register0
         ~chunked:true
         S.trace_code
@@ -1172,13 +1168,10 @@ module RPC = struct
             ~script:{storage; code}
             ~entrypoint
             ~parameter
-          >|=? fun ( {
-                       Script_interpreter.storage;
-                       operations;
-                       lazy_storage_diff;
-                       _;
-                     },
-                     trace ) -> (storage, operations, trace, lazy_storage_diff)) ;
+          >|=?
+          fun ( {Script_interpreter.storage; operations; lazy_storage_diff; _},
+                trace )
+            -> (storage, operations, trace, lazy_storage_diff)) ;
       Registration.register0
         ~chunked:true
         S.run_view
@@ -1293,16 +1286,11 @@ module RPC = struct
           in
           let code = Script.lazy_expr expr in
           Script_ir_translator.parse_code ~legacy ctxt ~code
-          >>=? fun ( Ex_code
-                       {
-                         code;
-                         arg_type;
-                         storage_type;
-                         views;
-                         root_name;
-                         code_size;
-                       },
-                     ctxt ) ->
+          >>=?
+          fun ( Ex_code
+                  {code; arg_type; storage_type; views; root_name; code_size},
+                ctxt )
+            ->
           Script_ir_translator.parse_data
             ~legacy
             ~allow_forged:true
@@ -2590,4 +2578,6 @@ module RPC = struct
   let rpc_services =
     register () ;
     RPC_directory.merge rpc_services !Registration.patched_services
+
+  let get_blocks_preservation_cycles ~get_context:_ = Lwt.return_none
 end

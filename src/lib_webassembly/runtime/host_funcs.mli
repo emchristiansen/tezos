@@ -5,7 +5,12 @@ type available_memories =
 
 type reveal_destination = {base : int32; max_bytes : int32}
 
-type reveal = Reveal_raw_data of string | Reveal_metadata
+type reveal =
+  | Reveal_raw of string
+      (** The interpretation of the payload of [Reveal_raw] is delegated to
+          the consumer of the interpreter. In the context of the WASM PVM,
+          the contents is expected to be compatible with
+          [Sc_rollup_reveal_hash.encoding]. *)
 
 type ticks = Z.t
 
@@ -14,7 +19,10 @@ type reveal_func =
   Values.value list ->
   (reveal * reveal_destination, int32) result Lwt.t
 
-(** The type of a Host function implementation *)
+(** The type of a Host function implementation.
+
+    - [Host_func f] operates on Irmin durable storage.
+    - [Nds_host_func f] operates on the NDS backend. *)
 type host_func =
   | Host_func of
       (Input_buffer.t ->
@@ -23,7 +31,27 @@ type host_func =
       available_memories ->
       Values.value list ->
       (Durable_storage.t * Values.value list * ticks) Lwt.t)
+  | Nds_host_func of
+      (Input_buffer.t ->
+      Output_buffer.t ->
+      Octez_riscv_nds_common.Nds.t ->
+      available_memories ->
+      Values.value list ->
+      (Octez_riscv_nds_common.Nds.t * Values.value list * ticks) Lwt.t)
   | Reveal_func of reveal_func
+
+(** An (immutable) host function registry builder that can be turned
+    into a registry using {!construct}. *)
+type builder
+
+(** A registry builder without any host functions. *)
+val empty_builder : builder
+
+(** [with_host_function ~global_name ~implem] adds the implementation
+    of a named host function in the builder. Will erase a previous
+    implementation for the given name. *)
+val with_host_function :
+  global_name:string -> implem:host_func -> builder -> builder
 
 (** A (mutable) host function registry *)
 type registry
@@ -39,3 +67,7 @@ val register : global_name:string -> host_func -> registry -> unit
 (** [lookup ~func_name] looks for the implementation of a named host
     function in the global symbol table. May raise [Not_found].*)
 val lookup : global_name:string -> registry -> host_func
+
+(** [construct builder] creates a new registry from the blueprint
+    encoded in [builder]. *)
+val construct : builder -> registry

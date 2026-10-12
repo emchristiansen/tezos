@@ -30,6 +30,8 @@
    Subject:      Test Michelson script typechecking failures
 *)
 
+let team = Tag.layer1
+
 let test_deprecated_typecheck script ~legacy =
   Protocol.register_test
     ~__FILE__
@@ -38,7 +40,8 @@ let test_deprecated_typecheck script ~legacy =
          "Test Deprecated Typecheck %s - %s"
          (if legacy then "in Legacy" else "Breaks")
          (Michelson_script.name_s script))
-    ~tags:["client"; "script"; "michelson"; "typechecking"]
+    ~tags:[team; "client"; "script"; "michelson"; "typechecking"]
+    ~uses_node:false
   @@ fun protocol ->
   let* client = Client.init_mockup ~protocol () in
   let ill_typed_scripts =
@@ -51,47 +54,54 @@ let test_deprecated_typecheck script ~legacy =
   let script_path = Michelson_script.path script in
   let expected_error =
     if List.mem (Michelson_script.name_s script) ill_typed_scripts then
-      "ill-typed script"
+      sf "script %S is ill-typed" script_path
     else "Use of deprecated instruction"
   in
-  Client.spawn_typecheck_script ~script:script_path ~legacy client
+  Client.spawn_typecheck_script ~scripts:[script_path] ~legacy client
   |> Process.check_error ~msg:(rex expected_error)
 
 let test_ill_typecheck script error_pattern =
   Protocol.register_test
     ~__FILE__
     ~title:(sf "Test Ill Typecheck - %s" script)
-    ~tags:["client"; "script"; "michelson"; "typechecking"]
+    ~tags:[team; "client"; "script"; "michelson"; "typechecking"]
+    ~uses_node:false
   @@ fun protocol ->
   let* client = Client.init_mockup ~protocol () in
   let script_path =
     Michelson_script.(find ["ill_typed"; script] protocol |> path)
   in
-  Client.spawn_typecheck_script ~script:script_path client
+  Client.spawn_typecheck_script ~scripts:[script_path] client
   |> Process.check_error ~msg:error_pattern
 
-let test_legacy_typecheck protocols =
-  [("timelock", Protocol.From_protocol 015)]
-  |> List.iter @@ fun (script, supports) ->
-     ( Protocol.register_test
-         ~__FILE__
-         ~supports
-         ~title:
-           (sf
-              "Test deprecated instructions typecheck conditionally - %s"
-              script)
-         ~tags:["client"; "script"; "michelson"; "typechecking"]
-     @@ fun protocol ->
-       let* client = Client.init_mockup ~protocol () in
-       let script_path =
-         Michelson_script.(find ["ill_typed"; script] protocol |> path)
-       in
-       let* () =
-         Client.spawn_typecheck_script ~script:script_path ~legacy:false client
-         |> Process.check_error ~msg:(rex "Use of deprecated instruction")
-       in
-       Client.typecheck_script ~script:script_path ~legacy:true client )
-       protocols
+(* The protocol produces more detailed errors when gas is
+   unlimited. We catch the difference in error details in the
+   regression traces. *)
+let test_error_details_regression =
+  Protocol.register_regression_test
+    ~__FILE__
+    ~title:
+      "Test Typecheck Error Details - error details with and without unlimited \
+       gas"
+    ~tags:[team; "client"; "script"; "michelson"; "typechecking"; "gas"]
+    ~uses_node:false
+  @@ fun protocol ->
+  let* client = Client.init_mockup ~protocol () in
+  let script_path =
+    Michelson_script.(
+      find ["ill_typed"; "stack_bottom_undup2able"] protocol |> path)
+  in
+  Lwt_list.iter_s
+    (fun unlimited_gas ->
+      Client.spawn_typecheck_script
+        ~hooks:Tezos_regression.hooks
+        ~protocol_hash:(Protocol.hash protocol)
+        ~no_base_dir_warnings:true
+        ~scripts:[script_path]
+        ~unlimited_gas
+        client
+      |> Process.check ~expect_failure:true)
+    [true; false]
 
 let register ~protocols =
   protocols
@@ -190,4 +200,4 @@ let register ~protocols =
   ]
   |> List.iter (fun (script, error_pattern) ->
          test_ill_typecheck script error_pattern protocols) ;
-  test_legacy_typecheck protocols
+  test_error_details_regression protocols

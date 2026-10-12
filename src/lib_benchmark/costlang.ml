@@ -23,10 +23,84 @@
 (*                                                                           *)
 (*****************************************************************************)
 
+module Num = struct
+  type t = Int of int | Float of float
+
+  let pp ppf =
+    let open Format in
+    function Int i -> pp_print_int ppf i | Float f -> pp_print_float ppf f
+
+  let add s1 s2 =
+    match (s1, s2) with
+    | Int x, Int y -> Int (x + y)
+    | Int x, Float y -> Float (float x +. y)
+    | Float x, Int y -> Float (x +. float y)
+    | Float x, Float y -> Float (x +. y)
+
+  let mul s1 s2 =
+    match (s1, s2) with
+    | Int x, Int y -> Int (x * y)
+    | Int x, Float y -> Float (float x *. y)
+    | Float x, Int y -> Float (x *. float y)
+    | Float x, Float y -> Float (x *. y)
+
+  let compare s1 s2 =
+    match (s1, s2) with
+    | Int x, Int y -> Int.compare x y
+    | Int x, Float y -> Float.compare (float x) y
+    | Float x, Int y -> Float.compare x (float y)
+    | Float x, Float y -> Float.compare x y
+end
+
+module Ty = struct
+  type _ t =
+    | Unit : unit t
+    | Num : Num.t t
+    | Int : int t
+    | Float : float t
+    | String : string t
+    | Bool : bool t
+    | Arrow : 'a t * 'b t -> ('a -> 'b) t
+
+  let unit = Unit
+
+  let num = Num
+
+  let int = Int
+
+  let float = Float
+
+  let string = String
+
+  let bool = Bool
+
+  let arrow t1 t2 = Arrow (t1, t2)
+
+  type (_, _) eq = Refl : ('a, 'a) eq
+
+  let rec equal : type a b. a t -> b t -> (a, b) eq option =
+   fun a b ->
+    match (a, b) with
+    | Unit, Unit -> Some Refl
+    | Num, Num -> Some Refl
+    | Int, Int -> Some Refl
+    | Bool, Bool -> Some Refl
+    | Float, Float -> Some Refl
+    | String, String -> Some Refl
+    | Arrow (t11, t12), Arrow (t21, t22) -> (
+        match equal t11 t21 with
+        | None -> None
+        | Some Refl -> (
+            match equal t12 t22 with None -> None | Some Refl -> Some Refl))
+    | _ -> None
+end
+
 module type S = sig
   type 'a repr
 
   type size
+
+  val size_ty : size Ty.t
 
   val true_ : bool repr
 
@@ -62,13 +136,15 @@ module type S = sig
 
   val shift_right : size repr -> int -> size repr
 
-  val lam : name:string -> ('a repr -> 'b repr) -> ('a -> 'b) repr
+  val lam' : name:string -> 'a Ty.t -> ('a repr -> 'b repr) -> ('a -> 'b) repr
+
+  val lam : name:string -> (size repr -> 'a repr) -> (size -> 'a) repr
 
   val app : ('a -> 'b) repr -> 'a repr -> 'b repr
 
   val let_ : name:string -> 'a repr -> ('a repr -> 'b repr) -> 'b repr
 
-  val if_ : bool repr -> 'a repr -> 'a repr -> 'a repr
+  val if_ : bool repr -> size repr -> size repr -> size repr
 end
 
 (* ------------------------------------------------------------------------- *)
@@ -78,6 +154,8 @@ module Void : S with type 'a repr = unit and type size = unit = struct
   type 'a repr = unit
 
   type size = unit
+
+  let size_ty = Ty.unit
 
   let true_ = ()
 
@@ -113,6 +191,8 @@ module Void : S with type 'a repr = unit and type size = unit = struct
 
   let eq _ _ = ()
 
+  let lam' ~name _ty _ = ignore name
+
   let lam ~name _ = ignore name
 
   let app _ _ = ()
@@ -126,6 +206,8 @@ module Pp : S with type 'a repr = string and type size = string = struct
   type 'a repr = string
 
   type size = string
+
+  let size_ty = Ty.string
 
   let true_ = "true"
 
@@ -161,9 +243,11 @@ module Pp : S with type 'a repr = string and type size = string = struct
 
   let eq x y = Format.asprintf "(%s = %s)" x y
 
-  let lam ~name f = Format.asprintf "fun %s -> %s" name (f name)
+  let lam' ~name _ty f = Format.asprintf "fun %s -> %s" name (f name)
 
-  let app f arg = Format.asprintf "(%s) %s" f arg
+  let lam ~name = lam' ~name size_ty
+
+  let app f arg = Format.asprintf "((%s) %s)" f arg
 
   let let_ ~name m f = Format.asprintf "let %s = %s in %s" name m (f name)
 
@@ -177,6 +261,8 @@ module Free_variables :
   type 'a repr = Set.t
 
   type size = unit
+
+  let size_ty = Ty.unit
 
   let lift_binop x y = Set.union x y
 
@@ -214,9 +300,11 @@ module Free_variables :
 
   let eq = lift_binop
 
-  let lam ~name f =
+  let lam' ~name _ty f =
     ignore name ;
     f Set.empty
+
+  let lam ~name = lam' ~name size_ty
 
   let app f arg = Set.union f arg
 
@@ -226,6 +314,124 @@ module Free_variables :
     Set.union m in_scope
 
   let if_ cond ift iff = Set.union cond (Set.union ift iff)
+end
+
+module Type = struct
+  type size = Num.t
+
+  let size_ty = Ty.num
+
+  type 'a repr = 'a Ty.t
+
+  let true_ = Ty.bool
+
+  let false_ = Ty.bool
+
+  let float _ = Ty.num
+
+  let int _ = Ty.num
+
+  let ( + ) _ _ = Ty.num
+
+  let sat_sub _ _ = Ty.num
+
+  let ( * ) _ _ = Ty.num
+
+  let ( / ) _ _ = Ty.num
+
+  let max _ _ = Ty.num
+
+  let min _ _ = Ty.num
+
+  let shift_left _ _ = Ty.num
+
+  let shift_right _ _ = Ty.num
+
+  let log2 _ = Ty.num
+
+  let sqrt _ = Ty.num
+
+  let free ~name:_ = Ty.num
+
+  let lt _ _ = Ty.bool
+
+  let eq _ _ = Ty.bool
+
+  let lam' ~name:_ ty f = Ty.arrow ty (f ty)
+
+  let lam ~name = lam' ~name size_ty
+
+  let app f a =
+    match f with
+    | Ty.Arrow (f, t) ->
+        assert (f = a) ;
+        t
+
+  let let_ ~name:_ v f = f v
+
+  let if_ _ t _ = t
+end
+
+module Arg_names = struct
+  type size = unit
+
+  let size_ty = Ty.unit
+
+  type 'a repr =
+    | Bool : bool repr
+    | Size : size repr
+    | Lambda : string * ('a repr -> 'b repr) -> ('a -> 'b) repr
+
+  let arg_name (Lambda (arg, _)) = arg
+
+  let unwrap_bool (Lambda (_, f)) = f Bool
+
+  let unwrap_size (Lambda (_, f)) = f Size
+
+  let true_ = Bool
+
+  let false_ = Bool
+
+  let float _ = Size
+
+  let int _ = Size
+
+  let ( + ) _ _ = Size
+
+  let sat_sub _ _ = Size
+
+  let ( * ) _ _ = Size
+
+  let ( / ) _ _ = Size
+
+  let max _ _ = Size
+
+  let min _ _ = Size
+
+  let shift_left _ _ = Size
+
+  let shift_right _ _ = Size
+
+  let log2 _ = Size
+
+  let sqrt _ = Size
+
+  let free ~name:_ = Size
+
+  let lt _ _ = Bool
+
+  let eq _ _ = Bool
+
+  let lam' ~name _ty f = Lambda (name, f)
+
+  let lam ~name = lam' ~name size_ty
+
+  let app (Lambda (_, f)) x = f x
+
+  let let_ ~name:_ v f = f v
+
+  (* We can't decide which branch to pick. This choice is arbitrary. *)
+  let if_ _ t _ = t
 end
 
 let sat_sub_float x y = max 0. (x -. y)
@@ -238,6 +444,8 @@ module Eval : S with type 'a repr = 'a and type size = float = struct
   type 'a repr = 'a
 
   type size = float
+
+  let size_ty = Ty.float
 
   let lift_binop op x y = op x y
 
@@ -275,9 +483,11 @@ module Eval : S with type 'a repr = 'a and type size = float = struct
 
   let eq x y = x = y
 
-  let lam ~name f =
+  let lam' ~name _ty f =
     ignore name ;
     f
+
+  let lam ~name = lam' ~name size_ty
 
   let app f arg = f arg
 
@@ -333,6 +543,8 @@ end
 (* multiset of strings = formal linear combinations with integer coefficients *) =
 struct
   type size = float
+
+  let size_ty = Ty.float
 
   type 'a repr = subst -> 'a result
 
@@ -443,13 +655,15 @@ struct
 
   let shift_right _ _ = raise (Eval_linear_combination "shift_right")
 
-  let lam ~name:_ _f _subst = raise (Eval_linear_combination "lambda")
+  let lam' ~name:_ _ty _f _subst = raise (Eval_linear_combination "lambda")
+
+  let lam ~name = lam' ~name size_ty
 
   let app _bound _body _subst = raise (Eval_linear_combination "app")
 
   let let_ ~name:_ bound body subst = body bound subst
 
-  let if_ (cond : bool repr) (ift : 'a repr) (iff : 'a repr) : 'a repr =
+  let if_ (cond : bool repr) (ift : size repr) (iff : size repr) : size repr =
    fun subst ->
     let (Bool b) = cond subst in
     if b then ift subst else iff subst
@@ -519,6 +733,8 @@ functor
   struct
     type size = X.size
 
+    let size_ty = X.size_ty
+
     type 'a repr = 'a X.repr hash_consed
 
     type unique_term_identifier =
@@ -570,7 +786,7 @@ functor
 
     let false_ = {repr = X.false_; hash = -1; tag = fresh ()}
 
-    let true_ = {repr = X.false_; hash = -1; tag = fresh ()}
+    let true_ = {repr = X.true_; hash = -1; tag = fresh ()}
 
     let float (f : float) =
       insert_if_not_present (fun () -> X.float f) (Float_tag {f})
@@ -632,8 +848,10 @@ functor
     let unlift_fun : type a b. (a repr -> b repr) -> a X.repr -> b X.repr =
      fun f x -> (f {repr = x; hash = -1; tag = fresh ()}).repr
 
-    let lam ~name body =
-      {repr = X.lam ~name (unlift_fun body); hash = -1; tag = fresh ()}
+    let lam' ~name ty body =
+      {repr = X.lam' ~name ty (unlift_fun body); hash = -1; tag = fresh ()}
+
+    let lam ~name = lam' ~name size_ty
 
     let app f arg = lift2_nohash X.app f arg
 
@@ -656,12 +874,15 @@ functor
   struct
     type size = X.size
 
+    let size_ty = X.size_ty
+
     (* A value is either a lambda that can be statically evaluated
        (case [Static_lam]) or any value that will be
        dynamically evaluated (case [Dynamic]). *)
     type 'a repr =
       | Static_lam : {
           name : string;
+          ty : 'a Ty.t; (* type of the argument *)
           lam : 'a X.repr -> 'b repr;
         }
           -> ('a -> 'b) repr
@@ -672,7 +893,7 @@ functor
     let rec prj : type a. a repr -> a X.repr =
      fun x ->
       match x with
-      | Static_lam {name; lam} -> X.lam ~name (fun arg -> prj (lam arg))
+      | Static_lam {name; ty; lam} -> X.lam' ~name ty (fun arg -> prj (lam arg))
       | Dynamic d -> d
 
     let lift1 f x = match x with Dynamic d -> dyn (f d) | _ -> assert false
@@ -716,10 +937,13 @@ functor
 
     let eq x y = lift2 X.eq x y
 
-    let lam : name:string -> ('a repr -> 'b repr) -> ('a -> 'b) repr =
-     fun ~name f ->
+    let lam' : name:string -> 'a Ty.t -> ('a repr -> 'b repr) -> ('a -> 'b) repr
+        =
+     fun ~name ty f ->
       let lam arg = f (dyn arg) in
-      Static_lam {name; lam}
+      Static_lam {name; ty; lam}
+
+    let lam ~name = lam' ~name size_ty
 
     let app : type a b. (a -> b) repr -> a repr -> b repr =
      fun f arg ->
@@ -743,6 +967,8 @@ functor
   ->
   struct
     type size = X.size
+
+    let size_ty = X.size_ty
 
     type 'a cps = {cont : 'b. ('a -> 'b X.repr) -> 'b X.repr}
 
@@ -793,8 +1019,10 @@ functor
 
     let eq = lift_binop X.eq
 
-    let lam ~name (f : 'a repr -> 'b repr) =
-      {cont = (fun k -> k (X.lam ~name (fun x -> prj (f (ret x)))))}
+    let lam' ~name ty (f : 'a repr -> 'b repr) =
+      {cont = (fun k -> k (X.lam' ~name ty (fun x -> prj (f (ret x)))))}
+
+    let lam ~name = lam' ~name size_ty
 
     let app f arg = {cont = (fun k -> k (X.app (prj f) (prj arg)))}
 
@@ -818,6 +1046,8 @@ module Eval_to_vector = Beta_normalize (Hash_cons_vector)
 
 module Fold_constants (X : S) = struct
   type size = X.size
+
+  let size_ty = X.size_ty
 
   type 'a maybe_const =
     | Int : int -> size maybe_const
@@ -907,12 +1137,12 @@ module Fold_constants (X : S) = struct
     | Bool _ -> assert false
 
   let log2 x =
-    inj
-    @@
     match x with
-    | Int i -> X.(log2 (int i))
-    | Float f -> X.(log2 (float f))
-    | Not_const term -> X.(log2 term)
+    | Int 1 -> Int 0
+    | Int i -> inj @@ X.(log2 (int i))
+    | Float 1. -> Float 0.
+    | Float f -> inj @@ X.(log2 (float f))
+    | Not_const term -> inj @@ X.(log2 term)
     | Bool _ -> assert false
 
   let sqrt x =
@@ -952,13 +1182,19 @@ module Fold_constants (X : S) = struct
     | Not_const x, Not_const y -> Not_const X.(eq x y)
     | Bool _, _ | _, Bool _ -> assert false
 
-  let lam ~name (f : 'a repr -> 'b repr) =
-    Not_const (X.lam ~name (fun x -> prj (f (inj x))))
+  let lam' ~name ty (f : 'a repr -> 'b repr) =
+    Not_const (X.lam' ~name ty (fun x -> prj (f (inj x))))
+
+  let lam ~name = lam' ~name size_ty
 
   let app f arg = Not_const (X.app (prj f) (prj arg))
 
-  let let_ ~name (m : 'a repr) (f : 'a repr -> 'b repr) : 'b repr =
-    Not_const (X.let_ ~name (prj m) (fun x -> prj (f (inj x))))
+  let let_ ~name (type a) (m : a repr) (f : a repr -> 'b repr) : 'b repr =
+    match m with
+    | Int _ | Float _ | Bool _ ->
+        (* let x = const in e => e[const/x] *)
+        f m
+    | Not_const _ -> Not_const (X.let_ ~name (prj m) (fun x -> prj (f (inj x))))
 
   let if_ cond ift iff =
     match cond with

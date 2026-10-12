@@ -40,9 +40,7 @@ module In_memory = struct
 
   type tree = Tree.tree
 
-  type proof = Context.Proof.tree Context.Proof.t
-
-  let hash_tree _ = assert false
+  type proof = Context_binary.Proof.tree Context_binary.Proof.t
 
   let verify_proof p f =
     Lwt.map Result.to_option (Context_binary.verify_tree_proof p f)
@@ -57,34 +55,24 @@ module In_memory = struct
     | Some k ->
         let index = Context_binary.index context in
         let* p = Context_binary.produce_tree_proof index k step in
-        return (Some p)
-    | None -> return None
+        return_some p
+    | None -> return_none
 
   let kinded_hash_to_state_hash = function
     | `Value hash | `Node hash ->
         Protocol.Alpha_context.Sc_rollup.State_hash.context_hash_to_state_hash
           hash
 
-  let proof_before proof = kinded_hash_to_state_hash proof.Context.Proof.before
+  let proof_before proof =
+    kinded_hash_to_state_hash proof.Context_binary.Proof.before
 
-  let proof_after proof = kinded_hash_to_state_hash proof.Context.Proof.after
+  let proof_after proof =
+    kinded_hash_to_state_hash proof.Context_binary.Proof.after
+
+  let cast_read_only proof =
+    Context_binary.Proof.{proof with after = proof.before}
 
   let proof_encoding =
     Tezos_context_merkle_proof_encoding.Merkle_proof_encoding.V2.Tree2
     .tree_proof_encoding
-
-  (* TODO: https://gitlab.com/tezos/tezos/-/issues/4386
-     Extracted and adapted from {!Tezos_context_memory}. *)
-  let make_empty_context ?(root = "/tmp") () =
-    let open Lwt_syntax in
-    let context_promise =
-      let+ index = Tezos_context_memory.Context_binary.init root in
-      Tezos_context_memory.Context_binary.empty index
-    in
-    match Lwt.state context_promise with
-    | Lwt.Return result -> result
-    | Lwt.Fail exn -> raise exn
-    | Lwt.Sleep ->
-        (* The in-memory context should never block *)
-        assert false
 end

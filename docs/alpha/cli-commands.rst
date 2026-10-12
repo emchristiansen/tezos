@@ -10,8 +10,10 @@ using shell commands such as (:ref:`indicating the appropriate protocol <octez_c
 
    octez-client -protocol <protocol_hash> man -verbosity 3
 
-The rest of this page documents the protocol-dependent tools.
-The protocol-independent tools are documented :doc:`here <../shell/cli-commands>`.
+.. note::
+
+	The rest of this page documents the protocol-dependent tools, that is, those whose behavior or features may be specific to each protocol.
+	The protocol-independent tools are documented :doc:`here <../shell/cli-commands>`.
 
 
 .. _client_manual_alpha:
@@ -19,23 +21,25 @@ The protocol-independent tools are documented :doc:`here <../shell/cli-commands>
 Client manual
 =============
 
+This is the manual page of the command line tool ``octez-client``. See :ref:`howtouse_tezos_client` for a general description of this tool.
+
 .. raw:: html
          :file: octez-client.html
 
 
-.. _baker_manual_alpha:
-
 Baker manual
 ============
 
-.. raw:: html
-         :file: octez-baker.html
+The manual page of the baker command line tool has moved :ref:`here <baker_manual>`.
 
-
-.. _accuser_manual_alpha:
 
 Accuser manual
 ==============
 
-.. raw:: html
-         :file: octez-accuser.html
+The manual page of the accuser command line tool has moved :ref:`here <accuser_manual>`.
+
+
+Protocol-independent tools
+==========================
+
+For manuals of the tools that do not vary with each protocol, see :doc:`here <../shell/cli-commands>`.

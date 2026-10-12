@@ -2708,21 +2708,6 @@ val log2up: t -> int
 external size: t -> int = "ml_z_size" [@@noalloc]
 (** Returns the number of machine words used to represent the number. *)
 
-external extract: t -> int -> int -> t = "ml_z_extract"
-(** [extract a off len] returns a nonnegative number corresponding to bits
-    [off] to [off]+[len]-1 of [b].
-    Negative [a] are considered in infinite-length 2's complement
-    representation.
- *)
-
-val signed_extract: t -> int -> int -> t
-(** [signed_extract a off len] extracts bits [off] to [off]+[len]-1 of [b],
-    as [extract] does, then sign-extends bit [len-1] of the result
-    (that is, bit [off + len - 1] of [a]).  The result is between
-    [- 2{^[len]-1}] (included) and [2{^[len]-1}] (excluded),
-    and equal to [extract a off len] modulo [2{^len}].
- *)
-
 external to_bits: t -> string = "ml_z_to_bits"
 (** Returns a binary representation of the argument.
     The string result should be interpreted as a sequence of bytes,
@@ -2825,7 +2810,7 @@ let () =
       Lwt_io.(read_line stdin)
       (fun line -> Lwt_io.printl line)
   in
-  Lwt_main.run p_3
+  Tezos_base_unix.Event_loop.main_run p_3
 
 (* ocamlfind opt -linkpkg -thread -package lwt.unix code.ml && ./a.out *)
 ]}
@@ -2859,7 +2844,7 @@ let () =
 
 {[
 let () =
-  Lwt_main.run begin
+  Tezos_base_unix.Event_loop.main_run begin
     Lwt.bind Lwt_io.(read_line stdin) (fun line ->
       Lwt.bind (Lwt_unix.sleep 1.) (fun () ->
         Lwt_io.printf "One second ago, you entered %s\n" line))
@@ -2873,7 +2858,7 @@ let () =
 
 {[
 let () =
-  Lwt_main.run begin
+  Tezos_base_unix.Event_loop.main_run begin
     let%lwt line = Lwt_io.(read_line stdin) in
     let%lwt () = Lwt_unix.sleep 1. in
     Lwt_io.printf "One second ago, you entered %s\n" line
@@ -2893,7 +2878,7 @@ let () =
 open Lwt.Infix
 
 let () =
-  Lwt_main.run begin
+  Tezos_base_unix.Event_loop.main_run begin
     Lwt_io.(read_line stdin) >>= fun line ->
     Lwt_unix.sleep 1. >>= fun () ->
     Lwt_io.printf "One second ago, you entered %s\n" line
@@ -2927,7 +2912,7 @@ let read_int : unit -> int Lwt.t = fun () ->
     Lwt_io.(read_line stdin)
 
 let () =
-  Lwt_main.run begin
+  Tezos_base_unix.Event_loop.main_run begin
     let%lwt number = read_int () in
     Lwt_io.printf "%i\n" number
   end
@@ -8442,52 +8427,51 @@ end
 
 type t = Updater.rpc_context
 
-class type ['pr] simple =
-  object
-    method call_proto_service0 :
-      'm 'q 'i 'o.
-      (([< RPC_service.meth] as 'm), t, t, 'q, 'i, 'o) RPC_service.t ->
-      'pr ->
-      'q ->
-      'i ->
-      'o Error_monad.shell_tzresult Lwt.t
+class type ['pr] simple = object
+  method call_proto_service0 :
+    'm 'q 'i 'o.
+    (([< RPC_service.meth] as 'm), t, t, 'q, 'i, 'o) RPC_service.t ->
+    'pr ->
+    'q ->
+    'i ->
+    'o Error_monad.shell_tzresult Lwt.t
 
-    method call_proto_service1 :
-      'm 'a 'q 'i 'o.
-      (([< RPC_service.meth] as 'm), t, t * 'a, 'q, 'i, 'o) RPC_service.t ->
-      'pr ->
-      'a ->
-      'q ->
-      'i ->
-      'o Error_monad.shell_tzresult Lwt.t
+  method call_proto_service1 :
+    'm 'a 'q 'i 'o.
+    (([< RPC_service.meth] as 'm), t, t * 'a, 'q, 'i, 'o) RPC_service.t ->
+    'pr ->
+    'a ->
+    'q ->
+    'i ->
+    'o Error_monad.shell_tzresult Lwt.t
 
-    method call_proto_service2 :
-      'm 'a 'b 'q 'i 'o.
-      (([< RPC_service.meth] as 'm), t, (t * 'a) * 'b, 'q, 'i, 'o) RPC_service.t ->
-      'pr ->
-      'a ->
-      'b ->
-      'q ->
-      'i ->
-      'o Error_monad.shell_tzresult Lwt.t
+  method call_proto_service2 :
+    'm 'a 'b 'q 'i 'o.
+    (([< RPC_service.meth] as 'm), t, (t * 'a) * 'b, 'q, 'i, 'o) RPC_service.t ->
+    'pr ->
+    'a ->
+    'b ->
+    'q ->
+    'i ->
+    'o Error_monad.shell_tzresult Lwt.t
 
-    method call_proto_service3 :
-      'm 'a 'b 'c 'q 'i 'o.
-      ( ([< RPC_service.meth] as 'm),
-        t,
-        ((t * 'a) * 'b) * 'c,
-        'q,
-        'i,
-        'o )
-      RPC_service.t ->
-      'pr ->
-      'a ->
-      'b ->
-      'c ->
-      'q ->
-      'i ->
-      'o Error_monad.shell_tzresult Lwt.t
-  end
+  method call_proto_service3 :
+    'm 'a 'b 'c 'q 'i 'o.
+    ( ([< RPC_service.meth] as 'm),
+      t,
+      ((t * 'a) * 'b) * 'c,
+      'q,
+      'i,
+      'o )
+    RPC_service.t ->
+    'pr ->
+    'a ->
+    'b ->
+    'c ->
+    'q ->
+    'i ->
+    'o Error_monad.shell_tzresult Lwt.t
+end
 
 val make_call0 :
   ([< RPC_service.meth], t, t, 'q, 'i, 'o) RPC_service.t ->

@@ -1,0 +1,73 @@
+// SPDX-FileCopyrightText: 2025 Functori <contact@functori.com>
+//
+// SPDX-License-Identifier: MIT
+
+use revm::primitives::B256;
+use tezos_smart_rollup_host::{path::OwnedPath, storage::StorageV1};
+
+use crate::error::EvmDbError;
+
+// Ref. https://www.evm.codes/?fork=cancun#40
+// (opcode 0x40: BLOCKHASH)
+pub const BLOCKS_STORED: u64 = 256;
+
+fn to_block_hash_path(block_number: u64) -> Result<OwnedPath, EvmDbError> {
+    let path: Vec<u8> = format!("/evm/world_state/blocks/indexes/{block_number}").into();
+    Ok(OwnedPath::try_from(path)?)
+}
+
+/// Get block hash by block number.
+pub fn get_block_hash(
+    host: &impl StorageV1,
+    block_number: u64,
+) -> Result<B256, EvmDbError> {
+    let block_path = to_block_hash_path(block_number)?;
+    let block_hash = host.store_read(&block_path, 0, 32)?;
+
+    if block_hash.len() == 32 {
+        Ok(B256::from_slice(&block_hash))
+    } else {
+        Err(EvmDbError::MalformedBlockHash {
+            block_number,
+            actual_length: block_hash.len(),
+        })
+    }
+}
+
+#[cfg(test)]
+mod test {
+    use super::{get_block_hash, to_block_hash_path};
+    use crate::error::EvmDbError;
+    use revm::primitives::B256;
+    use tezos_evm_runtime::runtime::MockKernelHost;
+    use tezos_smart_rollup_host::storage::StorageV1;
+
+    #[test]
+    fn test_malformed_hash() {
+        let mut host = MockKernelHost::default();
+
+        let block_number = 1u64;
+        let path = to_block_hash_path(block_number).unwrap();
+        host.store_write(&path, &[1; 31], 0).unwrap();
+
+        match get_block_hash(&host, block_number) {
+            Err(EvmDbError::MalformedBlockHash { .. }) => (),
+            other => panic!("Expected MalformedBlockHash, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn test_valid_hash() {
+        let mut host = MockKernelHost::default();
+
+        let block_number = 1u64;
+        let block_hash = &[42; 32];
+        let path = to_block_hash_path(block_number).unwrap();
+        host.store_write(&path, block_hash, 0).unwrap();
+
+        assert_eq!(
+            get_block_hash(&host, block_number).unwrap(),
+            B256::from(block_hash)
+        )
+    }
+}

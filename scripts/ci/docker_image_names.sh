@@ -1,0 +1,76 @@
+#!/bin/sh
+set -eu
+
+current_dir=$(cd "$(dirname "${0}")" && pwd)
+
+# Compute Octez distribution Docker image names and tags.
+# Writes DOCKER_IMAGE_NAME and DOCKER_IMAGE_TAG to docker.env.
+#
+# This script is ONLY needed by Octez distribution jobs that build/push
+# the end-user Docker images (debug, bare, minimal). It is called by
+# docker_initialize.sh --image-names (for distribution jobs) but NOT by
+# docker_initialize.sh without arguments (for CI/base image jobs).
+
+# Docker constraints on tags:
+# https://docs.docker.com/engine/reference/commandline/tag/
+
+# a simple library of functions used in multiple scripts
+# shellcheck source=scripts/ci/docker_registry.inc.sh
+. "$current_dir"/docker_registry.inc.sh
+
+echo '### Input variables'
+echo "CI_COMMIT_REF_NAME=${CI_COMMIT_REF_NAME}"
+echo "CI_DOCKER_HUB=${CI_DOCKER_HUB:-}"
+echo "CI_PROJECT_NAME=${CI_PROJECT_NAME}"
+echo "CI_PROJECT_NAMESPACE=${CI_PROJECT_NAMESPACE}"
+echo "IMAGE_ARCH_PREFIX=${IMAGE_ARCH_PREFIX:-}"
+echo "CI_COMMIT_REF_PROTECTED=${CI_COMMIT_REF_PROTECTED:-}"
+
+if [ "${CI_DOCKER_HUB:-}" = 'true' ] && [ "${CI_PROJECT_NAMESPACE}" = "tezos" ] && [ -n "${CI_DOCKER_AUTH:-}" ]; then
+  docker_image_name="docker.io/${CI_PROJECT_PATH}-"
+else
+  # default docker image name prefix. For example it is used to prefix the images
+  # tezos/tezos , tezos/tezos-bare, tezos/tezos-debug
+  # The GCP_RELEASE_REGISTRY has a different value for protected and not
+  # protected branches and it's configured in the gitlab CI
+  docker_image_name="${GCP_RELEASE_REGISTRY}/${CI_PROJECT_NAMESPACE}/${CI_PROJECT_NAME}/"
+fi
+
+image_tag=""
+if [ $# -eq 2 ] && [ "$1" = "--image-tag" ]; then
+  image_tag="$2"
+elif [ $# -ne 0 ]; then
+  echo "Usage: $(basename "$0") [--image-tag TAG]" >&2
+  exit 1
+fi
+
+if [ -n "${image_tag}" ]; then
+  docker_image_tag=$(echo "${IMAGE_ARCH_PREFIX:-}${image_tag}" | sanitizeTag)
+else
+  docker_image_tag=$(echo "${IMAGE_ARCH_PREFIX:-}${CI_COMMIT_REF_NAME}" | sanitizeTag)
+fi
+
+# Write computed Docker environment variables to
+# sourceable file for other shell scripts
+# these are used in the
+# - directly docker_release.sh
+# - all scripts sourcing docker.sh and docker.env
+# define debug, bare, and minimal for user images and build for the ci
+
+echo "export DOCKER_IMAGE_NAME=${docker_image_name}" > "${current_dir}/docker.env"
+echo "export DOCKER_IMAGE_TAG=${docker_image_tag}" >> "${current_dir}/docker.env"
+
+# Print out the results to verify everything is ok:
+
+# shellcheck source=./scripts/ci/docker.env
+. "${current_dir}/docker.env"
+# shellcheck source=./scripts/ci/docker.sh
+. "${current_dir}/docker.sh"
+
+echo '### Docker image names:'
+
+echo "${docker_build_image}:${DOCKER_IMAGE_TAG}"
+
+for docker_image in ${docker_images}; do
+  echo "${docker_image}:${DOCKER_IMAGE_TAG}"
+done

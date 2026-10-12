@@ -59,6 +59,8 @@ type atomic_transaction_batch = private {transactions : transaction list}
 (** A typed representation of {!Sc_rollup.Outbox.Message.t}. *)
 type outbox_message = private
   | Atomic_transaction_batch of atomic_transaction_batch
+  | Whitelist_update of Sc_rollup.Whitelist.t option
+  | Canonical_rollup_signal of string
 
 (** [make_internal_transfer ctxt ty ~payload ~sender ~source ~destination]
     constructs a smart rollup's [inbox message] (an L1 to L2 message)
@@ -68,7 +70,7 @@ val make_internal_transfer :
   ('a, _) Script_typed_ir.ty ->
   payload:'a ->
   sender:Contract_hash.t ->
-  source:public_key_hash ->
+  source:Implicit_account_repr.t ->
   destination:Sc_rollup.Address.t ->
   (Sc_rollup.Inbox_message.t * context) tzresult Lwt.t
 
@@ -101,10 +103,17 @@ module Internal_for_tests : sig
       transactions [ts]. *)
   val make_atomic_batch : transaction list -> outbox_message
 
-  (** [serialize_output_message msg] encodes the outbox message [msg] in binary
-      format. *)
-  val serialize_outbox_message :
-    outbox_message -> Sc_rollup.Outbox.Message.serialized tzresult
+  (** [serialize_output_transactions_untyped t] encodes the outbox transaction
+      batch [t] in binary format using the untyped outbox message
+      representation. *)
+  val serialize_outbox_transactions_untyped :
+    transaction list -> Sc_rollup.Outbox.Message.serialized tzresult
+
+  (** [serialize_output_transactions_typed t] encodes the outbox
+      transaction batch [t] in binary format using the typed outbox message
+      representation. *)
+  val serialize_outbox_transactions_typed :
+    transaction list -> Sc_rollup.Outbox.Message.serialized tzresult
 
   (** [deserialize_inbox_message bs] decodes an inbox message from the given data
       [bs]. *)

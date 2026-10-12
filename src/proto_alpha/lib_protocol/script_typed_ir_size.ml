@@ -52,7 +52,6 @@ let ty_traverse_f =
     | Key_t -> ret_succ_adding accu base_basic
     | Timestamp_t -> ret_succ_adding accu base_basic
     | Address_t -> ret_succ_adding accu base_basic
-    | Tx_rollup_l2_address_t -> ret_succ_adding accu base_basic
     | Bool_t -> ret_succ_adding accu base_basic
     | Operation_t -> ret_succ_adding accu base_basic
     | Chain_id_t -> ret_succ_adding accu base_basic
@@ -124,23 +123,34 @@ let script_nat_size n = Script_int.to_zint n |> z_size
 
 let script_int_size n = Script_int.to_zint n |> z_size
 
+(* Return the size of the OCaml object in memory corresponding to the
+   {signature}. The in memory size is retrieved with a call to
+   Obj.reachable_words function. *)
 let signature_size (Script_signature.Signature_tag x) =
   match x with
-  (* By Obj.reachable_words. *)
   | Ed25519 _ | Secp256k1 _ | P256 _ | Unknown _ -> !!96
   | Bls _ -> !!128
+  | Mldsa44 _ -> !!2448
 
-let key_hash_size (_x : Signature.public_key_hash) = !!64
+(* Return the size of the OCaml object in memory corresponding to the
+   {public_key_hash}. The in memory size is retrieved with a call to
+   Obj.reachable_words function. *)
+let key_hash_size (_x : Signature.Public_key_hash.t) = !!64
 (* By Obj.reachable_words. *)
 
+(* Return the addition of a constant and the size of the OCaml object in memory
+   corresponding to the {public key}. The in memory size is retrieved with a
+   call to Obj.reachable_words function. *)
 let public_key_size (x : public_key) =
   h1w
   +?
   match x with
+  (* By Obj.reachable_words. *)
   | Ed25519 _ -> 64
   | Secp256k1 _ -> 72
   | P256 _ -> 96
   | Bls _ -> 64
+  | Mldsa44 _ -> 1328
 
 let mutez_size = h2w
 
@@ -153,9 +163,6 @@ let address_size addr =
   +! destination_size addr.destination
   +! Entrypoint.in_memory_size addr.entrypoint
 
-let tx_rollup_l2_address_size (tx : tx_rollup_l2_address) =
-  Tx_rollup_l2_address.Indexable.in_memory_size @@ Indexable.forget tx
-
 let view_signature_size (View_signature {name; input_ty; output_ty}) =
   ret_adding
     (ty_size input_ty ++ ty_size output_ty)
@@ -167,8 +174,7 @@ let script_expr_hash_size = !!64
    the recursion is bound by the size of the witness, which is an
    11-bit unsigned integer, i.e. at most 2048. This is enough to
    guarantee there will be no stack overflow. *)
-let rec stack_prefix_preservation_witness_size_internal :
-    type a b c d e f g h.
+let rec stack_prefix_preservation_witness_size_internal : type a b c d e f g h.
     (a, b, c, d, e, f, g, h) stack_prefix_preservation_witness -> nodes_and_size
     = function
   | KPrefix (_loc, ty, w) ->
@@ -207,8 +213,6 @@ let contract_size : type t. t typed_contract -> nodes_and_size = function
       ret_adding
         (ty_size arg_ty)
         (h3w +! blake2b_hash_size +! Entrypoint.in_memory_size entrypoint)
-  | Typed_tx_rollup {arg_ty; tx_rollup} ->
-      ret_adding (ty_size arg_ty) (h2w +! Tx_rollup.in_memory_size tx_rollup)
   | Typed_sc_rollup {arg_ty; sc_rollup; entrypoint} ->
       ret_adding
         (ty_size arg_ty)
@@ -236,32 +240,29 @@ let chest_size chest =
   (*
      type chest = {
        locked_value : locked_value;
-       rsa_public : rsa_public;
        ciphertext : ciphertext;
      }
   *)
   let locked_value_size = 256 in
-  let rsa_public_size = 256 in
   let ciphertext_size = Script_timelock.get_plaintext_size chest in
-  h3w +? (locked_value_size + rsa_public_size + ciphertext_size)
+  h3w +? (locked_value_size + ciphertext_size)
 
 let chest_key_size _ =
   (*
      type chest_key = {
-       unlocked_value : unlocked_value;
-       proof : time_lock_proof
+       vdf_tuple : vdf_tuple; a record of 3 group elements, each of size 256 bytes
+       nonce : Z.t;  RSA modulus size (256 bytes) + 128 bits
      }
   *)
-  let unlocked_value_size = 256 in
-  let proof_size = 256 in
-  h2w +? (unlocked_value_size + proof_size)
+  let vdf_tuple_size = 3 * 256 in
+  let nonce_size = 256 + 16 in
+  h2w +? (vdf_tuple_size + nonce_size)
 
 (* The following mutually recursive functions are mostly
    tail-recursive and the only recursive call that is not a tailcall
    cannot be nested. (See [big_map_size].) For this reason, these
    functions should not trigger stack overflows. *)
-let rec value_size :
-    type a ac.
+let rec value_size : type a ac.
     count_lambda_nodes:bool ->
     nodes_and_size ->
     (a, ac) ty ->
@@ -282,8 +283,6 @@ let rec value_size :
     | Key_t -> ret_succ_adding accu (public_key_size x)
     | Timestamp_t -> ret_succ_adding accu (timestamp_size x)
     | Address_t -> ret_succ_adding accu (address_size x)
-    | Tx_rollup_l2_address_t ->
-        ret_succ_adding accu (tx_rollup_l2_address_size x)
     | Bool_t -> ret_succ accu
     | Pair_t (_, _, _, _) -> ret_succ_adding accu h2w
     | Or_t (_, _, _, _) -> ret_succ_adding accu h1w
@@ -293,11 +292,17 @@ let rec value_size :
     | List_t (_, _) -> ret_succ_adding accu (h2w +! (h2w *? x.length))
     | Set_t (_, _) ->
         let module M = (val Script_set.get x) in
-        let boxing_space = !!536 (* By Obj.reachable_words. *) in
+        let boxing_space =
+          !!536
+          (* By Obj.reachable_words. *)
+        in
         ret_succ_adding accu (boxing_space +! (h4w *? M.size))
     | Map_t (_, _, _) ->
         let module M = (val Script_map.get_module x) in
-        let boxing_space = !!696 (* By Obj.reachable_words. *) in
+        let boxing_space =
+          !!696
+          (* By Obj.reachable_words. *)
+        in
         ret_succ_adding accu (boxing_space +! (h5w *? M.size))
     | Big_map_t (cty, ty', _) ->
         (big_map_size [@ocaml.tailcall])
@@ -327,15 +332,18 @@ let rec value_size :
   in
   value_traverse ty x accu {apply}
 
-and big_map_size :
-    type a b bc.
+and big_map_size : type a b bc.
     count_lambda_nodes:bool ->
     nodes_and_size ->
     a comparable_ty ->
     (b, bc) ty ->
     (a, b) big_map ->
     nodes_and_size =
- fun ~count_lambda_nodes accu cty ty' (Big_map {id; diff; key_type; value_type}) ->
+ fun ~count_lambda_nodes
+     accu
+     cty
+     ty'
+     (Big_map {id; diff; key_type; value_type}) ->
   (* [Map.bindings] cannot overflow and only consumes a
      logarithmic amount of stack. *)
   let diff_size =
@@ -364,8 +372,7 @@ and big_map_size :
     (ty_size key_type ++ ty_size value_type ++ diff_size)
     (h4w +! id_size)
 
-and lambda_size :
-    type i o.
+and lambda_size : type i o.
     count_lambda_nodes:bool -> nodes_and_size -> (i, o) lambda -> nodes_and_size
     =
  fun ~count_lambda_nodes accu lam ->
@@ -383,8 +390,7 @@ and lambda_size :
   | Lam (kdescr, node) -> count_lambda_body kdescr node
   | LamRec (kdescr, node) -> count_lambda_body kdescr node
 
-and kdescr_size :
-    type a s r f.
+and kdescr_size : type a s r f.
     count_lambda_nodes:bool ->
     nodes_and_size ->
     (a, s, r, f) kdescr ->
@@ -395,8 +401,7 @@ and kdescr_size :
   in
   (kinstr_size [@ocaml.tailcall]) ~count_lambda_nodes accu kinstr
 
-and kinstr_size :
-    type a s r f.
+and kinstr_size : type a s r f.
     count_lambda_nodes:bool ->
     nodes_and_size ->
     (a, s, r, f) kinstr ->
@@ -419,20 +424,21 @@ and kinstr_size :
       (_k2 : (_, _, _, _) kinstr) (_k3 : (_, _, _, _) kinstr) =
     h4w
   in
-  let apply :
-      type a s r f. nodes_and_size -> (a, s, r, f) kinstr -> nodes_and_size =
+  let apply : type a s r f.
+      nodes_and_size -> (a, s, r, f) kinstr -> nodes_and_size =
    fun accu t ->
     match t with
     | IDrop (loc, k) -> ret_succ_adding accu (base1 loc k)
     | IDup (loc, k) -> ret_succ_adding accu (base1 loc k)
     | ISwap (loc, k) -> ret_succ_adding accu (base1 loc k)
-    | IConst (loc, ty, x, k) ->
+    | IPush (loc, ty, x, k) ->
         let accu = ret_succ_adding accu (base1 loc k +! (word_size *? 2)) in
         (value_size [@ocaml.tailcall])
           ~count_lambda_nodes
           (accu ++ ty_size ty)
           ty
           x
+    | IUnit (loc, k) -> ret_succ_adding accu (base1 loc k)
     | ICons_pair (loc, k) -> ret_succ_adding accu (base1 loc k)
     | ICar (loc, k) -> ret_succ_adding accu (base1 loc k)
     | ICdr (loc, k) -> ret_succ_adding accu (base1 loc k)
@@ -587,6 +593,9 @@ and kinstr_size :
           (base1 loc k +! stack_ty_for_logging_size sty +! (word_size *? 2))
     | ITransfer_tokens (loc, k) -> ret_succ_adding accu (base1 loc k)
     | IImplicit_account (loc, k) -> ret_succ_adding accu (base1 loc k)
+    | IIs_implicit_account (loc, k) -> ret_succ_adding accu (base1 loc k)
+    | IIndex_address (loc, k) -> ret_succ_adding accu (base1 loc k)
+    | IGet_address_index (loc, k) -> ret_succ_adding accu (base1 loc k)
     | ICreate_contract {loc; storage_type; code; k} ->
         ret_succ_adding
           (accu ++ ty_size storage_type ++ expr_size code)

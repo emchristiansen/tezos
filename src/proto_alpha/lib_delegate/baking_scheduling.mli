@@ -24,65 +24,84 @@
 (*****************************************************************************)
 
 open Baking_state
+open Baking_state_types
 open Protocol.Alpha_context
 
-type loop_state
+(** [create_global_state ?dal_node_rpc_ctxt ?constants ~chain context
+    baking_configuration consensus_keys] creates a
+    {!type-Baking_state.global_state}: [round_durations] are created from
+    [constants], and a forge worker is started. If [constants] is not provided,
+    an RPC is called to recover them from [context]. *)
+val create_global_state :
+  ?dal_node_rpc_ctxt:Tezos_rpc.Context.generic ->
+  ?constants:Constants.t ->
+  chain:Chain_services.chain ->
+  Protocol_client_context.full ->
+  Baking_configuration.t ->
+  Baking_state_types.Key.t list ->
+  global_state tzresult Lwt.t
 
-val create_loop_state :
-  ?get_valid_blocks_stream:proposal Lwt_stream.t Lwt.t ->
-  heads_stream:proposal Lwt_stream.t ->
-  Operation_worker.t ->
-  loop_state
+(** [create_initial_state ?canceler context ?synchronize
+    ?monitor_node_operations ~global_state current_proposal consensus_keys]
+    creates an initial {!Baking_state.t} for a single node connection by
+    initializing a {!type-Baking_state.automaton_state}, a
+    {!type-Baking_state.level_state} and a {!type-Baking_state.round_state}
+    from an existing [global_state].
 
-val sleep_until : Time.Protocol.t -> unit Lwt.t option
+    - For the [automaton_state] initialization, a validation mode is set based
+    on the baking configuration and an operation worker is started. If
+    [canceler] is provided, cancelling it will also trigger a shutdown of the
+    operation worker. See {!Baking_automaton.create_automaton_state}.
 
-(** An event monitor using the streams in [loop_state] (to create
-    promises) and a timeout promise [timeout]. The function reacts to a
-    promise being fulfilled by firing an event [Baking_state.event]. *)
-val wait_next_event :
-  timeout:[`Timeout of timeout_kind] Lwt.t ->
-  loop_state ->
-  (event option, error trace) result Lwt.t
+    - For the [level_state] initialization, information regarding the current
+    and next levels is retrieved (the current level being that of the
+    [current_proposal]) and delegate slots are computed for the given
+    [consensus_keys] at both levels. The DAL included attestations cache
+    committees are also initialized for both levels.
 
-val compute_next_round_time : state -> (Time.Protocol.t * Round.t) option
-
-val first_potential_round_at_next_level :
-  state ->
-  earliest_round:Round.t ->
-  (Round.t * consensus_key_and_delegate) option
-
-val compute_next_potential_baking_time_at_next_level :
-  state -> (Time.Protocol.t * Round.t) option Lwt.t
-
-val compute_next_timeout : state -> timeout_kind Lwt.t tzresult Lwt.t
-
+    - For the [round_state] initialization, current round is computed by calling
+    {!Baking_actions.compute_round} with [current_proposal] information if
+    [synchronize] is set to [true] (which is the default). *)
 val create_initial_state :
+  ?canceler:Lwt_canceler.t ->
   Protocol_client_context.full ->
   ?synchronize:bool ->
-  chain:Chain_services.chain ->
-  Baking_configuration.t ->
-  Operation_worker.t ->
+  ?monitor_node_operations:bool ->
+  global_state:global_state ->
   current_proposal:proposal ->
-  consensus_key list ->
+  Baking_state_types.Key.t list ->
   state tzresult Lwt.t
 
-val compute_bootstrap_event : state -> event tzresult
+(** [run context ?canceler ?stop_on_event ?on_error ?constants chain
+    baking_configuration consensus_keys] is the entry point of the baker
+    automaton. This function performs the following tasks:
 
-val automaton_loop :
-  ?stop_on_event:(event -> bool) ->
-  config:Baking_configuration.t ->
-  on_error:(tztrace -> (unit, tztrace) result Lwt.t) ->
-  loop_state ->
-  state ->
-  event ->
-  event option tzresult Lwt.t
+    - perform a sanity check that check the location of the baking files,
+    nonces, highwatermarks and state files, also verifying that the files are
+    loadable
 
+    - create the streams for valid blocks, new heads, and operations from the
+    node's mempool's
+
+    - create an initial state, see {!Baking_automaton.create_initial_state}
+
+    - register dal profiles by calling the [register_dal_profiles] node RPC
+
+    - start a revelation worker for nonces by calling
+    {!Baking_nonces.start_revelation_worker}
+
+    - create the automaton state, see {!Baking_automaton.create_loop_state}
+
+    - run the automaton loop, see {!Baking_automaton.automaton_loop} *)
 val run :
   Protocol_client_context.full ->
+  extra_nodes:Protocol_client_context.full list ->
+  ?dal_node_rpc_ctxt:Tezos_rpc.Context.generic ->
   ?canceler:Lwt_canceler.t ->
   ?stop_on_event:(event -> bool) ->
   ?on_error:(tztrace -> unit tzresult Lwt.t) ->
+  ?constants:Constants.t ->
   chain:Chain_services.chain ->
   Baking_configuration.t ->
-  consensus_key list ->
+  Baking_state_types.Key.t list ->
   unit tzresult Lwt.t

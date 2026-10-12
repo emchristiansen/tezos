@@ -66,11 +66,11 @@ module type S = sig
     ?first_key:key ->
     ?values:'a Map.Map.t ->
     ?produce_value:'a producer ->
-    ?origin:Lazy_map.tree ->
+    ?origin:Tezos_tree_encoding.wrapped_tree ->
     key ->
     'a t
 
-  val origin : 'a t -> Lazy_map.tree option
+  val origin : 'a t -> Tezos_tree_encoding.wrapped_tree option
 
   val empty : unit -> 'a t
 
@@ -105,6 +105,11 @@ module type S = sig
   val loaded_bindings : 'a t -> (key * 'a option) list
 
   val first_key : 'a t -> key
+
+  val encoding :
+    key Tezos_tree_encoding.t ->
+    'a Tezos_tree_encoding.t ->
+    'a t Tezos_tree_encoding.t
 end
 
 module ZZ : KeyS with type t = Z.t = struct
@@ -120,7 +125,7 @@ module ZZ : KeyS with type t = Z.t = struct
   let unsigned_compare = Z.compare
 end
 
-module Make (Key : KeyS) : S with type key = Key.t = struct
+module Make_no_enc (Key : KeyS) = struct
   module Map = Lazy_map.Make (Key)
 
   type key = Key.t
@@ -258,7 +263,7 @@ module Make (Key : KeyS) : S with type key = Key.t = struct
     (* The empty vector is not correctly taken into account otherwise, since
        `pred zero` = `-1`, which is an invalid key according to
        {!invalid_key}. *)
-    if map.num_elements = Key.zero then Lwt.return []
+    if map.num_elements = Key.zero then Lwt.return_nil
     else (unroll [@ocaml.tailcall]) [] (Key.pred map.num_elements)
 
   let concat lhs rhs =
@@ -277,6 +282,14 @@ module Make (Key : KeyS) : S with type key = Key.t = struct
     of_list (List.filter_map Fun.id (lhs @ rhs))
 
   let first_key vector = vector.first
+end
+
+module Make (Key : KeyS) : S with type key = Key.t = struct
+  module No_enc = Make_no_enc (Key)
+  module Encoding = Tezos_tree_encoding.Lazy_vector_encoding.Make (No_enc)
+  include No_enc
+
+  let encoding = Encoding.lazy_vector
 end
 
 module Int = struct
@@ -307,11 +320,11 @@ module Mutable = struct
     val create :
       ?values:'a Vector.Map.Map.t ->
       ?produce_value:'a Vector.producer ->
-      ?origin:Lazy_map.tree ->
+      ?origin:Tezos_tree_encoding.wrapped_tree ->
       key ->
       'a t
 
-    val origin : 'a t -> Lazy_map.tree option
+    val origin : 'a t -> Tezos_tree_encoding.wrapped_tree option
 
     val get : key -> 'a t -> 'a Lwt.t
 

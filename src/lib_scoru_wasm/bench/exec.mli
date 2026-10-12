@@ -53,14 +53,19 @@ val show_phase : phase -> string
 val finish_top_level_call_on_state :
   Internal_state.pvm_state -> (Internal_state.pvm_state * int64) Lwt.t
 
-(** [execute_on_state phase state] Execute a given [phase] of the execution loop
-    on the state. *)
+(** [execute_on_state ~reveal_builtins phase state] Execute a given [phase] of
+    the execution loop on the state. *)
 val execute_on_state :
-  phase -> Internal_state.pvm_state -> (Internal_state.pvm_state * int64) Lwt.t
+  reveal_builtins:Tezos_scoru_wasm.Builtins.reveals ->
+  phase ->
+  Internal_state.pvm_state ->
+  (Internal_state.pvm_state * int64) Lwt.t
 
 (** Execute one top level call using fast execution. *)
 val execute_fast :
-  Internal_state.pvm_state -> (Internal_state.pvm_state * int64) Lwt.t
+  reveal_builtins:Tezos_scoru_wasm.Builtins.reveals ->
+  Internal_state.pvm_state ->
+  (Internal_state.pvm_state * int64) Lwt.t
 
 (** [run path k] execute [k] on the content of the file at [path] *)
 val run : Lwt_io.file_name -> (string -> 'a Lwt.t) -> 'a Lwt.t
@@ -69,7 +74,7 @@ val run : Lwt_io.file_name -> (string -> 'a Lwt.t) -> 'a Lwt.t
         "src/lib_scoru_wasm/bench/inputs/my_kernel.wasm"]
        initialize a state from a kernel (byte format) *)
 val initial_boot_sector_from_kernel :
-  ?max_tick:int64 -> string -> Wasm.tree Lwt.t
+  ?max_tick:int64 -> string -> Wasm.state Lwt.t
 
 (** Inputs can be given :
     as a filename containing the input,
@@ -84,4 +89,4 @@ type message = Transfer of input | Other of input | Encoded of input
 (** [load_messages messages level state] sends messages to the inbox,
     at a given level. Will fail if the VM is not accepting input,
     and advance until next Snapshot.*)
-val load_messages : message list -> int32 -> Wasm.tree -> Wasm.tree Lwt.t
+val load_messages : message list -> int32 -> Wasm.state -> Wasm.state Lwt.t

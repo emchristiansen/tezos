@@ -36,6 +36,8 @@
 open Tezos_crypto
 open Tezos_crypto.Hashed
 
+let team = Tag.layer1
+
 type operation = {shell_header : branch; protocol_data : protocol_data}
 
 and branch = {branch : Block_hash.t}
@@ -89,7 +91,8 @@ let operation_content_encoding : operation_content Data_encoding.t =
            storage_limit;
            amount;
            destination;
-         } ->
+         }
+       ->
       (kind, source, fee, counter, gas_limit, storage_limit, amount, destination))
     (fun ( kind,
            source,
@@ -98,7 +101,8 @@ let operation_content_encoding : operation_content Data_encoding.t =
            gas_limit,
            storage_limit,
            amount,
-           destination ) ->
+           destination )
+       ->
       {
         kind;
         source;
@@ -272,7 +276,7 @@ let sample_next_transfer_for state ~fee ~branch ~account =
                 source = account.Account.public_key_hash;
                 fee = string_of_int fee;
                 counter = string_of_int @@ get_next_counter state account;
-                gas_limit = string_of_int 2000;
+                gas_limit = string_of_int 4000;
                 storage_limit = "0";
                 amount = string_of_int amount;
                 destination = receiver.Account.public_key_hash;
@@ -312,7 +316,7 @@ let bake_with_mempool ?protocol node client mempool =
   Client.bake_for_and_wait
     ?protocol
     ~force:true
-    ~context_path:(Node.data_dir node // "context")
+    ~context_path:(Node.data_dir node)
     client
 
 let get_current_head_hash state =
@@ -357,11 +361,11 @@ let check_ordering ops =
 
 let assert_block_is_well_baked block expected_number_manager_op =
   match JSON.(as_list (block |-> "operations")) with
-  | [endorsement_ops; vote_ops; anonymous_ops; manager_ops] ->
-      (* There very well might be endorsement operations *)
+  | [consensus_ops; vote_ops; anonymous_ops; manager_ops] ->
+      (* There very well might be attestation operations *)
       Log.debug
-        "%d endorsement operations"
-        (List.length (JSON.as_list endorsement_ops)) ;
+        "%d consensus operations"
+        (List.length (JSON.as_list consensus_ops)) ;
       List.iter
         (fun l -> assert (JSON.as_list l = []))
         [vote_ops; anonymous_ops] ;
@@ -420,7 +424,7 @@ let bake_and_check ?expected_baked_operations state ~protocol ~mempool ~sources
   let* () =
     bake_with_mempool ~protocol state.sandbox_node state.sandbox_client mempool
   in
-  let* block = RPC.(Client.call state.sandbox_client (get_chain_block ())) in
+  let* block = Client.RPC.call state.sandbox_client @@ RPC.get_chain_block () in
   let expected_number_manager_op =
     match expected_baked_operations with
     | None ->
@@ -451,7 +455,7 @@ let test_ordering =
   Protocol.register_test
     ~__FILE__
     ~title:"baking ordering"
-    ~tags:["baking"; "ordering"]
+    ~tags:[team; "baking"; "ordering"]
   @@ fun protocol ->
   let* state = init ~protocol in
   Log.info "Testing ordering by counter" ;
@@ -477,7 +481,7 @@ let test_ordering =
   bake_and_check state ~protocol ~mempool ~sources
 
 let check_op_not_in_baked_block client op =
-  let* ops = RPC.Client.call client @@ RPC.get_chain_block_operations () in
+  let* ops = Client.RPC.call client @@ RPC.get_chain_block_operations () in
   let open JSON in
   let ops_list = ops |=> 3 |> as_list in
   let res = List.exists (fun e -> e |-> "hash" |> as_string = op) ops_list in
@@ -488,16 +492,20 @@ let wrong_branch_operation_dismissal =
   Protocol.register_test
     ~__FILE__
     ~title:"wrong branch operation dismissal"
-    ~tags:["baking"; "branch"]
+    ~tags:[team; "baking"; "branch"]
   @@ fun protocol ->
   let* node = Node.init [Synchronisation_threshold 0; Private_mode] in
   let* client = Client.init ~endpoint:(Node node) () in
   let minimal_block_delay = 1 in
+  let consensus_threshold_name =
+    if Protocol.(number protocol >= 022) then "consensus_threshold_size"
+    else "consensus_threshold"
+  in
   let* parameter_file =
     Protocol.write_parameter_file
       ~base:(Either.Right (protocol, None))
       [
-        (["consensus_threshold"], `Int 1);
+        ([consensus_threshold_name], `Int 1);
         (["minimal_block_delay"], `String_of_int minimal_block_delay);
         (["delay_increment_per_round"], `String "1");
       ]
@@ -510,7 +518,7 @@ let wrong_branch_operation_dismissal =
   let* () = Client.propose_for ~minimal_timestamp:false ~key:[] client in
   (* We inject an operation where the branch is the head (instead of
      head~2). Such operation should not be included. *)
-  let* branch = RPC.Client.call client @@ RPC.get_chain_block_hash () in
+  let* branch = Client.RPC.call client @@ RPC.get_chain_block_hash () in
   Log.info "Injecting a transfer branched on the current head." ;
   let* (`OpHash oph) =
     Operation.Manager.(inject ~branch [make @@ transfer ()] client)
@@ -537,7 +545,7 @@ let baking_operation_exception =
   Protocol.register_test
     ~__FILE__
     ~title:"ensure we can still bake with a faulty operation"
-    ~tags:["baking"; "exception"]
+    ~tags:[team; "baking"; "exception"]
   @@ fun protocol ->
   let* node, client = Client.init_with_protocol `Client ~protocol () in
   let data_dir = Node.data_dir node in
@@ -555,15 +563,11 @@ let baking_operation_exception =
   (* We use [context_path] to ensure the baker will not use the
      preapply RPC. Indeed, this test was introduced because of a bug
      that happens when the baker does not use the preapply RPC. *)
-  let* () =
-    Client.bake_for_and_wait ~context_path:(data_dir // "context") client
-  in
+  let* () = Client.bake_for_and_wait ~context_path:data_dir client in
   let wait_injection = Node.wait_for_request ~request:`Inject node in
   let*! () = Client.reveal ~fee:Tez.one ~src:new_account.alias client in
   let* () = wait_injection in
-  let* () =
-    Client.bake_for_and_wait ~context_path:(data_dir // "context") client
-  in
+  let* () = Client.bake_for_and_wait ~context_path:data_dir client in
   let* _ =
     Operation.Manager.(
       inject
@@ -575,12 +579,12 @@ let baking_operation_exception =
                  minimal manager operation gas cost to cover this
                  possibility. See issue
                  https://gitlab.com/tezos/tezos/-/issues/3188 *)
-            ~gas_limit:(Constant.manager_operation_gas_cost + 400)
+            ~gas_limit:(Constant.manager_operation_gas_cost ~protocol + 400)
           @@ delegation ~delegate:new_account ();
         ]
         client)
   in
-  Client.bake_for_and_wait ~context_path:(data_dir // "context") client
+  Client.bake_for_and_wait ~context_path:data_dir client
 
 let init ?(overrides = []) protocol =
   let* sandbox_node = Node.init [Synchronisation_threshold 0; Private_mode] in
@@ -606,7 +610,7 @@ let test_operation_pool_ordering
          "External operations are ordered (%d transfers, max %d operations)"
          n_transfers
          operations)
-    ~tags:["operations_pool"; "baking"]
+    ~tags:[team; "operations_pool"; "baking"]
   @@ fun protocol ->
   let* endpoint, client = init protocol in
   (* Test preparation *)
@@ -621,7 +625,7 @@ let test_operation_pool_ordering
 
   let* () = Client.bake_for_and_wait ~endpoint client in
   let* gas_limit =
-    let* block = RPC.Client.call_json client (RPC.get_chain_block ()) in
+    let* block = Client.RPC.call_json client (RPC.get_chain_block ()) in
     JSON.get "operations" block
     |> JSON.geti 3 |> JSON.geti 0 |> JSON.get "contents" |> JSON.geti 0
     |> JSON.get "gas_limit" |> JSON.as_int |> Lwt.return
@@ -657,9 +661,9 @@ let test_operation_pool_ordering
 
   (* Create a valid operation pool from current mempool *)
   let* mempool =
-    RPC.Client.call client @@ RPC.get_chain_mempool_pending_operations ()
+    Client.RPC.call client @@ RPC.get_chain_mempool_pending_operations ()
   in
-  let mgmt_ops = JSON.get "applied" mempool in
+  let mgmt_ops = JSON.get "validated" mempool in
 
   let filename = Filename.temp_file "opool_" ".json" in
   let json = JSON.as_list mgmt_ops in
@@ -683,7 +687,7 @@ let test_operation_pool_ordering
   in
   let* op_hashes =
     let* json =
-      RPC.Client.call_json client (RPC.get_chain_block_operation_hashes ())
+      Client.RPC.call_json client (RPC.get_chain_block_operation_hashes ())
     in
     JSON.as_list (JSON.geti 3 json) |> Lwt.return
   in
@@ -716,10 +720,9 @@ let test_operation_pool_ordering
     block with the given [minimal_timestamp] flag. *)
 let baking_with_given_minimal_timestamp ~minimal_timestamp =
   Protocol.register_test
-    ~supports:Protocol.(From_protocol (number Mumbai + 1))
     ~__FILE__
     ~title:(sf "Baking minimal timestamp (%b)" minimal_timestamp)
-    ~tags:["baking"; "timestamp"]
+    ~tags:[team; "baking"; "timestamp"]
   @@ fun protocol ->
   let* _node, client =
     Client.init_with_protocol

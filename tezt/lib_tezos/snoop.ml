@@ -2,6 +2,7 @@
 (*                                                                           *)
 (* Open Source License                                                       *)
 (* Copyright (c) 2021 Nomadic Labs <contact@nomadic-labs.com>                *)
+(* Copyright (c) 2023  Marigold <contact@marigold.dev>                       *)
 (*                                                                           *)
 (* Permission is hereby granted, free of charge, to any person obtaining a   *)
 (* copy of this software and associated documentation files (the "Software"),*)
@@ -39,24 +40,29 @@ type tag =
   | Io
   | Misc
   | Builtin
-  | Gtoc
+  | Global_constants
   | Cache
   | Carbonated_map
-  | Tx_rollup
   | Tickets
   | Big_map
   | Skip_list
   | Sc_rollup
+  | Shell
+  | Apply
+  | Example
+  | Micheline
+  | Dal
 
 type michelson_term_kind = Data | Code
 
 type list_mode = All | Any | Exactly
 
-let create ?(path = Constant.tezos_snoop) ?(color = Log.Color.FG.blue) () =
+let create ?(path = Uses.path Constant.octez_snoop) ?(color = Log.Color.FG.blue)
+    () =
   {path; name = "snoop"; color}
 
 let spawn_command snoop command =
-  Process.spawn ~name:snoop.name ~color:snoop.color snoop.path @@ command
+  Process.spawn ~name:snoop.name ~color:snoop.color snoop.path command
 
 (* Benchmark command *)
 
@@ -118,8 +124,8 @@ let benchmark ~bench_name ~bench_num ~nsamples ~save_to ?seed ?config_file
 
 (* Infer command *)
 
-let infer_command ~model_name ~workload_data ~regression_method ~dump_csv
-    ~solution ?report ?graph () =
+let infer_command ~workload_data ~regression_method ~dump_csv ~solution ?report
+    ?graph () =
   let regression_method =
     match regression_method with
     | Lasso {positive} ->
@@ -138,27 +144,16 @@ let infer_command ~model_name ~workload_data ~regression_method ~dump_csv
     | None -> []
     | Some graph_file -> ["--dot-file"; graph_file]
   in
-  [
-    "infer";
-    "parameters";
-    "for";
-    "model";
-    model_name;
-    "on";
-    "data";
-    workload_data;
-    "using";
-  ]
+  ["infer"; "parameters"; "on"; "data"; workload_data; "using"]
   @ regression_method
   @ ["--dump-csv"; dump_csv; "--save-solution"; solution]
   @ report @ graph
 
-let spawn_infer_parameters ~model_name ~workload_data ~regression_method
-    ~dump_csv ~solution ?report ?graph snoop =
+let spawn_infer_parameters ~workload_data ~regression_method ~dump_csv ~solution
+    ?report ?graph snoop =
   spawn_command
     snoop
     (infer_command
-       ~model_name
        ~workload_data
        ~regression_method
        ~dump_csv
@@ -167,10 +162,9 @@ let spawn_infer_parameters ~model_name ~workload_data ~regression_method
        ?graph
        ())
 
-let infer_parameters ~model_name ~workload_data ~regression_method ~dump_csv
-    ~solution ?report ?graph snoop =
+let infer_parameters ~workload_data ~regression_method ~dump_csv ~solution
+    ?report ?graph snoop =
   spawn_infer_parameters
-    ~model_name
     ~workload_data
     ~regression_method
     ~dump_csv
@@ -348,14 +342,18 @@ let string_of_tag (tag : tag) =
   | Io -> "io"
   | Misc -> "misc"
   | Builtin -> "builtin"
-  | Gtoc -> "global_constants"
+  | Global_constants -> "global_constants"
   | Cache -> "cache"
   | Carbonated_map -> "carbonated_map"
-  | Tx_rollup -> "tx_rollup"
   | Tickets -> "tickets"
   | Big_map -> "big_map"
   | Skip_list -> "skip_list"
   | Sc_rollup -> "sc_rollup"
+  | Shell -> "shell"
+  | Apply -> "apply"
+  | Example -> "example"
+  | Micheline -> "micheline"
+  | Dal -> "dal"
 
 let list_benchmarks_command mode tags =
   let tags = List.map string_of_tag tags in
@@ -394,3 +392,27 @@ let write_config ~(benchmark : string) ~(bench_config : string) ~(file : string)
     else Lwt.return_unit
   in
   spawn_command snoop command |> Process.check
+
+let generate_code_for_solutions ~solution ?save_to ?split_to ?fixed_point snoop
+    =
+  let command =
+    ["generate"; "code"; "for"; "solutions"; solution]
+    @ (match fixed_point with None -> [] | Some fn -> ["--fixed-point"; fn])
+    @ (match save_to with None -> [] | Some file -> ["--save-to"; file])
+    @ match split_to with None -> [] | Some dir -> ["--split-to"; dir]
+  in
+
+  let process = spawn_command snoop command in
+  let* output = Process.check_and_read_stdout process in
+  match save_to with None -> Lwt.return output | _ -> Lwt.return ""
+
+let check_definitions ~files snoop =
+  let open Process in
+  let command ~files = ["check"; "definitions"; "of"] @ files in
+  let spawn ~files snoop = spawn_command snoop (command ~files) in
+  let process = spawn ~files snoop in
+  Lwt.catch
+    (fun () -> check process)
+    (fun exn ->
+      Log.error "Cost function definitions have some issues" ;
+      raise exn)

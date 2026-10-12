@@ -30,6 +30,8 @@
    Subject:      Integration tests of p2p layer.
 *)
 
+let team = Tag.layer1
+
 module ACL = struct
   (* Test.
 
@@ -53,7 +55,7 @@ module ACL = struct
     Test.register
       ~__FILE__
       ~title:"check ip greylisting"
-      ~tags:["p2p"; "acl"; "greylist"]
+      ~tags:[team; "p2p"; "acl"; "greylist"]
     @@ fun () ->
     let localhost_ips =
       [
@@ -73,7 +75,7 @@ module ACL = struct
         target
         ~data:"\000\010Hello, world. This is garbage, greylist me !"
     in
-    let* json = RPC.Client.call client RPC.get_network_greylist_ips in
+    let* json = Client.RPC.call client RPC.get_network_greylist_ips in
     let greylisted_ips = JSON.(as_list (json |-> "ips")) in
     let nb_greylisted_ips = List.length greylisted_ips in
     if nb_greylisted_ips <> 1 then
@@ -116,7 +118,7 @@ let check_peer_option =
   Protocol.register_test
     ~__FILE__
     ~title:"check peer option"
-    ~tags:["p2p"; "cli"; "peer"]
+    ~tags:[team; "p2p"; "cli"; "peer"]
   @@ fun protocol ->
   let* node_1 = Node.init [Synchronisation_threshold 0] in
   let* client = Client.init ~endpoint:(Node node_1) () in
@@ -145,7 +147,7 @@ let test_one_connection =
   Protocol.register_test
     ~__FILE__
     ~title:"check --connection=1 option"
-    ~tags:["p2p"; "cli"; "connections"]
+    ~tags:[team; "p2p"; "cli"; "connections"]
   @@ fun protocol ->
   let* node_1 = Node.init [Synchronisation_threshold 0] in
   let* client = Client.init ~endpoint:(Node node_1) () in
@@ -171,11 +173,14 @@ let rec wait_pred ~pred ~arg =
 (* [get_nb_connections ~client] returns the number of active connections of the
    node  to [client]. *)
 let get_nb_connections node =
-  let* ports = RPC.call node RPC.get_network_connections in
+  let* ports = Node.RPC.call node RPC.get_network_connections in
   return @@ List.length ports
 
 (* [wait_connections ~client n] waits until the node related to [client] has at
    least [n] active connections. *)
+(* TODO: https://gitlab.com/tezos/tezos/-/issues/4919
+   Use Node.wait_for instead of spaming the node with RPCs
+*)
 let wait_connections node nb_conns_target =
   wait_pred
     ~pred:(fun () ->
@@ -204,7 +209,9 @@ module Maintenance = struct
     Test.register
       ~__FILE__
       ~title:"p2p-maintenance-disabled"
-      ~tags:["p2p"; "node"; "maintenance"]
+      ~tags:[team; "p2p"; "node"; "maintenance"]
+      ~uses_client:false
+      ~uses_admin_client:false
     @@ fun () ->
     (* We set the maintenance idle time to 5 seconds to make the test
        shorter. *)
@@ -230,7 +237,7 @@ module Maintenance = struct
       Node.add_peer node peer ;
       let* () = Node.identity_generate node in
       let* () = Node.config_init node [] in
-      Node.Config_file.update node patch_config ;
+      let* () = Node.Config_file.update node patch_config in
       return node
     in
     let run_node node params =
@@ -318,7 +325,7 @@ module Maintenance = struct
     Test.register
       ~__FILE__
       ~title:"p2p-maintenance-init-expected_connections"
-      ~tags:["p2p"; "node"; "maintenance"]
+      ~tags:[team; "p2p"; "node"; "maintenance"; Tag.memory_hungry]
     @@ fun () ->
     (* Connections values evaluated from --connections option. *)
     let min_connections = expected_connections / 2 in
@@ -342,11 +349,21 @@ module Maintenance = struct
       max_target
       max_threshold
       max_connections ;
-    let* target_node = Node.init [Connections expected_connections] in
+    (* TODO: https://gitlab.com/tezos/tezos/-/issues/6442
+       This test launches 10 nodes and consumes a large amount of memory.
+       To reduce memory consumption each node launches its RPC server locally.
+       A better way to reduce memory consumption would be to use nodes that
+       only have the p2p layer. *)
+    let* target_node =
+      Node.init ~rpc_external:false [Connections expected_connections]
+    in
     let* target_client = Client.init ~endpoint:(Node target_node) () in
     Log.info "Target created." ;
     let nodes =
-      Cluster.create max_connections [Connections (max_connections - 1)]
+      Cluster.create
+        max_connections
+        ~rpc_external:false
+        [Connections (max_connections - 1)]
     in
     Cluster.clique nodes ;
     let* () = Cluster.start ~public:true nodes in
@@ -376,6 +393,248 @@ module Maintenance = struct
     test_expected_connections ()
 end
 
+module Swap = struct
+  module StringSet = Set.Make (String)
+
+  let run_node ?patch_config node =
+    let* () = Node.identity_generate node in
+    let* () = Node.config_init node [] in
+    let* () =
+      match patch_config with
+      | None -> Lwt.return_unit
+      | Some config -> Node.Config_file.update node config
+    in
+    let* () = Node.run node [] in
+    Node.wait_for_ready node
+
+  (* Tests the swap mechanism.
+     - Create the following topology:
+       1b-1a-swaper-2a-2b
+       with all nodes except swaper that has its maintenance and peer discovery
+       disabled.
+     - Check logs for swap request events
+     - Check that the new topology is one of the following:
+       1b-swaper-1a-2a-2b if swaper sent its request to 1a or
+       1b-1a-2a-swaper-2b if swaper sent its request to 2a.
+
+     If [disable_swap = true], checks that disabled nodes does not answer to
+     swap request. Disable the swap for nodes 1a and 1b and check that swaper
+     does not receive a swap ack after it sends a swap request.
+
+     If [terminate = true], all the nodes are terminated at the end of
+     the test to cleanup resources of this particularly greedy
+     test. *)
+
+  (* NOTE: This test has previously been flaky because of some race conditions that
+     where caused by inconsistencies regarding the way the maintenance was
+     triggered. Please see the following patch that solves the race condition
+     for more details:
+     https://gitlab.com/tezos/tezos/-/commit/9df348f7447df7c89bd1456e8640b7686e51aebe
+
+     More precisely, as the node [swaper] is configured with [Connection = 2],
+     the max number of connections it accepted was [3]. Thus, during the swap,
+     as a connection is added (before removing the replaced one), the number
+     of connections was equal to [3]. The maintenance was then triggered
+     unexpectedly. This should not occur anymore. *)
+  let test_swap_raw ?(disable_swap = false) ?(terminate = true) () =
+    let create_node name params =
+      Node.create ~name (Disable_p2p_maintenance :: params)
+    in
+    let run_node =
+      run_node
+        ~patch_config:
+          (JSON.update
+             "p2p"
+             (JSON.put
+                ( "disable_peer_discovery",
+                  JSON.parse ~origin:__LOC__ (Bool.to_string true) )))
+    in
+    let filter_get_peer json =
+      let peer = JSON.(json |-> "proposed_peer" |> as_string) in
+      Some peer
+    in
+    let filter_fail _ =
+      Test.fail
+        "Swap ack should not be send by node_1a or node_2a because it is \
+         disabled"
+    in
+    let wait_swap_request_received node =
+      let* peer =
+        Node.wait_for node "swap_request_received.v0" filter_get_peer
+      in
+      Lwt.return (node, peer)
+    in
+    let wait_swap_succeeded node =
+      let* () = Node.wait_for node "swap_succeeded.v0" (fun _ -> Some ()) in
+      Lwt.return node
+    in
+    let connect node1 node2 =
+      let addr, port = Node.point node2 in
+      let point = addr ^ ":" ^ Int.to_string port in
+      Node.RPC.(call node1 (put_network_points point))
+    in
+    let get_node_from_id nodes id =
+      Lwt_list.find_s
+        (fun node ->
+          let* node_id = Node.wait_for_identity node in
+          Lwt.return (id = node_id))
+        nodes
+    in
+    let check_conns expected_peers node =
+      let pp_set ppf s =
+        Format.pp_print_seq
+          ~pp_sep:(fun ppf () -> Format.fprintf ppf ", ")
+          Format.pp_print_string
+          ppf
+          (StringSet.to_seq s)
+      in
+      let* conns = Node.RPC.(call node get_network_connections) in
+      let conn_ids =
+        List.map (fun (_, _, id) -> id) conns |> StringSet.of_list
+      in
+      let name = Node.name node in
+      let* expected_ids =
+        Lwt_list.map_p Node.wait_for_identity expected_peers
+      in
+      let expected_ids = StringSet.of_list expected_ids in
+      Log.info
+        "Testing connections for %s to be : [%a]"
+        name
+        pp_set
+        expected_ids ;
+      if not (StringSet.subset expected_ids conn_ids) then
+        Test.fail
+          "Missing connections for node %s (expected: [%a], found: [%a])"
+          name
+          pp_set
+          expected_ids
+          pp_set
+          conn_ids ;
+      unit
+    in
+    let prefix, params =
+      if disable_swap then ("disable.", [Node.Disable_p2p_swap]) else ("", [])
+    in
+    let node_1a = create_node (prefix ^ "1a") params in
+    let node_1b = create_node (prefix ^ "1b") params in
+    let node_2a = create_node (prefix ^ "2a") params in
+    let node_2b = create_node (prefix ^ "2b") params in
+    let swaper = Node.create ~name:(prefix ^ "swaper") [Connections 2] in
+    let nodes = [node_1a; node_1b; node_2a; node_2b; swaper] in
+    let swap_request_received =
+      Lwt.pick
+        [wait_swap_request_received node_1a; wait_swap_request_received node_2a]
+    in
+    let filter = if disable_swap then filter_fail else filter_get_peer in
+    let swap_ack_received =
+      Node.wait_for swaper "swap_ack_received.v0" filter
+    in
+    let swap_succeeded =
+      let* node =
+        Lwt.pick [wait_swap_succeeded node_1a; wait_swap_succeeded node_2a]
+      and* _ = wait_swap_succeeded swaper in
+      Lwt.return node
+    in
+    Node.add_peer swaper node_1a ;
+    Node.add_peer swaper node_2a ;
+    let* () = Lwt_list.iter_p run_node [node_1b; node_1a; node_2a; node_2b] in
+    let* _ = connect node_1a node_1b in
+    let* _ = connect node_2a node_2b in
+    let* () = run_node swaper in
+    let* requested_node =
+      let* requested_node, proposed_peer = swap_request_received in
+      let* proposed_node = get_node_from_id nodes proposed_peer in
+      Log.info
+        "%s node received a swap request with %s proposed"
+        (Node.name requested_node)
+        (Node.name proposed_node) ;
+      Lwt.return requested_node
+    and* () =
+      let* proposed_peer = swap_ack_received in
+      let* proposed_node = get_node_from_id nodes proposed_peer in
+      Log.info
+        "swaper node received a swap ack with %s proposed"
+        (Node.name proposed_node) ;
+      unit
+    and* succeded_requested_node = swap_succeeded in
+    Check.(
+      (Node.name requested_node = Node.name succeded_requested_node) string)
+      ~error_msg:
+        "Expected requested node and succesful node to be the same. But node \
+         %L differs from %R." ;
+    Log.info
+      "swap succeeded between %s and %s"
+      (Node.name swaper)
+      (Node.name succeded_requested_node) ;
+    let swaper_expected_conns, requested_node_expected_conns =
+      if Node.name requested_node = Node.name node_1a then
+        ([node_1a; node_1b], [swaper; node_2a])
+      else ([node_2a; node_2b], [swaper; node_1a])
+    in
+    let* () = check_conns swaper_expected_conns swaper in
+    let* () = check_conns requested_node_expected_conns requested_node in
+    if terminate then Lwt_list.iter_s Node.terminate nodes else unit
+
+  (* Same as [test_swap_raw] with default parameters. *)
+  let test_swap () =
+    Test.register
+      ~__FILE__
+      ~title:"p2p-swap"
+      ~tags:[team; "p2p"; "node"; "swap"; Tag.ci_disabled]
+      ~uses_client:false
+      ~uses_admin_client:false
+    @@ fun () -> test_swap_raw ()
+
+  (* Checks that nodes with swap disabled neither respond to swap request nor
+     send swap request. *)
+  let test_swap_disable () =
+    Test.register
+      ~__FILE__
+      ~title:"p2p-swap-disable"
+      ~tags:[team; "p2p"; "node"; "swap"]
+      ~uses_client:false
+      ~uses_admin_client:false
+    @@ fun () ->
+    (* Since we try to verify that something does not happen, we need
+       to find when we consider having waited enough time to consider
+       the event will not happen. The idea is to define this duration
+       from the duration that it takes to have the thing to happen in
+       a normal situation. Thus, we record the tezt_swap_raw_duration
+       to calibrate that duration. *)
+    let start = Tezos_base.Time.System.now () in
+    let* () = test_swap_raw () in
+    let stop = Tezos_base.Time.System.now () in
+    let tezt_swap_raw_duration =
+      Ptime.Span.to_float_s
+        (Ptime.Span.sub (Ptime.to_span stop) (Ptime.to_span start))
+    in
+    Log.info "swap_raw test terminated in %f sec." tezt_swap_raw_duration ;
+    (* Test that nodes with swap disabled does not answer to swap requests. *)
+    let _ = test_swap_raw ~disable_swap:true ~terminate:false () in
+    (* Test that nodes with swap disabled does not send swap requests.
+       Launch a node with swap disabled and 2 neighbors and checks that it does
+       not send swap request. *)
+    let* node1 = Node.init [Disable_p2p_maintenance] in
+    let* node2 = Node.init [Disable_p2p_maintenance] in
+    let center = Node.create [Disable_p2p_swap; Connections 2] in
+    Node.add_peer center node1 ;
+    Node.add_peer center node2 ;
+    let swap_request_received node =
+      Node.wait_for node "swap_request_received.v0" (fun _ ->
+          Test.fail "Node with swap disabled should not send swap request")
+    in
+    let _ = swap_request_received node1 in
+    let _ = swap_request_received node2 in
+    (* Test Succeed after 10 sec + normal test finished *)
+    let wait_threshold = 10. +. tezt_swap_raw_duration in
+    Log.info "Waiting %f sec. for no swap disable request" wait_threshold ;
+    Lwt_unix.sleep wait_threshold
+
+  let tests () =
+    test_swap () ;
+    test_swap_disable ()
+end
+
 let port_from_peers_file file_name =
   JSON.parse_file file_name |> JSON.geti 0
   |> JSON.get "last_established_connection"
@@ -392,7 +651,9 @@ let test_advertised_port () =
   Test.register
     ~__FILE__
     ~title:"check --advertised-net-port=PORT option"
-    ~tags:["p2p"; "cli"; "connections"]
+    ~tags:[team; "p2p"; "cli"; "connections"]
+    ~uses_client:false
+    ~uses_admin_client:false
   @@ fun () ->
   let* node_1 = Node.init [Connections 1] in
   let maintenance_p =
@@ -429,7 +690,7 @@ let test_advertised_port () =
   unit
 
 let known_points node =
-  let* points = RPC.(call node get_network_points) in
+  let* points = Node.RPC.(call node get_network_points) in
   return
   @@ List.map
        (fun (str, _) ->
@@ -445,7 +706,7 @@ module Known_Points_GC = struct
     let node = Node.create [Connections 0] in
     let* () = Node.identity_generate node in
     let* () = Node.config_init node [] in
-    let () =
+    let* () =
       Node.Config_file.update
         node
         (JSON.update
@@ -471,7 +732,7 @@ module Known_Points_GC = struct
     Test.register
       ~__FILE__
       ~title:"check preservation of trusted known points and peers"
-      ~tags:["p2p"; "pool"; "gc"]
+      ~tags:[team; "p2p"; "pool"; "gc"]
     @@ fun () ->
     let* node_1 = create_node () in
     let nodes = List.init 6 (fun _ -> Node.create []) in
@@ -503,7 +764,7 @@ module Known_Points_GC = struct
     Test.register
       ~__FILE__
       ~title:"check non-preservation of known points"
-      ~tags:["p2p"; "pool"; "gc"]
+      ~tags:[team; "p2p"; "pool"; "gc"]
     @@ fun () ->
     let* node_1 = create_node () in
     let node_A = Node.create [] in
@@ -557,9 +818,11 @@ module Connect_handler = struct
     Test.register
       ~__FILE__
       ~title:"peers with different chain name"
-      ~tags:["p2p"; "connect_handler"]
+      ~tags:[team; "p2p"; "connect_handler"]
+      ~uses_client:false
+      ~uses_admin_client:false
     @@ fun () ->
-    let addr_of_port port = "127.0.0.1:" ^ string_of_int port in
+    let addr_of_port port = sf "%s:%d" Constant.default_host port in
     let create_node ?chain_name ?peer_port port =
       let peer_arg =
         Option.map (fun p -> Node.Peer (addr_of_port p)) peer_port
@@ -568,19 +831,21 @@ module Connect_handler = struct
       let node = Node.create ~net_port:port (Connections 1 :: peer_arg) in
       let* () = Node.identity_generate node in
       let* () = Node.config_init node [] in
-      Option.iter
-        (fun name ->
-          Node.Config_file.update node (fun json ->
-              (* Loads a full unsugared "ghostnet" configuration,
-                 so that we can update the chain_name separately
-                 without depending on a network alias. *)
-              Node.Config_file.set_ghostnet_sandbox_network () json
-              |> JSON.update
-                   "network"
-                   (JSON.put
-                      ( "chain_name",
-                        JSON.annotate ~origin:__LOC__ (`String name) ))))
-        chain_name ;
+      let* () =
+        match chain_name with
+        | None -> Lwt.return_unit
+        | Some name ->
+            Node.Config_file.update node (fun json ->
+                (* Loads a full unsugared "ghostnet" configuration,
+                   so that we can update the chain_name separately
+                   without depending on a network alias. *)
+                Node.Config_file.set_ghostnet_sandbox_network () json
+                |> JSON.update
+                     "network"
+                     (JSON.put
+                        ( "chain_name",
+                          JSON.annotate ~origin:__LOC__ (`String name) )))
+      in
       return node
     in
     let run_node node = Node.run ~event_level:`Debug node [] in
@@ -632,7 +897,11 @@ let trusted_ring () =
   Test.register
     ~__FILE__
     ~title:"p2p - set a trusted ring"
-    ~tags:["p2p"; "connection"; "trusted"; "ring"]
+      (* TODO: https://gitlab.com/tezos/tezos/-/issues/7276
+         This test is flaky because it times out sometimes. *)
+    ~tags:[team; "p2p"; "connection"; "trusted"; "ring"; Tag.flaky]
+    ~uses_client:false
+    ~uses_admin_client:false
   @@ fun () ->
   let num_nodes = 5 in
   Log.info "Initialize nodes" ;
@@ -670,7 +939,7 @@ let trusted_ring () =
       point_id_of_node (List.nth nodes ((index + 1) mod num_nodes))
     in
     let data = JSON.annotate ~origin:"acl" @@ `O [("acl", `String "trust")] in
-    RPC.(call node @@ patch_network_point neighbour_point_id data)
+    Node.RPC.(call node @@ patch_network_point neighbour_point_id data)
   in
   Log.info "Wait for connections" ;
   let* () = connection_p in
@@ -684,9 +953,9 @@ let trusted_ring () =
   let* () =
     iter_p nodes @@ fun node ->
     let point_id = point_id_of_node node in
-    let* peer_id = RPC.(call node @@ get_network_self) in
-    let* points = RPC.(call node @@ get_network_points) in
-    let* peers = RPC.(call node @@ get_network_peers) in
+    let* peer_id = Node.RPC.(call node @@ get_network_self) in
+    let* points = Node.RPC.(call node @@ get_network_points) in
+    let* peers = Node.RPC.(call node @@ get_network_peers) in
     let trusted_points = List.filter point_is_trusted points in
     let running_points = List.filter point_is_running points in
     (* the set of known points that are not the node itself *)
@@ -722,6 +991,16 @@ let trusted_ring () =
   in
   unit
 
+let check_connected_points expected node =
+  let* points = Node.RPC.(call node @@ get_network_points) in
+  let connected_points = List.filter point_is_running points in
+  Check.(
+    (List.length connected_points = expected)
+      int
+      ~__LOC__
+      ~error_msg:"Expected %R connected points, got %L") ;
+  unit
+
 (* This test sets up a clique between a set of [M] nodes [N_1;
    ...; N_M].
 
@@ -742,13 +1021,16 @@ let expected_peer_id () =
   Test.register
     ~__FILE__
     ~title:"Test expected_peer_id"
-    ~tags:["p2p"; "connections"; "expected_peer_id"]
+    ~tags:[team; "p2p"; "connections"; "expected_peer_id"]
+    ~uses_client:false
+    ~uses_admin_client:false
   @@ fun () ->
   let num_nodes = 5 in
   Log.info "Start a clique of %d nodes" num_nodes ;
   let nodes = Cluster.create num_nodes [] in
   Cluster.clique nodes ;
   let* () = Cluster.start ~wait_connections:true nodes in
+  let* () = Lwt_list.iter_s (check_connected_points (num_nodes - 1)) nodes in
   let point_id_of_node node =
     let addr, port = Node.point node in
     sf "%s:%d" addr port
@@ -756,7 +1038,7 @@ let expected_peer_id () =
   let* peer_ids =
     Lwt_list.map_s
       (fun node ->
-        let* peer_id = RPC.(call node @@ get_network_self) in
+        let* peer_id = Node.RPC.(call node @@ get_network_self) in
         Log.info "Peer id of node %s: %s" (Node.name node) peer_id ;
         return peer_id)
       nodes
@@ -776,7 +1058,7 @@ let expected_peer_id () =
       JSON.annotate ~origin:"expected_peer_id"
       @@ `O [("peer_id", `String neighbor_peer_id)]
     in
-    RPC.(call node @@ patch_network_point neighbor_point_id data)
+    Node.RPC.(call node @@ patch_network_point neighbor_point_id data)
   in
   Log.info
     "Check expected_peer_id and that we still have %d connected points per node"
@@ -790,7 +1072,7 @@ let expected_peer_id () =
     let neighbor_index = next index in
     let neighbor_point_id = point_id_of_node (List.nth nodes neighbor_index) in
     let* neighbor_peer =
-      RPC.(call node @@ get_network_point neighbor_point_id)
+      Node.RPC.(call node @@ get_network_point neighbor_point_id)
     in
     Check.(
       (JSON.(neighbor_peer |-> "expected_peer_id" |> as_string)
@@ -800,15 +1082,9 @@ let expected_peer_id () =
         ~error_msg:
           ("Expected the expected_peer_id of neighbor of " ^ Node.name node
          ^ " to be %R, got %L")) ;
-    let* points = RPC.(call node @@ get_network_points) in
-    let connected_points = List.filter point_is_running points in
-    Check.(
-      (List.length connected_points = num_nodes - 1)
-        int
-        ~__LOC__
-        ~error_msg:"Expected %R connected points, got %L") ;
-    unit
+    check_connected_points (num_nodes - 1) node
   in
+
   Log.info "Set wrong [expected_peer_id]" ;
   (* For all nodes [node], we set [expected_peer_id] on its
      connection to its neighbor [next(node)] to the peer id of
@@ -847,7 +1123,7 @@ let expected_peer_id () =
       JSON.annotate ~origin:"expected_peer_id"
       @@ `O [("peer_id", `String peer_id)]
     in
-    RPC.(call node @@ patch_network_point neighbor_point_id data)
+    Node.RPC.(call node @@ patch_network_point neighbor_point_id data)
   in
   Log.info "Waiting for disconnections" ;
   let* () = all_disconnections in
@@ -855,15 +1131,8 @@ let expected_peer_id () =
   (* Each node should now have two connected peers less *)
   let* () =
     iter_p nodes @@ fun node ->
-    let* points = RPC.(call node @@ get_network_points) in
-    let connected_points = List.filter point_is_running points in
     (* We lost two connections *)
-    Check.(
-      (List.length connected_points = num_nodes - 3)
-        int
-        ~__LOC__
-        ~error_msg:"Expected %R connected points, got %L") ;
-    unit
+    check_connected_points (num_nodes - 3) node
   in
   unit
 
@@ -927,13 +1196,14 @@ module P2p_stat = struct
   }
 
   let parse_p2p_stat client_output =
-    let fail ~__LOC__ line =
+    let fail ~__LOC__ section line =
       Test.fail
         ~__LOC__
-        "[parse_p2p_stat] Could not parse line:\n\
+        "[parse_p2p_stat] Could not parse %s from line:\n\
          %s\n\
         \ when parsing client output:\n\
          %s"
+        section
         line
         client_output
     in
@@ -941,40 +1211,58 @@ module P2p_stat = struct
     let _prefix, lines = span (( <> ) "GLOBAL STATS") lines in
     let _global_stats, lines = span (( <> ) "CONNECTIONS") lines in
     let connections, lines = span (( <> ) "KNOWN PEERS") lines in
+    let incoming, outgoing = span (( <> ) " OUTGOING") connections in
     let known_peers, known_points = span (( <> ) "KNOWN POINTS") lines in
-    let connections =
+    let incoming_connections =
       (* Example: *)
       (* ↘ idscnVnp4ZgHbxBem9ZkaGtmVDdPt3 127.0.0.1:16392 (TEZOS.2 (p2p: 1))  *\) *)
       List.map
         (fun line ->
           match line =~* rex "(id\\w+)" with
           | Some peer_id -> Peer_id peer_id
-          | None -> fail ~__LOC__ line)
-        (List.tl connections)
+          | None -> fail ~__LOC__ "incoming connections" line)
+        (* Removing the lines:
+           - CONNECTIONS
+           - INCOMING *)
+        (List.tl (List.tl incoming))
     in
+    let outgoing_connections =
+      (* Example: *)
+      (* ↗ idscnVnp4ZgHbxBem9ZkaGtmVDdPt3 127.0.0.1:16392 (TEZOS.2 (p2p: 1))  *\) *)
+      List.map
+        (fun line ->
+          match line =~* rex "(id\\w+)" with
+          | Some peer_id -> Peer_id peer_id
+          | None -> fail ~__LOC__ "outgoing connections" line)
+        (List.tl outgoing)
+    in
+    let connections = incoming_connections @ outgoing_connections in
     let known_peers =
       (* Example: *)
       (* ⚏  1 idtn1bQKkQvzgPH5zbD86Bi3eTgQhB ↗ 0 B (0 B/s) ↘ 0 B (0 B/s)   *\) *)
       List.map
         (fun line ->
-          match line =~** rex "(⚏|⚌).* (id\\w+)" with
+          match line =~** rex "  (⚏|⚌).* (id\\w+)" with
           | Some (connection, peer_id) ->
               {id = Peer_id peer_id; connected = connection = "⚌"}
-          | None -> fail ~__LOC__ line)
-        (List.tl known_peers)
+          | None -> fail ~__LOC__ "peers" line)
+        (* Removing the lines:
+           - KNOWNPEERS
+           - St Sc Peer Id Upload Download Tr *)
+        (List.tl (List.tl known_peers))
     in
     let known_points =
       (* Example: *)
       (* ⚏  127.0.0.1:16388 (last seen: idtn1bQKkQvzgPH5zbD86Bi3eTgQhB 2023-01-16T13:23:08.499-00:00) *)
       List.map
         (fun line ->
-          match line =~*** rex "(⚏|⚌)\\s+(\\S+:\\S+).* (id\\w+)" with
+          match line =~*** rex "  (⚏|⚌)\\s+(\\S+:\\S+).* (id\\w+)" with
           | Some (connection, point_id, peer_id) ->
               {
                 id = point_id_of_string point_id;
                 peer = {connected = connection = "⚌"; id = Peer_id peer_id};
               }
-          | None -> fail ~__LOC__ line)
+          | None -> fail ~__LOC__ "points" line)
         (List.tl known_points)
     in
     {connections; known_peers; known_points}
@@ -985,7 +1273,7 @@ module P2p_stat = struct
     Test.register
       ~__FILE__
       ~title:"Test [octez-admin-client p2p stat]"
-      ~tags:["p2p"; "connections"; "p2p_stat"]
+      ~tags:[team; "p2p"; "connections"; "p2p_stat"]
     @@ fun () ->
     let num_nodes = 5 in
     Log.info "Start a clique of %d nodes" num_nodes ;
@@ -999,7 +1287,7 @@ module P2p_stat = struct
       let* output = Client.Admin.p2p_stat client in
       let p2p_stat = parse_p2p_stat output in
       let* rpc_points =
-        let* points = RPC.(call node @@ get_network_points) in
+        let* points = Node.RPC.(call node @@ get_network_points) in
         return
           (List.map
              (fun (point_id_s, meta) ->
@@ -1016,7 +1304,7 @@ module P2p_stat = struct
              points)
       in
       let* rpc_peers =
-        let* peers = RPC.(call node @@ get_network_peers) in
+        let* peers = Node.RPC.(call node @@ get_network_peers) in
         return
           (List.map
              (fun (peer_id_s, meta) ->
@@ -1042,15 +1330,149 @@ module P2p_stat = struct
     unit
 end
 
+module Peer_discovery = struct
+  let connect node1 node2 =
+    let point = Node.point_str node2 in
+    Node.RPC.(call node1 (put_network_points point))
+
+  let create_node ?name ~maintenance_idle_time () =
+    let patch_maintenance_idle_time =
+      JSON.update
+        "p2p"
+        (JSON.update
+           "limits"
+           (JSON.put
+              ( "maintenance-idle-time",
+                JSON.parse
+                  ~origin:__LOC__
+                  (Float.to_string maintenance_idle_time) )))
+    in
+    let node = Node.create ?name [] in
+    let* () = Node.identity_generate node in
+    let* () = Node.config_init node [] in
+    let* () = Node.Config_file.update node patch_maintenance_idle_time in
+    return node
+
+  let run_node node =
+    let* () = Node.run ~event_sections_levels:[("p2p.conn", `Debug)] node [] in
+    Node.wait_for_ready node
+
+  (* Launches 3 nodes (named a, b, center), connects node a and node b to node center.
+
+     Waits node a be advertised of node b's point or node b be advertised of
+     node a's point.
+  *)
+  let peer_discovery_test_raw ~maintenance_idle_time () =
+    let create_node = create_node ~maintenance_idle_time in
+    let advertise_received node point =
+      let filter_advertise point json =
+        let points = JSON.(json |-> "points" |> as_list) in
+        if List.exists (fun x -> JSON.as_string x = point) points then Some ()
+        else None
+      in
+      let point = Node.point_str point in
+      Node.wait_for node "advertise_received.v0" (filter_advertise point)
+    in
+    let* node1 = create_node ~name:"node_a" () in
+    let* node2 = create_node ~name:"node_b" () in
+    let* center = create_node ~name:"node_center" () in
+    let advertise_received1 =
+      let* _ = advertise_received node1 node2 in
+      Log.info "adv a b" ;
+      unit
+    in
+    let advertise_received2 =
+      let* _ = advertise_received node2 node1 in
+      Log.info "adv b a" ;
+      unit
+    in
+    let* () = run_node center in
+    let* () = run_node node1 in
+    let* () = run_node node2 in
+    let* _ = connect center node1 in
+    let* _ = connect center node2 in
+    let* () = advertise_received1 and* () = advertise_received2 in
+    unit
+
+  (* Tests the peer discovery mechanism.
+     Same as [peer_discovery_test_raw]. *)
+  let peer_discovery_test () =
+    Test.register
+      ~__FILE__
+      ~title:"p2p-peer-discovery"
+      ~tags:[team; "p2p"; "node"; "peer_discovery"]
+      ~uses_client:false
+      ~uses_admin_client:false
+    @@ fun () ->
+    let maintenance_idle_time = 5. in
+    peer_discovery_test_raw ~maintenance_idle_time ()
+
+  (* Launches 3 nodes (named 1, 2, disabled_center), connects node 1 and node 2
+     to node disabled_center, then checks there is no advertise or bootstrap
+     message received by node 1 or 2.
+
+     To determine when the test succeed, waits twice the maintenance idle time
+     + [peer_discover_test_raw] execution time. *)
+  let peer_discovery_disable () =
+    Test.register
+      ~__FILE__
+      ~title:"p2p-peer-discovery-disable"
+      ~tags:[team; "p2p"; "node"; "peer_discovery"]
+      ~uses_client:false
+      ~uses_admin_client:false
+    @@ fun () ->
+    let maintenance_idle_time = 5. in
+    let create_node = create_node ~maintenance_idle_time in
+    let fail_on_bootstrap_received node =
+      Node.wait_for node "bootstrap_received.v0" (fun _ ->
+          Test.fail
+            "A bootstrap message has been received by a node that should be \
+             connected only to a node with disabled peer discovery")
+    in
+    let fail_on_advertise_received node =
+      Node.wait_for node "advertise_received.v0" (fun _ ->
+          Test.fail "An advertise message has been received")
+    in
+    let* node1 = create_node ~name:"node1" () in
+    let* node2 = create_node ~name:"node2" () in
+    let* center = create_node ~name:"disabled_center" () in
+    let patch_center_config =
+      JSON.update
+        "p2p"
+        (JSON.put
+           ( "disable_peer_discovery",
+             JSON.parse ~origin:__LOC__ (Bool.to_string true) ))
+    in
+    let* () = Node.Config_file.update center patch_center_config in
+    let _ = fail_on_bootstrap_received node1 in
+    let _ = fail_on_bootstrap_received node2 in
+    let _ = fail_on_advertise_received node1 in
+    let _ = fail_on_advertise_received node2 in
+    let* () = run_node center in
+    let* () = run_node node1 in
+    let* () = run_node node2 in
+    let* _ = connect center node1 in
+    let* _ = connect center node2 in
+    (* Waits twice the maintenance idle time + [peer_discover_test_raw]
+       execution time *)
+    Lwt_unix.sleep (2. *. maintenance_idle_time)
+
+  let tests () =
+    peer_discovery_test () ;
+    peer_discovery_disable ()
+end
+
 let register_protocol_independent () =
   Maintenance.tests () ;
+  Swap.tests () ;
   ACL.tests () ;
   test_advertised_port () ;
   Known_Points_GC.tests () ;
   Connect_handler.tests () ;
   trusted_ring () ;
   expected_peer_id () ;
-  P2p_stat.register ()
+  P2p_stat.register () ;
+  Peer_discovery.tests ()
 
 let register ~(protocols : Protocol.t list) =
   check_peer_option protocols ;

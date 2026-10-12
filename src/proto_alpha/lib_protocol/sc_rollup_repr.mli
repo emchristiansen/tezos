@@ -42,14 +42,13 @@
 
 (** A smart rollup has an address starting with "sr1". *)
 module Address : sig
-  include S.HASH
-
-  (** [encoded_size] is the number of bytes needed to represent an address. *)
-  val encoded_size : int
+  include module type of struct
+    include Smart_rollup.Address
+  end
 
   val of_b58data : Base58.data -> t option
 
-  (** [prefix] is the prefix of smart contract rollup addresses. *)
+  (** Prefix of smart rollup addresses in base58-check. *)
   val prefix : string
 end
 
@@ -57,20 +56,8 @@ module Internal_for_tests : sig
   val originated_sc_rollup : Origination_nonce.t -> Address.t
 end
 
-module State_hash : sig
-  include S.HASH
-
-  (** [context_hash_to_state_hash ch] turns an (Irmin) context hash
-      into a state hash. *)
-  val context_hash_to_state_hash : Context_hash.t -> t
-
-  (* Hackish way to disable hash_bytes and hash_string to force people to use
-     context_hash_to_state_hash (without changing content of HASH.S) *)
-  type unreachable = |
-
-  val hash_bytes : unreachable -> t
-
-  val hash_string : unreachable -> t
+module State_hash : module type of struct
+  include Smart_rollup.State_hash
 end
 
 (** Number of ticks computed by a single commitment. This represents a claim
@@ -97,9 +84,41 @@ val pp : Format.formatter -> t -> unit
     uses in RAM. *)
 val in_memory_size : t -> Cache_memory_helpers.sint
 
-(** A [Staker] is an implicit account, identified by its public key hash. *)
-module Staker :
-  S.SIGNATURE_PUBLIC_KEY_HASH with type t = Signature.Public_key_hash.t
+(** A [Staker] is an implicit account, identified by its account hash. *)
+module Staker : sig
+  include module type of struct
+    include Implicit_account_repr
+  end
+
+  (** Classic RPC argument with name ["pkh"]. *)
+  val rpc_arg : t RPC_arg.t
+
+  (** RPC argument with name ["staker1_pkh"]. *)
+  val rpc_arg_staker1 : t RPC_arg.t
+
+  (** RPC argument with name ["staker2_pkh"]. *)
+  val rpc_arg_staker2 : t RPC_arg.t
+end
 
 (** The data model uses an index of these addresses. *)
 module Index : Storage_description.INDEX with type t = Address.t
+
+module Past_commitment_period : sig
+  type t = {
+    commitment_period_in_blocks : int;
+        (** The number of blocks separating two valid commitment for a given
+            particular Tezos protocol. *)
+    next_protocol_activation : Raw_level_repr.t;
+        (** The activation level of the next protocol, which is also the last
+            level during which the commitment period is valid. That is, if
+
+            {math inbox_level + commitment_period_in_blocks <= next_protocol_activation}
+
+            then [inbox_level + commitment_period_in_blocks] is the expected
+            level of the next commitment.
+
+            Otherwise, the commitment period of the next protocol applies. *)
+  }
+
+  val encoding : t Data_encoding.t
+end

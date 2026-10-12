@@ -104,8 +104,8 @@ let strip_locations (type a b) (root : (a, b) node) : b canonical =
   in
   Canonical (strip_locations root Return)
 
-let extract_locations :
-    type l p. (l, p) node -> p canonical * (canonical_location * l) list =
+let extract_locations : type l p.
+    (l, p) node -> p canonical * (canonical_location * l) list =
  fun root ->
   let id =
     let id = ref (-1) in
@@ -153,8 +153,8 @@ let extract_locations :
   let stripped = strip_locations root Return in
   (Canonical stripped, List.rev !loc_table)
 
-let inject_locations :
-    type l p. (canonical_location -> l) -> p canonical -> (l, p) node =
+let inject_locations : type l p.
+    (canonical_location -> l) -> p canonical -> (l, p) node =
  fun lookup (Canonical root) ->
   let rec inject_locations l k =
     match l with
@@ -209,9 +209,8 @@ let map : type a b. (a -> b) -> a canonical -> b canonical =
   in
   Canonical (map_node expr Return)
 
-let map_node :
-    type la lb pa pb. (la -> lb) -> (pa -> pb) -> (la, pa) node -> (lb, pb) node
-    =
+let map_node : type la lb pa pb.
+    (la -> lb) -> (pa -> pb) -> (la, pa) node -> (lb, pb) node =
  fun fl fp node ->
   let rec map_node fl fp node k =
     match node with
@@ -399,14 +398,8 @@ let%test_module "semantics_preservation" =
         else invalid_arg "sample_in_interval"
 
       let reasonable_width_function ~depth rng_state =
-        match Sys.backend_type with
-        | Other _ ->
-            (* e.g. js_of_ocaml *)
-            (* chosen experimentally to avoid stack_overflow *)
-            sample_in_interval 0 (19 / (Bits.numbits depth + 1)) rng_state
-        | Native | Bytecode ->
-            (* Entirely ad-hoc *)
-            sample_in_interval 0 (20 / (Bits.numbits depth + 1)) rng_state
+        (* Entirely ad-hoc *)
+        sample_in_interval 0 (20 / (Bits.numbits depth + 1)) rng_state
 
       let sample = sample reasonable_width_function
     end

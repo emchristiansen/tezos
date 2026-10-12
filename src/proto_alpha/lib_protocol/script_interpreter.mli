@@ -36,20 +36,6 @@
 open Alpha_context
 open Script_typed_ir
 
-type error += Reject of Script.location * Script.expr * execution_trace option
-
-type error += Overflow of Script.location * execution_trace option
-
-type error += Runtime_contract_error of Contract_hash.t
-
-type error += Bad_contract_parameter of Contract.t (* `Permanent *)
-
-type error += Cannot_serialize_failure
-
-type error += Cannot_serialize_storage
-
-type error += Michelson_too_many_recursive_calls
-
 (** The result from script interpretation. *)
 type execution_result = {
   script : Script_ir_translator.ex_script;
@@ -59,11 +45,13 @@ type execution_result = {
   operations : packed_internal_operation list;
   ticket_diffs : Z.t Ticket_token_map.t;
   ticket_receipt : Ticket_receipt.t;
+  address_registry_diff : Address_registry.diff list;
+  balance_updates : Receipt.balance_updates;
 }
 
 type step_constants = Script_typed_ir.step_constants = {
-  source : Destination.t;
-  payer : Signature.public_key_hash;
+  sender : Destination.t;
+  payer : Implicit_account_repr.t;
   self : Contract_hash.t;
   amount : Tez.t;
   balance : Tez.t;
@@ -78,7 +66,7 @@ type step_constants = Script_typed_ir.step_constants = {
 
    This will update the local storage of the contract
    [step_constants.self]. Other pieces of contextual information
-   ([source], [payer], [amount], and [chaind_id]) are also passed in
+   ([sender], [payer], [amount], and [chain_id]) are also passed in
    [step_constant].
 
    [internal] is [true] if and only if the execution happens within an

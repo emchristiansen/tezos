@@ -90,7 +90,6 @@ type prevalidator_limits = {
   max_refused_operations : int;
   operation_timeout : Time.System.Span.t;
   operations_batch_size : int;
-  disable_precheck : bool;
 }
 
 let default_prevalidator_limits =
@@ -98,33 +97,16 @@ let default_prevalidator_limits =
     operation_timeout = Time.System.Span.of_seconds_exn 10.;
     max_refused_operations = 1000;
     operations_batch_size = 50;
-    disable_precheck = false;
   }
 
 let prevalidator_limits_encoding =
   let open Data_encoding in
   conv
-    (fun {
-           operation_timeout;
-           max_refused_operations;
-           operations_batch_size;
-           disable_precheck;
-         } ->
-      ( operation_timeout,
-        max_refused_operations,
-        operations_batch_size,
-        disable_precheck ))
-    (fun ( operation_timeout,
-           max_refused_operations,
-           operations_batch_size,
-           disable_precheck ) ->
-      {
-        operation_timeout;
-        max_refused_operations;
-        operations_batch_size;
-        disable_precheck;
-      })
-    (obj4
+    (fun {operation_timeout; max_refused_operations; operations_batch_size} ->
+      (operation_timeout, max_refused_operations, operations_batch_size))
+    (fun (operation_timeout, max_refused_operations, operations_batch_size) ->
+      {operation_timeout; max_refused_operations; operations_batch_size})
+    (obj3
        (dft
           "operations_request_timeout"
           timeout_encoding
@@ -136,11 +118,7 @@ let prevalidator_limits_encoding =
        (dft
           "operations_batch_size"
           int31
-          default_prevalidator_limits.operations_batch_size)
-       (dft
-          "disable_precheck"
-          bool
-          default_prevalidator_limits.disable_precheck))
+          default_prevalidator_limits.operations_batch_size))
 
 type peer_validator_limits = {
   new_head_request_timeout : Time.System.Span.t;
@@ -165,7 +143,8 @@ let peer_validator_limits_encoding =
            block_operations_timeout;
            protocol_timeout;
            new_head_request_timeout;
-         } ->
+         }
+       ->
       ( block_header_timeout,
         block_operations_timeout,
         protocol_timeout,
@@ -173,7 +152,8 @@ let peer_validator_limits_encoding =
     (fun ( block_header_timeout,
            block_operations_timeout,
            protocol_timeout,
-           new_head_request_timeout ) ->
+           new_head_request_timeout )
+       ->
       {
         block_header_timeout;
         block_operations_timeout;
@@ -227,7 +207,7 @@ let synchronisation_heuristic_encoding default_latency default_threshold =
 type chain_validator_limits = {synchronisation : synchronisation_limits}
 
 let default_chain_validator_limits =
-  {synchronisation = {latency = 150; threshold = 4}}
+  {synchronisation = {latency = 50; threshold = 4}}
 
 let chain_validator_limits_encoding =
   let open Data_encoding in
@@ -242,7 +222,7 @@ let chain_validator_limits_encoding =
        [
          case
            ~title:"synchronisation_heuristic_encoding"
-           Json_only
+           (Tag 0)
            (synchronisation_heuristic_encoding
               default_chain_validator_limits.synchronisation.latency
               default_chain_validator_limits.synchronisation.threshold)
@@ -250,7 +230,7 @@ let chain_validator_limits_encoding =
            (fun x -> x);
          case
            ~title:"legacy_bootstrap_threshold_encoding"
-           Json_only
+           (Tag 1)
            (obj1
               (dft
                  "bootstrap_threshold"
@@ -267,12 +247,18 @@ let chain_validator_limits_encoding =
              });
        ])
 
+let default_disable_context_pruning = false
+
+let default_storage_maintenance_delay = Storage_maintenance.Auto
+
 type limits = {
   block_validator_limits : block_validator_limits;
   prevalidator_limits : prevalidator_limits;
   peer_validator_limits : peer_validator_limits;
   chain_validator_limits : chain_validator_limits;
   history_mode : History_mode.t option;
+  disable_context_pruning : bool option;
+  storage_maintenance_delay : Storage_maintenance.delay option;
 }
 
 let default_limits =
@@ -282,6 +268,8 @@ let default_limits =
     peer_validator_limits = default_peer_validator_limits;
     chain_validator_limits = default_chain_validator_limits;
     history_mode = None;
+    disable_context_pruning = None;
+    storage_maintenance_delay = None;
   }
 
 let limits_encoding =
@@ -293,25 +281,35 @@ let limits_encoding =
            prevalidator_limits;
            chain_validator_limits;
            history_mode;
-         } ->
+           disable_context_pruning;
+           storage_maintenance_delay;
+         }
+       ->
       ( peer_validator_limits,
         block_validator_limits,
         prevalidator_limits,
         chain_validator_limits,
-        history_mode ))
+        history_mode,
+        disable_context_pruning,
+        storage_maintenance_delay ))
     (fun ( peer_validator_limits,
            block_validator_limits,
            prevalidator_limits,
            chain_validator_limits,
-           history_mode ) ->
+           history_mode,
+           disable_context_pruning,
+           storage_maintenance_delay )
+       ->
       {
         peer_validator_limits;
         block_validator_limits;
         prevalidator_limits;
         chain_validator_limits;
         history_mode;
+        disable_context_pruning;
+        storage_maintenance_delay;
       })
-    (obj5
+    (obj7
        (dft
           "peer_validator"
           peer_validator_limits_encoding
@@ -328,4 +326,6 @@ let limits_encoding =
           "chain_validator"
           chain_validator_limits_encoding
           default_chain_validator_limits)
-       (opt "history_mode" History_mode.encoding))
+       (opt "history_mode" History_mode.encoding)
+       (opt "disable_context_pruning" bool)
+       (opt "storage_maintenance_delay" Storage_maintenance.delay_encoding))

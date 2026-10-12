@@ -108,7 +108,7 @@ let commands () =
       (prefixes ["check"; "that"; "message"]
       @@ string_param ~name:"message" ~desc:"signed message"
       @@ prefixes ["was"; "signed"; "by"]
-      @@ Client_keys.Public_key.alias_param
+      @@ Client_keys.Public_key.source_param
            ~name:"signer"
            ~desc:"name of the signer contract"
       @@ prefixes ["to"; "produce"]
@@ -119,9 +119,10 @@ let commands () =
       @@ stop)
       (fun (block_head, quiet)
            message
-           (_, (key_locator, _))
+           (key_locator, _)
            signature
-           (cctxt : #Protocol_client_context.full) ->
+           (cctxt : #Protocol_client_context.full)
+         ->
         let open Lwt_result_syntax in
         let* block =
           Shell_services.Blocks.hash
@@ -154,7 +155,8 @@ let commands () =
       (fun ()
            unsigned_block_header
            delegate
-           (cctxt : #Protocol_client_context.full) ->
+           (cctxt : #Protocol_client_context.full)
+         ->
         let open Lwt_result_syntax in
         let unsigned_header =
           Data_encoding.Binary.to_bytes_exn

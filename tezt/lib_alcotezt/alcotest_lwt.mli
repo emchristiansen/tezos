@@ -36,10 +36,7 @@
 (** Return type for tests. *)
 type return = unit Lwt.t
 
-(** Speed levels.
-
-    In Alcotest, one can ask not to run slow tests with [-q] from the command-line.
-    In Tezt, the equivalent is [-a quick]. *)
+(** Speed levels. Same as {!Alcotest.speed_level}. *)
 type speed_level = [`Quick | `Slow]
 
 (** Test cases.
@@ -64,4 +61,5 @@ type 'a test = string * 'a test_case list
 
     In Tezt, this calls [Test.register] but does not actually run the test suite.
     The name of the test suite is used as the filename for the Tezt test. *)
-val run : string -> unit test list -> return
+val run :
+  __FILE__:string -> ?tags:string list -> string -> unit test list -> return

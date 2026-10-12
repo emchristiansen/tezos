@@ -1,0 +1,1448 @@
+(*****************************************************************************)
+(*                                                                           *)
+(* SPDX-License-Identifier: MIT                                              *)
+(* Copyright (c) 2025 Nomadic Labs, <contact@nomadic-labs.com>               *)
+(*                                                                           *)
+(*****************************************************************************)
+
+open Alpha_context
+open Script_native_types
+open Script_typed_ir
+
+(** Returns the same error as when executing [PUSH string
+    <error_mnemonic> ; FAILWITH] in a script.
+
+    Used in native contracts that must be FA2.1-compliant, so that
+    errors that are specified in the standard will behave identically
+    to scripted FA2.1 contracts.  *)
+let standard_error ~mnemonic =
+  let open Micheline in
+  Script_interpreter_errors.Reject
+    (dummy_location, strip_locations (String (dummy_location, mnemonic)), None)
+
+module CLST_contract = struct
+  open Script_native_types.CLST_types
+
+  type error +=
+    | Empty_transfer
+    | Non_empty_transfer of Destination.t * Tez.t
+    | Non_implicit_contract of Destination.t
+    | Balance_too_low of Destination.t * nat * nat
+    | Amount_too_large of Destination.t * nat
+    | Only_owner_can_change_operator of Destination.t * Destination.t
+    | Empty_ticket
+    | Contract_is_not_delegate of Destination.t
+    | Delegate_is_not_registered of Destination.t
+    | Delegate_is_already_registered of Destination.t
+
+  let is_implicit : Destination.t -> bool = function
+    | Destination.Contract (Contract.Implicit _) -> true
+    | _ -> false
+
+  type entrypoint_execution_result =
+    operation Script_list.t
+    * Clst_contract_storage.t
+    * Receipt.balance_updates
+    * context
+
+  let execute_deposit (ctxt, (step_constants : Script_typed_ir.step_constants))
+      (() : deposit) (storage : Clst_contract_storage.t) :
+      entrypoint_execution_result tzresult Lwt.t =
+    let open Lwt_result_syntax in
+    let*? () = error_when Tez.(step_constants.amount = zero) Empty_transfer in
+    let*? () =
+      error_when
+        (not (is_implicit step_constants.sender))
+        (Non_implicit_contract step_constants.sender)
+    in
+    let address =
+      {destination = step_constants.sender; entrypoint = Entrypoint.default}
+    in
+    let* amount, ctxt =
+      Clst_contract_storage.get_balance_from_storage ctxt storage address
+    in
+    let total_supply =
+      Clst_contract_storage.get_total_supply_from_storage storage
+    in
+    let* added_amount, ctxt =
+      Clst_contract_storage.tez_to_clst_tokens
+        ctxt
+        ~total_supply
+        step_constants.amount
+    in
+    let*? () =
+      error_when
+        Compare.Int.(Script_int.(compare zero_n added_amount) = 0)
+        Empty_transfer
+    in
+    let new_amount = Script_int.(add_n added_amount amount) in
+    let* new_storage, ctxt =
+      Clst_contract_storage.set_balance_from_storage
+        ctxt
+        storage
+        address
+        new_amount
+    in
+    let new_storage =
+      Clst_contract_storage.increment_total_supply new_storage added_amount
+    in
+    let* ctxt, balance_updates =
+      Clst_contract_storage.deposit_to_clst_deposits
+        ctxt
+        ~clst_contract_hash:step_constants.self
+        step_constants.amount
+    in
+    let*? entrypoint_str = Entrypoint.of_string_lax "deposit" in
+    let* op_balance_event, ctxt =
+      Clst_events.balance_update_event
+        (ctxt, step_constants)
+        ~entrypoint:entrypoint_str
+        ~owner:address
+        ~token_id:Clst_contract_storage.token_id
+        ~new_balance:new_amount
+        ~diff:(Script_int.int added_amount)
+    in
+    let* op_total_supply_event, ctxt =
+      Clst_events.total_supply_update_event
+        (ctxt, step_constants)
+        ~entrypoint:entrypoint_str
+        ~token_id:Clst_contract_storage.token_id
+        ~new_total_supply:
+          (Clst_contract_storage.get_total_supply_from_storage new_storage)
+        ~diff:(Script_int.int added_amount)
+    in
+    return
+      ( Script_list.of_list [op_balance_event; op_total_supply_event],
+        new_storage,
+        balance_updates,
+        ctxt )
+
+  let execute_redeem (ctxt, (step_constants : Script_typed_ir.step_constants))
+      (amount : redeem) (storage : Clst_contract_storage.t) :
+      entrypoint_execution_result tzresult Lwt.t =
+    let open Lwt_result_syntax in
+    let*? () =
+      error_when
+        Tez.(step_constants.amount <> zero)
+        (Non_empty_transfer (step_constants.sender, step_constants.amount))
+    in
+    let*? () =
+      error_when
+        Compare.Int.(Script_int.(compare zero_n amount) = 0)
+        Empty_transfer
+    in
+    let*? () =
+      error_when
+        Compare.Int.(
+          Script_int.(compare (of_int64 Int64.max_int) (int amount)) < 0)
+        (Amount_too_large (step_constants.sender, amount))
+    in
+    let* account =
+      match step_constants.sender with
+      | Contract (Implicit _ as implicit) -> return implicit
+      | sender -> tzfail (Non_implicit_contract sender)
+    in
+    let address =
+      {destination = step_constants.sender; entrypoint = Entrypoint.default}
+    in
+    let* current_amount, ctxt =
+      Clst_contract_storage.get_balance_from_storage ctxt storage address
+    in
+    let* removed_amount =
+      if Compare.Int.(Script_int.compare current_amount amount < 0) then
+        tzfail (Balance_too_low (step_constants.sender, current_amount, amount))
+      else return amount
+    in
+    let new_amount = Script_int.(abs (sub current_amount removed_amount)) in
+    let* new_storage, ctxt =
+      Clst_contract_storage.set_balance_from_storage
+        ctxt
+        storage
+        address
+        new_amount
+    in
+    let total_supply =
+      Clst_contract_storage.get_total_supply_from_storage storage
+    in
+    let* amount_tez, ctxt =
+      if Compare.Int.(Script_int.compare removed_amount total_supply = 0) then
+        (* Last redeemer: clear all dust by transferring exact remaining
+           pool balance *)
+        let* total_tez = Clst.total_amount_of_tez ctxt in
+        return (total_tez, ctxt)
+      else
+        Clst_contract_storage.clst_tokens_to_tez
+          ctxt
+          ~total_supply
+          removed_amount
+    in
+    let*? new_storage =
+      Clst_contract_storage.decrement_total_supply new_storage removed_amount
+    in
+    let* ctxt, balance_updates =
+      Clst_contract_storage.redeem_from_clst_deposits
+        ctxt
+        ~staker:account
+        amount_tez
+    in
+    let*? entrypoint_str = Entrypoint.of_string_lax "redeem" in
+    let* op_balance_event, ctxt =
+      Clst_events.balance_update_event
+        (ctxt, step_constants)
+        ~entrypoint:entrypoint_str
+        ~owner:address
+        ~token_id:Clst_contract_storage.token_id
+        ~new_balance:new_amount
+        ~diff:(Script_int.neg removed_amount)
+    in
+    let* op_total_supply_event, ctxt =
+      Clst_events.total_supply_update_event
+        (ctxt, step_constants)
+        ~entrypoint:entrypoint_str
+        ~token_id:Clst_contract_storage.token_id
+        ~new_total_supply:
+          (Clst_contract_storage.get_total_supply_from_storage new_storage)
+        ~diff:(Script_int.neg removed_amount)
+    in
+    return
+      ( Script_list.of_list [op_balance_event; op_total_supply_event],
+        new_storage,
+        balance_updates,
+        ctxt )
+
+  let check_token_id token_id =
+    error_unless
+      Compare.Int.(
+        Script_int.(compare token_id Clst_contract_storage.token_id) = 0)
+      (standard_error ~mnemonic:"FA2_TOKEN_UNDEFINED")
+
+  let execute_finalize_redeem (ctxt, (step_constants : step_constants))
+      (redeemer : Signature.public_key_hash) (storage : Clst_contract_storage.t)
+      : entrypoint_execution_result tzresult Lwt.t =
+    let open Lwt_result_syntax in
+    let account = Contract.Implicit redeemer in
+    let typed_account = Typed_implicit redeemer in
+    let* ctxt, balance_updates, finalized_amount =
+      Clst_contract_storage.finalize
+        ctxt
+        ~clst_contract_hash:step_constants.self
+        ~staker:account
+    in
+    let gas_counter, outdated_ctxt =
+      Local_gas_counter.local_gas_counter_and_outdated_context ctxt
+    in
+    let* op, outdated_ctxt, gas_counter =
+      Script_interpreter_defs.transfer
+        (outdated_ctxt, step_constants)
+        gas_counter
+        finalized_amount
+        Micheline.dummy_location
+        typed_account
+        ()
+    in
+    let ctxt = Local_gas_counter.update_context gas_counter outdated_ctxt in
+    return (Script_list.of_list [op], storage, balance_updates, ctxt)
+
+  (** - If the sender is [from_] itself, no permission is needed.
+      - Otherwise, infinite allowance take precedence over finite allowance.
+      - If the sender is a spender, the allowance is decremented by
+        [amount] and the allowance event is accumulated for later deduplication.
+      - Fails with [FA2_NOT_OPERATOR] if no relationship exists, or
+        with [FA2.1_INSUFFICIENT_ALLOWANCE] if the spender's allowance
+        is insufficient. *)
+  let allowance_check_and_update (step_constants : step_constants)
+      (ctxt, storage, events) from_ (_token_id, amount) =
+    let open Lwt_result_syntax in
+    let from_is_sender =
+      let {destination; entrypoint} = from_ in
+      Destination.equal destination step_constants.sender
+      && Entrypoint.is_default entrypoint
+    in
+    if from_is_sender then return (ctxt, storage, events)
+    else
+      let sender_address =
+        {destination = step_constants.sender; entrypoint = Entrypoint.default}
+      in
+      let* allowance, ctxt =
+        Clst_contract_storage.get_account_operator_allowance
+          ctxt
+          storage
+          ~owner:from_
+          ~spender:sender_address
+      in
+      match allowance with
+      | Some Infinite -> return (ctxt, storage, events)
+      | Some (Finite allowance) ->
+          let*? () =
+            error_unless
+              Compare.Int.(Script_int.compare allowance amount >= 0)
+              (standard_error ~mnemonic:"FA2.1_INSUFFICIENT_ALLOWANCE")
+          in
+          let new_allowance = Script_int.(abs (sub allowance amount)) in
+          let* storage, ctxt =
+            Clst_contract_storage.set_account_operator_allowance
+              ctxt
+              storage
+              ~owner:from_
+              ~spender:sender_address
+              (Some (Finite new_allowance))
+          in
+          let events =
+            Clst_events.update_allowance_events
+              events
+              ~owner:from_
+              ~spender:sender_address
+              ~new_allowance
+              ~diff:(Script_int.neg amount)
+          in
+          return (ctxt, storage, events)
+      | None -> tzfail (standard_error ~mnemonic:"FA2_NOT_OPERATOR")
+
+  let execute_transfer_one_from (step_constants : step_constants)
+      (ctxt, storage, events) from_ (token_id, amount) =
+    let open Lwt_result_syntax in
+    let*? () = check_token_id token_id in
+    (* Smart contracts cannot hold tokens at all.
+
+       We do check that [from_] is implicit too, because otherwise a
+       transfer of zero would succeed and make it appear in the
+       storage, which might break invariants in some tools. *)
+    let*? () =
+      error_unless
+        (is_implicit from_.destination)
+        (Non_implicit_contract from_.destination)
+    in
+    (* Check permission and update the allowance if the sender has a
+       finite allowance on the owner's tokens. *)
+    let* ctxt, storage, events =
+      allowance_check_and_update
+        step_constants
+        (ctxt, storage, events)
+        from_
+        (token_id, amount)
+    in
+    let* balance_from, ctxt =
+      Clst_contract_storage.get_balance_from_storage ctxt storage from_
+    in
+    let*? () =
+      error_when
+        Compare.Int.(Script_int.compare balance_from amount < 0)
+        (standard_error ~mnemonic:"FA2_INSUFFICIENT_BALANCE")
+    in
+    let new_balance_from = Script_int.(abs (sub balance_from amount)) in
+    (* Note: Transferring 0 from or to an account that didn't have a
+       balance, will set its balance to 0. This is in accordance with
+       the FA2 standard: transfers of zero must be treated as normal
+       transfers.
+
+       And if we ever want to add an invariant that accounts with no
+       tokens are not present at all in the ledger, then it's probably
+       {!Clst_storage.set_balance_from_storage}'s job to enforce it
+       anyway. *)
+    let* storage, ctxt =
+      Clst_contract_storage.set_balance_from_storage
+        ctxt
+        storage
+        from_
+        new_balance_from
+    in
+    let events =
+      Clst_events.update_balance_events
+        events
+        ~owner:from_
+        ~new_balance:new_balance_from
+        ~diff:(Script_int.neg amount)
+    in
+    return (ctxt, storage, events)
+
+  (** Implementation of the [transfer] entrypoint, compliant with the
+      FA2.1 standard:
+      https://tzip.tezosagora.org/proposal/tzip-26/#entrypoint-semantics
+
+      This implementation is not optimized: the storage is updated
+      with each individual transfer. It would be more efficient to
+      keep the balances of affected accounts in memory and update the
+      storage only at the end, but this is good enough and less
+      error-prone. *)
+  let execute_transfer (ctxt, (step_constants : Script_typed_ir.step_constants))
+      (transfer : transfer) (storage : Clst_contract_storage.t) :
+      entrypoint_execution_result tzresult Lwt.t =
+    let open Lwt_result_syntax in
+    let*? entrypoint_str = Entrypoint.of_string_lax "transfer" in
+    let*? () =
+      error_unless
+        Tez.(step_constants.amount = zero)
+        (Non_empty_transfer (step_constants.sender, step_constants.amount))
+    in
+    let execute_one from_ (ctxt, storage, events) (to_, (token_id, amount)) =
+      let*? () =
+        error_unless
+          (is_implicit to_.destination)
+          (Non_implicit_contract to_.destination)
+      in
+      let* ctxt, storage, events =
+        execute_transfer_one_from
+          step_constants
+          (ctxt, storage, events)
+          from_
+          (token_id, amount)
+      in
+      let* balance_to, ctxt =
+        Clst_contract_storage.get_balance_from_storage ctxt storage to_
+      in
+      let new_balance_to = Script_int.(add_n balance_to amount) in
+      let* storage, ctxt =
+        Clst_contract_storage.set_balance_from_storage
+          ctxt
+          storage
+          to_
+          new_balance_to
+      in
+      let events =
+        Clst_events.update_balance_events
+          events
+          ~owner:to_
+          ~new_balance:new_balance_to
+          ~diff:(Script_int.int amount)
+      in
+      let* op_transfer_event, ctxt =
+        Clst_events.transfer_event
+          (ctxt, step_constants)
+          ~entrypoint:entrypoint_str
+          ~sender:from_
+          ~receiver:to_
+          ~token_id:Clst_contract_storage.token_id
+          ~amount
+      in
+      return
+        (ctxt, storage, Clst_events.add_transfer_event events op_transfer_event)
+    in
+    let execute_from (ctxt, storage, events) (from_, txs) =
+      List.fold_left_es
+        (execute_one from_)
+        (ctxt, storage, events)
+        (Script_list.to_list txs)
+    in
+    let* ctxt, storage, events =
+      List.fold_left_es
+        execute_from
+        (ctxt, storage, Clst_events.init_events)
+        (Script_list.to_list transfer)
+    in
+    let* all_events_ops, ctxt =
+      Clst_events.emit_all_events
+        (ctxt, step_constants)
+        ~entrypoint:entrypoint_str
+        events
+    in
+    return (Script_list.of_list all_events_ops, storage, [], ctxt)
+
+  let execute_approval (step_constants : step_constants) (ctxt, storage, events)
+      ((owner, (spender, (token_id, delta))) : approval) =
+    let open Lwt_result_syntax in
+    (* Restrict operator updates only to the owner of the token. *)
+    let*? () =
+      error_when
+        (not (Destination.equal step_constants.sender owner.destination))
+        (Only_owner_can_change_operator
+           (step_constants.sender, owner.destination))
+    in
+    (* Check token_id is the one defined by the contract. *)
+    let*? () = check_token_id token_id in
+    let* allowance, ctxt =
+      Clst_contract_storage.get_account_operator_allowance
+        ctxt
+        storage
+        ~owner
+        ~spender
+    in
+    let new_allowance, diff =
+      match (allowance, delta) with
+      (* "Operator has precedence over spender" (cf TZIP26), i.e. if an
+       infinite allowance is set, then only the [update_operators]
+       entrypoint will have an effect on it. *)
+      | Some Infinite, _ -> (Clst_contract_storage.Infinite, Script_int.zero)
+      (* Spender already has a finite allowance *)
+      | Some (Finite allowance), L increase ->
+          (Finite (Script_int.add_n allowance increase), Script_int.int increase)
+      (* If the allowance would underflow, TZIP26 considers it as zero,
+       and not an error. *)
+      | Some (Finite allowance), R decrease ->
+          let new_allowance =
+            Script_int.sub allowance decrease
+            |> Script_int.is_nat
+            |> Option.value ~default:Script_int.zero_n
+          in
+          (Finite new_allowance, Script_int.sub new_allowance allowance)
+      (* Spender has no allowance defined already. *)
+      | None, L increase -> (Finite increase, Script_int.int increase)
+      | None, R _decrease -> (Finite Script_int.zero_n, Script_int.zero)
+    in
+    let* storage, ctxt =
+      Clst_contract_storage.set_account_operator_allowance
+        ctxt
+        storage
+        ~owner
+        ~spender
+        (Some new_allowance)
+    in
+    match new_allowance with
+    | Finite new_allowance ->
+        let events =
+          Clst_events.update_allowance_events
+            events
+            ~owner
+            ~spender
+            ~new_allowance
+            ~diff
+        in
+        return (ctxt, storage, events)
+    | Infinite ->
+        (* the allowance_update event is not issued iff the allowance
+           is infinite *)
+        return (ctxt, storage, events)
+
+  let execute_approve (ctxt, (step_constants : step_constants))
+      (value : approve) (storage : Clst_contract_storage.t) =
+    let open Lwt_result_syntax in
+    let*? entrypoint_str = Entrypoint.of_string_lax "approve" in
+    let* ctxt, storage, events =
+      List.fold_left_es
+        (execute_approval step_constants)
+        (ctxt, storage, Clst_events.init_events)
+        (Script_list.to_list value)
+    in
+    let* all_events_ops, ctxt =
+      Clst_events.emit_all_events
+        (ctxt, step_constants)
+        ~entrypoint:entrypoint_str
+        events
+    in
+    return (Script_list.of_list all_events_ops, storage, [], ctxt)
+
+  let execute_update_operator (step_constants : step_constants)
+      (ctxt, storage, events) ((owner, (operator, token_id)) : operator) action
+      =
+    let open Lwt_result_syntax in
+    (* Restrict operator updates only to the owner of the token. *)
+    let*? () =
+      error_when
+        (not (Destination.equal step_constants.sender owner.destination))
+        (Only_owner_can_change_operator
+           (step_constants.sender, owner.destination))
+    in
+    (* Check token_id is the one defined by the contract. *)
+    let*? () = check_token_id token_id in
+    let new_allowance, is_operator =
+      match action with
+      | `Add -> (Some Clst_contract_storage.Infinite, true)
+      | `Remove -> (None, false)
+    in
+    let* storage, ctxt =
+      Clst_contract_storage.set_account_operator_allowance
+        ctxt
+        storage
+        ~owner
+        ~spender:operator
+        new_allowance
+    in
+    let events =
+      Clst_events.update_operator_events events ~owner ~operator ~is_operator
+    in
+    return (ctxt, storage, events)
+
+  let execute_update_operators (ctxt, (step_constants : step_constants))
+      (value : update_operators) (storage : Clst_contract_storage.t) =
+    let open Lwt_result_syntax in
+    let*? entrypoint_str = Entrypoint.of_string_lax "update_operators" in
+    let* ctxt, storage, events =
+      List.fold_left_es
+        (fun acc add_or_remove ->
+          let action, op =
+            match add_or_remove with L op -> (`Add, op) | R op -> (`Remove, op)
+          in
+          execute_update_operator step_constants acc op action)
+        (ctxt, storage, Clst_events.init_events)
+        (Script_list.to_list value)
+    in
+    let* all_events_ops, ctxt =
+      Clst_events.emit_all_events
+        (ctxt, step_constants)
+        ~entrypoint:entrypoint_str
+        events
+    in
+    return (Script_list.of_list all_events_ops, storage, [], ctxt)
+
+  let execute_balance_of_one (storage : Clst_contract_storage.t)
+      (responses, ctxt) ((owner, token_id) : balance_request) =
+    let open Lwt_result_syntax in
+    (* Check token_id is the one defined by the contract. *)
+    let*? () = check_token_id token_id in
+    let* balance, ctxt =
+      Clst_contract_storage.get_balance_from_storage ctxt storage owner
+    in
+    let response = ((owner, token_id), balance) in
+    return (response :: responses, ctxt)
+
+  let execute_balance_of (ctxt, (step_constants : step_constants))
+      (value : balance_of) (storage : Clst_contract_storage.t) =
+    let open Lwt_result_syntax in
+    let requests, typed_contract = value in
+    let* rev_responses, ctxt =
+      List.fold_left_es
+        (execute_balance_of_one storage)
+        ([], ctxt)
+        (Script_list.to_list requests)
+    in
+    let responses = List.rev rev_responses |> Script_list.of_list in
+    let gas_counter, outdated_ctxt =
+      Local_gas_counter.local_gas_counter_and_outdated_context ctxt
+    in
+    let* op, outdated_ctxt, gas_counter =
+      Script_interpreter_defs.transfer
+        (outdated_ctxt, step_constants)
+        gas_counter
+        Tez.zero
+        Micheline.dummy_location
+        typed_contract
+        responses
+    in
+    let ctxt = Local_gas_counter.update_context gas_counter outdated_ctxt in
+    return (Script_list.of_list [op], storage, [], ctxt)
+
+  (** Implementation of the [export_ticket] entrypoint, compliant with
+      the FA2.1 standard:
+      https://tzip.tezosagora.org/proposal/tzip-26/#entrypoint-semantics
+
+      The entrypoint MUST comply with the same policy as the [transfer]
+      entrypoint. The balance of [from_] MUST be decreased by [amount]
+      for each associated [token_id]. The balance of [to_] and
+      [destination] MUST remain unchanged. The total supply MUST remain
+      unchanged. *)
+  let execute_export_ticket
+      (ctxt, (step_constants : Script_typed_ir.step_constants))
+      (export_ticket : export_ticket) (storage : Clst_contract_storage.t) :
+      entrypoint_execution_result tzresult Lwt.t =
+    let open Lwt_result_syntax in
+    let*? entrypoint_str = Entrypoint.of_string_lax "export_ticket" in
+    let*? () =
+      error_unless
+        Tez.(step_constants.amount = zero)
+        (Non_empty_transfer (step_constants.sender, step_constants.amount))
+    in
+    let create_ticket_one (ctxt, storage, events) (from_, (token_id, amount)) =
+      let* ctxt, storage, events =
+        execute_transfer_one_from
+          step_constants
+          (ctxt, storage, events)
+          from_
+          (token_id, amount)
+      in
+      let* ticket_amount =
+        match Ticket_amount.of_n amount with
+        | Some amount -> return amount
+        | None -> tzfail Empty_ticket
+      in
+      let ticket =
+        {
+          ticketer = Contract.Originated step_constants.self;
+          contents = (token_id, (None : bytes option));
+          amount = ticket_amount;
+        }
+      in
+      return (ctxt, storage, events, ticket)
+    in
+
+    let transfer_ticket (ctxt, ops) (to_, ticket) =
+      let*? ticket_ty = CLST_types.clst_ticket_ty in
+      let* typed_contract =
+        match to_.destination with
+        | Contract (Implicit pkh) ->
+            return (Typed_implicit_with_ticket {destination = pkh; ticket_ty})
+        | Contract (Originated hash) ->
+            return
+              (Typed_originated
+                 {
+                   arg_ty = ticket_ty;
+                   contract_hash = hash;
+                   entrypoint = to_.entrypoint;
+                 })
+        | Sc_rollup sc ->
+            return
+              (Typed_sc_rollup
+                 {
+                   arg_ty = ticket_ty;
+                   sc_rollup = sc;
+                   entrypoint = to_.entrypoint;
+                 })
+        | _ -> tzfail (standard_error ~mnemonic:"FA2.1_INVALID_DESTINATION")
+      in
+      let gas_counter, outdated_ctxt =
+        Local_gas_counter.local_gas_counter_and_outdated_context ctxt
+      in
+      let* op, outdated_ctxt, gas_counter =
+        Script_interpreter_defs.transfer
+          (outdated_ctxt, step_constants)
+          gas_counter
+          Tez.zero
+          Micheline.dummy_location
+          typed_contract
+          ticket
+      in
+      let ctxt = Local_gas_counter.update_context gas_counter outdated_ctxt in
+      return (ctxt, op :: ops)
+    in
+
+    let execute_export_ticket_one (ctxt, storage, events, all_ops)
+        (destination, txs) =
+      let* ctxt, storage, events, rev_ops =
+        match destination with
+        | None ->
+            (* None, an operation is emitted for each exported ticket to
+             its corresponding address %to_ and this address MUST be
+             typed as a (contract (ticket (pair nat (option
+             bytes))). This allows tz addresses to receive tickets
+             directly. The contract MUST fail with the error mnemonic
+             "FA2.1_INVALID_DESTINATION" if an address %to_ can't be
+             correctly typed. *)
+            List.fold_left_es
+              (fun (ctxt, storage, events, ops) (to_, tickets_to_export) ->
+                List.fold_left_es
+                  (fun (ctxt, storage, events, ops) ticket_to_export ->
+                    let* ctxt, storage, events, ticket =
+                      create_ticket_one (ctxt, storage, events) ticket_to_export
+                    in
+                    let* ctxt, ops =
+                      transfer_ticket (ctxt, ops) (to_, ticket)
+                    in
+                    return (ctxt, storage, events, ops))
+                  (ctxt, storage, events, ops)
+                  (Script_list.to_list tickets_to_export))
+              (ctxt, storage, events, all_ops)
+              (Script_list.to_list txs)
+        | Some destination_contract ->
+            (* (Some contract), only one operation is necessary to
+               transfer the tickets to this contract. The contract
+               parameter (list (pair address (list (ticket (pair nat
+               (option bytes)))))) MUST be constructed using (address
+               %to_) and (list %tickets_to_export). *)
+            let* ctxt, storage, events, rev_tickets =
+              List.fold_left_es
+                (fun (ctxt, storage, events, tickets_acc)
+                     (to_, tickets_to_export)
+                   ->
+                  let* ctxt, storage, events, tickets_rev =
+                    List.fold_left_es
+                      (fun (ctxt, storage, events, tickets) ticket_to_export ->
+                        let* ctxt, storage, events, ticket =
+                          create_ticket_one
+                            (ctxt, storage, events)
+                            ticket_to_export
+                        in
+                        return (ctxt, storage, events, ticket :: tickets))
+                      (ctxt, storage, events, [])
+                      (Script_list.to_list tickets_to_export)
+                  in
+                  let tickets = List.rev tickets_rev in
+                  return (ctxt, storage, events, (to_, tickets) :: tickets_acc))
+                (ctxt, storage, events, [])
+                (Script_list.to_list txs)
+            in
+            let tickets = List.rev rev_tickets in
+            let param =
+              Script_list.of_list
+                (List.map
+                   (fun (to_, tks) -> (to_, Script_list.of_list tks))
+                   tickets)
+            in
+            let gas_counter, outdated_ctxt =
+              Local_gas_counter.local_gas_counter_and_outdated_context ctxt
+            in
+            let* op, outdated_ctxt, gas_counter =
+              Script_interpreter_defs.transfer
+                (outdated_ctxt, step_constants)
+                gas_counter
+                Tez.zero
+                Micheline.dummy_location
+                destination_contract
+                param
+            in
+            let ctxt =
+              Local_gas_counter.update_context gas_counter outdated_ctxt
+            in
+            return (ctxt, storage, events, op :: all_ops)
+      in
+      return (ctxt, storage, events, rev_ops)
+    in
+    let* ctxt, storage, events, rev_ops =
+      List.fold_left_es
+        execute_export_ticket_one
+        (ctxt, storage, Clst_events.init_events, [])
+        (Script_list.to_list export_ticket)
+    in
+    let* balance_and_allowance_ops, ctxt =
+      Clst_events.emit_all_events
+        (ctxt, step_constants)
+        ~entrypoint:entrypoint_str
+        events
+    in
+    let all_ops =
+      List.rev_append balance_and_allowance_ops (List.rev rev_ops)
+    in
+    return (Script_list.of_list all_ops, storage, [], ctxt)
+
+  let import_one_ticket (step_constants : Script_typed_ir.step_constants)
+      (ctxt, storage, events) to_ ticket =
+    let open Lwt_result_syntax in
+    let {ticketer; contents = token_id, _option_bytes; amount} = ticket in
+    let*? () =
+      error_unless
+        (Contract.equal (Contract.Originated step_constants.self) ticketer)
+        (standard_error ~mnemonic:"FA2.1_INVALID_TICKET")
+    in
+    let*? () = check_token_id token_id in
+    let*? () =
+      error_unless
+        (is_implicit to_.destination)
+        (Non_implicit_contract to_.destination)
+    in
+    let* balance_to, ctxt =
+      Clst_contract_storage.get_balance_from_storage ctxt storage to_
+    in
+    let amount = Ticket_amount.to_n amount in
+    let new_balance_to = Script_int.(add_n balance_to amount) in
+    let* storage, ctxt =
+      Clst_contract_storage.set_balance_from_storage
+        ctxt
+        storage
+        to_
+        new_balance_to
+    in
+    let events =
+      Clst_events.update_balance_events
+        events
+        ~owner:to_
+        ~new_balance:new_balance_to
+        ~diff:(Script_int.int amount)
+    in
+    return (ctxt, storage, events)
+
+  let execute_import_ticket
+      (ctxt, (step_constants : Script_typed_ir.step_constants))
+      (import_ticket : import_ticket) (storage : Clst_contract_storage.t) :
+      entrypoint_execution_result tzresult Lwt.t =
+    let open Lwt_result_syntax in
+    let*? entrypoint_str = Entrypoint.of_string_lax "import_ticket" in
+    let*? () =
+      error_unless
+        Tez.(step_constants.amount = zero)
+        (Non_empty_transfer (step_constants.sender, step_constants.amount))
+    in
+    let* ctxt, storage, events =
+      List.fold_left_es
+        (fun acc (to_, tickets) ->
+          List.fold_left_es
+            (fun acc ticket -> import_one_ticket step_constants acc to_ ticket)
+            acc
+            (Script_list.to_list tickets))
+        (ctxt, storage, Clst_events.init_events)
+        (Script_list.to_list import_ticket)
+    in
+    let* all_events_ops, ctxt =
+      Clst_events.emit_all_events
+        (ctxt, step_constants)
+        ~entrypoint:entrypoint_str
+        events
+    in
+    return (Script_list.of_list all_events_ops, storage, [], ctxt)
+
+  let execute_import_ticket_from_implicit
+      (ctxt, (step_constants : Script_typed_ir.step_constants))
+      (ticket : import_ticket_from_implicit) (storage : Clst_contract_storage.t)
+      : entrypoint_execution_result tzresult Lwt.t =
+    let open Lwt_result_syntax in
+    let*? entrypoint_str =
+      Entrypoint.of_string_lax "import_ticket_from_implicit"
+    in
+    let*? () =
+      error_unless
+        Tez.(step_constants.amount = zero)
+        (Non_empty_transfer (step_constants.sender, step_constants.amount))
+    in
+    let*? () =
+      error_unless
+        (is_implicit step_constants.sender)
+        (Non_implicit_contract step_constants.sender)
+    in
+    let sender_address =
+      {destination = step_constants.sender; entrypoint = Entrypoint.default}
+    in
+    let* ctxt, storage, events =
+      import_one_ticket
+        step_constants
+        (ctxt, storage, Clst_events.init_events)
+        sender_address
+        ticket
+    in
+    let* all_events_ops, ctxt =
+      Clst_events.emit_all_events
+        (ctxt, step_constants)
+        ~entrypoint:entrypoint_str
+        events
+    in
+    return (Script_list.of_list all_events_ops, storage, [], ctxt)
+
+  let execute_lambda_export
+      (_ctxt, (_step_constants : Script_typed_ir.step_constants))
+      ((_tickets_to_export, _action) : lambda_export)
+      (_storage : Clst_contract_storage.t) :
+      entrypoint_execution_result tzresult Lwt.t =
+    tzfail (standard_error ~mnemonic:"FA2.1 lambda_export is not implemented")
+
+  let execute_register_delegate (ctxt, (step_constants : step_constants))
+      parameters (storage : Clst_contract_storage.t) :
+      entrypoint_execution_result tzresult Lwt.t =
+    let open Lwt_result_syntax in
+    let*? () =
+      error_when
+        Tez.(step_constants.amount <> zero)
+        (Non_empty_transfer (step_constants.sender, step_constants.amount))
+    in
+    let* pkh =
+      match step_constants.sender with
+      | Contract (Implicit pkh) ->
+          let* is_delegate = Contract.is_delegate ctxt pkh in
+          let*? () =
+            error_unless
+              is_delegate
+              (Contract_is_not_delegate step_constants.sender)
+          in
+          let* is_delegate_eventually_registered =
+            Clst_contract_storage.is_delegate_eventually_registered ctxt pkh
+          in
+          let*? () =
+            error_unless
+              (not is_delegate_eventually_registered)
+              (Delegate_is_already_registered step_constants.sender)
+          in
+          return pkh
+      | sender -> tzfail (Non_implicit_contract sender)
+    in
+    let ( edge_of_clst_staking_over_baking_millionth,
+          ratio_of_clst_staking_over_direct_staking_billionth ) =
+      match parameters with
+      | Some params -> params
+      | None ->
+          (* We trust the default values to not be negative. *)
+          ( Clst_delegates_parameters_repr.default
+              .edge_of_clst_staking_over_baking_millionth |> Script_int.of_int32
+            |> Script_int.abs,
+            Clst_delegates_parameters_repr.default
+              .ratio_of_clst_staking_over_direct_staking_billionth
+            |> Script_int.of_int32 |> Script_int.abs )
+    in
+    let* ctxt =
+      Clst_contract_storage.register_delegate
+        ctxt
+        ~delegate:pkh
+        ~edge_of_clst_staking_over_baking_millionth
+        ~ratio_of_clst_staking_over_direct_staking_billionth
+    in
+    return (Script_list.empty, storage, [], ctxt)
+
+  let execute_update_delegate_parameters
+      (ctxt, (step_constants : step_constants))
+      ( edge_of_clst_staking_over_baking_millionth,
+        ratio_of_clst_staking_over_direct_staking_billionth )
+      (storage : Clst_contract_storage.t) :
+      entrypoint_execution_result tzresult Lwt.t =
+    let open Lwt_result_syntax in
+    let*? () =
+      error_when
+        Tez.(step_constants.amount <> zero)
+        (Non_empty_transfer (step_constants.sender, step_constants.amount))
+    in
+    let* pkh =
+      match step_constants.sender with
+      | Contract (Implicit pkh) ->
+          let* is_delegate = Contract.is_delegate ctxt pkh in
+          let*? () =
+            error_unless
+              is_delegate
+              (Contract_is_not_delegate step_constants.sender)
+          in
+          let* is_delegate_eventually_registered =
+            Clst_contract_storage.is_delegate_eventually_registered ctxt pkh
+          in
+          let*? () =
+            error_unless
+              is_delegate_eventually_registered
+              (Delegate_is_not_registered step_constants.sender)
+          in
+          return pkh
+      | sender -> tzfail (Non_implicit_contract sender)
+    in
+    let* ctxt =
+      Clst_contract_storage.register_delegate
+        ctxt
+        ~delegate:pkh
+        ~edge_of_clst_staking_over_baking_millionth
+        ~ratio_of_clst_staking_over_direct_staking_billionth
+    in
+    return (Script_list.empty, storage, [], ctxt)
+
+  let execute_unregister_delegate (ctxt, (step_constants : step_constants)) ()
+      (storage : Clst_contract_storage.t) :
+      entrypoint_execution_result tzresult Lwt.t =
+    let open Lwt_result_syntax in
+    let*? () =
+      error_when
+        Tez.(step_constants.amount <> zero)
+        (Non_empty_transfer (step_constants.sender, step_constants.amount))
+    in
+    let* pkh =
+      match step_constants.sender with
+      | Contract (Implicit pkh) ->
+          let* is_delegate = Contract.is_delegate ctxt pkh in
+          let*? () =
+            error_unless
+              is_delegate
+              (Contract_is_not_delegate step_constants.sender)
+          in
+          let* is_eventually_registered =
+            Clst_contract_storage.is_delegate_eventually_registered ctxt pkh
+          in
+          let*? () =
+            error_unless
+              is_eventually_registered
+              (Delegate_is_not_registered step_constants.sender)
+          in
+          return pkh
+      | sender -> tzfail (Non_implicit_contract sender)
+    in
+    let* ctxt = Clst_contract_storage.unregister_delegate ctxt ~delegate:pkh in
+    return (Script_list.empty, storage, [], ctxt)
+
+  let execute_with_wrapped_storage (ctxt, (step_constants : step_constants))
+      (value : arg) (storage : Clst_contract_storage.t) =
+    match entrypoint_from_arg value with
+    | Deposit () -> execute_deposit (ctxt, step_constants) () storage
+    | Redeem amount -> execute_redeem (ctxt, step_constants) amount storage
+    | Finalize_redeem redeemer ->
+        execute_finalize_redeem (ctxt, step_constants) redeemer storage
+    | Register_delegate parameters ->
+        execute_register_delegate (ctxt, step_constants) parameters storage
+    | Update_delegate_parameters parameters ->
+        execute_update_delegate_parameters
+          (ctxt, step_constants)
+          parameters
+          storage
+    | Unregister_delegate () ->
+        execute_unregister_delegate (ctxt, step_constants) () storage
+    | Transfer transfer ->
+        execute_transfer (ctxt, step_constants) transfer storage
+    | Balance_of requests ->
+        execute_balance_of (ctxt, step_constants) requests storage
+    | Approve approvals ->
+        execute_approve (ctxt, step_constants) approvals storage
+    | Update_operators operators ->
+        execute_update_operators (ctxt, step_constants) operators storage
+    | Export_ticket txs ->
+        execute_export_ticket (ctxt, step_constants) txs storage
+    | Import_ticket tickets ->
+        execute_import_ticket (ctxt, step_constants) tickets storage
+    | Lambda_export lambda_export ->
+        execute_lambda_export (ctxt, step_constants) lambda_export storage
+    | Import_ticket_from_implicit ticket ->
+        execute_import_ticket_from_implicit
+          (ctxt, step_constants)
+          ticket
+          storage
+
+  let execute (ctxt, step_constants) value storage =
+    let open Lwt_result_syntax in
+    let storage = Clst_contract_storage.from_clst_storage storage in
+    let* operations, storage, balance_updates, context =
+      execute_with_wrapped_storage (ctxt, step_constants) value storage
+    in
+    return
+      ( ( operations,
+          Clst_contract_storage.to_clst_storage storage,
+          balance_updates ),
+        context )
+
+  module Views = struct
+    let balance : storage ex_view tzresult =
+      let open Result_syntax in
+      let* name = Script_string.of_string "get_balance" in
+      let* ty = CLST_types.balance_view_ty in
+      let implementation (ctxt, _step_constants) ((address : address), token_id)
+          (storage : storage) =
+        let open Lwt_result_syntax in
+        if
+          Compare.Int.(
+            Script_int.compare token_id Clst_contract_storage.token_id = 0)
+        then
+          Clst_contract_storage.get_balance_from_storage
+            ctxt
+            (Clst_contract_storage.from_clst_storage storage)
+            address
+        else return (Script_int.zero_n, ctxt)
+      in
+      return (Ex_view {name; ty; implementation})
+
+    let total_supply : storage ex_view tzresult =
+      let open Result_syntax in
+      let* name = Script_string.of_string "get_total_supply" in
+      let implementation (ctxt, _step_constants) (token_id : nat)
+          (storage : storage) =
+        let open Lwt_result_syntax in
+        if
+          Compare.Int.(
+            Script_int.compare token_id Clst_contract_storage.token_id = 0)
+        then
+          let total_supply =
+            Clst_contract_storage.(
+              get_total_supply_from_storage (from_clst_storage storage))
+          in
+          return (total_supply, ctxt)
+        else return (Script_int.zero_n, ctxt)
+      in
+      return
+        (Ex_view {name; ty = CLST_types.total_supply_view_ty; implementation})
+
+    let is_token : storage ex_view tzresult =
+      let open Result_syntax in
+      let* name = Script_string.of_string "is_token" in
+      let implementation (ctxt, _step_constants) (token_id : nat)
+          (_storage : storage) =
+        let open Lwt_result_syntax in
+        let is_token =
+          Compare.Int.(
+            Script_int.compare token_id Clst_contract_storage.token_id = 0)
+        in
+        return (is_token, ctxt)
+      in
+      return (Ex_view {name; ty = CLST_types.is_token_view_ty; implementation})
+
+    let get_allowance : storage ex_view tzresult =
+      let open Result_syntax in
+      let* name = Script_string.of_string "get_allowance" in
+      let implementation (ctxt, _step_constants) (owner, (spender, token_id))
+          (storage : storage) =
+        let open Lwt_result_syntax in
+        if
+          Compare.Int.(
+            Script_int.compare token_id Clst_contract_storage.token_id = 0)
+        then
+          let* allowance, ctxt =
+            Clst_contract_storage.get_account_operator_allowance
+              ctxt
+              (Clst_contract_storage.from_clst_storage storage)
+              ~owner
+              ~spender
+          in
+          let allowance =
+            match allowance with
+            | None | Some Infinite -> Script_int.zero_n
+            | Some (Finite n) -> n
+          in
+          return (allowance, ctxt)
+        else return (Script_int.zero_n, ctxt)
+      in
+      let* ty = CLST_types.get_allowance_view_ty in
+      return (Ex_view {name; ty; implementation})
+
+    let is_operator : storage ex_view tzresult =
+      let open Result_syntax in
+      let* name = Script_string.of_string "is_operator" in
+      let implementation (ctxt, _step_constants) (owner, (operator, token_id))
+          (storage : storage) =
+        let open Lwt_result_syntax in
+        if
+          Compare.Int.(
+            Script_int.compare token_id Clst_contract_storage.token_id = 0)
+        then
+          let* allowance, ctxt =
+            Clst_contract_storage.get_account_operator_allowance
+              ctxt
+              (Clst_contract_storage.from_clst_storage storage)
+              ~owner
+              ~spender:operator
+          in
+          (* According to TZIP26, an operator has an infinite
+             allowance. *)
+          let is_operator =
+            match allowance with
+            | Some Infinite -> true
+            | None | Some (Finite _) -> false
+          in
+          return (is_operator, ctxt)
+        else return (false, ctxt)
+      in
+      let* ty = CLST_types.is_operator_view_ty in
+      return (Ex_view {name; ty; implementation})
+
+    let get_token_metadata : storage ex_view tzresult =
+      let open Result_syntax in
+      let* name = Script_string.of_string "get_token_metadata" in
+      let implementation (ctxt, _step_constants) (token_id : nat)
+          (storage : storage) =
+        let open Lwt_result_syntax in
+        let* token_info, ctxt =
+          Clst_contract_storage.get_token_info
+            ctxt
+            (Clst_contract_storage.from_clst_storage storage)
+            ~token_id
+        in
+        let token_info =
+          Option.value
+            ~default:(Script_map.empty string_t)
+            (Option.map snd token_info)
+        in
+        return (token_info, ctxt)
+      in
+      let* ty = CLST_types.get_token_metadata_view_ty in
+      return (Ex_view {name; ty; implementation})
+
+    let view_map : storage Script_native_types.view_map tzresult =
+      let open Result_syntax in
+      let* (Ex_view {name = get_balance_name; _} as get_balance) = balance in
+      let* (Ex_view {name = get_total_supply_name; _} as get_total_supply) =
+        total_supply
+      in
+      let* (Ex_view {name = is_token_name; _} as is_token) = is_token in
+      let* (Ex_view {name = get_allowance_name; _} as get_allowance) =
+        get_allowance
+      in
+      let* (Ex_view {name = is_operator_name; _} as is_operator) =
+        is_operator
+      in
+      let* (Ex_view {name = get_token_metadata_name; _} as get_token_metadata) =
+        get_token_metadata
+      in
+      let view_map =
+        Script_map.update
+          get_balance_name
+          (Some get_balance)
+          (Script_map.empty string_t)
+      in
+      let view_map =
+        Script_map.update get_total_supply_name (Some get_total_supply) view_map
+      in
+      let view_map = Script_map.update is_token_name (Some is_token) view_map in
+      let view_map =
+        Script_map.update get_allowance_name (Some get_allowance) view_map
+      in
+      let view_map =
+        Script_map.update is_operator_name (Some is_operator) view_map
+      in
+      let view_map =
+        Script_map.update
+          get_token_metadata_name
+          (Some get_token_metadata)
+          view_map
+      in
+      return view_map
+  end
+end
+
+let get_views : type arg storage.
+    (arg, storage) kind -> storage Script_native_types.view_map tzresult =
+  function
+  | CLST_kind -> CLST_contract.Views.view_map
+
+let execute (type arg storage) (ctxt, step_constants)
+    (kind : (arg, storage) kind) (arg : arg) (storage : storage) :
+    ( (operation Script_list.t * storage * Receipt.balance_updates) * context,
+      error trace )
+    result
+    Lwt.t =
+  match kind with
+  | CLST_kind -> CLST_contract.execute (ctxt, step_constants) arg storage
+
+let () =
+  register_error_kind
+    `Branch
+    ~id:"stez.empty_transfer"
+    ~title:"Empty transfer"
+    ~description:"Forbidden to deposit or withdraw 0ꜩ on the sTEZ contract."
+    ~pp:(fun ppf () ->
+      Format.fprintf
+        ppf
+        "Deposit or withdraw 0ꜩ on the sTEZ contract are forbidden.")
+    Data_encoding.unit
+    (function CLST_contract.Empty_transfer -> Some () | _ -> None)
+    (fun () -> CLST_contract.Empty_transfer) ;
+  register_error_kind
+    `Branch
+    ~id:"stez.non_empty_transfer"
+    ~title:"Non empty transfer"
+    ~description:"Transferred amount is not used"
+    ~pp:(fun ppf (address, amount) ->
+      Format.fprintf
+        ppf
+        "Transferred amount %a from contract %a is not used"
+        Tez.pp
+        amount
+        Destination.pp
+        address)
+    Data_encoding.(
+      obj2 (req "address" Destination.encoding) (req "amount" Tez.encoding))
+    (function
+      | CLST_contract.Non_empty_transfer (address, amount) ->
+          Some (address, amount)
+      | _ -> None)
+    (fun (address, amount) ->
+      CLST_contract.Non_empty_transfer (address, amount)) ;
+  register_error_kind
+    `Branch
+    ~id:"stez.non_implicit_contract"
+    ~title:"Non implicit contract"
+    ~description:
+      "Only implicit contracts can deposit on the sTEZ contract, or be the \
+       origin or destination of token transfers."
+    ~pp:(fun ppf address ->
+      Format.fprintf
+        ppf
+        "Only implicit contracts can deposit on the sTEZ contract, or be the \
+         origin or destination of token transfers; %a is not implicit."
+        Destination.pp
+        address)
+    Data_encoding.(obj1 (req "address" Destination.encoding))
+    (function
+      | CLST_contract.Non_implicit_contract address -> Some address | _ -> None)
+    (fun address -> CLST_contract.Non_implicit_contract address) ;
+  register_error_kind
+    `Branch
+    ~id:"stez.balance_too_low"
+    ~title:"Balance is too low"
+    ~description:"Spending more stez tokens than the contract has"
+    ~pp:(fun ppf (address, balance, amount) ->
+      Format.fprintf
+        ppf
+        "Balance of contract %a too low (%s) to spend %s"
+        Destination.pp
+        address
+        (Script_int.to_string balance)
+        (Script_int.to_string amount))
+    Data_encoding.(
+      obj3
+        (req "address" Destination.encoding)
+        (req "balance" Script_int.n_encoding)
+        (req "amount" Script_int.n_encoding))
+    (function
+      | CLST_contract.Balance_too_low (address, balance, amount) ->
+          Some (address, balance, amount)
+      | _ -> None)
+    (fun (address, balance, amount) ->
+      CLST_contract.Balance_too_low (address, balance, amount)) ;
+  register_error_kind
+    `Branch
+    ~id:"stez.amount_too_large"
+    ~title:"Amount is too large"
+    ~description:"Amount is too large for transfer"
+    ~pp:(fun ppf (address, amount) ->
+      Format.fprintf
+        ppf
+        "Amount %s is too large to transfer to contract %a"
+        (Script_int.to_string amount)
+        Destination.pp
+        address)
+    Data_encoding.(
+      obj2
+        (req "address" Destination.encoding)
+        (req "amount" Script_int.n_encoding))
+    (function
+      | CLST_contract.Amount_too_large (address, amount) ->
+          Some (address, amount)
+      | _ -> None)
+    (fun (address, amount) -> CLST_contract.Amount_too_large (address, amount)) ;
+  register_error_kind
+    `Branch
+    ~id:"stez.only_owner_can_change_operator"
+    ~title:"Only the owner can update operators"
+    ~description:"Only the owner can update operators"
+    ~pp:(fun ppf (sender, owner) ->
+      Format.fprintf
+        ppf
+        "%a cannot update operators on behalf of %a, only %a can do it."
+        Destination.pp
+        sender
+        Destination.pp
+        owner
+        Destination.pp
+        owner)
+    Data_encoding.(
+      obj2
+        (req "sender" Destination.encoding)
+        (req "owner" Destination.encoding))
+    (function
+      | CLST_contract.Only_owner_can_change_operator (sender, owner) ->
+          Some (sender, owner)
+      | _ -> None)
+    (fun (sender, owner) ->
+      CLST_contract.Only_owner_can_change_operator (sender, owner)) ;
+  register_error_kind
+    `Branch
+    ~id:"stez.empty_ticket"
+    ~title:"Empty ticket"
+    ~description:"Forbidden to create a zero ticket."
+    ~pp:(fun ppf () -> Format.fprintf ppf "Zero tickets are forbidden.")
+    Data_encoding.unit
+    (function CLST_contract.Empty_ticket -> Some () | _ -> None)
+    (fun () -> CLST_contract.Empty_ticket) ;
+  register_error_kind
+    `Branch
+    ~id:"stez.contract_is_not_delegate"
+    ~title:"Contract is not a delegate"
+    ~description:"A non-delegate contract cannot register on sTEZ contract"
+    ~pp:(fun ppf address ->
+      Format.fprintf
+        ppf
+        "Only bakers can register to get staking power from the sTEZ contract. \
+         Contract %a is not a baker."
+        Destination.pp
+        address)
+    Data_encoding.(obj1 (req "address" Destination.encoding))
+    (function
+      | CLST_contract.Contract_is_not_delegate address -> Some address
+      | _ -> None)
+    (fun address -> CLST_contract.Contract_is_not_delegate address) ;
+  register_error_kind
+    `Branch
+    ~id:"stez.delegate_is_not_registered"
+    ~title:"Delegate is not registered on the sTEZ contract"
+    ~description:
+      "A delegate cannot update its parameters or unregister without being \
+       registered on the sTEZ contract"
+    ~pp:(fun ppf address ->
+      Format.fprintf
+        ppf
+        "Delegate %a cannot update its parameters or unregister without being \
+         registered on the sTEZ contract"
+        Destination.pp
+        address)
+    Data_encoding.(obj1 (req "address" Destination.encoding))
+    (function
+      | CLST_contract.Delegate_is_not_registered address -> Some address
+      | _ -> None)
+    (fun address -> CLST_contract.Delegate_is_not_registered address) ;
+  register_error_kind
+    `Branch
+    ~id:"stez.delegate_is_already_registered"
+    ~title:"Delegate is already registered on the sTEZ contract"
+    ~description:
+      "A registered delegate cannot register again on the sTEZ contract"
+    ~pp:(fun ppf address ->
+      Format.fprintf
+        ppf
+        "Delegate %a is already registered on sTEZ contract, no need to \
+         refresh it"
+        Destination.pp
+        address)
+    Data_encoding.(obj1 (req "address" Destination.encoding))
+    (function
+      | CLST_contract.Delegate_is_already_registered address -> Some address
+      | _ -> None)
+    (fun address -> CLST_contract.Delegate_is_already_registered address)

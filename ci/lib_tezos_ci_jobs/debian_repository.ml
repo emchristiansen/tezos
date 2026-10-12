@@ -1,0 +1,398 @@
+(*****************************************************************************)
+(*                                                                           *)
+(* SPDX-License-Identifier: MIT                                              *)
+(* Copyright (c) 2024 Nomadic Labs. <contact@nomadic-labs.com>               *)
+(*                                                                           *)
+(*****************************************************************************)
+
+(* This module defines the jobs of the [debian_repository] child
+   pipeline.
+
+   This pipeline builds the old and old Debian (and Ubuntu)
+   packages. *)
+
+let only_if_changed =
+  [
+    "scripts/packaging/build-deb-local.sh";
+    "scripts/packaging/Release.conf";
+    "scripts/packaging/octez/debian/*";
+    "scripts/ci/build-debian-packages_current.sh";
+    "scripts/ci/build-debian-packages.sh";
+    "scripts/ci/prepare-apt-repo.sh";
+    "scripts/ci/create_debian_repo.sh";
+    "scripts/packaging/octez-archive-keyring/**/*";
+    "scripts/ci/build-keyring-deb.sh";
+    "scripts/packaging/tests/deb/test-keyring*";
+    "docs/introduction/install-bin-deb.sh";
+    "scripts/version.sh";
+  ]
+
+open Tezos_ci
+module CI = Cacio.Shared
+
+(* Types for the repository pipelines.
+   - Release: we run all the release jobs, but no tests
+   - Partial: we run only a subset of the tests jobs
+   - Full: we run the complete test matrix *)
+type repository_pipeline = Full | Partial | Release
+
+let supported_releases (distro : Distro.name) = function
+  | Full | Release -> Distro.supported_releases distro
+  | Partial -> ( match distro with Debian -> ["trixie"] | Ubuntu -> ["22.04"])
+
+(** Return a tuple (ARCHITECTURES, <archs>) based on the type
+    of repository pipeline. *)
+let archs_variables pipeline =
+  let archs : Runner.Arch.t list =
+    match pipeline with Partial -> [Amd64] | Full | Release -> [Amd64; Arm64]
+  in
+  [
+    ( "ARCHITECTURES",
+      String.concat " " (List.map Runner.Arch.show_uniform archs) );
+  ]
+
+let tag_amd64 = Runner.Tag.show Gcp_very_high_cpu
+
+let tag_arm64 = Runner.Tag.show Gcp_arm64
+
+(* Points to [(debian|ubuntu)-build] static images. *)
+let build_dependency_image =
+  Image.mk_external
+    ~image_path:
+      (sf
+         "${GCP_PROTECTED_REGISTRY}/tezos/tezos/$DISTRIBUTION-build:$RELEASE-%s"
+         Tezos_ci.Images.Base_images.base_images_tag)
+
+(* Points to the plain [(debian|ubuntu):<release>] base images. The
+   [$DISTRIBUTION] and [$RELEASE] variables in the image path are expanded by
+   GitLab when the job starts, from the values set by the job's
+   [parallel:matrix]; this lets a single job definition iterate over
+   releases. *)
+let base_distro_image =
+  Image.mk_external
+    ~image_path:
+      (sf
+         "${GCP_PROTECTED_REGISTRY}/tezos/tezos/$DISTRIBUTION:$RELEASE-%s"
+         Tezos_ci.Images.Base_images.base_images_tag)
+
+(* [RELEASE] is intentionally not set here: it is provided by the
+   [parallel:matrix] of the jobs that use these variables, and is only
+   referenced (as [$RELEASE]) in [DEP_IMAGE]. *)
+let make_debian_variables distribution image_kind version =
+  ( "DEP_IMAGE",
+    sf
+      "${GCP_PROTECTED_REGISTRY}/tezos/tezos/%s-%s:$RELEASE-%s"
+      distribution
+      image_kind
+      version )
+  :: [("PREFIX", ""); ("DISTRIBUTION", distribution)]
+
+(* This is a hack to enable Cargo networking for jobs in child pipelines.
+
+   Global variables of the parent pipeline
+   are passed to the child pipeline. Inside the child
+   pipeline, variables received from the parent pipeline take
+   precedence over job-level variables. It's bit strange. So
+   to override the default [CARGO_NET_OFFLINE=true], we cannot
+   just set it in the job-level variables of this job.
+
+   [enable_sccache] adds the cache directive for [$CI_PROJECT_DIR/_sccache].
+
+   See
+   {{:https://docs.gitlab.com/ee/ci/variables/index.html#cicd-variable-precedence}here}
+   for more info. *)
+let cargo_network_hack = "export CARGO_NET_OFFLINE=false"
+
+let make_package_build_job ?tag ~target =
+  CI.job
+    ~image:build_dependency_image
+    ~stage:Build
+    ?tag
+    ~artifacts:(Gitlab_ci.Util.artifacts ["packages/$DISTRIBUTION/$RELEASE"])
+    ~script:
+      [cargo_network_hack; "./scripts/ci/build-debian-packages.sh " ^ target]
+
+(* data packages. we build them once *)
+let job_build_data_packages =
+  make_package_build_job
+    "oc.build-data_packages"
+    ~__POS__
+    ~description:"Build the Debian packages that contain Tezos data."
+    ~variables:[("DISTRIBUTION", "debian"); ("RELEASE", "trixie")]
+    ~target:"zcash"
+
+(* keyring package. Architecture: all, built once. *)
+let job_build_keyring_package =
+  make_package_build_job
+    "oc.build-keyring_package"
+    ~__POS__
+    ~description:"Build the octez-archive-keyring Debian package."
+    ~variables:[("DISTRIBUTION", "debian"); ("RELEASE", "trixie")]
+      (* The build sources repository-keys.sh, which fetches the production
+         public signing key(s) from GCP on protected branches. That fetch
+         authenticates to GCP via Workload Identity Federation, which needs the
+         GCP_ID_TOKEN OIDC token generated by this id_tokens section. *)
+    ~id_tokens:Tezos_ci.id_tokens
+    ~target:"keyring"
+
+(* These jobs build the packages in a matrix using the
+   build dependencies images *)
+let job_build =
+  Cacio.parameterize @@ fun distro ->
+  Cacio.parameterize @@ fun pipeline_type ->
+  let matrix =
+    (* Set of distro/release/architecture combinations for which we build deb packages.
+       A dependency image will be built once for each combination of [RELEASE] and [TAGS]. *)
+    [
+      [
+        ("RELEASE", supported_releases distro pipeline_type);
+        ( "TAGS",
+          match pipeline_type with
+          | Partial -> [tag_amd64]
+          | Full | Release -> [tag_amd64; tag_arm64] );
+      ];
+    ]
+  in
+  make_package_build_job
+    ("oc.build-" ^ Distro.name_for_scripts distro)
+    ~__POS__
+    ~description:
+      (sf "Build the Debian packages for %s." (Distro.name_for_humans distro))
+    ~variables:
+      [
+        ("DISTRIBUTION", Distro.name_for_scripts distro);
+        ("DUNE_BUILD_JOBS", "-j 12");
+      ]
+    ~parallel:(Matrix matrix)
+    ~sccache:(Cacio.sccache ())
+    ~target:"binaries"
+    ~tag:Dynamic
+
+let job_apt_repo =
+  Cacio.parameterize @@ fun (distro : Distro.name) ->
+  Cacio.parameterize @@ fun pipeline_type ->
+  CI.job
+    ("apt_repo_" ^ Distro.name_for_scripts distro)
+    ~__POS__
+    ~only_if_changed
+    ~description:
+      (sf
+         "Create the apt repository for %s packages and sign it."
+         (Distro.name_for_humans distro))
+    ~stage:Publish
+    ~needs:
+      [
+        (Artifacts, job_build_data_packages);
+        (Artifacts, job_build_keyring_package);
+        (Artifacts, job_build distro pipeline_type);
+      ]
+    ~image:(Distro.main_image distro)
+    ~variables:
+      (archs_variables pipeline_type
+      @ [("GNUPGHOME", "$CI_PROJECT_DIR/.gnupg"); ("PREFIX", "")])
+    ~retry:Tezos_ci.no_retry
+    ~id_tokens:Tezos_ci.id_tokens
+    ~script:
+      [
+        ". ./scripts/version.sh";
+        "apt-get install -y --update apt-utils debsigs";
+        String.concat
+          " "
+          ("./scripts/ci/create_debian_repo.sh"
+          :: Distro.name_for_scripts distro
+          :: supported_releases distro pipeline_type);
+      ]
+
+let job_lintian =
+  Cacio.parameterize @@ fun distro ->
+  Cacio.parameterize @@ fun pipeline_type ->
+  CI.job
+    ("oc.lintian_" ^ Distro.name_for_scripts distro)
+    ~__POS__
+    ~only_if_changed
+    ~stage:Test_publication
+    ~description:
+      (sf "Run lintian on %s packages." (Distro.name_for_humans distro))
+    ~needs:[(Artifacts, job_build distro pipeline_type)]
+    ~image:(Distro.main_image distro)
+    ~script:
+      [
+        ". ./scripts/version.sh";
+        "export DEBIAN_FRONTEND=noninteractive";
+        "apt-get update";
+        "apt-get install lintian parallel -y";
+        String.concat
+          " "
+          ("./scripts/ci/lintian_debian_packages.sh"
+          :: Distro.name_for_scripts distro
+          :: supported_releases distro pipeline_type);
+      ]
+
+(* Rebuild the Debian binary, data and keyring packages for trixie/amd64 and
+   check, with diffoscope, that they are byte-for-byte identical to the packages
+   already built by [job_build_debian], [job_build_data_packages] and
+   [job_build_keyring_package] (pulled in as artifacts). Reusing the existing
+   builds as the reference means we only pay for one extra build.
+
+   This job only ever runs in the scheduled [Tezos_ci_pipelines.debian_daily] pipeline (registered
+   with [Full] below). It checks a single distribution/architecture pair, pinned
+   by the DISTRIBUTION and RELEASE variables (debian/trixie) and the amd64 tag;
+   reproducibility of that pair is taken as representative of the other
+   combinations. The [pipeline_type] parameter only exists to thread the right
+   matrix variant into the [job_build_debian] dependency. *)
+let job_reproducibility_debian =
+  Cacio.parameterize @@ fun pipeline_type ->
+  CI.job
+    "oc.reproducibility_debian"
+    ~__POS__
+    ~description:
+      "Rebuild the Debian packages and check they are byte-for-byte identical \
+       to the first build (reproducible builds)."
+    ~image:build_dependency_image
+    ~stage:Test_publication
+    ~cpu:Very_high
+    ~needs:
+      [
+        (Artifacts, job_build Debian pipeline_type);
+        (Artifacts, job_build_data_packages);
+        (Artifacts, job_build_keyring_package);
+      ]
+    ~variables:
+      [
+        ("DISTRIBUTION", "debian");
+        ("RELEASE", "trixie");
+        ("DUNE_BUILD_JOBS", "-j 12");
+      ]
+      (* The rebuild includes the keyring package, whose build sources
+         repository-keys.sh to fetch the production public signing key(s) from
+         GCP on protected branches. That fetch authenticates to GCP via Workload
+         Identity Federation, which needs the GCP_ID_TOKEN OIDC token generated
+         by this id_tokens section; without it the rebuild falls back to the
+         temporary key and produces a differently-versioned keyring package. *)
+    ~id_tokens:Tezos_ci.id_tokens
+    ~sccache:(Cacio.sccache ())
+    ~script:[cargo_network_hack; "./scripts/ci/test-debian-reproducibility.sh"]
+
+let job_install_bin =
+  Cacio.parameterize @@ fun (name : Distro.name) ->
+  Cacio.parameterize @@ fun pipeline_type ->
+  CI.job
+    (sf "oc.install_bin_%s" (Distro.name_for_scripts name))
+    ~__POS__
+    ~only_if_changed
+    ~stage:Test_publication
+    ~description:
+      (sf
+         "Check that %s packages can be installed."
+         (Distro.name_for_humans name))
+    ~needs:[(Job, job_apt_repo name pipeline_type)]
+    ~image:base_distro_image
+    ~variables:[("PREFIX", ""); ("DISTRIBUTION", Distro.name_for_scripts name)]
+    ~parallel:(Matrix [[("RELEASE", supported_releases name pipeline_type)]])
+    ~script:["./docs/introduction/install-bin-deb.sh $DISTRIBUTION $RELEASE"]
+
+let make_systemd_test_job ~script ~(name : Distro.name) ~pipeline_type =
+  CI.job
+    ~only_if_changed
+    ~stage:Test_publication
+    ~needs:[(Job, job_apt_repo name pipeline_type)]
+    ~image:Images.Base_images.alpine_docker_ci
+    ~services:[{name = Images.Base_images.dind_service}]
+    ~retry:Tezos_ci.dind_retry
+    ~variables:
+      ([("DOCKER_VERSION", Docker.version)]
+      @ make_debian_variables
+          (Distro.name_for_scripts name)
+          "systemd"
+          Tezos_ci.Images.Base_images.base_images_tag)
+    ~parallel:(Matrix [[("RELEASE", supported_releases name pipeline_type)]])
+    ~script:
+      [
+        "./scripts/ci/docker_initialize.sh";
+        "./scripts/ci/systemd-packages-test.sh " ^ script
+        ^ " images/packages/debian-systemd-tests.Dockerfile";
+      ]
+
+let job_install_bin_systemd =
+  Cacio.parameterize @@ fun (name : Distro.name) ->
+  Cacio.parameterize @@ fun pipeline_type ->
+  make_systemd_test_job
+    (sf "oc.install_bin_%s_systemd" (Distro.name_for_scripts name))
+    ~__POS__
+    ~description:"Check that packages that use systemd can be installed."
+    ~name
+    ~pipeline_type
+    ~script:"scripts/packaging/tests/deb/install-bin-deb.sh"
+
+(* Note: this job is in the publish stage because it depends on a job
+   that is in the publish stage, but it is a test.
+   Ideally we would build the images in the build stage, test them in the test stage,
+   and only then publish them in the publish stage. *)
+let job_upgrade_bin_systemd =
+  Cacio.parameterize @@ fun (name : Distro.name) ->
+  Cacio.parameterize @@ fun pipeline_type ->
+  make_systemd_test_job
+    (sf "oc.upgrade_bin_%s_systemd" (Distro.name_for_scripts name))
+    ~__POS__
+    ~description:"Check the upgrade process in a systemd enabled Docker image."
+    ~name
+    ~pipeline_type
+    ~script:"scripts/packaging/tests/deb/upgrade-systemd-test.sh"
+
+let job_test_keyring =
+  Cacio.parameterize @@ fun (name : Distro.name) ->
+  Cacio.parameterize @@ fun pipeline_type ->
+  make_systemd_test_job
+    ("oc.test_keyring_" ^ Distro.name_for_scripts name)
+    ~__POS__
+    ~description:"Check that the keyring package works for APT authentication."
+    ~name
+    ~pipeline_type
+    ~script:"scripts/packaging/tests/deb/test-keyring.sh"
+
+(* Each of these jobs iterates over the releases supported by [name] for the
+   given [pipeline_type] with [parallel:matrix], so we register one job per
+   distribution rather than one per distribution/release pair. *)
+let jobs_for (name : Distro.name) pipeline_type :
+    (Cacio.trigger * Cacio.job) list =
+  [
+    (Auto, job_apt_repo name pipeline_type);
+    (Auto, job_lintian name pipeline_type);
+    (Auto, job_install_bin name pipeline_type);
+    (Auto, job_install_bin_systemd name pipeline_type);
+    (Auto, job_upgrade_bin_systemd name pipeline_type);
+    (Auto, job_test_keyring name pipeline_type);
+  ]
+
+let jobs pipeline_type =
+  match pipeline_type with
+  | Partial -> jobs_for Distro.Debian Partial
+  | Full | Release ->
+      List.concat_map
+        (fun name -> jobs_for name pipeline_type)
+        [Distro.Debian; Ubuntu]
+
+let () =
+  (* Register the Debian partial jobs directly into before_merging and
+     merge_train pipelines with only_if_changed so they run automatically
+     only when relevant files change. *)
+  Tezos_ci_pipelines.register_merge_request_jobs (jobs Partial) ;
+  (* In merge pipelines we tests only Debian.
+     Ubuntu packages are built and tested in the scheduled pipelines. *)
+  Cacio.register_jobs Tezos_ci_pipelines.debian_daily (jobs Full) ;
+  Cacio.register_jobs
+    Tezos_ci_pipelines.debian_daily
+    [(Auto, job_reproducibility_debian Full)] ;
+  ()
+
+(* Jobs exported outside this module.
+   For now we do not need the Distro module outside of this module,
+   so we export instances instead of the functions themselves. *)
+
+let job_build_debian = job_build Debian
+
+let job_build_ubuntu = job_build Ubuntu
+
+let job_apt_repo_debian = job_apt_repo Debian
+
+let job_apt_repo_ubuntu = job_apt_repo Ubuntu

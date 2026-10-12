@@ -26,8 +26,8 @@
 (** Testing
     -------
     Component:    Protocol Library
-    Invocation:   dune exec \
-                  src/proto_alpha/lib_protocol/test/pbt/test_sampler.exe
+    Invocation:   dune exec src/proto_alpha/lib_protocol/test/pbt/main.exe \
+                  -- --file test_sampler.ml
     Subject:      Operations in Saturation_repr
 *)
 
@@ -77,8 +77,7 @@ module Helpers = struct
     in
     loop total []
 
-  let empirical_distribution :
-      type a.
+  let empirical_distribution : type a.
       (module Std with type t = a) ->
       nsamples:int ->
       (unit -> a) ->
@@ -266,8 +265,6 @@ let alias_z_test =
 
 let () =
   Alcotest.run
-    "protocol > pbt > sampling"
-    [
-      ( Protocol.name ^ ": sampling",
-        qcheck_wrap [alias_float_test; alias_z_test] );
-    ]
+    ~__FILE__
+    Protocol.name
+    [("sampling", qcheck_wrap [alias_float_test; alias_z_test])]

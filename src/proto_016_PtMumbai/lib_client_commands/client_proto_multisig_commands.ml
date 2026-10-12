@@ -128,7 +128,7 @@ let prepare_command_display prepared_command bytes_only =
           "@[<2>Public keys of the signers:@ %a@]"
           (Format.pp_print_list
              ~pp_sep:(fun ppf () -> Format.fprintf ppf "@ ")
-             Tezos_crypto.Signature.Public_key.pp))
+             Signature.Public_key.pp))
       prepared_command.Client_proto_multisig.keys
 
 let get_parameter_type (cctxt : #Protocol_client_context.full)
@@ -203,7 +203,7 @@ let commands_rw () : #Protocol_client_context.full Tezos_clic.command list =
            Client_proto_args.fee_parameter_args
            Client_proto_context_commands.verbose_signing_switch)
         (prefixes ["deploy"; "multisig"]
-        @@ Client_proto_contracts.RawContractAlias.fresh_alias_param
+        @@ Client_proto_contracts.Raw_contract_alias.fresh_alias_param
              ~name:"new_multisig"
              ~desc:"name of the new multisig contract"
         @@ prefix "transferring"
@@ -211,7 +211,7 @@ let commands_rw () : #Protocol_client_context.full Tezos_clic.command list =
              ~name:"qty"
              ~desc:"amount taken from source"
         @@ prefix "from"
-        @@ Client_proto_contracts.ContractAlias.destination_param
+        @@ Client_proto_contracts.Contract_alias.destination_param
              ~name:"src"
              ~desc:"name of the source contract"
         @@ prefixes ["with"; "threshold"]
@@ -232,10 +232,11 @@ let commands_rw () : #Protocol_client_context.full Tezos_clic.command list =
              source
              threshold
              keys
-             (cctxt : #Protocol_client_context.full) ->
+             (cctxt : #Protocol_client_context.full)
+           ->
           let open Lwt_result_syntax in
           let* alias_name =
-            Client_proto_contracts.RawContractAlias.of_fresh
+            Client_proto_contracts.Raw_contract_alias.of_fresh
               cctxt
               force
               alias_name
@@ -293,7 +294,7 @@ let commands_rw () : #Protocol_client_context.full Tezos_clic.command list =
         ~desc:"Sign a transaction for a multisig contract."
         (args2 arg_arg entrypoint_arg)
         (prefixes ["sign"; "multisig"; "transaction"; "on"]
-        @@ Client_proto_contracts.OriginatedContractAlias.destination_param
+        @@ Client_proto_contracts.Originated_contract_alias.destination_param
              ~name:"multisig"
              ~desc:"name or address of the originated multisig contract"
         @@ prefix "transferring"
@@ -301,7 +302,7 @@ let commands_rw () : #Protocol_client_context.full Tezos_clic.command list =
              ~name:"qty"
              ~desc:"amount taken from source"
         @@ prefix "to"
-        @@ Client_proto_contracts.ContractAlias.destination_param
+        @@ Client_proto_contracts.Contract_alias.destination_param
              ~name:"dst"
              ~desc:"name/literal of the destination contract"
         @@ prefixes ["using"; "secret"; "key"]
@@ -311,7 +312,8 @@ let commands_rw () : #Protocol_client_context.full Tezos_clic.command list =
              amount
              destination
              sk
-             (cctxt : #Protocol_client_context.full) ->
+             (cctxt : #Protocol_client_context.full)
+           ->
           let open Lwt_result_syntax in
           let entrypoint =
             Option.value ~default:Entrypoint.default entrypoint
@@ -336,14 +338,14 @@ let commands_rw () : #Protocol_client_context.full Tezos_clic.command list =
               ()
           in
           let* signature = Client_keys.sign cctxt sk prepared_command.bytes in
-          Format.printf "%a@." Tezos_crypto.Signature.pp signature ;
+          Format.printf "%a@." Signature.pp signature ;
           return_unit);
       command
         ~group
         ~desc:"Sign a lambda for a generic multisig contract."
         no_options
         (prefixes ["sign"; "multisig"; "transaction"; "on"]
-        @@ Client_proto_contracts.OriginatedContractAlias.destination_param
+        @@ Client_proto_contracts.Originated_contract_alias.destination_param
              ~name:"multisig"
              ~desc:"name or address of the originated multisig contract"
         @@ prefixes ["running"; "lambda"]
@@ -354,7 +356,8 @@ let commands_rw () : #Protocol_client_context.full Tezos_clic.command list =
              multisig_contract
              lambda
              sk
-             (cctxt : #Protocol_client_context.full) ->
+             (cctxt : #Protocol_client_context.full)
+           ->
           let open Lwt_result_syntax in
           let*? {expanded = lambda; _} =
             Micheline_parser.no_parsing_error
@@ -370,14 +373,14 @@ let commands_rw () : #Protocol_client_context.full Tezos_clic.command list =
               ()
           in
           let* signature = Client_keys.sign cctxt sk prepared_command.bytes in
-          Format.printf "%a@." Tezos_crypto.Signature.pp signature ;
+          Format.printf "%a@." Signature.pp signature ;
           return_unit);
       command
         ~group
         ~desc:"Sign a delegate change for a multisig contract."
         no_options
         (prefixes ["sign"; "multisig"; "transaction"; "on"]
-        @@ Client_proto_contracts.OriginatedContractAlias.destination_param
+        @@ Client_proto_contracts.Originated_contract_alias.destination_param
              ~name:"multisig"
              ~desc:"name or address of the originated multisig contract"
         @@ prefixes ["setting"; "delegate"; "to"]
@@ -390,7 +393,8 @@ let commands_rw () : #Protocol_client_context.full Tezos_clic.command list =
              multisig_contract
              delegate
              sk
-             (cctxt : #Protocol_client_context.full) ->
+             (cctxt : #Protocol_client_context.full)
+           ->
           let open Lwt_result_syntax in
           let* prepared_command =
             Client_proto_multisig.prepare_multisig_transaction
@@ -402,14 +406,14 @@ let commands_rw () : #Protocol_client_context.full Tezos_clic.command list =
               ()
           in
           let* signature = Client_keys.sign cctxt sk prepared_command.bytes in
-          Format.printf "%a@." Tezos_crypto.Signature.pp signature ;
+          Format.printf "%a@." Signature.pp signature ;
           return_unit);
       command
         ~group
         ~desc:"Sign a delegate withdraw for a multisig contract."
         no_options
         (prefixes ["sign"; "multisig"; "transaction"; "on"]
-        @@ Client_proto_contracts.OriginatedContractAlias.destination_param
+        @@ Client_proto_contracts.Originated_contract_alias.destination_param
              ~name:"multisig"
              ~desc:"name or address of the originated multisig contract"
         @@ prefixes ["withdrawing"; "delegate"]
@@ -427,7 +431,7 @@ let commands_rw () : #Protocol_client_context.full Tezos_clic.command list =
               ()
           in
           let* signature = Client_keys.sign cctxt sk prepared_command.bytes in
-          Format.printf "%a@." Tezos_crypto.Signature.pp signature ;
+          Format.printf "%a@." Signature.pp signature ;
           return_unit);
       command
         ~group
@@ -435,7 +439,7 @@ let commands_rw () : #Protocol_client_context.full Tezos_clic.command list =
           "Sign a change of public keys and threshold for a multisig contract."
         no_options
         (prefixes ["sign"; "multisig"; "transaction"; "on"]
-        @@ Client_proto_contracts.OriginatedContractAlias.destination_param
+        @@ Client_proto_contracts.Originated_contract_alias.destination_param
              ~name:"multisig"
              ~desc:"name or address of the originated multisig contract"
         @@ prefixes ["using"; "secret"; "key"]
@@ -449,7 +453,8 @@ let commands_rw () : #Protocol_client_context.full Tezos_clic.command list =
              sk
              new_threshold
              new_keys
-             (cctxt : #Protocol_client_context.full) ->
+             (cctxt : #Protocol_client_context.full)
+           ->
           let open Lwt_result_syntax in
           let* keys =
             List.map_es
@@ -467,14 +472,14 @@ let commands_rw () : #Protocol_client_context.full Tezos_clic.command list =
               ()
           in
           let* signature = Client_keys.sign cctxt sk prepared_command.bytes in
-          Format.printf "%a@." Tezos_crypto.Signature.pp signature ;
+          Format.printf "%a@." Signature.pp signature ;
           return_unit);
       command
         ~group
         ~desc:"Transfer tokens using a multisig contract."
         transfer_options
         (prefixes ["from"; "multisig"; "contract"]
-        @@ Client_proto_contracts.OriginatedContractAlias.destination_param
+        @@ Client_proto_contracts.Originated_contract_alias.destination_param
              ~name:"multisig"
              ~desc:"name/literal of the multisig contract"
         @@ prefix "transfer"
@@ -482,11 +487,11 @@ let commands_rw () : #Protocol_client_context.full Tezos_clic.command list =
              ~name:"qty"
              ~desc:"amount taken from the multisig contract"
         @@ prefix "to"
-        @@ Client_proto_contracts.ContractAlias.destination_param
+        @@ Client_proto_contracts.Contract_alias.destination_param
              ~name:"dst"
              ~desc:"name/literal of the destination contract"
         @@ prefixes ["on"; "behalf"; "of"]
-        @@ Client_proto_contracts.ContractAlias.destination_param
+        @@ Client_proto_contracts.Contract_alias.destination_param
              ~name:"src"
              ~desc:"source calling the multisig contract"
         @@ prefixes ["with"; "signatures"]
@@ -506,7 +511,8 @@ let commands_rw () : #Protocol_client_context.full Tezos_clic.command list =
              destination
              source
              signatures
-             (cctxt : #Protocol_client_context.full) ->
+             (cctxt : #Protocol_client_context.full)
+           ->
           let open Lwt_result_syntax in
           let entrypoint =
             Option.value ~default:Entrypoint.default entrypoint
@@ -568,13 +574,13 @@ let commands_rw () : #Protocol_client_context.full Tezos_clic.command list =
         ~desc:"Run a lambda on a generic multisig contract."
         non_transfer_options
         (prefixes ["from"; "multisig"; "contract"]
-        @@ Client_proto_contracts.OriginatedContractAlias.destination_param
+        @@ Client_proto_contracts.Originated_contract_alias.destination_param
              ~name:"multisig"
              ~desc:"name/literal of the multisig contract"
         @@ prefixes ["run"; "lambda"]
         @@ lambda_param ()
         @@ prefixes ["on"; "behalf"; "of"]
-        @@ Client_proto_contracts.ContractAlias.destination_param
+        @@ Client_proto_contracts.Contract_alias.destination_param
              ~name:"src"
              ~desc:"source calling the multisig contract"
         @@ prefixes ["with"; "signatures"]
@@ -591,7 +597,8 @@ let commands_rw () : #Protocol_client_context.full Tezos_clic.command list =
              lambda
              source
              signatures
-             (cctxt : #Protocol_client_context.full) ->
+             (cctxt : #Protocol_client_context.full)
+           ->
           let open Lwt_result_syntax in
           match source with
           | Originated _ ->
@@ -638,7 +645,7 @@ let commands_rw () : #Protocol_client_context.full Tezos_clic.command list =
         ~desc:"Change the delegate of a multisig contract."
         non_transfer_options
         (prefixes ["set"; "delegate"; "of"; "multisig"; "contract"]
-        @@ Client_proto_contracts.OriginatedContractAlias.destination_param
+        @@ Client_proto_contracts.Originated_contract_alias.destination_param
              ~name:"multisig"
              ~desc:"name or address of the originated multisig contract"
         @@ prefix "to"
@@ -646,7 +653,7 @@ let commands_rw () : #Protocol_client_context.full Tezos_clic.command list =
              ~name:"dlgt"
              ~desc:"new delegate of the new multisig contract"
         @@ prefixes ["on"; "behalf"; "of"]
-        @@ Client_proto_contracts.ContractAlias.destination_param
+        @@ Client_proto_contracts.Contract_alias.destination_param
              ~name:"src"
              ~desc:"source calling the multisig contract"
         @@ prefixes ["with"; "signatures"]
@@ -663,7 +670,8 @@ let commands_rw () : #Protocol_client_context.full Tezos_clic.command list =
              delegate
              source
              signatures
-             (cctxt : #Protocol_client_context.full) ->
+             (cctxt : #Protocol_client_context.full)
+           ->
           let open Lwt_result_syntax in
           match source with
           | Originated _ ->
@@ -707,11 +715,11 @@ let commands_rw () : #Protocol_client_context.full Tezos_clic.command list =
         ~desc:"Withdraw the delegate of a multisig contract."
         non_transfer_options
         (prefixes ["withdraw"; "delegate"; "of"; "multisig"; "contract"]
-        @@ Client_proto_contracts.OriginatedContractAlias.destination_param
+        @@ Client_proto_contracts.Originated_contract_alias.destination_param
              ~name:"multisig"
              ~desc:"name or address of the originated multisig contract"
         @@ prefixes ["on"; "behalf"; "of"]
-        @@ Client_proto_contracts.ContractAlias.destination_param
+        @@ Client_proto_contracts.Contract_alias.destination_param
              ~name:"src"
              ~desc:"source calling the multisig contract"
         @@ prefixes ["with"; "signatures"]
@@ -727,7 +735,8 @@ let commands_rw () : #Protocol_client_context.full Tezos_clic.command list =
              multisig_contract
              source
              signatures
-             (cctxt : #Protocol_client_context.full) ->
+             (cctxt : #Protocol_client_context.full)
+           ->
           let open Lwt_result_syntax in
           match source with
           | Originated _ ->
@@ -770,13 +779,13 @@ let commands_rw () : #Protocol_client_context.full Tezos_clic.command list =
         ~desc:"Change public keys and threshold for a multisig contract."
         non_transfer_options
         (prefixes ["set"; "threshold"; "of"; "multisig"; "contract"]
-        @@ Client_proto_contracts.OriginatedContractAlias.destination_param
+        @@ Client_proto_contracts.Originated_contract_alias.destination_param
              ~name:"multisig"
              ~desc:"name or address of the originated multisig contract"
         @@ prefixes ["to"] @@ threshold_param ()
         @@ prefixes ["and"; "public"; "keys"; "to"]
         @@ non_terminal_seq (public_key_param ()) ~suffix:["on"; "behalf"; "of"]
-        @@ Client_proto_contracts.ContractAlias.destination_param
+        @@ Client_proto_contracts.Contract_alias.destination_param
              ~name:"src"
              ~desc:"source calling the multisig contract"
         @@ prefixes ["with"; "signatures"]
@@ -794,7 +803,8 @@ let commands_rw () : #Protocol_client_context.full Tezos_clic.command list =
              new_keys
              source
              signatures
-             (cctxt : #Protocol_client_context.full) ->
+             (cctxt : #Protocol_client_context.full)
+           ->
           let open Lwt_result_syntax in
           match source with
           | Originated _ ->
@@ -855,11 +865,11 @@ let commands_rw () : #Protocol_client_context.full Tezos_clic.command list =
                 be obtained by one of the \"prepare multisig transaction\" \
                 commands"
         @@ prefixes ["on"; "multisig"; "contract"]
-        @@ Client_proto_contracts.OriginatedContractAlias.destination_param
+        @@ Client_proto_contracts.Originated_contract_alias.destination_param
              ~name:"multisig"
              ~desc:"name or address of the originated multisig contract"
         @@ prefixes ["on"; "behalf"; "of"]
-        @@ Client_proto_contracts.ContractAlias.destination_param
+        @@ Client_proto_contracts.Contract_alias.destination_param
              ~name:"src"
              ~desc:"source calling the multisig contract"
         @@ prefixes ["with"; "signatures"]
@@ -876,7 +886,8 @@ let commands_rw () : #Protocol_client_context.full Tezos_clic.command list =
              multisig_contract
              source
              signatures
-             (cctxt : #Protocol_client_context.full) ->
+             (cctxt : #Protocol_client_context.full)
+           ->
           let open Lwt_result_syntax in
           match source with
           | Originated _ ->
@@ -921,7 +932,7 @@ let commands_rw () : #Protocol_client_context.full Tezos_clic.command list =
            multisigned transfer."
         (args3 bytes_only_switch arg_arg entrypoint_arg)
         (prefixes ["prepare"; "multisig"; "transaction"; "on"]
-        @@ Client_proto_contracts.OriginatedContractAlias.destination_param
+        @@ Client_proto_contracts.Originated_contract_alias.destination_param
              ~name:"multisig"
              ~desc:"name or address of the originated multisig contract"
         @@ prefix "transferring"
@@ -929,7 +940,7 @@ let commands_rw () : #Protocol_client_context.full Tezos_clic.command list =
              ~name:"qty"
              ~desc:"amount taken from source"
         @@ prefix "to"
-        @@ Client_proto_contracts.ContractAlias.destination_param
+        @@ Client_proto_contracts.Contract_alias.destination_param
              ~name:"dst"
              ~desc:"name/literal of the destination contract"
         @@ stop)
@@ -937,7 +948,8 @@ let commands_rw () : #Protocol_client_context.full Tezos_clic.command list =
              multisig_contract
              amount
              destination
-             (cctxt : #Protocol_client_context.full) ->
+             (cctxt : #Protocol_client_context.full)
+           ->
           let open Lwt_result_syntax in
           let entrypoint =
             Option.value ~default:Entrypoint.default entrypoint
@@ -969,7 +981,7 @@ let commands_rw () : #Protocol_client_context.full Tezos_clic.command list =
            multisigned lambda execution in a generic multisig contract."
         (args1 bytes_only_switch)
         (prefixes ["prepare"; "multisig"; "transaction"; "on"]
-        @@ Client_proto_contracts.OriginatedContractAlias.destination_param
+        @@ Client_proto_contracts.Originated_contract_alias.destination_param
              ~name:"multisig"
              ~desc:"name or address of the originated multisig contract"
         @@ prefixes ["running"; "lambda"]
@@ -977,7 +989,8 @@ let commands_rw () : #Protocol_client_context.full Tezos_clic.command list =
         (fun bytes_only
              multisig_contract
              lambda
-             (cctxt : #Protocol_client_context.full) ->
+             (cctxt : #Protocol_client_context.full)
+           ->
           let open Lwt_result_syntax in
           let*? {expanded = lambda; _} =
             Micheline_parser.no_parsing_error
@@ -1000,7 +1013,7 @@ let commands_rw () : #Protocol_client_context.full Tezos_clic.command list =
            multisigned delegate change."
         (args1 bytes_only_switch)
         (prefixes ["prepare"; "multisig"; "transaction"; "on"]
-        @@ Client_proto_contracts.OriginatedContractAlias.destination_param
+        @@ Client_proto_contracts.Originated_contract_alias.destination_param
              ~name:"multisig"
              ~desc:"name or address of the originated multisig contract"
         @@ prefixes ["setting"; "delegate"; "to"]
@@ -1011,7 +1024,8 @@ let commands_rw () : #Protocol_client_context.full Tezos_clic.command list =
         (fun bytes_only
              multisig_contract
              new_delegate
-             (cctxt : #Protocol_client_context.full) ->
+             (cctxt : #Protocol_client_context.full)
+           ->
           let open Lwt_result_syntax in
           let* prepared_command =
             Client_proto_multisig.prepare_multisig_transaction
@@ -1031,14 +1045,15 @@ let commands_rw () : #Protocol_client_context.full Tezos_clic.command list =
            multisigned delegate withdraw."
         (args1 bytes_only_switch)
         (prefixes ["prepare"; "multisig"; "transaction"; "on"]
-        @@ Client_proto_contracts.OriginatedContractAlias.destination_param
+        @@ Client_proto_contracts.Originated_contract_alias.destination_param
              ~name:"multisig"
              ~desc:"name or address of the originated multisig contract"
         @@ prefixes ["withdrawing"; "delegate"]
         @@ stop)
         (fun bytes_only
              multisig_contract
-             (cctxt : #Protocol_client_context.full) ->
+             (cctxt : #Protocol_client_context.full)
+           ->
           let open Lwt_result_syntax in
           let* prepared_command =
             Client_proto_multisig.prepare_multisig_transaction
@@ -1057,7 +1072,7 @@ let commands_rw () : #Protocol_client_context.full Tezos_clic.command list =
            multisigned change of keys and threshold."
         (args1 bytes_only_switch)
         (prefixes ["prepare"; "multisig"; "transaction"; "on"]
-        @@ Client_proto_contracts.OriginatedContractAlias.destination_param
+        @@ Client_proto_contracts.Originated_contract_alias.destination_param
              ~name:"multisig"
              ~desc:"name or address of the originated multisig contract"
         @@ prefixes ["setting"; "threshold"; "to"]
@@ -1068,7 +1083,8 @@ let commands_rw () : #Protocol_client_context.full Tezos_clic.command list =
              multisig_contract
              new_threshold
              new_keys
-             (cctxt : #Protocol_client_context.full) ->
+             (cctxt : #Protocol_client_context.full)
+           ->
           let open Lwt_result_syntax in
           let* keys =
             List.map_es

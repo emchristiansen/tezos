@@ -27,53 +27,157 @@ type operation_application_result = Succeeded | Failed
 
 type slot_index = int
 
+type lag_index = int
+
+type attestation_lag = int
+
 type slot_header = {
   published_level : int32;
   slot_index : slot_index;
-  commitment : Tezos_crypto_dal.Cryptobox.Verifier.commitment;
+  commitment : Cryptobox.Verifier.commitment;
 }
 
-type proto_parameters = {
-  feature_enable : bool;
-  number_of_slots : int;
-  attestation_lag : int;
-  attestation_threshold : int;
-  cryptobox_parameters : Tezos_crypto_dal.Cryptobox.Verifier.parameters;
-  blocks_per_epoch : int32;
-}
+type unfolded_lag_attestation = {lag_index : int; slot_indices : int list}
 
 module type T = sig
   module Proto : Registered_protocol.T
 
   type block_info
 
+  type dal_attestations
+
+  type slot_availability
+
+  type attestation_operation
+
+  type tb_slot
+
+  val tb_slot_to_int : tb_slot -> int
+
   val block_info :
     ?chain:Tezos_shell_services.Block_services.chain ->
     ?block:Tezos_shell_services.Block_services.block ->
-    metadata:[`Always | `Never] ->
-    Client_context.full ->
+    operations_metadata:[`Always | `Never] ->
+    Tezos_rpc.Context.generic ->
     block_info tzresult Lwt.t
 
   val get_constants :
     Tezos_shell_services.Chain_services.chain ->
     Tezos_shell_services.Block_services.block ->
-    Client_context.full ->
-    proto_parameters tzresult Lwt.t
+    Tezos_rpc.Context.generic ->
+    Tezos_dal_node_services.Types.proto_parameters tzresult Lwt.t
 
   val get_published_slot_headers :
-    block_info ->
-    (slot_header * operation_application_result) list tzresult Lwt.t
+    block_level:int32 ->
+    Tezos_rpc__RPC_context.generic ->
+    slot_header list tzresult Lwt.t
 
-  val get_committee :
-    Client_context.full ->
+  val get_attestations :
+    block_level:int32 ->
+    Tezos_rpc__RPC_context.generic ->
+    (tb_slot * attestation_operation * dal_attestations option) list tzresult
+    Lwt.t
+
+  val get_committees :
+    Tezos_rpc.Context.generic ->
     level:int32 ->
-    (int * int) Tezos_crypto.Signature.Public_key_hash.Map.t tzresult Lwt.t
+    (int list * int) Signature.Public_key_hash.Map.t tzresult Lwt.t
 
-  val attested_slot_headers :
-    Block_hash.t ->
-    block_info ->
+  val slot_availability : block_info -> slot_availability tzresult
+
+  val is_baker_attested :
+    dal_attestations ->
     number_of_slots:int ->
-    slot_index list tzresult
+    number_of_lags:int ->
+    lag_index:int ->
+    slot_index ->
+    bool
+
+  val decode_baker_attestations :
+    dal_attestations ->
+    number_of_slots:int ->
+    number_of_lags:int ->
+    unfolded_lag_attestation list tzresult
+
+  val is_protocol_attested :
+    slot_availability ->
+    number_of_slots:int ->
+    number_of_lags:int ->
+    lag_index:int ->
+    slot_index ->
+    bool
+
+  val get_round : Fitness.t -> int32 tzresult
+
+  val block_shell_header : block_info -> Block_header.shell_header
+
+  val inject_entrapment_evidence :
+    Tezos_rpc.Context.generic ->
+    attested_level:Int32.t ->
+    attestation_operation ->
+    slot_index:slot_index ->
+    lag_index:lag_index ->
+    shard:Cryptobox.shard ->
+    proof:Cryptobox.shard_proof ->
+    tb_slot:tb_slot ->
+    unit tzresult Lwt.t
+
+  val publish :
+    Tezos_rpc.Context.generic ->
+    block_level:int32 ->
+    source:Signature.Public_key_hash.t ->
+    slot_index:slot_index ->
+    commitment:Tezos_crypto_dal.Cryptobox.commitment ->
+    commitment_proof:Tezos_crypto_dal.Cryptobox.commitment_proof ->
+    src_sk:Signature.Secret_key.t ->
+    unit ->
+    Operation_hash.t tzresult Lwt.t
+
+  val is_delegate :
+    Tezos_rpc.Context.generic ->
+    pkh:Signature.Public_key_hash.t ->
+    bool tzresult Lwt.t
+
+  val is_migration_pending :
+    Tezos_rpc.Context.generic -> (bool * int32) tzresult Lwt.t
+
+  (* Section of helpers for Skip lists *)
+
+  module Skip_list : sig
+    type cell
+
+    type hash
+
+    val cell_encoding : cell Data_encoding.t
+
+    val hash_encoding : hash Data_encoding.t
+
+    val cell_equal : cell -> cell -> bool
+
+    val hash_equal : hash -> hash -> bool
+
+    val cell_hash : cell -> hash
+
+    val back_pointer : cell -> index:int -> (hash option, unit) result
+
+    val cells_of_level :
+      attested_level:int32 ->
+      Tezos_rpc.Context.generic ->
+      dal_constants:Tezos_dal_node_services.Types.proto_parameters ->
+      pred_publication_level_dal_constants:
+        Tezos_dal_node_services.Types.proto_parameters tzresult Lwt.t Lazy.t ->
+      (hash * cell * slot_index * attestation_lag) list tzresult Lwt.t
+
+    val slot_header_of_cell : cell -> slot_header option
+
+    val proto_attestation_status :
+      cell -> [`Attested of attestation_lag | `Unattested | `Unpublished] option
+  end
+
+  module RPC : sig
+    val directory :
+      Dal_store_sqlite3.Skip_list_cells.t -> unit Tezos_rpc.Directory.t
+  end
 end
 
 let table : (module T) Protocol_hash.Table.t = Protocol_hash.Table.create 5

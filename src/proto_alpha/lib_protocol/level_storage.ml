@@ -38,7 +38,10 @@ let root c = Raw_context.cycle_eras c |> Level_repr.root_level
 let succ c (l : Level_repr.t) = from_raw c (Raw_level_repr.succ l.level)
 
 let pred c (l : Level_repr.t) =
-  match Raw_level_repr.pred l.Level_repr.level with
+  (* This returns [None] rather than level zero when [l] is level one
+     because {!from_raw} raises an exception when called on zero
+     (because [Level_repr.era_of_level] cannot find level zero's era). *)
+  match Raw_level_repr.pred_dontreturnzero l.Level_repr.level with
   | None -> None
   | Some l -> Some (from_raw c l)
 
@@ -97,12 +100,20 @@ let levels_with_commitments_in_cycle ctxt c =
   in
   loop first []
 
-let last_allowed_fork_level c =
+let last_preserved_block_level c =
   let level = Raw_context.current_level c in
-  let preserved_cycles = Constants_storage.preserved_cycles c in
-  match Cycle_repr.sub level.cycle preserved_cycles with
+  let block_conservation_cycles =
+    Constants_storage.blocks_preservation_cycles c
+  in
+  match Cycle_repr.sub level.cycle block_conservation_cycles with
   | None -> Raw_level_repr.root
   | Some cycle -> (first_level_in_cycle c cycle).level
+
+let last_finalized_block_level c =
+  let current = Raw_context.current_level c in
+  let current_raw = current.level in
+  let finalized_level = Raw_level_repr.sub current_raw 2 in
+  match finalized_level with None -> Raw_level_repr.root | Some l -> l
 
 let last_of_a_cycle ctxt level =
   let cycle_eras = Raw_context.cycle_eras ctxt in
@@ -111,15 +122,6 @@ let last_of_a_cycle ctxt level =
 let dawn_of_a_new_cycle ctxt =
   let level = current ctxt in
   if last_of_a_cycle ctxt level then Some level.cycle else None
-
-let may_snapshot_stake_distribution ctxt =
-  let level = current ctxt in
-  let blocks_per_stake_snapshot =
-    Constants_storage.blocks_per_stake_snapshot ctxt
-  in
-  Compare.Int32.equal
-    (Int32.rem level.cycle_position blocks_per_stake_snapshot)
-    (Int32.pred blocks_per_stake_snapshot)
 
 let may_compute_randao ctxt =
   let level = current ctxt in

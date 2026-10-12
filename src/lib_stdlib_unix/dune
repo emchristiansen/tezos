@@ -3,25 +3,29 @@
 
 (library
  (name tezos_stdlib_unix)
- (public_name tezos-stdlib-unix)
+ (public_name octez-libs.stdlib-unix)
  (instrumentation (backend bisect_ppx))
  (libraries
   unix
-  tezos-error-monad
-  tezos-lwt-result-stdlib
-  tezos-event-logging
-  tezos-stdlib
-  data-encoding
+  octez-libs.error-monad
+  octez-libs.lwt-result-stdlib
+  octez-libs.event-logging
+  octez-libs.stdlib
+  octez-libs.data-encoding
   aches-lwt
   lwt.unix
+  lwt-exit
   ipaddr.unix
   re
   ezjsonm
   ptime
+  ptime.clock.os
   mtime
   mtime.clock.os
-  lwt_log
-  uri)
+  uri
+  progress
+  camlp-streams
+  octez-lwt-domain)
  (flags
   (:standard)
   -open Tezos_error_monad

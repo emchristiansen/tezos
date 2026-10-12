@@ -72,6 +72,7 @@ type config = {
 }
 
 val create :
+  ?fd_pool:P2p_fd.fd_pool ->
   config ->
   'peer P2p_params.peer_meta_config ->
   P2p_trigger.t ->
@@ -81,9 +82,10 @@ val create :
 (** [save_peers pool] save all peer currently known by the node on disk *)
 val save_peers : ('msg, 'peer, 'conn) t -> unit Lwt.t
 
-(** [tear_down_connections pool] close all connections, and returns when member
-    connections are either disconnected or canceled. *)
-val tear_down_connections : ('msg, 'peer, 'conn) t -> unit Lwt.t
+(** [tear_down_connections ~reason pool] close all connections, and returns
+    when member connections are either disconnected or canceled. *)
+val tear_down_connections :
+  reason:P2p_disconnection_reason.t -> ('msg, 'peer, 'conn) t -> unit Lwt.t
 
 (** [destroy pool] calls tear_down_connections and save the known peers list on the disk *)
 val destroy : ('msg, 'peer, 'conn) t -> unit Lwt.t
@@ -275,6 +277,13 @@ module Peers : sig
 
   (** [get_greylisted_list t] returns the list of all the greylisted peers *)
   val get_greylisted_list : ('msg, 'peer, 'conn) t -> P2p_peer.Id.t list
+
+  (** [info_of_peer_info t peer] returns the peer info from the peer
+      state info. *)
+  val info_of_peer_info :
+    ('msg, 'peer, 'conn) t ->
+    (('msg, 'peer, 'conn) P2p_conn.t, 'peer, 'conn) P2p_peer_state.Info.t ->
+    ('peer, 'conn) P2p_peer.Info.t
 end
 
 (** {1 Functions on [Points]} *)
@@ -330,8 +339,9 @@ module Points : sig
   val ban :
     ('msg, 'peer, 'conn) t -> ?ban_peers:bool -> P2p_point.Id.t -> unit Lwt.t
 
-  (* TODO this isn't consistent with greylist functions where only an addr is
-     provided). *)
+  (* TODO https://gitlab.com/tezos/tezos/-/issues/7028
+     this isn't consistent with greylist functions where only an addr is
+     provided. *)
 
   (** [unban t point_id] removes this point address from the black list.
       and unban all associated peers. The [point_id] port is ignored. *)
@@ -420,10 +430,19 @@ val add_to_id_points : ('msg, 'peer, 'conn) t -> P2p_point.Id.t -> unit
 val set_expected_peer_id :
   ('msg, 'peer, 'conn) t -> P2p_point.Id.t -> P2p_peer.Id.t -> unit Lwt.t
 
+(** [get_fd_pool t] returns the file descriptors pool contained in [t], if any.*)
+val get_fd_pool : ('msg, 'peer, 'conn) t -> P2p_fd.fd_pool option
+
 (**/**)
 
 module Internal_for_tests : sig
-  (** [create peer_encoding peer] returns a pool. [peer_encoding] and [peer] are needed as some functions of [P2p_pool]
-      return it. *)
-  val create : 'peer Data_encoding.t -> 'peer -> ('msg, 'peer, 'conn) t
+  (** [create ?fd_pool peer_encoding peer] returns a pool.
+     [peer_encoding] and [peer] are needed as some functions of [P2p_pool]
+     return it.
+     [fd_pool] is the field containing the file descriptors pool of the constructed pool.*)
+  val create :
+    ?fd_pool:P2p_fd.fd_pool ->
+    'peer Data_encoding.t ->
+    'peer ->
+    ('msg, 'peer, 'conn) t
 end

@@ -29,6 +29,12 @@
 
     This module is an interface for the slot storage for the layer 1.
 
+    It is responsible for maintaining the following tables:
+    - {!Storage.Dal.Slot.LevelHistories}
+    - {!Storage.Dal.Slot.Headers}
+    - {!Storage.Dal.Slot.History}
+    - {!Storage.Dal.AttestationHistory}
+
     Depending on the current level of the context and the [attestation_lag] (a
     constant given by the context), the status of the slot may differ:
 
@@ -44,14 +50,38 @@
     - For every level below [current_level - attestation_lag], there should not be
    any slot in the storage.  *)
 
-(** [find_slot_headers ctxt level] returns [Some slot_headers] where [slot_headers]
-   are pending slots at level [level].  [None] is returned if no
-   [slot_header] was registered at this level. The function fails if
-   the reading into the context fails. *)
+(** [register_slot_header ctxt slot_header ~source] returns a new context
+     where the new candidate [slot] published by [source] has been taken into
+     account.
+
+    Returns [Some (ctxt,updated)] where [updated=true] if the candidate is
+    registered. [Some (ctxt,false)] if another candidate was already registered
+    previously. Returns an error if the slot is invalid. *)
+val register_slot_header :
+  Raw_context.t ->
+  Dal_slot_repr.Header.t ->
+  source:Contract_repr.t ->
+  Raw_context.t tzresult
+
+(** [find_slot_headers ctxt level] returns [Some slot_headers] where
+    [slot_headers] are pending slots at level [level] alongside the contracts
+    addresses that published them.  [None] is returned if no [slot_header] was
+    registered at this level. The function fails if the reading into the context
+    fails. *)
 val find_slot_headers :
   Raw_context.t ->
   Raw_level_repr.t ->
-  Dal_slot_repr.Header.t list option tzresult Lwt.t
+  (Dal_slot_repr.Header.t * Contract_repr.t) list option tzresult Lwt.t
+
+(** [find_level_histories ctxt] returns the cells of the DAL skip list produced
+    at the current level alongside their hashes. Returns [None] if no entry is
+    present in the storage (yet). The function fails if the reading from the
+    context fails. *)
+val find_level_histories :
+  Raw_context.t ->
+  (Dal_slot_repr.History.Pointer_hash.t * Dal_slot_repr.History.t) list option
+  tzresult
+  Lwt.t
 
 (** [finalize_current_slot_headers ctxt] finalizes the current slot
    headers posted on this block and marks them as pending into the
@@ -64,9 +94,17 @@ val finalize_current_slot_headers : Raw_context.t -> Raw_context.t Lwt.t
     pending slots at [current_level - attestation_lag] level are removed from
     the context. *)
 val finalize_pending_slot_headers :
-  Raw_context.t -> (Raw_context.t * Dal_attestation_repr.t) tzresult Lwt.t
+  Raw_context.t ->
+  (Raw_context.t * Dal_attestations_repr.Slot_availability.t) tzresult Lwt.t
 
 (** [get_slot_headers_history ctxt] returns the current value of slots_history stored
    in [ctxt], or Slots_history.genesis if no value is stored yet. *)
 val get_slot_headers_history :
   Raw_context.t -> Dal_slot_repr.History.t tzresult Lwt.t
+
+module Internal_for_tests : sig
+  val get_delegate_ordering :
+    Raw_context.t ->
+    committee_level:Raw_level_repr.t ->
+    (Raw_context.t * Implicit_account_repr.t list) tzresult Lwt.t
+end

@@ -23,14 +23,29 @@
 (*                                                                           *)
 (*****************************************************************************)
 
-type parameters = Dal.parameters = {
-  redundancy_factor : int;
-  page_size : int;
-  slot_size : int;
-  number_of_shards : int;
-}
+module Parameters = struct
+  type t = Dal.parameters = {
+    redundancy_factor : int;
+    page_size : int;
+    slot_size : int;
+    number_of_shards : int;
+  }
 
-let parameters_encoding = Dal.parameters_encoding
+  module Comp = struct
+    type nonrec t = t
+
+    let compare a b =
+      let open Compare in
+      or_else (Int.compare a.redundancy_factor b.redundancy_factor) @@ fun () ->
+      or_else (Int.compare a.page_size b.page_size) @@ fun () ->
+      or_else (Int.compare a.slot_size b.slot_size) @@ fun () ->
+      Int.compare a.number_of_shards b.number_of_shards
+  end
+
+  include Compare.Make (Comp)
+
+  let parameters_encoding = Dal.parameters_encoding
+end
 
 module Commitment = struct
   (* DAL/FIXME https://gitlab.com/tezos/tezos/-/issues/3389
@@ -46,6 +61,8 @@ module Commitment = struct
   let pp = Dal.Commitment.pp
 
   let zero = Dal.Commitment.zero
+
+  let of_b58check_opt = Dal.Commitment.of_b58check_opt
 end
 
 module Commitment_proof = struct
@@ -68,21 +85,6 @@ module Header = struct
   let equal {id; commitment} s2 =
     slot_id_equal id s2.id && Commitment.equal commitment s2.commitment
 
-  let compare_slot_id {published_level; index} s2 =
-    let c = Raw_level_repr.compare published_level s2.published_level in
-    if Compare.Int.(c <> 0) then c
-    else Dal_slot_index_repr.compare index s2.index
-
-  let zero_id =
-    {
-      (* We don't expect to have any published slot at level
-         Raw_level_repr.root. *)
-      published_level = Raw_level_repr.root;
-      index = Dal_slot_index_repr.zero;
-    }
-
-  let zero = {id = zero_id; commitment = Commitment.zero}
-
   let id_encoding =
     let open Data_encoding in
     conv
@@ -97,7 +99,21 @@ module Header = struct
     conv
       (fun {id; commitment} -> (id, commitment))
       (fun (id, commitment) -> {id; commitment})
-      (merge_objs id_encoding (obj1 (req "commitment" Commitment.encoding)))
+      (* A tag is added to ensure we can migrate from this encoding to
+         different version if we decide to change the encoding. *)
+      (union
+         [
+           case
+             ~title:"v0"
+             (Tag 0)
+             (merge_objs
+                (obj1 (req "version" (constant "0")))
+                (merge_objs
+                   id_encoding
+                   (obj1 (req "commitment" Commitment.encoding))))
+             (fun x -> Some ((), x))
+             (fun ((), x) -> x);
+         ])
 
   let pp_id fmt {published_level; index} =
     Format.fprintf
@@ -112,10 +128,84 @@ module Header = struct
     Format.fprintf fmt "id:(%a), commitment: %a" pp_id id Commitment.pp c
 
   let verify_commitment cryptobox commitment proof =
-    ok (Dal.verify_commitment cryptobox commitment proof)
+    Ok (Dal.verify_commitment cryptobox commitment proof)
 end
 
 module Slot_index = Dal_slot_index_repr
+
+module Shard_with_proof = struct
+  type t = {shard : Dal.shard; proof : Dal.shard_proof}
+
+  let encoding =
+    let open Data_encoding in
+    conv
+      (fun {shard; proof} -> (shard, proof))
+      (fun (shard, proof) -> {shard; proof})
+      (obj2
+         (req "shard" Dal.shard_encoding)
+         (req "proof" Dal.shard_proof_encoding))
+
+  type error += Dal_shard_proof_error of string
+
+  let () =
+    let open Data_encoding in
+    register_error_kind
+      `Permanent
+      ~id:"dal_slot_repr.shard_with_proof.dal_shard_proof_error"
+      ~title:"DAL shard proof error"
+      ~description:"An error occurred while validating the DAL shard proof."
+      ~pp:(fun ppf e -> Format.fprintf ppf "DAL shard proof error: %s" e)
+      (obj1 (req "error" (string Plain)))
+      (function Dal_shard_proof_error e -> Some e | _ -> None)
+      (fun e -> Dal_shard_proof_error e)
+
+  let dal_proof_error reason = Dal_shard_proof_error reason
+
+  let proof_error reason = error @@ dal_proof_error reason
+
+  let verify cryptobox commitment t =
+    let open Result_syntax in
+    let fail_with_error_msg what =
+      Format.kasprintf
+        proof_error
+        "%s (for commitment = %a)."
+        what
+        Commitment.pp
+        commitment
+    in
+    match Dal.verify_shard cryptobox commitment t.shard t.proof with
+    | Ok () -> return ()
+    | Error `Invalid_shard -> fail_with_error_msg "Invalid shard"
+    | Error (`Invalid_degree_strictly_less_than_expected _) ->
+        fail_with_error_msg "Invalid_degree_strictly_less_than_expected"
+    | Error `Shard_length_mismatch ->
+        fail_with_error_msg "Shard_length_mismatch"
+    | Error (`Shard_index_out_of_range str) ->
+        fail_with_error_msg ("Shard_index_out_of_range (" ^ str ^ ")")
+
+  type error += Dal_encoding_error_in_share_is_trap
+
+  let () =
+    let open Data_encoding in
+    let description =
+      "An encoding error occurred while checking whether a shard is a trap."
+    in
+    register_error_kind
+      `Permanent
+      ~id:"dal_slot_repr.shard_with_proof.share_is_trap_error"
+      ~title:"encoding error in Dal.share_is_trap"
+      ~description
+      ~pp:(fun ppf () -> Format.fprintf ppf "%s" description)
+      unit
+      (function Dal_encoding_error_in_share_is_trap -> Some () | _ -> None)
+      (fun () -> Dal_encoding_error_in_share_is_trap)
+
+  let share_is_trap delegate share ~traps_fraction =
+    let open Result_syntax in
+    match Dal.share_is_trap delegate share ~traps_fraction with
+    | Ok res -> return res
+    | Error `Decoding_error -> error Dal_encoding_error_in_share_is_trap
+end
 
 module Page = struct
   type content = Bytes.t
@@ -136,6 +226,36 @@ module Page = struct
     let compare = Compare.Int.compare
 
     let equal = Compare.Int.equal
+
+    type error += Invalid_page_index of {given : int; min : int; max : int}
+
+    let () =
+      let open Data_encoding in
+      register_error_kind
+        `Permanent
+        ~id:"dal_page_index_repr.index.invalid_index"
+        ~title:"Invalid Dal page index"
+        ~description:
+          "The given index is out of range of representable page indices"
+        ~pp:(fun ppf (given, min, max) ->
+          Format.fprintf
+            ppf
+            "The given index %d is out of range of representable page indices \
+             [%d, %d]"
+            given
+            min
+            max)
+        (obj3 (req "given" int31) (req "min" int31) (req "max" int31))
+        (function
+          | Invalid_page_index {given; min; max} -> Some (given, min, max)
+          | _ -> None)
+        (fun (given, min, max) -> Invalid_page_index {given; min; max})
+
+    let check_is_in_range ~number_of_pages page_id =
+      error_unless
+        Compare.Int.(0 <= page_id && page_id < number_of_pages)
+        (Invalid_page_index
+           {given = page_id; min = zero; max = number_of_pages - 1})
   end
 
   type t = {slot_id : Header.id; page_index : Index.t}
@@ -187,7 +307,10 @@ module Slot_market = struct
 
   module Slot_index_map = Map.Make (Dal_slot_index_repr)
 
-  type t = {length : int; slot_headers : Header.t Slot_index_map.t}
+  type t = {
+    length : int;
+    slot_headers : (Header.t * Contract_repr.t) Slot_index_map.t;
+  }
 
   let init ~length =
     if Compare.Int.(length < 0) then
@@ -197,7 +320,7 @@ module Slot_market = struct
 
   let length {length; _} = length
 
-  let register t new_slot_header =
+  let register t new_slot_header ~source =
     let open Header in
     if
       not
@@ -210,7 +333,7 @@ module Slot_market = struct
       let update = function
         | None ->
             has_changed := true ;
-            Some new_slot_header
+            Some (new_slot_header, source)
         | Some x -> Some x
       in
       let slot_headers =
@@ -227,12 +350,47 @@ module History = struct
   (* History is represented via a skip list. The content of the cell
      is the hash of a merkle proof. *)
 
-  (* A leaf of the merkle tree is a slot. *)
-  module Leaf = struct
-    type t = Header.t
+  type attestation_lag_kind = Legacy | Dynamic of int
 
-    let to_bytes = Data_encoding.Binary.to_bytes_exn Header.encoding
-  end
+  (** The legacy attestation lag used by mainnet, ghostnet and shadownet *)
+  let legacy_attestation_lag = 8
+
+  let attestation_lag_value = function
+    | Legacy -> legacy_attestation_lag
+    | Dynamic n -> n
+
+  let attestation_lag_kind_equal lag1 lag2 =
+    match (lag1, lag2) with
+    | Legacy, Legacy -> true
+    | Dynamic n1, Dynamic n2 -> Compare.Int.equal n1 n2
+    | Legacy, Dynamic _ | Dynamic _, Legacy -> false
+
+  let pp_attestation_lag_kind fmt = function
+    | Legacy -> Format.fprintf fmt "Legacy:%d" legacy_attestation_lag
+    | Dynamic n -> Format.fprintf fmt "Dynamic:%d" n
+
+  type lag_check = Exact_lag of int | Lag_interval of int * int
+
+  let interval_lag_check ~attestation_lags =
+    let min_lag =
+      List.fold_left Compare.Int.min legacy_attestation_lag attestation_lags
+    in
+    Lag_interval (min_lag, legacy_attestation_lag)
+
+  type cell_id = {header_id : Header.id; attestation_lag : attestation_lag_kind}
+
+  let cell_id_equal cid1 cid2 =
+    attestation_lag_kind_equal cid1.attestation_lag cid2.attestation_lag
+    && Header.slot_id_equal cid1.header_id cid2.header_id
+
+  let pp_cell_id fmt {header_id; attestation_lag} =
+    Format.fprintf
+      fmt
+      "{slot_id:%a, lag:%a}"
+      Header.pp_id
+      header_id
+      pp_attestation_lag_kind
+      attestation_lag
 
   module Content_prefix = struct
     let (_prefix : string) = "dash1"
@@ -248,7 +406,6 @@ module History = struct
   end
 
   module Content_hash = Blake2B.Make (Base58) (Content_prefix)
-  module Merkle_list = Merkle_list.Make (Leaf) (Content_hash)
 
   (* Pointers of the skip lists are used to encode the content and the
      backpointers. *)
@@ -287,51 +444,377 @@ module History = struct
         | _ -> None)
       (fun () -> Add_element_in_slots_skip_list_violates_ordering)
 
-  module Skip_list = struct
-    include Skip_list_repr.Make (Skip_list_parameters)
+  module Content_v2 = struct
+    (** Each cell of the skip list is either a slot id (i.e. a published level
+        and a slot index) for which no slot header is published or a published
+        slot header associated to the address which published the operation
+        (implicit account or smart contract), the attestation status from the
+        protocol point of view, the number of attested shards and the total
+        number of shards.
 
-    (** All confirmed DAL slots will be stored in a skip list, where only the
-        last cell is remembered in the L1 context. The skip list is used in
-        the proof phase of a refutation game to verify whether a given slot
-        exists (i.e., confirmed) or not in the skip list. The skip list is
-        supposed to be sorted, as its 'search' function explicitly uses a given
-        `compare` function during the list traversal to quickly (in log(size))
-        reach the target if any.
+        In fact, we take the opportunity of this skip list upgrade to allow the
+        publisher to be a smart contract, even if it's not currently
+        implemented. In case we decide to publish commitments via smart
+        contracts (combined with Adaptive DAL, this would allow implementing a
+        kind of DAC using the DAL infra), the skip list will not require a
+        migration. *)
+    type t =
+      | Unpublished of cell_id
+      | Published of {
+          header : Header.t;
+          attestation_lag : attestation_lag_kind;
+          publisher : Contract_repr.t;
+          is_proto_attested : bool;
+          attested_shards : int;
+          total_shards : int;
+        }
 
-        In our case, we will store one slot per cell in the skip list and
-        maintain that the list is well sorted (and without redundancy) w.r.t.
-        the [compare_slot_id] function.
+    let content_id = function
+      | Unpublished cell_id -> cell_id
+      | Published {attestation_lag; header = {id; _}; _} ->
+          {attestation_lag; header_id = id}
 
-        Below, we redefine the [next] function (that allows adding elements
-        on top of the list) to enforce that the constructed skip list is
-        well-sorted. We also define a wrapper around the search function to
-        guarantee that it can only be called with the adequate compare function.
-    *)
+    let encoding =
+      let open Data_encoding in
+      let legacy_unpublished_case =
+        case
+          ~title:"unpublished"
+          (Tag 2)
+          (merge_objs
+             (obj1 (req "kind" (constant "unpublished")))
+             Header.id_encoding)
+          (function
+            | Unpublished {header_id; attestation_lag = Legacy} ->
+                Some ((), header_id)
+            | Unpublished {attestation_lag = Dynamic _; _} ->
+                (* We'll use a different encoding for [Dynamic] to keep
+                 encoding and hash retro-compatibility for [Legacy]. *)
+                None
+            | Published _ -> None)
+          (fun ((), header_id) ->
+            Unpublished {header_id; attestation_lag = Legacy})
+      in
+      let legacy_published_case =
+        case
+          ~title:"published"
+          (Tag 3)
+          (merge_objs
+             (obj5
+                (req "kind" (constant "published"))
+                (req "publisher" Contract_repr.encoding)
+                (req "is_proto_attested" bool)
+                (req "attested_shards" uint16)
+                (req "total_shards" uint16))
+             Header.encoding)
+          (function
+            | Unpublished _ -> None
+            | Published {attestation_lag = Dynamic _; _} ->
+                (* We'll use a different encoding for [Dynamic] to keep
+                 encoding and hash retro-compatibility for [Legacy]. *)
+                None
+            | Published
+                {
+                  header;
+                  attestation_lag = Legacy;
+                  publisher;
+                  is_proto_attested;
+                  attested_shards;
+                  total_shards;
+                } ->
+                Some
+                  ( ( (),
+                      publisher,
+                      is_proto_attested,
+                      attested_shards,
+                      total_shards ),
+                    header ))
+          (fun ( ( (),
+                   publisher,
+                   is_proto_attested,
+                   attested_shards,
+                   total_shards ),
+                 header )
+             ->
+            Published
+              {
+                header;
+                attestation_lag = Legacy;
+                publisher;
+                is_proto_attested;
+                attested_shards;
+                total_shards;
+              })
+      in
+      let dynamic_unpublished_case =
+        case
+          ~title:"unpublished_dyn"
+          (Tag 4)
+          (merge_objs
+             (obj2
+                (req "kind" (constant "unpublished"))
+                (req "attestation_lag" uint8))
+             Header.id_encoding)
+          (function
+            | Unpublished {header_id; attestation_lag = Dynamic lag} ->
+                Some (((), lag), header_id)
+            | Unpublished {attestation_lag = Legacy; _} -> None
+            | Published _ -> None)
+          (fun (((), lag), header_id) ->
+            Unpublished {header_id; attestation_lag = Dynamic lag})
+      in
+      let dynamic_published_case =
+        case
+          ~title:"published_dyn"
+          (Tag 5)
+          (merge_objs
+             (obj6
+                (req "kind" (constant "published"))
+                (req "publisher" Contract_repr.encoding)
+                (req "is_proto_attested" bool)
+                (req "attested_shards" uint16)
+                (req "total_shards" uint16)
+                (req "attestation_lag" uint8))
+             Header.encoding)
+          (function
+            | Unpublished _ -> None
+            | Published {attestation_lag = Legacy; _} -> None
+            | Published
+                {
+                  header;
+                  attestation_lag = Dynamic lag;
+                  publisher;
+                  is_proto_attested;
+                  attested_shards;
+                  total_shards;
+                } ->
+                Some
+                  ( ( (),
+                      publisher,
+                      is_proto_attested,
+                      attested_shards,
+                      total_shards,
+                      lag ),
+                    header ))
+          (fun ( ( (),
+                   publisher,
+                   is_proto_attested,
+                   attested_shards,
+                   total_shards,
+                   lag ),
+                 header )
+             ->
+            Published
+              {
+                header;
+                attestation_lag = Dynamic lag;
+                publisher;
+                is_proto_attested;
+                attested_shards;
+                total_shards;
+              })
+      in
+      union
+        ~tag_size:`Uint8
+        [
+          legacy_unpublished_case;
+          legacy_published_case;
+          dynamic_unpublished_case;
+          dynamic_published_case;
+        ]
 
+    let equal t1 t2 =
+      match (t1, t2) with
+      | Unpublished cid1, Unpublished cid2 -> cell_id_equal cid1 cid2
+      | ( Published
+            {
+              header;
+              attestation_lag;
+              publisher;
+              is_proto_attested;
+              attested_shards;
+              total_shards;
+            },
+          Published sh ) ->
+          Header.equal header sh.header
+          && attestation_lag_kind_equal attestation_lag sh.attestation_lag
+          && Contract_repr.equal publisher sh.publisher
+          && Compare.Bool.equal is_proto_attested sh.is_proto_attested
+          && Compare.Int.equal attested_shards sh.attested_shards
+          && Compare.Int.equal total_shards sh.total_shards
+      | Unpublished _, _ | Published _, _ -> false
+
+    let zero, zero_level =
+      let zero_level = Raw_level_repr.root in
+      let zero_index = Dal_slot_index_repr.zero in
+      ( Unpublished
+          {
+            header_id = {published_level = zero_level; index = zero_index};
+            attestation_lag = Legacy;
+          },
+        zero_level )
+
+    let pp fmt = function
+      | Unpublished cid -> Format.fprintf fmt "Unpublished (%a)" pp_cell_id cid
+      | Published
+          {
+            header;
+            attestation_lag;
+            publisher;
+            is_proto_attested;
+            attested_shards;
+            total_shards;
+          } ->
+          Format.fprintf
+            fmt
+            "Published { @[header: %a@] @[lag: %a@] @[publisher: %a@] \
+             @[is_proto_attested: %b@] @[attested_shards: %d@] @[total_shards: \
+             %d@] }"
+            Header.pp
+            header
+            pp_attestation_lag_kind
+            attestation_lag
+            Contract_repr.pp
+            publisher
+            is_proto_attested
+            attested_shards
+            total_shards
+
+    let to_bytes current_slot =
+      Data_encoding.Binary.to_bytes_exn encoding current_slot
+  end
+
+  module Mk_skip_list (Content : sig
+    type t
+
+    val content_id : t -> cell_id
+  end) =
+  struct
+    include Skip_list.Make (Skip_list_parameters)
+
+    (* [compare_slot_ids_by_dynamic_attested_level id1 ~dynamic_lag1 id2
+      ~dynamic_lag2] defines a total and deterministic ordering over DAL slot
+      identifiers.
+
+       The primary sort key is the slot's effective attestation level
+       [published_level + lag], where [lag] is derived from the attestation-lag
+       kind:
+
+       - [Legacy] is mapped to [0] (so legacy cells are ordered by their
+         [published_level] first, as before);
+
+       - [Dynamic d] is mapped to [d].
+
+       This ordering is intended to match the insertion order of skip-list cells
+       when the protocol may attest different slots with different lags (dynamic
+       attestation lag). We then break ties with [published_level] and finally
+       [slot_index] to preserve a total order.
+
+       When all cells use [Legacy] (or, more generally, when all lags map to
+       [0]), this reduces to the historical lexicographic ordering over
+       [(published_level, slot_index)]. *)
+    let compare_slot_ids_by_dynamic_attested_level =
+      let key_of_slot_id slot_id ~dlag =
+        let dlag_value = match dlag with Legacy -> 0 | Dynamic d -> d in
+        let Header.{published_level; index} = slot_id in
+        (Raw_level_repr.add published_level dlag_value, published_level, index)
+      in
+      fun slot_id1 ~dynamic_lag1 slot_id2 ~dynamic_lag2 ->
+        let a1, p1, i1 = key_of_slot_id slot_id1 ~dlag:dynamic_lag1 in
+        let a2, p2, i2 = key_of_slot_id slot_id2 ~dlag:dynamic_lag2 in
+        let c = Raw_level_repr.compare a1 a2 in
+        if Compare.Int.(c <> 0) then c
+        else
+          let c = Raw_level_repr.compare p1 p2 in
+          if Compare.Int.(c <> 0) then c else Dal_slot_index_repr.compare i1 i2
+
+    (* All DAL slot ids are stored in a skip list (with or without a commitment
+       depending on attestation status). The skip list must remain sorted
+       because its [search] procedure relies on a [compare] function to reach a
+       target slot id in logarithmic time.
+
+       With dynamic attestation lag, the insertion order is no longer
+       necessarily the lexicographic order on [(published_level,
+       slot_index)]. We therefore enforce sortedness using the same ordering as
+       [search], i.e. primarily by the slot effective attestation level
+       [published_level + lag] (where [lag] is derived from the attestation-lag
+       kind), and then by [published_level] and [slot_index] as tie-breakers. *)
     let next ~prev_cell ~prev_cell_ptr elt =
       let open Result_syntax in
+      let prev_cid = content prev_cell |> Content.content_id in
+      let elt_cid = Content.content_id elt in
+      let well_ordered =
+        Compare.Int.(
+          compare_slot_ids_by_dynamic_attested_level
+            prev_cid.header_id
+            ~dynamic_lag1:prev_cid.attestation_lag
+            elt_cid.header_id
+            ~dynamic_lag2:elt_cid.attestation_lag
+          < 0)
+      in
       let* () =
-        error_when
-          (Compare.Int.( <= )
-             (Header.compare_slot_id
-                elt.Header.id
-                (content prev_cell).Header.id)
-             0)
+        error_unless
+          well_ordered
           Add_element_in_slots_skip_list_violates_ordering
       in
       return @@ next ~prev_cell ~prev_cell_ptr elt
 
-    let search ~deref ~cell ~target_id =
-      Lwt.search ~deref ~cell ~compare:(fun slot ->
-          Header.compare_slot_id slot.Header.id target_id)
+    (* Wrapper around [Skip_list.search] that enforces using the same ordering
+      as the one used to build the list: slot ids are primarily ordered by their
+      effective attestation level [published_level + lag] (with [lag] derived
+      from the attestation-lag kind), and then by [published_level] and
+      [slot_index] as tie-breakers.
+
+      The caller must provide [target_dynamic_lag], i.e. the lag to use when
+      interpreting the target slot id in this ordering. *)
+    let search ~deref ~cell ~target_slot_id ~target_dynamic_lag =
+      Lwt.search ~deref ~cell ~compare:(fun content ->
+          let cid = Content.content_id content in
+          compare_slot_ids_by_dynamic_attested_level
+            cid.header_id
+            ~dynamic_lag1:cid.attestation_lag
+            target_slot_id
+            ~dynamic_lag2:target_dynamic_lag)
+
+    (* When the attestation lag of the target slot is unknown, try all
+       admissible interpretations of the target position in the skip-list
+       ordering: [Legacy] then [Dynamic lag], with [lag] from [0] to
+       [legacy_attestation_lag] (i.e. 8).  Return the first result whose
+       [last_cell] is [Found _]; otherwise return the last obtained search
+       result.
+
+       This function allows to plug the search function above, adapted to the
+       dynamic_lag-compatible ordering, while keeping the interface unchanged on
+       the proofs production side. *)
+    let search_with_any_attestation_lag ~deref ~cell ~target_slot_id =
+      let open Lwt_syntax in
+      let max_lag = legacy_attestation_lag in
+      let rec loop last_res curr_lag =
+        if Compare.Int.(curr_lag > max_lag) then return last_res
+        else
+          let* res =
+            search
+              ~deref
+              ~cell
+              ~target_slot_id
+              ~target_dynamic_lag:(Dynamic curr_lag)
+          in
+          match res.last_cell with
+          | Found _ -> return res
+          | _ -> loop res (curr_lag + 1)
+      in
+      let* res_legacy =
+        search ~deref ~cell ~target_slot_id ~target_dynamic_lag:Legacy
+      in
+      match res_legacy.last_cell with
+      | Found _ -> return res_legacy
+      | _ -> loop res_legacy 0
   end
 
-  module V1 = struct
-    (* The content of a cell is the hash of all the slot commitments
-       represented as a merkle list. *)
-    (* TODO/DAL: https://gitlab.com/tezos/tezos/-/issues/3765
-       Decide how to store attested slots in the skip list's content. *)
-    type content = Header.t
+  module V2 = struct
+    module Content = Content_v2
+    module Skip_list = Mk_skip_list (Content)
+
+    type content = Content.t
 
     (* A pointer to a cell is the hash of its content and all the back
        pointers. *)
@@ -341,34 +824,61 @@ module History = struct
 
     type t = history
 
+    let back_pointer cell ~index = Skip_list.back_pointer cell index
+
+    let genesis, genesis_level =
+      (Skip_list.genesis Content.zero, Content.zero_level)
+
     let history_encoding =
-      Skip_list.encoding Pointer_hash.encoding Header.encoding
+      let open Data_encoding in
+      (* The history_encoding is given as a union of two versions of the skip
+         list. The legacy case is only used to deserialize the skip list cells
+         which may appear in refutation games started on a previous version of
+         the protocol, before the activation of the DAL. In this case, the
+         snapshotted cells are always the genesis one and cannot be used by the
+         players so we deserialize it on the fly to the new representation of
+         the genesis cell. *)
+      union
+        ~tag_size:`Uint8
+        [
+          case
+            ~title:"dal_skip_list_legacy"
+            (Tag 0)
+            (obj2
+               (req "kind" (constant "dal_skip_list_legacy"))
+               (req "skip_list" (Data_encoding.Fixed.bytes Hex 57)))
+            (fun _ -> None)
+            (fun ((), _) -> genesis);
+          case
+            ~title:"dal_skip_list"
+            (Tag 1)
+            (obj2
+               (req "kind" (constant "dal_skip_list"))
+               (req
+                  "skip_list"
+                  (Skip_list.encoding Pointer_hash.encoding Content.encoding)))
+            (fun x -> Some ((), x))
+            (fun ((), x) -> x);
+        ]
 
     let equal_history : history -> history -> bool =
-      Skip_list.equal Pointer_hash.equal Header.equal
+      Skip_list.equal Pointer_hash.equal Content.equal
 
     let encoding = history_encoding
 
     let equal : t -> t -> bool = equal_history
 
-    let genesis : t = Skip_list.genesis Header.zero
-
     let hash cell =
       let current_slot = Skip_list.content cell in
       let back_pointers_hashes = Skip_list.back_pointers cell in
-      Data_encoding.Binary.to_bytes_exn Header.encoding current_slot
+      Content.to_bytes current_slot
       :: List.map Pointer_hash.to_bytes back_pointers_hashes
       |> Pointer_hash.hash_bytes
 
     let pp_history fmt (history : history) =
-      let history_hash = hash history in
-      Format.fprintf
-        fmt
-        "@[hash : %a@;%a@]"
-        Pointer_hash.pp
-        history_hash
-        (Skip_list.pp ~pp_content:Header.pp ~pp_ptr:Pointer_hash.pp)
-        history
+      Skip_list.pp ~pp_content:Content.pp ~pp_ptr:Pointer_hash.pp fmt history
+
+    let pp = pp_history
 
     module History_cache =
       Bounded_history_repr.Make
@@ -386,78 +896,174 @@ module History = struct
           let equal = equal_history
         end)
 
-    let add_confirmed_slot_header (t, cache) slot_header =
+    (* Insert a cell in the skip list [t] and the corresponding association [(hash(t),
+       t)] in the given [cache].
+
+       Note that if the given skip list contains the genesis cell, its content is
+       reset with the given content. This ensures the invariant that
+       there are no gaps in the successive cells of the list. *)
+    let add_cell (t, cache) next_cell_content =
       let open Result_syntax in
       let prev_cell_ptr = hash t in
-      let* cache = History_cache.remember prev_cell_ptr t cache in
-      let* new_cell = Skip_list.next ~prev_cell:t ~prev_cell_ptr slot_header in
-      return (new_cell, cache)
+      let Header.{published_level; _} =
+        (Skip_list.content t |> Content.content_id).header_id
+      in
+      let* new_head =
+        if Raw_level_repr.equal published_level genesis_level then
+          (* If this is the first real cell of DAL, replace dummy genesis. *)
+          return (Skip_list.genesis next_cell_content)
+        else Skip_list.next ~prev_cell:t ~prev_cell_ptr next_cell_content
+      in
+      let new_head_hash = hash new_head in
+      let* cache = History_cache.remember new_head_hash new_head cache in
+      return (new_head, cache)
 
-    let add_confirmed_slot_headers (t : t) cache slot_headers =
-      List.fold_left_e add_confirmed_slot_header (t, cache) slot_headers
+    (* Function to update the skip list with [slots]. [slots] is a list of
+       tuples [(slot_header, publisher, status_opt)], where the optional status
+       field distinguishes between published slots (which have a status field) and
+       unpublished slots (which don't).
 
-    let add_confirmed_slot_headers_no_cache =
-      let no_cache = History_cache.empty ~capacity:0L in
-      fun t slots ->
-        List.fold_left_e add_confirmed_slot_header (t, no_cache) slots >|? fst
+       This function uses the [fill_unpublished_gaps] flag to control whether to
+       fill missing slot indices with Unpublished cells.
+
+       Behavior:
+       - When [fill_unpublished_gaps = false]: only processes the provided slots;
+         all provided slots should have a status
+       - When [fill_unpublished_gaps = true]: fills gaps with [Unpublished] cells.
+         - If [status = Some _]: creates a [Published] cell
+         - If [status = None]: skips the slot (no cell added) *)
+    let update_skip_list t cache ~published_level ~number_of_slots
+        ~attestation_lag ~slots ~fill_unpublished_gaps =
+      let open Result_syntax in
+      let module I = Dal_slot_index_repr in
+      let mk_unpublished index =
+        Content.Unpublished
+          {header_id = Header.{published_level; index}; attestation_lag}
+      in
+      let mk_published header publisher
+          Dal_attestations_repr.Accountability.
+            {is_proto_attested; attested_shards; total_shards; attesters = _} =
+        Content.(
+          Published
+            {
+              header;
+              attestation_lag;
+              publisher;
+              is_proto_attested;
+              attested_shards;
+              total_shards;
+            })
+      in
+      let* slot_contents =
+        if fill_unpublished_gaps then
+          (* Fill gaps with Unpublished cells *)
+          let all_slot_indices = I.all_slots ~number_of_slots in
+          let rec aux indices provided_slots =
+            match (indices, provided_slots) with
+            | _, [] ->
+                (* All remaining indices become Unpublished *)
+                List.map mk_unpublished indices |> ok
+            | [], _ :: _ ->
+                (* Provided slots exceed [number_of_slots] *)
+                tzfail Add_element_in_slots_skip_list_violates_ordering
+            | i :: indices', (header, publisher, status_opt) :: provided_slots'
+              ->
+                let* () =
+                  error_unless
+                    Raw_level_repr.(
+                      published_level = header.Header.id.published_level)
+                    Add_element_in_slots_skip_list_violates_ordering
+                in
+                if I.(i = header.id.index) then
+                  (* This index has a provided slot *)
+                  match status_opt with
+                  | Some status ->
+                      (* Published slot with status: add Published cell *)
+                      let* res = aux indices' provided_slots' in
+                      let cell = mk_published header publisher status in
+                      cell :: res |> ok
+                  | None ->
+                      (* Published slot without status: skip it (don't add any cell). *)
+                      aux indices' provided_slots'
+                else if I.(i < header.Header.id.index) then
+                  (* Gap: create Unpublished for this index *)
+                  let* res = aux indices' provided_slots in
+                  mk_unpublished i :: res |> ok
+                else
+                  (* i > header.Header.id.index: ordering violation *)
+                  tzfail Add_element_in_slots_skip_list_violates_ordering
+          in
+          aux all_slot_indices slots
+        else
+          (* No gap filling: only process provided slots *)
+          let* () =
+            List.iter_e
+              (fun (slot_header, _publisher, _status_opt) ->
+                error_unless
+                  Raw_level_repr.(
+                    published_level = slot_header.Header.id.published_level)
+                  Add_element_in_slots_skip_list_violates_ordering)
+              slots
+          in
+          List.map_e
+            (fun (header, publisher, status_opt) ->
+              match status_opt with
+              | Some status -> return (mk_published header publisher status)
+              | None ->
+                  (* As a precondition of this function, this shouldn't happen
+                     when [fill_unpublished_gaps = false]. *)
+                  assert false)
+            slots
+      in
+      List.fold_left_e add_cell (t, cache) slot_contents
 
     (* Dal proofs section *)
 
-    (** An inclusion proof, for a page ID, is a list of the slots' history
-        skip list's cells that encodes a minimal path:
-        - from a starting cell, which serves as a reference. It is usually called
-        'snapshot' below,
-        - to a final cell, that is either the exact target cell in case the slot
-         of the page is confirmed, or a cell whose slot ID is the smallest
-         that directly follows the page's slot id, in case the target slot
-         is not confirmed.
-
-         Using the starting cell as a trustable starting point (i.e. maintained
-         and provided by L1), and combined with the extra information stored in
-         the {!proof} type below, one can verify if a slot (and then a page of
-         that slot) is confirmed on L1 or not. *)
+    (** An inclusion proof is a sequence (list) of cells from the Dal skip list,
+        represented as [c1; c2; ...; cn], that encodes a minimal path from the
+        head [c1] (referred to as the "reference" or "snapshot" cell below) to a
+        target cell [cn]. Thanks to the back-pointers, it can be demonstrated
+        that the successive elements of the sequence are indeed cells of the
+        skip list. *)
     type inclusion_proof = history list
 
     (** (See the documentation in the mli file to understand what we want to
-        prove in game refutation involving Dal and why.)
+        prove in a refutation game involving Dal and why.)
 
         A Dal proof is an algebraic datatype with two cases, where we basically
         prove that a Dal page is confirmed on L1 or not. Being 'not confirmed'
         here includes the case where the slot's header is not published and the
-        case where the slot's header is published, but the endorsers didn't
+        case where the slot's header is published, but the attesters didn't
         confirm the availability of its data.
 
-        To produce a proof representation for a page (see function {!produce_proof_repr}
-        below), we assume given:
+        To produce a proof representation for a page (see function
+        {!produce_proof_repr} below), we assume given:
 
         - [page_id], identifies the page;
 
         - [slots_history], a current/recent cell of the slots history skip list.
-          Typically, it should be the skip list cell snapshotted when starting the
-          refutation game;
+        Typically, it should be the skip list cell snapshotted when starting the
+        refutation game;
 
-       - [history_cache], a sufficiently large slots history cache, to navigate
-          back through the successive cells of the skip list. Typically,
-          the cache should at least contain the cell whose slot ID is [page_id.slot_id]
-          in case the page is confirmed, or the cell whose slot ID is immediately
-          after [page_id.slot_id] in case of an unconfirmed page. Indeed,
-          inclusion proofs encode paths through skip lists' cells where the head
-          is the reference/snapshot cell and the last element is the target slot
-          in or the nearest upper slot (w.r.t [page_id]'s slot id and to
-          skip list elements ordering) ;
+       - [get_history], a sufficiently large slots history cache, encoded as a
+       function from pointer hashes to their corresponding skip lists cells, to
+       navigate back through the successive cells of the skip list. The cache
+       should at least contain the cells starting from the published level of
+       the page ID for which we want to generate a proof. Indeed, inclusion
+       proofs encode paths through skip lists' cells where the head is the
+       reference/snapshot cell and the last element is the target cell inserted
+       at the level corresponding to the page's published level). Note that, the
+       case where the level of the page is far in the past (i.e. the skip list
+       was not populated yet) should be handled by the caller ;
 
-        - [page_info], that provides the page's information (the content and
-          the slot membership proof) for page_id. In case the page is supposed
-          to be confirmed, this argument should contain the page's content and
-          the proof that the page is part of the (confirmed) slot whose ID is
-          given in [page_id]. In case we want to show that the page is not confirmed,
-          the value [page_info] should be [None].
+        - [page_info], provides information for [page_id]. In case the page is
+        supposed to be confirmed, this argument should contain the page's
+        content and the proof that the page is part of the (confirmed) slot
+        whose ID is given in [page_id]. In case we want to show that the page is
+        not confirmed, the value [page_info] should be [None].
 
       [dal_parameters] is used when verifying that/if the page is part of
-      the candidate slot (if any).
-
-
-*)
+      the candidate slot (if any). *)
     type proof_repr =
       | Page_confirmed of {
           target_cell : history;
@@ -475,50 +1081,63 @@ module History = struct
               (** [page_proof] is the proof that the page whose content is
                   [page_data] is actually the [page_id.page_index]th page of
                   the slot stored in [target_cell] and identified by
-                  page_id.slot_id. *)
+                  [page_id.slot_id]. *)
+          attestation_threshold_percent : int option;
+              (** In case of Adjustable DAL, [attestation_threshold_percent] is set
+                  to some attestation threshold defined by the rollup kernel. For
+                  regular DAL, it's set to None. *)
+          restricted_commitments_publishers : Contract_repr.t list option;
+              (** In case of Adjustable DAL, [restricted_commitments_publishers]
+                  is set to the rollup's list of authorized addresses, if
+                  any. For regular DAL, it's set to None. *)
         }  (** The case where the slot's page is confirmed/attested on L1. *)
       | Page_unconfirmed of {
-          prev_cell : history;
-              (** [prev_cell] is the cell of the skip list containing a
-                  (confirmed) slot, and whose ID is the biggest (w.r.t. to skip
-                  list elements ordering), but smaller than [page_id.slot_id]. *)
-          next_cell_opt : history option;
-              (** [next_cell_opt] is the cell that immediately follows [prev_cell]
-                  in the skip list, if [prev_cell] is not the latest element in
-                  the list. Otherwise, it's set to [None]. *)
-          next_inc_proof : inclusion_proof;
-              (** [inc_proof] is a (minimal) path in the skip list that proves
-                  cells inclusion. In case, [next_cell_opt] contains some cell
-                  'next_cell', the head of the list is the [slots_history]
-                  provided to produce the proof, and the last cell is
-                  'next_cell'. In case [next_cell_opt] is [None], the list is
-                  empty.
-
-                  We maintain the following invariant in case the inclusion
-                  proof is not empty:
-                  ```
-                   (content next_cell).id > page_id.slot_id > (content prev_cell).id AND
-                   hash prev_cell = back_pointer next_cell 0 AND
-                   Some next_cell = next_cell_opt AND
-                   head next_inc_proof = slots_history
-                  ```
-
-                  Said differently, `next_cell` and `prev_cell` are two consecutive
-                  cells of the skip list whose contents' IDs surround the page's
-                  slot ID. Moreover, the head of the list should be equal to
-                  the initial (snapshotted) slots_history skip list.
-
-                  The case of an empty inclusion proof happens when the inputs
-                  are such that: `page_id.slot_id > (content slots_history).id`.
-                  The returned proof statement implies the following property in this case:
-
-                  ```
-                  next_cell_opt = None AND prev_cell = slots_history
-                  ```
-              *)
+          target_cell : history;
+          inc_proof : inclusion_proof;
+          attestation_threshold_percent : int option;
+              (** In case of Adjustable DAL, [attestation_threshold_percent] is set
+                  to some attestation threshold defined by the rollup kernel. For
+                  regular DAL, it's set to None. *)
+          restricted_commitments_publishers : Contract_repr.t list option;
+              (** In case of Adjustable DAL, [restricted_commitments_publishers]
+                  is set to the rollup's list of authorized addresses, if
+                  any. For regular DAL, it's set to None. *)
         }
-          (** The case where the slot's page doesn't exist or is not
-              confirmed on L1. *)
+          (** The case where the slot's page doesn't exist or is not confirmed
+              on L1. The fields are similar to {!Page_confirmed} case except
+              that we don't have a page data or proof to check.
+
+              As said above, in case the level of the page is far in the past
+              (for instance, the skip list was not populated yet or the slots of
+              that level are not valid to be imported by the DAL anymore) should
+              be handled by the caller. In fact, the [proof_repr] type here only
+              covers levels where a new cell has been added to the skip list. *)
+      | Invalid_page_id of {
+          target_cell_and_inc_proof : (history * inclusion_proof) option;
+              (** There are two kinds of invalidity:
+
+                  - It is not possible to get a target cell, and it is clear
+                  from the given inputs that the page ID is either in the future
+                  or far in the past (TTL expired) w.r.t. our max attestation
+                  lag value; this case is represented by [None].
+
+                  - We can access the target cell of the page ID (thus we
+                  provide it with the inclusion proof above), and validating the
+                  page with the attestation lag of that cell tells us that the
+                  page is invalid. *)
+          attestation_threshold_percent : int option;
+              (** In case of Adjustable DAL, [attestation_threshold_percent] is set
+                  to some attestation threshold defined by the rollup kernel. For
+                  regular DAL, it's set to None. *)
+          restricted_commitments_publishers : Contract_repr.t list option;
+              (** In case of Adjustable DAL, [restricted_commitments_publishers]
+                  is set to the rollup's list of authorized addresses, if
+                  any. For regular DAL, it's set to None. *)
+        }
+          (** This case covers situations where the requested/imported page's ID
+              is either in the future w.r.t. attestation lag, in the past
+              w.r.t. (attested) slots validity window, or in the past w.r.t.
+              DAL activation level / rollup origination level. *)
 
     let proof_repr_encoding =
       let open Data_encoding in
@@ -526,36 +1145,132 @@ module History = struct
         case
           ~title:"confirmed dal page proof representation"
           (Tag 0)
-          (obj5
+          (obj7
              (req "kind" (constant "confirmed"))
              (req "target_cell" history_encoding)
              (req "inc_proof" (list history_encoding))
              (req "page_data" (bytes Hex))
-             (req "page_proof" Page.proof_encoding))
+             (req "page_proof" Page.proof_encoding)
+             (opt "attestation_threshold_percent" uint8)
+             (opt
+                "restricted_commitments_publishers"
+                (list Contract_repr.encoding)))
           (function
-            | Page_confirmed {target_cell; inc_proof; page_data; page_proof} ->
-                Some ((), target_cell, inc_proof, page_data, page_proof)
+            | Page_confirmed
+                {
+                  target_cell;
+                  inc_proof;
+                  page_data;
+                  page_proof;
+                  attestation_threshold_percent;
+                  restricted_commitments_publishers;
+                } ->
+                Some
+                  ( (),
+                    target_cell,
+                    inc_proof,
+                    page_data,
+                    page_proof,
+                    attestation_threshold_percent,
+                    restricted_commitments_publishers )
             | _ -> None)
-          (fun ((), target_cell, inc_proof, page_data, page_proof) ->
-            Page_confirmed {target_cell; inc_proof; page_data; page_proof})
+          (fun ( (),
+                 target_cell,
+                 inc_proof,
+                 page_data,
+                 page_proof,
+                 attestation_threshold_percent,
+                 restricted_commitments_publishers )
+             ->
+            Page_confirmed
+              {
+                target_cell;
+                inc_proof;
+                page_data;
+                page_proof;
+                attestation_threshold_percent;
+                restricted_commitments_publishers;
+              })
       and case_page_unconfirmed =
         case
           ~title:"unconfirmed dal page proof representation"
           (Tag 1)
-          (obj4
+          (obj5
              (req "kind" (constant "unconfirmed"))
-             (req "prev_cell" history_encoding)
-             (req "next_cell_opt" (option history_encoding))
-             (req "next_inc_proof" (list history_encoding)))
+             (req "target_cell" history_encoding)
+             (req "inc_proof" (list history_encoding))
+             (opt "attestation_threshold_percent" uint8)
+             (opt
+                "restricted_commitments_publishers"
+                (list Contract_repr.encoding)))
           (function
-            | Page_unconfirmed {prev_cell; next_cell_opt; next_inc_proof} ->
-                Some ((), prev_cell, next_cell_opt, next_inc_proof)
+            | Page_unconfirmed
+                {
+                  target_cell;
+                  inc_proof;
+                  attestation_threshold_percent;
+                  restricted_commitments_publishers;
+                } ->
+                Some
+                  ( (),
+                    target_cell,
+                    inc_proof,
+                    attestation_threshold_percent,
+                    restricted_commitments_publishers )
             | _ -> None)
-          (fun ((), prev_cell, next_cell_opt, next_inc_proof) ->
-            Page_unconfirmed {prev_cell; next_cell_opt; next_inc_proof})
+          (fun ( (),
+                 target_cell,
+                 inc_proof,
+                 attestation_threshold_percent,
+                 restricted_commitments_publishers )
+             ->
+            Page_unconfirmed
+              {
+                target_cell;
+                inc_proof;
+                attestation_threshold_percent;
+                restricted_commitments_publishers;
+              })
       in
-
-      union [case_page_confirmed; case_page_unconfirmed]
+      let case_invalid_page_id =
+        case
+          ~title:"invalid page id representation"
+          (Tag 2)
+          (obj4
+             (req "kind" (constant "invalid_page_id"))
+             (opt
+                "target_cell_and_inc_proof"
+                (tup2 history_encoding (list history_encoding)))
+             (opt "attestation_threshold_percent" uint8)
+             (opt
+                "restricted_commitments_publishers"
+                (list Contract_repr.encoding)))
+          (function
+            | Invalid_page_id
+                {
+                  target_cell_and_inc_proof;
+                  attestation_threshold_percent;
+                  restricted_commitments_publishers;
+                } ->
+                Some
+                  ( (),
+                    target_cell_and_inc_proof,
+                    attestation_threshold_percent,
+                    restricted_commitments_publishers )
+            | _ -> None)
+          (fun ( (),
+                 target_cell_and_inc_proof,
+                 attestation_threshold_percent,
+                 restricted_commitments_publishers )
+             ->
+            Invalid_page_id
+              {
+                target_cell_and_inc_proof;
+                attestation_threshold_percent;
+                restricted_commitments_publishers;
+              })
+      in
+      union [case_page_confirmed; case_page_unconfirmed; case_invalid_page_id]
 
     (** Proof's type is set to bytes and not a structural datatype because
         when a proof appears in a tezos operation or in an rpc, a user can not
@@ -564,8 +1279,6 @@ module History = struct
 
     type proof = bytes
 
-    (** DAL/FIXME: https://gitlab.com/tezos/tezos/-/issues/4084
-        DAL proof's encoding should be bounded *)
     let proof_encoding = Data_encoding.(bytes Hex)
 
     type error += Dal_invalid_proof_serialization
@@ -581,9 +1294,10 @@ module History = struct
         (fun () -> Dal_invalid_proof_serialization)
 
     let serialize_proof proof =
+      let open Result_syntax in
       match Data_encoding.Binary.to_bytes_opt proof_repr_encoding proof with
-      | None -> error Dal_invalid_proof_serialization
-      | Some serialized_proof -> ok serialized_proof
+      | None -> tzfail Dal_invalid_proof_serialization
+      | Some serialized_proof -> return serialized_proof
 
     type error += Dal_invalid_proof_deserialization
 
@@ -598,13 +1312,22 @@ module History = struct
         (fun () -> Dal_invalid_proof_deserialization)
 
     let deserialize_proof proof =
+      let open Result_syntax in
       match Data_encoding.Binary.of_bytes_opt proof_repr_encoding proof with
-      | None -> error Dal_invalid_proof_deserialization
-      | Some deserialized_proof -> ok deserialized_proof
+      | None -> tzfail Dal_invalid_proof_deserialization
+      | Some deserialized_proof -> return deserialized_proof
 
-    let pp_inclusion_proof = Format.pp_print_list pp_history
+    let pp_inclusion_proof =
+      Format.pp_print_list ~pp_sep:Format.pp_print_space pp_history
 
-    let pp_history_opt = Format.pp_print_option pp_history
+    let pp_whitelist fmt = function
+      | None -> Format.fprintf fmt "<any>"
+      | Some l ->
+          (Format.pp_print_list
+             ~pp_sep:Format.pp_print_space
+             Contract_repr.pp_short)
+            fmt
+            l
 
     let pp_proof ~serialized fmt p =
       if serialized then Format.pp_print_string fmt (Bytes.to_string p)
@@ -613,11 +1336,20 @@ module History = struct
         | Error msg -> Error_monad.pp_trace fmt msg
         | Ok proof -> (
             match proof with
-            | Page_confirmed {target_cell; inc_proof; page_data; page_proof} ->
+            | Page_confirmed
+                {
+                  target_cell;
+                  inc_proof;
+                  page_data;
+                  page_proof;
+                  attestation_threshold_percent;
+                  restricted_commitments_publishers;
+                } ->
                 Format.fprintf
                   fmt
                   "Page_confirmed (target_cell=%a, data=%s,@ \
-                   inc_proof:[size=%d |@ path=%a]@ page_proof:%a)"
+                   inc_proof:[size=%d |@ path=%a]@ page_proof:%a@ \
+                   attestation_threshold_percent:%a@ commitment_publisher:%a)"
                   pp_history
                   target_cell
                   (Bytes.to_string page_data)
@@ -626,21 +1358,62 @@ module History = struct
                   inc_proof
                   Page.pp_proof
                   page_proof
-            | Page_unconfirmed {prev_cell; next_cell_opt; next_inc_proof} ->
+                  (Format.pp_print_option Format.pp_print_int)
+                  attestation_threshold_percent
+                  pp_whitelist
+                  restricted_commitments_publishers
+            | Page_unconfirmed
+                {
+                  target_cell;
+                  inc_proof;
+                  attestation_threshold_percent;
+                  restricted_commitments_publishers;
+                } ->
                 Format.fprintf
                   fmt
-                  "Page_unconfirmed (prev_cell = %a | next_cell = %a | \
-                   prev_inc_proof:[size=%d@ | path=%a])"
+                  "Page_unconfirmed (target_cell = %a | inc_proof:[size=%d@ | \
+                   path=%a]@ attestation_threshold_percent:%a@ \
+                   commitment_publisher:%a)"
                   pp_history
-                  prev_cell
-                  pp_history_opt
-                  next_cell_opt
-                  (List.length next_inc_proof)
+                  target_cell
+                  (List.length inc_proof)
                   pp_inclusion_proof
-                  next_inc_proof)
+                  inc_proof
+                  (Format.pp_print_option Format.pp_print_int)
+                  attestation_threshold_percent
+                  pp_whitelist
+                  restricted_commitments_publishers
+            | Invalid_page_id
+                {
+                  target_cell_and_inc_proof;
+                  attestation_threshold_percent;
+                  restricted_commitments_publishers;
+                } ->
+                let pp_target_and_proof fmt = function
+                  | None -> Format.fprintf fmt "pp_target_and_proof = <None>"
+                  | Some (target_cell, inc_proof) ->
+                      Format.fprintf
+                        fmt
+                        "target_cell = %a | inc_proof:[size=%d@ | path=%a]@"
+                        pp_history
+                        target_cell
+                        (List.length inc_proof)
+                        pp_inclusion_proof
+                        inc_proof
+                in
+                Format.fprintf
+                  fmt
+                  "Invalid_page_id (%a attestation_threshold_percent:%a@ \
+                   commitment_publisher:%a)"
+                  pp_target_and_proof
+                  target_cell_and_inc_proof
+                  (Format.pp_print_option Format.pp_print_int)
+                  attestation_threshold_percent
+                  pp_whitelist
+                  restricted_commitments_publishers)
 
     type error +=
-      | Dal_proof_error of string
+      | Dal_page_proof_error of string
       | Unexpected_page_size of {expected_size : int; page_size : int}
 
     let () =
@@ -648,12 +1421,13 @@ module History = struct
       register_error_kind
         `Permanent
         ~id:"dal_slot_repr.slots_history.dal_proof_error"
-        ~title:"Dal proof error"
-        ~description:"Error occurred during Dal proof production or validation"
-        ~pp:(fun ppf e -> Format.fprintf ppf "Dal proof error: %s" e)
+        ~title:"DAL page proof error"
+        ~description:
+          "Error occurred during DAL page proof production or validation"
+        ~pp:(fun ppf e -> Format.fprintf ppf "DAL page proof error: %s" e)
         (obj1 (req "error" (string Plain)))
-        (function Dal_proof_error e -> Some e | _ -> None)
-        (fun e -> Dal_proof_error e)
+        (function Dal_page_proof_error e -> Some e | _ -> None)
+        (fun e -> Dal_page_proof_error e)
 
     let () =
       let open Data_encoding in
@@ -678,10 +1452,16 @@ module History = struct
         (fun (expected_size, page_size) ->
           Unexpected_page_size {expected_size; page_size})
 
-    let dal_proof_error reason = Dal_proof_error reason
+    let dal_proof_error reason = Dal_page_proof_error reason
 
     let proof_error reason = error @@ dal_proof_error reason
 
+    (* This function is called from [produce_proof] or [verify_proof].
+       The parameters provided to this function are those of the level at which
+       the slot of the imported page has been published.
+       This is the case since all calls to those functions are in
+       `src/proto_alpha/lib_protocol/sc_rollup_proof_repr.ml`, where the queries
+       for parameters of the publication level are. *)
     let check_page_proof dal_params proof data ({Page.page_index; _} as pid)
         commitment =
       let open Result_syntax in
@@ -694,7 +1474,7 @@ module History = struct
         Format.kasprintf proof_error "%s (page id=%a)." what Page.pp pid
       in
       match Dal.verify_page dal commitment ~page_index data proof with
-      | Ok true -> return ()
+      | Ok true -> return_unit
       | Ok false ->
           fail_with_error_msg
             "Wrong page content for the given page index and slot commitment"
@@ -708,90 +1488,228 @@ module History = struct
                  page_size = Bytes.length data;
                }
 
-    let produce_proof_repr dal_params page_id ~page_info ~get_history slots_hist
-        =
-      let open Lwt_result_syntax in
-      let Page.{slot_id; page_index = _} = page_id in
-      (* We search for a slot whose ID is equal to target_id. *)
-      let*! search_result =
-        Skip_list.search ~deref:get_history ~target_id:slot_id ~cell:slots_hist
-      in
-      match (page_info, search_result.Skip_list.last_cell) with
-      | _, Deref_returned_none ->
-          tzfail
-          @@ dal_proof_error
-               "Skip_list.search returned 'Deref_returned_none': Slots history \
-                cache is ill-formed or has too few entries."
-      | _, No_exact_or_lower_ptr ->
-          tzfail
-          @@ dal_proof_error
-               "Skip_list.search returned 'No_exact_or_lower_ptr', while it is \
-                initialized with a min elt (slot zero)."
-      | Some (page_data, page_proof), Found target_cell ->
-          (* The slot to which the page is supposed to belong is found. *)
-          let Header.{id; commitment} = Skip_list.content target_cell in
-          (* We check that the slot is not the dummy slot. *)
-          let*? () =
-            error_when
-              Compare.Int.(Header.compare_slot_id id Header.zero.id = 0)
-              (dal_proof_error
-                 "Skip_list.search returned 'Found <zero_slot>': No existence \
-                  proof should be constructed with the slot zero.")
-          in
-          let*? () =
-            check_page_proof dal_params page_proof page_data page_id commitment
-          in
-          let inc_proof = List.rev search_result.Skip_list.rev_path in
-          let*? () =
-            error_when
-              (List.is_empty inc_proof)
-              (dal_proof_error "The inclusion proof cannot be empty")
-          in
-          (* All checks succeeded. We return a `Page_confirmed` proof. *)
-          return
-            ( Page_confirmed {inc_proof; target_cell; page_data; page_proof},
-              Some page_data )
-      | None, Nearest {lower = prev_cell; upper = next_cell_opt} ->
-          (* There is no previously confirmed slot in the skip list whose ID
-             corresponds to the {published_level; slot_index} information
-             given in [page_id]. But, `search` returned a skip list [prev_cell]
-             (and possibly [next_cell_opt]) such that:
-             - the ID of [prev_cell]'s slot is the biggest immediately smaller than
-               the page's information {published_level; slot_index}
-             - if not equal to [None], the ID of [next_cell_opt]'s slot is the smallest
-               immediately bigger than the page's slot id `slot_id`.
-             - if [next_cell_opt] is [None] then, [prev_cell] should be equal to
-               the given history_proof cell. *)
-          let* next_inc_proof =
-            match search_result.Skip_list.rev_path with
-            | [] -> assert false (* Not reachable *)
-            | prev :: rev_next_inc_proof ->
-                let*? () =
-                  error_unless
-                    (equal_history prev prev_cell)
-                    (dal_proof_error
-                       "Internal error: search's Nearest result is \
-                        inconsistent.")
-                in
-                return @@ List.rev rev_next_inc_proof
-          in
-          return
-            (Page_unconfirmed {prev_cell; next_cell_opt; next_inc_proof}, None)
-      | None, Found _ ->
-          tzfail
-          @@ dal_proof_error
-               "The page ID's slot is confirmed, but no page content and proof \
-                are provided."
-      | Some _, Nearest _ ->
-          tzfail
-          @@ dal_proof_error
-               "The page ID's slot is not confirmed, but page content and \
-                proof are provided."
+    let is_attestation_threshold_reached ~attestation_threshold_percent
+        ~attested_shards ~total_shards =
+      Compare.Int.(
+        100 * attested_shards >= attestation_threshold_percent * total_shards)
 
-    let produce_proof dal_params page_id ~page_info ~get_history slots_hist =
+    let allowed_commitments_publisher publisher
+        restricted_commitments_publishers =
+      match restricted_commitments_publishers with
+      | None -> true
+      | Some whitelist -> List.exists (Contract_repr.equal publisher) whitelist
+
+    let is_commitment_attested ~attestation_threshold_percent
+        ~restricted_commitments_publishers cell_content =
+      let open Content_v2 in
+      match (cell_content, attestation_threshold_percent) with
+      | Unpublished _, _ -> None
+      | Published {header = {commitment; id = _}; is_proto_attested; _}, None ->
+          if is_proto_attested then Some commitment else None
+      | ( Published
+            {
+              header = {commitment; id = _};
+              attested_shards;
+              total_shards;
+              publisher;
+              _;
+            },
+          Some attestation_threshold_percent ) ->
+          if
+            is_attestation_threshold_reached
+              ~attestation_threshold_percent
+              ~attested_shards
+              ~total_shards
+            && allowed_commitments_publisher
+                 publisher
+                 restricted_commitments_publishers
+          then Some commitment
+          else None
+
+    (** The [produce_proof_repr] function assumes that some invariants hold, such as:
+        - The DAL has been activated,
+        - The level of [page_id] is after the DAL activation level.
+
+        Under these assumptions, we recall that we maintain an invariant
+        ensuring that we a have a cell per slot index in the skip list at every level
+        after DAL activation. *)
+    let produce_proof_repr dal_params ~precheck_lag ~page_id_is_valid
+        ~attestation_threshold_percent ~restricted_commitments_publishers
+        page_id ~page_info ~get_history slots_hist =
+      let open Lwt_result_syntax in
+      (* Pre-check: over-approximate the validity of [page_id] given that we
+         do not know the exact DAL attestation lag yet.
+
+         The caller provides [precheck_lag], typically a [Lag_interval]
+         covering all admissible lags for the page's published level.
+         [page_id_is_valid] with a [Lag_interval] checks whether there
+         exists a lag in that interval for which the page id would be valid.
+
+           - If it returns [false], the page id is definitely invalid for
+             every admissible lag, and we immediately return
+             [Invalid_page_id] without a target cell or inclusion proof.
+
+           - If it returns [true], we proceed to search the skip list for
+             the target cell. Once found, the exact lag from the cell is
+             used for an authoritative post-check (see the [Exact_lag] call
+             to [page_id_is_valid] below), which may still conclude
+             [Invalid_page_id] -- this time with the target cell attached.
+
+         This check avoids the skip-list walk and produces a cheaper proof
+         (no inclusion proof needed) for obviously-invalid page ids. It is
+         also necessary for correctness: if a malicious agent requests a
+         page whose published level is not in the skip list, the search
+         below would fail; the pre-check catches this case early. *)
+      let may_be_valid_in_our_range_of_lags =
+        page_id_is_valid ~lag_check:precheck_lag page_id
+      in
+      if not may_be_valid_in_our_range_of_lags then
+        (* Page id is definitely invalid, even under the upper bound. *)
+        return
+          ( Invalid_page_id
+              {
+                target_cell_and_inc_proof = None;
+                attestation_threshold_percent;
+                restricted_commitments_publishers;
+              },
+            None )
+      else
+        let Page.{slot_id = target_slot_id; page_index = _} = page_id in
+        (* We first search for the slots attested at level [published_level]. *)
+        let*! search_result =
+          Skip_list.search_with_any_attestation_lag
+            ~deref:get_history
+            ~target_slot_id
+            ~cell:slots_hist
+        in
+        (* The search should necessarily find a cell in the skip list (assuming
+         enough cache is given) under the assumptions made when calling
+         {!produce_proof_repr}. *)
+        match search_result.Skip_list.last_cell with
+        | Deref_returned_none ->
+            tzfail
+            @@ dal_proof_error
+                 "Skip_list.search returned 'Deref_returned_none': Slots \
+                  history cache is ill-formed or has too few entries."
+        | No_exact_or_lower_ptr ->
+            tzfail
+            @@ dal_proof_error
+                 "Skip_list.search returned 'No_exact_or_lower_ptr', while it \
+                  is initialized with a min elt (slot zero)."
+        | Nearest _ ->
+            (* This should not happen under normal settings: there is one cell
+               at each level after DAL activation. The case where the page's
+               level is before DAL activation level should be handled by the
+               caller ({!Sc_refutation_proof.produce} in our case).
+
+               For a published level far in the future w.r.t. to inbox level,
+               the test with may_be_valid_in_our_range_of_lags should prevent us
+               to run this part of the code. *)
+            tzfail
+            @@ dal_proof_error
+                 "Skip_list.search returned Nearest', while all given levels \
+                  to produce proofs are supposed to be in the skip list."
+        | Found target_cell ->
+            let* proof, page_opt =
+              let inc_proof = List.rev search_result.Skip_list.rev_path in
+              let target_cell_content = Skip_list.content target_cell in
+              let is_commitment_attested =
+                is_commitment_attested
+                  ~attestation_threshold_percent
+                  ~restricted_commitments_publishers
+                  target_cell_content
+              in
+              let {attestation_lag; header_id = _} =
+                Content.content_id target_cell_content
+              in
+              let dal_attestation_lag = attestation_lag_value attestation_lag in
+              if
+                not
+                  (page_id_is_valid
+                     ~lag_check:(Exact_lag dal_attestation_lag)
+                     page_id)
+              then
+                return
+                  ( Invalid_page_id
+                      {
+                        target_cell_and_inc_proof = Some (target_cell, inc_proof);
+                        attestation_threshold_percent;
+                        restricted_commitments_publishers;
+                      },
+                    None )
+              else
+                match (page_info, is_commitment_attested) with
+                | Some (page_data, page_proof), Some commitment ->
+                    (* The case where the slot to which the page is supposed to belong
+                 is found and the page's information are given. *)
+                    let*? () =
+                      (* We check the page's proof against the commitment. *)
+                      check_page_proof
+                        dal_params
+                        page_proof
+                        page_data
+                        page_id
+                        commitment
+                    in
+                    (* All checks succeeded. We return a `Page_confirmed` proof. *)
+                    return
+                      ( Page_confirmed
+                          {
+                            target_cell;
+                            inc_proof;
+                            page_data;
+                            page_proof;
+                            attestation_threshold_percent;
+                            restricted_commitments_publishers;
+                          },
+                        Some page_data )
+                | None, None ->
+                    (* The slot corresponding to the given page's index is not found in
+                 the attested slots of the page's level, and no information is
+                 given for that page. So, we produce a proof that the page is not
+                 attested. *)
+                    return
+                      ( Page_unconfirmed
+                          {
+                            target_cell;
+                            inc_proof;
+                            attestation_threshold_percent;
+                            restricted_commitments_publishers;
+                          },
+                        None )
+                | None, Some _ ->
+                    (* Mismatch: case where no page information are given, but the
+                 slot is attested. *)
+                    tzfail
+                    @@ dal_proof_error
+                         "The page ID's slot is confirmed, but no page content \
+                          and proof are provided."
+                | Some _, None ->
+                    (* Mismatch: case where page information are given, but the slot
+                 is not attested. *)
+                    tzfail
+                    @@ dal_proof_error
+                         "The page ID's slot is not confirmed, but page \
+                          content and proof are provided."
+            in
+            return (proof, page_opt)
+
+    let produce_proof dal_params ~precheck_lag ~page_id_is_valid
+        ~attestation_threshold_percent ~restricted_commitments_publishers
+        page_id ~page_info ~get_history slots_hist :
+        (proof * Page.content option) tzresult Lwt.t =
       let open Lwt_result_syntax in
       let* proof_repr, page_data =
-        produce_proof_repr dal_params page_id ~page_info ~get_history slots_hist
+        produce_proof_repr
+          dal_params
+          ~precheck_lag
+          ~page_id_is_valid
+          ~attestation_threshold_percent
+          ~restricted_commitments_publishers
+          page_id
+          ~page_info
+          ~get_history
+          slots_hist
       in
       let*? serialized_proof = serialize_proof proof_repr in
       return (serialized_proof, page_data)
@@ -818,102 +1736,188 @@ module History = struct
            path)
         (dal_proof_error "verify_proof_repr: invalid inclusion Dal proof.")
 
-    let verify_proof_repr dal_params page_id snapshot proof =
+    let verify_proof_repr dal_params ~precheck_lag ~page_id_is_valid page_id
+        snapshot proof =
       let open Result_syntax in
-      let Page.{slot_id; page_index = _} = page_id in
+      let Page.{slot_id = Header.{published_level; index}; page_index = _} =
+        page_id
+      in
       match proof with
-      | Page_confirmed {target_cell; page_data; page_proof; inc_proof} ->
-          (* If the page is supposed to be confirmed, the last cell in
-             [inc_proof] should store the slot of the page. *)
-          let Header.{id; commitment} = Skip_list.content target_cell in
+      | Invalid_page_id {target_cell_and_inc_proof = None; _} ->
+          (* Pre-check: the proof claims the page id is invalid and does not
+             provide a target cell. We verify that the page id is indeed
+             invalid for every admissible lag. This must use the same
+             [precheck_lag] as the producer; see [produce_proof_repr]. *)
+          if page_id_is_valid ~lag_check:precheck_lag page_id then
+            tzfail
+            @@ dal_proof_error
+                 "page_id_is_valid returned true for an Invalid_page_id but \
+                  the provided proof doesn't contain the target cell and \
+                  inclusion proof."
+          else return None
+      | _ ->
+          (* With the recent refactoring of the skip list shape, we always have
+             a target cell and an inclusion proof in the provided proof, because
+             the skip list contains a cell for each slot index of each level. *)
+          let ( target_cell,
+                inc_proof,
+                attestation_threshold_percent,
+                restricted_commitments_publishers ) =
+            match proof with
+            | Invalid_page_id {target_cell_and_inc_proof = None; _} ->
+                assert false (* Not reachable: handled above *)
+            | Page_confirmed
+                {
+                  target_cell;
+                  inc_proof;
+                  page_data = _;
+                  page_proof = _;
+                  attestation_threshold_percent;
+                  restricted_commitments_publishers;
+                }
+            | Page_unconfirmed
+                {
+                  target_cell;
+                  inc_proof;
+                  attestation_threshold_percent;
+                  restricted_commitments_publishers;
+                }
+            | Invalid_page_id
+                {
+                  target_cell_and_inc_proof = Some (target_cell, inc_proof);
+                  attestation_threshold_percent;
+                  restricted_commitments_publishers;
+                } ->
+                ( target_cell,
+                  inc_proof,
+                  attestation_threshold_percent,
+                  restricted_commitments_publishers )
+          in
+          let cell_content = Skip_list.content target_cell in
+          (* We check that the target cell has the same level and index than the
+         page we're about to prove. *)
+          let {header_id = slot_id; attestation_lag} =
+            Content.content_id cell_content
+          in
           let* () =
             error_when
-              Compare.Int.(Header.compare_slot_id id Header.zero.id = 0)
-              (dal_proof_error
-                 "verify_proof_repr: cannot construct a confirmation page \
-                  proof with 'zero' as target slot.")
+              Raw_level_repr.(slot_id.published_level <> published_level)
+              (dal_proof_error "verify_proof_repr: published_level mismatch.")
           in
+          let* () =
+            error_when
+              (not (Dal_slot_index_repr.equal slot_id.index index))
+              (dal_proof_error "verify_proof_repr: slot index mismatch.")
+          in
+          (* We check that the given inclusion proof indeed links our L1 snapshot to
+         the target cell. *)
           let* () =
             verify_inclusion_proof inc_proof ~src:snapshot ~dest:target_cell
           in
-          (* We check that the page indeed belongs to the target slot at the
-             given page index. *)
-          let* () =
-            check_page_proof dal_params page_proof page_data page_id commitment
+          let is_commitment_attested =
+            is_commitment_attested
+              ~attestation_threshold_percent
+              ~restricted_commitments_publishers
+              cell_content
           in
-          (* If all checks succeed, we return the data/content of the page. *)
-          return_some page_data
-      | Page_unconfirmed {prev_cell; next_cell_opt; next_inc_proof} ->
-          (* The page's slot is supposed to be unconfirmed. *)
-          let ( < ) a b = Compare.Int.(Header.compare_slot_id a b < 0) in
-          (* We retrieve the last cell of the inclusion proof to be able to
-             call {!verify_inclusion_proof}. We also do some well-formedness on
-             the shape of the inclusion proof (see the case [Page_unconfirmed]
-             of type {!proof}). *)
-          let* () =
-            match next_cell_opt with
-            | None ->
-                let* () =
-                  error_unless
-                    (List.is_empty next_inc_proof)
-                    (dal_proof_error
-                       "verify_proof_repr: invalid next_inc_proof")
+          let* data_opt =
+            match (proof, is_commitment_attested) with
+            | Page_unconfirmed _, Some _ ->
+                error
+                @@ dal_proof_error
+                     "verify_proof_repr: the confirmation proof doesn't \
+                      contain the attested slot."
+            | Page_unconfirmed _, None -> return_none
+            | Page_confirmed _, None ->
+                error
+                @@ dal_proof_error
+                     "verify_proof_repr: the unconfirmation proof contains the \
+                      target slot."
+            | Page_confirmed {page_data; page_proof; _}, Some commitment ->
+                (* We check that the page indeed belongs to the target slot at the
+                   given page index. *)
+                let dal_attestation_lag =
+                  attestation_lag_value attestation_lag
                 in
-                (* In case the inclusion proof has no elements, we check that:
-                   - the prev_cell slot's id is smaller than the unconfirmed slot's ID
-                   - the snapshot is equal to the [prev_cell] skip list.
-
-                   This way, and since the skip list is sorted wrt.
-                   {!compare_slot_id}, we are sure that the skip list whose head
-                   is [snapshot] = [prev_cell] cannot contain a slot whose ID is
-                   [slot_id]. *)
-                error_unless
-                  ((Skip_list.content prev_cell).id < slot_id
-                  && equal_history snapshot prev_cell)
-                  (dal_proof_error "verify_proof_repr: invalid next_inc_proof")
-            | Some next_cell ->
-                (* In case the inclusion proof has at least one element,
-                   we check that:
-                   - the [prev_cell] slot's id is smaller than [slot_id]
-                   - the [next_cell] slot's id is greater than [slot_id]
-                   - the [next_cell] cell is a direct successor of the
-                     [prev_cell] cell.
-                   - the [next_cell] cell is a predecessor of [snapshot]
-
-                   Since the skip list is sorted wrt. {!compare_slot_id}, and
-                   if the call to {!verify_inclusion_proof} succeeds, we are
-                   sure that the skip list whose head is [snapshot] cannot
-                   contain a slot whose ID is [slot_id]. *)
-                let* () =
-                  error_unless
-                    ((Skip_list.content prev_cell).id < slot_id
-                    && slot_id < (Skip_list.content next_cell).id
-                    &&
-                    let prev_cell_pointer =
-                      Skip_list.back_pointer next_cell 0
-                    in
-                    match prev_cell_pointer with
-                    | None -> false
-                    | Some prev_ptr ->
-                        Pointer_hash.equal prev_ptr (hash prev_cell))
-                    (dal_proof_error
-                       "verify_proof_repr: invalid next_inc_proof")
+                if
+                  not
+                  @@ page_id_is_valid
+                       ~lag_check:(Exact_lag dal_attestation_lag)
+                       page_id
+                then
+                  (* This probably means that the page was imported before its
+                     attestation status was known.  *)
+                  return None
+                else
+                  let* () =
+                    check_page_proof
+                      dal_params
+                      page_proof
+                      page_data
+                      page_id
+                      commitment
+                  in
+                  return_some page_data
+            | Invalid_page_id _, _ ->
+                let dal_attestation_lag =
+                  attestation_lag_value attestation_lag
                 in
-                verify_inclusion_proof
-                  next_inc_proof
-                  ~src:snapshot
-                  ~dest:next_cell
+                if
+                  page_id_is_valid
+                    ~lag_check:(Exact_lag dal_attestation_lag)
+                    page_id
+                then
+                  tzfail
+                  @@ dal_proof_error
+                       "page_id_is_valid returned true for an Invalid_page_id \
+                        whose target cell is given."
+                else return None
           in
-          return_none
+          return data_opt
 
-    let verify_proof dal_params page_id snapshot serialized_proof =
+    let verify_proof dal_params ~precheck_lag ~page_id_is_valid page_id snapshot
+        serialized_proof =
       let open Result_syntax in
       let* proof_repr = deserialize_proof serialized_proof in
-      verify_proof_repr dal_params page_id snapshot proof_repr
+      verify_proof_repr
+        dal_params
+        ~precheck_lag
+        ~page_id_is_valid
+        page_id
+        snapshot
+        proof_repr
+
+    let adal_parameters_of_proof serialized_proof =
+      let open Result_syntax in
+      let+ proof_repr = deserialize_proof serialized_proof in
+      match proof_repr with
+      | Page_confirmed
+          {attestation_threshold_percent; restricted_commitments_publishers; _}
+      | Page_unconfirmed
+          {attestation_threshold_percent; restricted_commitments_publishers; _}
+      | Invalid_page_id
+          {attestation_threshold_percent; restricted_commitments_publishers; _}
+        ->
+          (attestation_threshold_percent, restricted_commitments_publishers)
+
+    type cell_content = Content_v2.t =
+      | Unpublished of cell_id
+      | Published of {
+          header : Header.t;
+          attestation_lag : attestation_lag_kind;
+          publisher : Contract_repr.t;
+          is_proto_attested : bool;
+          attested_shards : int;
+          total_shards : int;
+        }
+
+    let content = Skip_list.content
+
+    let content_id = Content_v2.content_id
+
+    let pp_content = Content_v2.pp
 
     module Internal_for_tests = struct
-      let content = Skip_list.content
-
       let proof_statement_is serialized_proof expected =
         match deserialize_proof serialized_proof with
         | Error _ -> false
@@ -925,5 +1929,5 @@ module History = struct
     end
   end
 
-  include V1
+  include V2
 end

@@ -27,7 +27,7 @@ open Protocol
 open Alpha_context
 open Tezos_micheline
 open Script_tc_errors
-open Script_interpreter
+open Script_interpreter_errors
 open Michelson_v1_printer
 
 let print_ty ppf ty = Michelson_v1_printer.print_expr_unwrapped ppf ty
@@ -124,36 +124,48 @@ type error += Fetch_script_meta_error of error trace
 
 let fetch_script (cctxt : #Protocol_client_context.rpc_context) ~chain ~block
     contract =
-  Plugin.RPC.Contract.get_script_normalized
-    cctxt
-    (chain, block)
-    ~unparsing_mode:Readable
-    ~normalize_types:true
-    ~contract
-  >>=? function
-  | None -> fail (Fetch_script_not_found_meta_error contract)
+  let open Lwt_result_syntax in
+  let* script_opt =
+    Plugin.RPC.Contract.get_script_normalized
+      cctxt
+      (chain, block)
+      ~unparsing_mode:Readable
+      ~normalize_types:true
+      ~contract
+  in
+  match script_opt with
+  | None -> tzfail (Fetch_script_not_found_meta_error contract)
   | Some {code; storage = _} ->
       Lwt.return @@ Environment.wrap_tzresult @@ Script_repr.force_decode code
 
 type error +=
-  | Rich_runtime_contract_error of Contract_hash.t * Michelson_v1_parser.parsed
+  | Rich_runtime_contract_error of
+      Contract_hash.t * string Michelson_v1_parser.parser_result
 
 let enrich_runtime_errors cctxt ~chain ~block ~parsed =
+  let open Lwt_result_syntax in
   List.map_s (function
-      | Environment.Ecoproto_error (Runtime_contract_error contract) -> (
-          (* If we know the script already, we don't fetch it *)
-          match parsed with
-          | Some parsed ->
-              Lwt.return @@ Rich_runtime_contract_error (contract, parsed)
-          | None -> (
-              fetch_script cctxt ~chain ~block contract >|= function
-              | Ok script ->
-                  let parsed = Michelson_v1_printer.unparse_toplevel script in
-                  Rich_runtime_contract_error (contract, parsed)
-              | Error err -> Fetch_script_meta_error err))
-      | e -> Lwt.return e)
+    | Environment.Ecoproto_error (Runtime_contract_error contract) -> (
+        (* If we know the script already, we don't fetch it *)
+        match parsed with
+        | Some parsed ->
+            Lwt.return (Rich_runtime_contract_error (contract, parsed))
+        | None -> (
+            let*! script_opt = fetch_script cctxt ~chain ~block contract in
+            Lwt.return
+            @@
+            match script_opt with
+            | Ok script ->
+                let parsed =
+                  Michelson_v1_parser.unrecognize_prims
+                  @@ Michelson_v1_printer.unparse_toplevel script
+                in
+                Rich_runtime_contract_error (contract, parsed)
+            | Error err -> Fetch_script_meta_error err))
+    | e -> Lwt.return e)
 
-let report_errors ~details ~show_source ?parsed ppf errs =
+let report_errors ~details ~show_source
+    ?(parsed : string Michelson_v1_parser.parser_result option) ppf errs =
   let rec print_trace locations errs =
     let print_loc ppf loc =
       match locations loc with
@@ -187,6 +199,28 @@ let report_errors ~details ~show_source ?parsed ppf errs =
     in
     match errs with
     | [] -> ()
+    | Michelson_v1_stack.Wrong_stack_item loc_node :: rest ->
+        Format.fprintf
+          ppf
+          "@[<v 0>%a,@ wrong syntax for a stack element, expecting something \
+           of the following shape: Stack_elt <ty> <val>; got %a.@]"
+          Michelson_v1_stack.print_localized_node_location
+          loc_node
+          Michelson_v1_stack.print_localized_node
+          loc_node ;
+        if rest <> [] then Format.fprintf ppf "@," ;
+        print_trace locations rest
+    | Michelson_v1_stack.Wrong_stack loc_node :: rest ->
+        Format.fprintf
+          ppf
+          "@[<v 0>%a,@ wrong syntax for stack, expecting a sequence of \
+           elements of the following shape: Stack_elt <ty> <val>; got %a.@]"
+          Michelson_v1_stack.print_localized_node_location
+          loc_node
+          Michelson_v1_stack.print_localized_node
+          loc_node ;
+        if rest <> [] then Format.fprintf ppf "@," ;
+        print_trace locations rest
     | Environment.Ecoproto_error
         (Michelson_v1_primitives.Invalid_primitive_name (expr, loc))
       :: rest ->
@@ -214,9 +248,13 @@ let report_errors ~details ~show_source ?parsed ppf errs =
     | Environment.Ecoproto_error (Ill_typed_data (name, expr, ty)) :: rest ->
         let parsed =
           match parsed with
-          | Some parsed when expr = parsed.Michelson_v1_parser.expanded ->
+          | Some parsed
+            when Michelson_v1_primitives.strings_of_prims expr
+                 = parsed.Michelson_v1_parser.expanded ->
               parsed
-          | Some _ | None -> Michelson_v1_printer.unparse_expression expr
+          | Some _ | None ->
+              Michelson_v1_parser.unrecognize_prims
+              @@ Michelson_v1_printer.unparse_expression expr
         in
         let hilights = collect_error_locations rest in
         Format.fprintf
@@ -224,8 +262,7 @@ let report_errors ~details ~show_source ?parsed ppf errs =
           "@[<hov 0>@[<hov 2>Ill typed %adata:@ %a@]@ @[<hov 2>is not an \
            expression of type@ %a@]@]"
           (fun ppf -> function
-            | None -> ()
-            | Some s -> Format.fprintf ppf "%s " s)
+            | None -> () | Some s -> Format.fprintf ppf "%s " s)
           name
           print_source
           (parsed, hilights)
@@ -283,9 +320,13 @@ let report_errors ~details ~show_source ?parsed ppf errs =
     | Environment.Ecoproto_error (Ill_formed_type (_, expr, loc)) :: rest ->
         let parsed =
           match parsed with
-          | Some parsed when expr = parsed.Michelson_v1_parser.expanded ->
+          | Some parsed
+            when Michelson_v1_primitives.strings_of_prims expr
+                 = parsed.Michelson_v1_parser.expanded ->
               parsed
-          | Some _ | None -> Michelson_v1_printer.unparse_expression expr
+          | Some _ | None ->
+              Michelson_v1_parser.unrecognize_prims
+              @@ Michelson_v1_printer.unparse_expression expr
         in
         let hilights = loc :: collect_error_locations errs in
         if show_source then
@@ -304,10 +345,13 @@ let report_errors ~details ~show_source ?parsed ppf errs =
         let parsed =
           match parsed with
           | Some parsed
-            when (not details) && expr = parsed.Michelson_v1_parser.expanded ->
+            when (not details)
+                 && Michelson_v1_primitives.strings_of_prims expr
+                    = parsed.Michelson_v1_parser.expanded ->
               parsed
           | Some _ | None ->
-              Michelson_v1_printer.unparse_toplevel ~type_map expr
+              Michelson_v1_parser.unrecognize_prims
+              @@ Michelson_v1_printer.unparse_toplevel ~type_map expr
         in
         let hilights = collect_error_locations rest in
         if show_source then
@@ -382,6 +426,14 @@ let report_errors ~details ~show_source ?parsed ppf errs =
           loc ;
         if rest <> [] then Format.fprintf ppf "@," ;
         print_trace locations rest
+    | Environment.Ecoproto_error (Unpackable_type loc) :: rest ->
+        Format.fprintf
+          ppf
+          "%aValue has a type that cannot be packed"
+          print_loc
+          loc ;
+        if rest <> [] then Format.fprintf ppf "@," ;
+        print_trace locations rest
     | Environment.Ecoproto_error (Runtime_contract_error contract) :: rest ->
         Format.fprintf
           ppf
@@ -435,8 +487,10 @@ let report_errors ~details ~show_source ?parsed ppf errs =
            Try again with a higher storage limit.@]" ;
         if rest <> [] then Format.fprintf ppf "@," ;
         print_trace locations rest
-    | [Environment.Ecoproto_error (Script_interpreter.Bad_contract_parameter c)]
-      ->
+    | [
+     Environment.Ecoproto_error
+       (Script_interpreter_errors.Bad_contract_parameter c);
+    ] ->
         Format.fprintf
           ppf
           "@[<v 0>Account %a is not a smart contract, it does not take \
@@ -789,6 +843,16 @@ let report_errors ~details ~show_source ?parsed ppf errs =
                       print_execution_trace
                       trace)
               trace
+        | Unexpected_implicit_account_parameters_type (loc, expr) ->
+            Format.fprintf
+              ppf
+              "@[<hov 0>@[<hov 2>%aExpression@ %a@]@ @[<hov 2>is not \
+               acceptable as a handle to an implicit account, whose parameters \
+               type can only be unit or ticket <ty>.@]@]"
+              print_loc
+              loc
+              print_expr
+              expr
         | err -> Format.fprintf ppf "%a" Environment.Error_monad.pp err) ;
         if rest <> [] then Format.fprintf ppf "@," ;
         print_trace locations rest

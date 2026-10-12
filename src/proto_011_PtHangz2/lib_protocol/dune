@@ -3,10 +3,10 @@
 
 (library
  (name tezos_protocol_environment_011_PtHangz2)
- (public_name tezos-protocol-011-PtHangz2.environment)
+ (public_name tezos-protocol-011-PtHangz2.protocol.environment)
  (instrumentation (backend bisect_ppx))
  (libraries
-  tezos-protocol-environment)
+  octez-proto-libs.protocol-environment)
  (library_flags (:standard -linkall))
  (modules Tezos_protocol_environment_011_PtHangz2))
 
@@ -19,14 +19,14 @@
 
 (library
  (name tezos_raw_protocol_011_PtHangz2)
- (public_name tezos-protocol-011-PtHangz2.raw)
+ (public_name tezos-protocol-011-PtHangz2.protocol.raw)
  (instrumentation (backend bisect_ppx))
  (libraries
-  tezos-protocol-011-PtHangz2.environment)
+  tezos-protocol-011-PtHangz2.protocol.environment)
  (library_flags (:standard -linkall))
  (flags
   (:standard)
-  -w -51
+  -w -32-34-51
   -nostdlib
   -nopervasives
   -open Tezos_protocol_environment_011_PtHangz2
@@ -133,22 +133,22 @@
 
 (library
  (name tezos_protocol_011_PtHangz2)
- (public_name tezos-protocol-011-PtHangz2)
+ (public_name tezos-protocol-011-PtHangz2.protocol)
  (instrumentation (backend bisect_ppx))
  (libraries
-  tezos-protocol-environment
-  tezos-protocol-environment.sigs
-  tezos-protocol-011-PtHangz2.raw)
+  octez-proto-libs.protocol-environment
+  octez-proto-libs.protocol-environment.sigs
+  tezos-protocol-011-PtHangz2.protocol.raw)
  (flags
   (:standard)
-  -w -51
+  -w -32-34-51
   -nopervasives)
  (modules Protocol Tezos_protocol_011_PtHangz2))
 
 (install
  (package tezos-protocol-011-PtHangz2)
  (section lib)
- (files (TEZOS_PROTOCOL as raw/TEZOS_PROTOCOL)))
+ (files (TEZOS_PROTOCOL as protocol/raw/TEZOS_PROTOCOL)))
 
 (rule
  (targets protocol.ml)
@@ -265,16 +265,39 @@
   alpha_services.ml alpha_services.mli
   main.ml main.mli
   (:src_dir TEZOS_PROTOCOL))
- (action (run %{bin:octez-protocol-compiler} -warning -51 -warn-error +a .)))
+ (action
+  (run %{bin:octez-protocol-compiler} -warning -32-34-51 -warn-error +a .)))
+
+(library
+ (name tezos_protocol_011_PtHangz2_lifted)
+ (public_name tezos-protocol-011-PtHangz2.protocol.lifted)
+ (instrumentation (backend bisect_ppx))
+ (libraries
+  octez-proto-libs.protocol-environment
+  octez-proto-libs.protocol-environment.sigs
+  tezos-protocol-011-PtHangz2.protocol)
+ (flags
+  (:standard)
+  -w -32-34-51
+  -nopervasives
+  -open Tezos_protocol_011_PtHangz2)
+ (modules Lifted_protocol))
+
+(rule
+ (targets lifted_protocol.ml)
+ (action
+  (write-file
+   %{targets}
+   "\ninclude Environment.Lift (Protocol)\nlet hash = Protocol.hash\n")))
 
 (library
  (name tezos_protocol_011_PtHangz2_functor)
  (libraries
-  tezos-protocol-environment
-  tezos-protocol-environment.sigs)
+  octez-proto-libs.protocol-environment
+  octez-proto-libs.protocol-environment.sigs)
  (flags
   (:standard)
-  -w -51
+  -w -32-34-51
   -nopervasives)
  (modules Functor))
 
@@ -387,16 +410,16 @@
 
 (library
  (name tezos_embedded_protocol_011_PtHangz2)
- (public_name tezos-embedded-protocol-011-PtHangz2)
+ (public_name tezos-protocol-011-PtHangz2.embedded-protocol)
  (instrumentation (backend bisect_ppx))
  (libraries
-  tezos-protocol-011-PtHangz2
-  tezos-protocol-updater
-  tezos-protocol-environment)
+  tezos-protocol-011-PtHangz2.protocol
+  octez-shell-libs.protocol-updater
+  octez-proto-libs.protocol-environment)
  (library_flags (:standard -linkall))
  (flags
   (:standard)
-  -w -51)
+  -w -32-34-51)
  (modules Registerer))
 
 (rule

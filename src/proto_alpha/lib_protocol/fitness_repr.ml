@@ -33,6 +33,7 @@ type t = {
 
 let encoding =
   let open Data_encoding in
+  let open Result_syntax in
   def
     "fitness"
     (conv_with_guard
@@ -40,11 +41,11 @@ let encoding =
          (level, locked_round, predecessor_round, round))
        (fun (level, locked_round, predecessor_round, round) ->
          match locked_round with
-         | None -> ok {level; locked_round; predecessor_round; round}
+         | None -> return {level; locked_round; predecessor_round; round}
          | Some locked_round_val ->
              if Round_repr.(round <= locked_round_val) then
                Error "Locked round must be smaller than round."
-             else ok {level; locked_round; predecessor_round; round})
+             else return {level; locked_round; predecessor_round; round})
        (obj4
           (req "level" Raw_level_repr.encoding)
           (req "locked_round" (option Round_repr.encoding))
@@ -141,14 +142,17 @@ let create_without_locked_round ~level ~predecessor_round ~round =
   {level; locked_round = None; predecessor_round; round}
 
 let create ~level ~locked_round ~predecessor_round ~round =
+  let open Result_syntax in
   match locked_round with
-  | None -> ok {level; locked_round; predecessor_round; round}
+  | None -> return {level; locked_round; predecessor_round; round}
   | Some locked_round_val ->
-      error_when
-        Round_repr.(round <= locked_round_val)
-        (Locked_round_not_less_than_round
-           {round; locked_round = locked_round_val})
-      >>? fun () -> ok {level; locked_round; predecessor_round; round}
+      let* () =
+        error_when
+          Round_repr.(round <= locked_round_val)
+          (Locked_round_not_less_than_round
+             {round; locked_round = locked_round_val})
+      in
+      return {level; locked_round; predecessor_round; round}
 
 let int32_to_bytes i =
   let b = Bytes.make 4 '\000' in
@@ -156,8 +160,9 @@ let int32_to_bytes i =
   b
 
 let int32_of_bytes b =
-  if Compare.Int.(Bytes.length b <> 4) then error Invalid_fitness
-  else ok (TzEndian.get_int32 b 0)
+  let open Result_syntax in
+  if Compare.Int.(Bytes.length b <> 4) then tzfail Invalid_fitness
+  else return (TzEndian.get_int32 b 0)
 
 (* Locked round is an option. And we want None to be smaller than any other
    value. The way the shell handles the order makes the empty Bytes smaller
@@ -167,45 +172,76 @@ let locked_round_to_bytes = function
   | Some locked_round -> int32_to_bytes (Round_repr.to_int32 locked_round)
 
 let locked_round_of_bytes b =
+  let open Result_syntax in
   match Bytes.length b with
-  | 0 -> ok None
-  | 4 -> Round_repr.of_int32 (TzEndian.get_int32 b 0) >>? fun r -> ok (Some r)
-  | _ -> error Invalid_fitness
+  | 0 -> return_none
+  | 4 ->
+      let* r = Round_repr.of_int32 (TzEndian.get_int32 b 0) in
+      return_some r
+  | _ -> tzfail Invalid_fitness
 
+(** [predecessor_round_of_bytes bytes] assumes that [bytes] encode the 32-bit
+    big-endian representation of the predecessor of the opposite of the
+    [predecessor_round] value (0 -> -1, 1 -> -2, etc.).
+
+    This encoding ensures that, when compared lexicographically as raw bytes,
+    the encoding of 0 is the largest possible 32-bit value (\255\255\255\255),
+    1 the second largest (\255\255\255\254), and so on.
+
+    We revert this transformation when decoding to recover the original
+    [predecessor_round] value. *)
 let predecessor_round_of_bytes neg_predecessor_round =
-  int32_of_bytes neg_predecessor_round >>? fun neg_predecessor_round ->
+  let open Result_syntax in
+  let* neg_predecessor_round = int32_of_bytes neg_predecessor_round in
   Round_repr.of_int32 @@ Int32.pred (Int32.neg neg_predecessor_round)
 
-let round_of_bytes round = int32_of_bytes round >>? Round_repr.of_int32
+let round_of_bytes round =
+  let open Result_syntax in
+  let* value = int32_of_bytes round in
+  Round_repr.of_int32 value
 
 let to_raw {level; locked_round; predecessor_round; round} =
   [
     Bytes.of_string Constants_repr.fitness_version_number;
     int32_to_bytes (Raw_level_repr.to_int32 level);
     locked_round_to_bytes locked_round;
+    (* [predecessor_round] is encoded as the 32-bit big-endian representation of
+       the predecessor of the opposite of its value (0 -> -1, 1 -> -2, etc.).
+
+       This encoding ensures that, when compared lexicographically as raw bytes,
+       the encoding of 0 is the largest possible 32-bit value
+       (\255\255\255\255), 1 the second largest (\255\255\255\254), etc.. *)
     int32_to_bytes
       (Int32.pred (Int32.neg (Round_repr.to_int32 predecessor_round)));
     int32_to_bytes (Round_repr.to_int32 round);
   ]
 
-let from_raw = function
+let from_raw =
+  let open Result_syntax in
+  function
   | [version; level; locked_round; neg_predecessor_round; round]
     when Compare.String.(
            Bytes.to_string version = Constants_repr.fitness_version_number) ->
-      int32_of_bytes level >>? Raw_level_repr.of_int32 >>? fun level ->
-      locked_round_of_bytes locked_round >>? fun locked_round ->
-      predecessor_round_of_bytes neg_predecessor_round
-      >>? fun predecessor_round ->
-      round_of_bytes round >>? fun round ->
+      let* level =
+        let* value = int32_of_bytes level in
+        Raw_level_repr.of_int32 value
+      in
+      let* locked_round = locked_round_of_bytes locked_round in
+      let* predecessor_round =
+        predecessor_round_of_bytes neg_predecessor_round
+      in
+      let* round = round_of_bytes round in
       create ~level ~locked_round ~predecessor_round ~round
   | [version; _]
     when Compare.String.(
            Bytes.to_string version < Constants_repr.fitness_version_number) ->
-      error Outdated_fitness
-  | [] (* genesis fitness *) -> error Outdated_fitness
-  | _ -> error Invalid_fitness
+      tzfail Outdated_fitness
+  | [] (* genesis fitness *) -> tzfail Outdated_fitness
+  | _ -> tzfail Invalid_fitness
 
-let round_from_raw = function
+let round_from_raw =
+  let open Result_syntax in
+  function
   | [version; _level; _locked_round; _neg_predecessor_round; round]
     when Compare.String.(
            Bytes.to_string version = Constants_repr.fitness_version_number) ->
@@ -213,11 +249,13 @@ let round_from_raw = function
   | [version; _]
     when Compare.String.(
            Bytes.to_string version < Constants_repr.fitness_version_number) ->
-      ok Round_repr.zero
-  | [] (* genesis fitness *) -> ok Round_repr.zero
-  | _ -> error Invalid_fitness
+      return Round_repr.zero
+  | [] (* genesis fitness *) -> return Round_repr.zero
+  | _ -> tzfail Invalid_fitness
 
-let predecessor_round_from_raw = function
+let predecessor_round_from_raw =
+  let open Result_syntax in
+  function
   | [version; _level; _locked_round; neg_predecessor_round; _round]
     when Compare.String.(
            Bytes.to_string version = Constants_repr.fitness_version_number) ->
@@ -225,9 +263,23 @@ let predecessor_round_from_raw = function
   | [version; _]
     when Compare.String.(
            Bytes.to_string version < Constants_repr.fitness_version_number) ->
-      ok Round_repr.zero
-  | [] (* genesis fitness *) -> ok Round_repr.zero
-  | _ -> error Invalid_fitness
+      return Round_repr.zero
+  | [] (* genesis fitness *) -> return Round_repr.zero
+  | _ -> tzfail Invalid_fitness
+
+let locked_round_from_raw =
+  let open Result_syntax in
+  function
+  | [version; _level; locked_round; _neg_predecessor_round; _round]
+    when Compare.String.(
+           Bytes.to_string version = Constants_repr.fitness_version_number) ->
+      locked_round_of_bytes locked_round
+  | [version; _]
+    when Compare.String.(
+           Bytes.to_string version < Constants_repr.fitness_version_number) ->
+      return_none
+  | [] (* former genesis fitness *) -> return_none
+  | _ -> tzfail Invalid_fitness
 
 let check_except_locked_round fitness ~level ~predecessor_round =
   let {
@@ -241,15 +293,6 @@ let check_except_locked_round fitness ~level ~predecessor_round =
   let correct =
     Raw_level_repr.(level = expected_level)
     && Round_repr.(predecessor_round = expected_predecessor_round)
-  in
-  error_unless correct Wrong_fitness
-
-let check_locked_round ~fitness_locked_round ~locked_round =
-  let correct =
-    match (locked_round, fitness_locked_round) with
-    | None, None -> true
-    | Some _, None | None, Some _ -> false
-    | Some v, Some v' -> Round_repr.(v = v')
   in
   error_unless correct Wrong_fitness
 

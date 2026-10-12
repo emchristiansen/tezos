@@ -23,9 +23,90 @@
 (*                                                                           *)
 (*****************************************************************************)
 
-module type Authenticated_request = sig
+type pkh =
+  | Pkh_with_version of
+      Tezos_crypto.Signature.Public_key_hash.t * Tezos_crypto.Signature.version
+  | Pkh of Tezos_crypto.Signature.Public_key_hash.t
+
+(* This encoding should be kept compatible with the one in
+   [Lib_crypto.Signature_V<n>.raw_encoding] especially if a new case is
+   added. *)
+let pkh_encoding =
+  let open Data_encoding in
+  def
+    "signer_messages.public_key_hash"
+    ~description:"signer messages public key hash encoding"
+  @@ union
+       [
+         case
+           (Tag 0)
+           Tezos_crypto.Signature.Ed25519.Public_key_hash.encoding
+           ~title:"Ed25519"
+           (function Pkh (Ed25519 x) -> Some x | _ -> None)
+           (function x -> Pkh (Ed25519 x));
+         case
+           (Tag 1)
+           Tezos_crypto.Signature.Secp256k1.Public_key_hash.encoding
+           ~title:"Secp256k1"
+           (function Pkh (Secp256k1 x) -> Some x | _ -> None)
+           (function x -> Pkh (Secp256k1 x));
+         case
+           (Tag 2)
+           ~title:"P256"
+           Tezos_crypto.Signature.P256.Public_key_hash.encoding
+           (function Pkh (P256 x) -> Some x | _ -> None)
+           (function x -> Pkh (P256 x));
+         case
+           (Tag 3)
+           ~title:"Bls"
+           (with_decoding_guard
+              (function
+                | (Bls _ : Tezos_crypto.Signature.Public_key_hash.t), _ -> Ok ()
+                | _ -> Error "expected a BLS public key hash")
+              (obj2
+                 (req "pkh" Tezos_crypto.Signature.Public_key_hash.encoding)
+                 (req "version" Tezos_crypto.Signature.version_encoding)))
+           (function
+             | Pkh (Bls _ as x) ->
+                 Some (x, Tezos_crypto.Signature.V_latest.version)
+             | Pkh_with_version ((Bls _ as x), version) -> Some (x, version)
+             | _ -> None)
+           (function x, version -> Pkh_with_version (x, version));
+         case
+           (Tag 4)
+           ~title:"Mldsa44"
+           Tezos_crypto.Signature.Mldsa44.Public_key_hash.encoding
+           (function Pkh (Mldsa44 x) -> Some x | _ -> None)
+           (function x -> Pkh (Mldsa44 x));
+       ]
+
+let request_pkh ?version (pkh : Tezos_crypto.Signature.Public_key_hash.t) =
+  match (pkh, version) with
+  | _, None -> Pkh pkh
+  | (Ed25519 _ | Secp256k1 _ | P256 _ | Mldsa44 _), Some _ -> Pkh pkh
+  | Bls _, Some version -> Pkh_with_version (pkh, version)
+
+(* [to_sign_with_tag ~tag ~pkh ~data] is the payload an authorized key signs to
+   authenticate a request, as [\x04 | tag | pkh | data]. [\x04] is the magic
+   byte of authenticated signing requests, which no Tezos operation uses, so
+   that signing such a payload cannot produce a usable operation signature.
+   [tag] identifies the request kind, so that an authorization cannot be
+   replayed on another kind. *)
+let to_sign_with_tag ~tag ~pkh ~data =
+  let tag_bytes = Bytes.make 1 '0' in
+  TzEndian.set_int8 tag_bytes 0 tag ;
+  Bytes.concat
+    Bytes.empty
+    [
+      Bytes.of_string "\x04";
+      tag_bytes;
+      Tezos_crypto.Signature.Public_key_hash.to_bytes pkh;
+      data;
+    ]
+
+module type Authenticated_signing_request = sig
   type t = {
-    pkh : Tezos_crypto.Signature.Public_key_hash.t;
+    pkh : pkh;
     data : Bytes.t;
     signature : Tezos_crypto.Signature.t option;
   }
@@ -40,21 +121,15 @@ module type Tag = sig
   val tag : int
 end
 
-module Make_authenticated_request (T : Tag) : Authenticated_request = struct
+module Make_authenticated_signing_request (T : Tag) :
+  Authenticated_signing_request = struct
   type t = {
-    pkh : Tezos_crypto.Signature.Public_key_hash.t;
+    pkh : pkh;
     data : Bytes.t;
     signature : Tezos_crypto.Signature.t option;
   }
 
-  let x04 = Bytes.of_string "\x04"
-
-  let to_sign ~pkh ~data =
-    let tag = Bytes.make 1 '0' in
-    TzEndian.set_int8 tag 0 T.tag ;
-    Bytes.concat
-      Bytes.empty
-      [x04; tag; Tezos_crypto.Signature.Public_key_hash.to_bytes pkh; data]
+  let to_sign ~pkh ~data = to_sign_with_tag ~tag:T.tag ~pkh ~data
 
   let encoding =
     let open Data_encoding in
@@ -62,13 +137,13 @@ module Make_authenticated_request (T : Tag) : Authenticated_request = struct
       (fun {pkh; data; signature} -> (pkh, data, signature))
       (fun (pkh, data, signature) -> {pkh; data; signature})
       (obj3
-         (req "pkh" Tezos_crypto.Signature.Public_key_hash.encoding)
+         (req "pkh" pkh_encoding)
          (req "data" bytes)
          (opt "signature" Tezos_crypto.Signature.encoding))
 end
 
 module Sign = struct
-  module Request = Make_authenticated_request (struct
+  module Request = Make_authenticated_signing_request (struct
     let tag = 1
   end)
 
@@ -80,6 +155,39 @@ module Sign = struct
       def "signer_messages.sign.response"
       @@ obj1 (req "signature" Tezos_crypto.Signature.encoding)
   end
+end
+
+module type Authenticated_request = sig
+  type t = {
+    pkh : Tezos_crypto.Signature.Public_key_hash.t;
+    data : Bytes.t;
+    signature : Tezos_crypto.Signature.t option;
+  }
+
+  val to_sign :
+    pkh:Tezos_crypto.Signature.Public_key_hash.t -> data:Bytes.t -> Bytes.t
+
+  val encoding : t Data_encoding.t
+end
+
+module Make_authenticated_request (T : Tag) : Authenticated_request = struct
+  type t = {
+    pkh : Tezos_crypto.Signature.Public_key_hash.t;
+    data : Bytes.t;
+    signature : Tezos_crypto.Signature.t option;
+  }
+
+  let to_sign ~pkh ~data = to_sign_with_tag ~tag:T.tag ~pkh ~data
+
+  let encoding =
+    let open Data_encoding in
+    conv
+      (fun {pkh; data; signature} -> (pkh, data, signature))
+      (fun (pkh, data, signature) -> {pkh; data; signature})
+      (obj3
+         (req "pkh" Tezos_crypto.Signature.Public_key_hash.encoding)
+         (req "data" bytes)
+         (opt "signature" Tezos_crypto.Signature.encoding))
 end
 
 module Deterministic_nonce = struct
@@ -178,6 +286,73 @@ module Authorized_keys = struct
   end
 end
 
+module Known_keys = struct
+  module Response = struct
+    type t = Tezos_crypto.Signature.Public_key_hash.t list
+
+    let encoding =
+      let open Data_encoding in
+      def "signer_messages.known_keys.response"
+      @@ obj1
+           (req
+              "known_keys"
+              (list Tezos_crypto.Signature.Public_key_hash.encoding))
+  end
+end
+
+module Bls_prove_possession = struct
+  module Request = struct
+    type t = {
+      pkh : Tezos_crypto.Signature.Public_key_hash.t;
+      override_pk : Tezos_crypto.Signature.Bls.Public_key.t option;
+      signature : Tezos_crypto.Signature.t option;
+    }
+
+    (* Distinct from the [Sign] (1), [Deterministic_nonce] (2) and
+       [Deterministic_nonce_hash] (3) tags: an authentication signature must
+       never be replayable across request kinds. In particular a proof of
+       possession authorization must not be usable to make the signer sign
+       the same bytes under the regular signing ciphersuite. *)
+    let tag = 4
+
+    (* [override_pk] is the [data] of the payload. The signer protocol has
+       no freshness, so what an authentication signature covers is the only
+       thing that scopes it: were it bound to [pkh] alone, a single captured
+       authorization would authorize a proof of possession over *any* public
+       key. *)
+    let to_sign ~pkh ~override_pk =
+      let data =
+        match override_pk with
+        | None -> Bytes.empty
+        | Some pk ->
+            Data_encoding.Binary.to_bytes_exn
+              Tezos_crypto.Signature.Bls.Public_key.encoding
+              pk
+      in
+      to_sign_with_tag ~tag ~pkh ~data
+
+    let encoding =
+      let open Data_encoding in
+      def "signer_messages.bls_prove_possession.request"
+      @@ conv
+           (fun {pkh; override_pk; signature} -> (pkh, override_pk, signature))
+           (fun (pkh, override_pk, signature) -> {pkh; override_pk; signature})
+           (obj3
+              (req "pkh" Tezos_crypto.Signature.Public_key_hash.encoding)
+              (opt "override_pk" Tezos_crypto.Signature.Bls.Public_key.encoding)
+              (opt "signature" Tezos_crypto.Signature.encoding))
+  end
+
+  module Response = struct
+    type t = Tezos_crypto.Signature.Bls.t
+
+    let encoding =
+      let open Data_encoding in
+      def "signer_messages.bls_prove_possession.response"
+      @@ obj1 (req "bls_prove_possession" Tezos_crypto.Signature.Bls.encoding)
+  end
+end
+
 module Request = struct
   type t =
     | Sign of Sign.Request.t
@@ -186,6 +361,8 @@ module Request = struct
     | Deterministic_nonce of Deterministic_nonce.Request.t
     | Deterministic_nonce_hash of Deterministic_nonce_hash.Request.t
     | Supports_deterministic_nonces of Supports_deterministic_nonces.Request.t
+    | Known_keys
+    | Bls_prove_possession of Bls_prove_possession.Request.t
 
   let encoding =
     let open Data_encoding in
@@ -240,6 +417,20 @@ module Request = struct
              (function
                | Supports_deterministic_nonces req -> Some ((), req) | _ -> None)
              (fun ((), req) -> Supports_deterministic_nonces req);
+           case
+             (Tag 6)
+             ~title:"Known_keys"
+             (obj1 (req "kind" (constant "known_keys")))
+             (function Known_keys -> Some () | _ -> None)
+             (fun () -> Known_keys);
+           case
+             (Tag 7)
+             ~title:"Bls_prove_possession"
+             (merge_objs
+                (obj1 (req "kind" (constant "Bls_prove_possession")))
+                Bls_prove_possession.Request.encoding)
+             (function Bls_prove_possession req -> Some ((), req) | _ -> None)
+             (fun ((), req) -> Bls_prove_possession req);
          ]
 end
 
@@ -250,4 +441,6 @@ let () =
   register Deterministic_nonce.Response.encoding ;
   register Deterministic_nonce_hash.Response.encoding ;
   register Supports_deterministic_nonces.Response.encoding ;
-  register Public_key.Response.encoding
+  register Public_key.Response.encoding ;
+  register Known_keys.Response.encoding ;
+  register Bls_prove_possession.Response.encoding

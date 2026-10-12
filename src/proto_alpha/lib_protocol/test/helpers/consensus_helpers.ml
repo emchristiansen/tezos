@@ -23,165 +23,127 @@
 (*                                                                           *)
 (*****************************************************************************)
 
-open Protocol
-open Alpha_context
+type kind = Preattestation | Attestation | Aggregate
 
-type mode = Application | Construction | Mempool
+(** Crafts a consensus operation.
 
-let show_mode = function
-  | Application -> "Application"
-  | Construction -> "Construction"
-  | Mempool -> "Mempool"
+    By default, a (pre)attestation is for the first slot, whereas an
+    attestations aggregate is for all the level's attesters that are
+    using a BLS consensus key.
 
-type kind = Preendorsement | Endorsement
+    Moreover, the operation points to the given [attested_block]: in
+    other words, it has that block's level, round, payload hash, and
+    its branch is the predecessor of that block.
 
-(** Craft an endorsement or preendorsement, and bake a block
-    containing it (in application or construction modes) or inject it
-    into a mempool. When [error] is [None], check that it succeeds,
-    otherwise check that it fails as specified by [error].
-
-    By default, the (pre)endorsement is for the first slot and is
-    signed by the delegate that owns this slot. Moreover, the operation
-    points to the given [endorsed_block]: in other words, it has that
-    block's level, round, payload hash, and its branch is the
-    predecessor of that block. Optional arguments allow to override
-    these default parameters.
-
-    The [predecessor] is used as the predecessor of the baked block or
-    the head of the mempool. When it is not provided, we use the
-    [endorsed_block] for this. *)
-let test_consensus_operation ?delegate ?slot ?level ?round ?block_payload_hash
-    ?branch ~endorsed_block ?(predecessor = endorsed_block) ?error ~loc kind
-    mode =
-  let open Lwt_result_syntax in
-  let* operation =
-    match kind with
-    | Preendorsement ->
-        Op.preendorsement
-          ?delegate
-          ?slot
-          ?level
-          ?round
-          ?block_payload_hash
-          ?branch
-          endorsed_block
-    | Endorsement ->
-        Op.endorsement
-          ?delegate
-          ?slot
-          ?level
-          ?round
-          ?block_payload_hash
-          ?branch
-          endorsed_block
-  in
-  let check_error res =
-    match error with
-    | Some error -> Assert.proto_error ~loc res error
-    | None ->
-        let*? _ = res in
-        return_unit
-  in
-  match mode with
-  | Application ->
-      Block.bake ~baking_mode:Application ~operation predecessor >>= check_error
-  | Construction ->
-      Block.bake ~baking_mode:Baking ~operation predecessor >>= check_error
-  | Mempool ->
-      let*! res =
-        let* inc =
-          Incremental.begin_construction ~mempool_mode:true predecessor
-        in
-        let* inc = Incremental.add_operation inc operation in
-        (* Finalization doesn't do much in mempool mode, but some RPCs
-           still call it, so we check that it doesn't fail unexpectedly. *)
-        Incremental.finalize_block inc
-      in
-      check_error res
-
-let test_consensus_operation_all_modes_different_outcomes ?delegate ?slot ?level
-    ?round ?block_payload_hash ?branch ~endorsed_block ?predecessor ~loc
-    ?application_error ?construction_error ?mempool_error kind =
-  List.iter_es
-    (fun (mode, error) ->
-      test_consensus_operation
-        ?delegate
-        ?slot
+    Optional arguments allow to override these default parameters. *)
+let craft_consensus_operation ?attesting_slot ?level ?round ?block_payload_hash
+    ?branch ~attested_block kind =
+  match kind with
+  | Preattestation ->
+      Op.preattestation
+        ?attesting_slot
         ?level
         ?round
         ?block_payload_hash
         ?branch
-        ~endorsed_block
-        ?predecessor
-        ?error
-        ~loc:(Format.sprintf "%s (%s mode)" loc (show_mode mode))
-        kind
-        mode)
-    [
-      (Application, application_error);
-      (Construction, construction_error);
-      (Mempool, mempool_error);
-    ]
+        attested_block
+  | Attestation ->
+      Op.attestation
+        ?attesting_slot
+        ?level
+        ?round
+        ?block_payload_hash
+        ?branch
+        attested_block
+  | Aggregate ->
+      Op.attestations_aggregate
+        ?level
+        ?round
+        ?block_payload_hash
+        ?branch
+        attested_block
 
-let test_consensus_operation_all_modes ?delegate ?slot ?level ?round
-    ?block_payload_hash ?branch ~endorsed_block ?predecessor ?error ~loc kind =
-  test_consensus_operation_all_modes_different_outcomes
-    ?delegate
-    ?slot
-    ?level
-    ?round
-    ?block_payload_hash
-    ?branch
-    ~endorsed_block
-    ?predecessor
+let test_consensus_operation ?attesting_slot ?level ?round ?block_payload_hash
+    ?branch ~attested_block ?(predecessor = attested_block) ?error ~loc kind
+    mode =
+  let open Lwt_result_syntax in
+  let* operation =
+    craft_consensus_operation
+      ?attesting_slot
+      ?level
+      ?round
+      ?block_payload_hash
+      ?branch
+      ~attested_block
+      kind
+  in
+  Op.check_validation_and_application ~loc ?error ~predecessor mode operation
+
+let test_consensus_operation_all_modes_different_outcomes ?attesting_slot ?level
+    ?round ?block_payload_hash ?branch ~attested_block
+    ?(predecessor = attested_block) ~loc ?application_error ?construction_error
+    ?mempool_error kind =
+  let open Lwt_result_syntax in
+  let* operation =
+    craft_consensus_operation
+      ?attesting_slot
+      ?level
+      ?round
+      ?block_payload_hash
+      ?branch
+      ~attested_block
+      kind
+  in
+  Op.check_validation_and_application_all_modes_different_outcomes
     ~loc
-    ?application_error:error
-    ?construction_error:error
-    ?mempool_error:error
-    kind
+    ?application_error
+    ?construction_error
+    ?mempool_error
+    ~predecessor
+    operation
 
-let delegate_of_first_slot b =
-  let module V = Plugin.RPC.Validators in
-  Context.get_endorsers b >|=? function
-  | {V.consensus_key; slots = s :: _; _} :: _ -> (consensus_key, s)
-  | _ -> assert false
-
-let delegate_of_slot ?(different_slot = false) slot b =
-  let module V = Plugin.RPC.Validators in
-  Context.get_endorsers b >|=? fun endorsers ->
-  List.find_map
-    (function
-      | {V.consensus_key; slots = s :: _; _}
-        when if different_slot then not (Slot.equal s slot)
-             else Slot.equal s slot ->
-          Some consensus_key
-      | _ -> None)
-    endorsers
-  |> function
-  | None -> assert false
-  | Some d -> d
+let test_consensus_operation_all_modes ?attesting_slot ?level ?round
+    ?block_payload_hash ?branch ~attested_block ?(predecessor = attested_block)
+    ?error ~loc kind =
+  let open Lwt_result_syntax in
+  let* operation =
+    craft_consensus_operation
+      ?attesting_slot
+      ?level
+      ?round
+      ?block_payload_hash
+      ?branch
+      ~attested_block
+      kind
+  in
+  Op.check_validation_and_application_all_modes
+    ~loc
+    ?error
+    ~predecessor
+    operation
 
 let test_consensus_op_for_next ~genesis ~kind ~next =
-  let dorsement ~endorsed_block ~delegate =
+  let open Lwt_result_syntax in
+  let consensus_op ~attested_block ~attesting_slot =
     match kind with
-    | `Preendorsement -> Op.preendorsement ~delegate endorsed_block
-    | `Endorsement -> Op.endorsement ~delegate endorsed_block
+    | `Preattestation -> Op.preattestation ~attesting_slot attested_block
+    | `Attestation -> Op.attestation ~attesting_slot attested_block
   in
-  Block.bake genesis >>=? fun b1 ->
-  (match next with
-  | `Level -> Block.bake b1
-  | `Round -> Block.bake ~policy:(By_round 1) genesis)
-  >>=? fun b2 ->
-  Incremental.begin_construction ~mempool_mode:true b1 >>=? fun inc ->
-  delegate_of_first_slot (B b1) >>=? fun (delegate, slot) ->
-  dorsement ~endorsed_block:b1 ~delegate >>=? fun operation ->
-  Incremental.add_operation inc operation >>=? fun inc ->
-  delegate_of_slot ~different_slot:true slot (B b2) >>=? fun delegate ->
-  dorsement ~endorsed_block:b2 ~delegate >>=? fun operation ->
-  Incremental.add_operation inc operation >>= fun res ->
-  let error_title =
+  let* b1 = Block.bake genesis in
+  let* b2 =
     match next with
-    | `Level -> "Consensus operation for future level"
-    | `Round -> "Consensus operation for future round"
+    | `Level -> Block.bake b1
+    | `Round -> Block.bake ~policy:(By_round 1) genesis
   in
-  Assert.proto_error_with_info ~loc:__LOC__ res error_title
+  let* inc = Incremental.begin_construction ~mempool_mode:true b1 in
+  let* attesting_slot = Op.get_attesting_slot ~attested_block:b1 in
+  let* operation = consensus_op ~attested_block:b1 ~attesting_slot in
+  let* inc = Incremental.add_operation inc operation in
+  let* attesting_slot =
+    Op.get_different_attesting_slot
+      ~consensus_pkh_to_avoid:attesting_slot.consensus_pkh
+      ~attested_block:b2
+  in
+  let* operation = consensus_op ~attested_block:b2 ~attesting_slot in
+  let* (_ : Incremental.t) = Incremental.add_operation inc operation in
+  return_unit

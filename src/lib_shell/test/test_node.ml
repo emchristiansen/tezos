@@ -26,8 +26,8 @@
 (** Testing
     -------
     Component:    Shell (Node)
-    Invocation:   dune exec src/lib_shell/test/test_shell.exe \
-                  -- test '^test node$'
+    Invocation:   dune exec src/lib_shell/test/main.exe \
+                  -- --file test_node.ml
     Dependencies: src/lib_shell/test/shell_test_helpers.ml
     Subject:      Unit tests for node. Currently only tests that
                   events are emitted.
@@ -49,16 +49,16 @@ let init_config (* (f : 'a -> unit -> unit Lwt.t) *) f test_dir switch () :
       user_activated_upgrades = [];
       user_activated_protocol_overrides = [];
       operation_metadata_size_limit = Unlimited;
+      internal_events = Tezos_base.Internal_event_config.stdout;
       data_dir = test_dir;
       store_root = test_dir // "store";
-      context_root = test_dir // "context";
       protocol_root = test_dir // "protocol";
       patch_context = None;
       p2p = None;
       target = None;
       disable_mempool = false;
       enable_testchain = true;
-      dal = Tezos_crypto_dal.Cryptobox.Config.default;
+      dal_config = Tezos_crypto_dal.Cryptobox.Config.default;
     }
   in
   f sandbox_parameters config switch ()
@@ -77,6 +77,7 @@ let default_p2p : P2p.config =
     proof_of_work_target = Tezos_crypto.Crypto_box.default_pow_target;
     trust_discovered_peers = false;
     reconnection_config = Point_reconnection_config.default;
+    disable_peer_discovery = false;
   }
 
 let default_p2p_limits =
@@ -109,11 +110,24 @@ let ( let*?? ) m f =
 (** Node creation in sandbox. Expects one event with status
     [p2p_layer_disabled]. *)
 let node_sandbox_initialization_events sandbox_parameters config _switch () =
+  let version =
+    Tezos_version.Version.to_string
+      Tezos_version_value.Current_git_info.octez_version
+  in
+  let commit_info =
+    ({
+       commit_hash = Tezos_version_value.Current_git_info.commit_hash;
+       commit_date = Tezos_version_value.Current_git_info.committer_date;
+     }
+      : Tezos_version.Octez_node_version.commit_info)
+  in
   let*?? n =
     Node.create
       ~sandboxed:true
       ~sandbox_parameters
       ~singleprocess:true
+      ~version
+      ~commit_info
       (* Tezos_shell.Node.config *)
       config
       (* Tezos_shell.Node.peer_validator_limits *)
@@ -125,7 +139,8 @@ let node_sandbox_initialization_events sandbox_parameters config _switch () =
       (* Tezos_shell.Node.chain_validator_limits *)
       Shell_limits.default_chain_validator_limits
       (* Tezos_shell_services.History_mode.t option *)
-      None
+      ?history_mode:None (* Tezos_shell_services.Storage_maintenance option *)
+      ?maintenance_delay:None
   in
   (* Start tests *)
   let evs = Mock_sink.get_events ?filter () in
@@ -135,7 +150,7 @@ let node_sandbox_initialization_events sandbox_parameters config _switch () =
       {
         level = Some Internal_event.Notice;
         section = Some section;
-        name = "shell-node";
+        name = "p2p-initialization";
       })
     (WithExceptions.Option.get ~loc:__LOC__ @@ List.nth evs 0) ;
   (* End tests *)
@@ -144,10 +159,23 @@ let node_sandbox_initialization_events sandbox_parameters config _switch () =
 (** Node creation. Expects two events with statuses
     [bootstrapping] and [p2p_maintain_started]. *)
 let node_initialization_events _sandbox_parameters config _switch () =
+  let version =
+    Tezos_version.Version.to_string
+      Tezos_version_value.Current_git_info.octez_version
+  in
+  let commit_info =
+    ({
+       commit_hash = Tezos_version_value.Current_git_info.commit_hash;
+       commit_date = Tezos_version_value.Current_git_info.committer_date;
+     }
+      : Tezos_version.Octez_node_version.commit_info)
+  in
   let*?? n =
     Node.create
       ~sandboxed:false
       ~singleprocess:true
+      ~version
+      ~commit_info
       (* Tezos_shell.Node.config *)
       {config with p2p = default_p2p}
       (* Tezos_shell.Node.peer_validator_limits *)
@@ -159,7 +187,8 @@ let node_initialization_events _sandbox_parameters config _switch () =
       (* Tezos_shell.Node.chain_validator_limits *)
       Shell_limits.default_chain_validator_limits
       (* Tezos_shell_services.History_mode.t option *)
-      None
+      ?history_mode:None (* Tezos_shell_services.Storage_maintenance option *)
+      ?maintenance_delay:None
   in
   (* Start tests *)
   let evs = Mock_sink.get_events ?filter () in
@@ -169,7 +198,7 @@ let node_initialization_events _sandbox_parameters config _switch () =
       {
         level = Some Internal_event.Notice;
         section = Some section;
-        name = "shell-node";
+        name = "p2p-initialization";
       })
     (WithExceptions.Option.get ~loc:__LOC__ @@ List.nth evs 0) ;
   Mock_sink.Pattern.(
@@ -177,17 +206,30 @@ let node_initialization_events _sandbox_parameters config _switch () =
       {
         level = Some Internal_event.Notice;
         section = Some section;
-        name = "shell-node";
+        name = "p2p-initialization";
       })
     (WithExceptions.Option.get ~loc:__LOC__ @@ List.nth evs 1) ;
   (* End tests *)
   Node.shutdown n
 
 let node_store_known_protocol_events _sandbox_parameters config _switch () =
+  let version =
+    Tezos_version.Version.to_string
+      Tezos_version_value.Current_git_info.octez_version
+  in
+  let commit_info =
+    ({
+       commit_hash = Tezos_version_value.Current_git_info.commit_hash;
+       commit_date = Tezos_version_value.Current_git_info.committer_date;
+     }
+      : Tezos_version.Octez_node_version.commit_info)
+  in
   let*?? n =
     Node.create
       ~sandboxed:false
       ~singleprocess:true
+      ~version
+      ~commit_info
       (* Tezos_shell.Node.config *)
       {config with p2p = default_p2p}
       (* Tezos_shell.Node.peer_validator_limits *)
@@ -199,7 +241,8 @@ let node_store_known_protocol_events _sandbox_parameters config _switch () =
       (* Tezos_shell.Node.chain_validator_limits *)
       Shell_limits.default_chain_validator_limits
       (* Tezos_shell_services.History_mode.t option *)
-      None
+      ?history_mode:None (* Tezos_shell_services.Storage_maintenance option *)
+      ?maintenance_delay:None
   in
   (* Start tests *)
   Mock_sink.(
@@ -226,3 +269,7 @@ let tests =
       `Quick
       (wrap node_initialization_events);
   ]
+
+let () =
+  Alcotest_lwt.run ~__FILE__ "tezos-shell" [("test node", tests)]
+  |> Lwt_main.run

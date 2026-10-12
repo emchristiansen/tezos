@@ -10,17 +10,26 @@ src_dir="$(dirname "$script_dir")"
 
 # make sure that this variable is declared
 ocaml_version=${ocaml_version:?}
-opam_repository=${opam_repository:?}
 
 create_opam_switch() {
-    [ -n "$1" ] || { echo "create_opam_switch expects a non-empty argument"; return 1; }
-    opam switch create "$1" --repositories=tezos "ocaml-base-compiler.$ocaml_version" --no-install
+  [ -n "$1" ] || {
+    echo "create_opam_switch expects a non-empty argument"
+    return 1
+  }
+  opam switch create "$1" --repositories=tezos "ocaml-base-compiler.$ocaml_version" --no-install
 }
 
 if [ "$1" = "--dev" ]; then
-    dev=yes
+  dev=yes
 else
-    dev=
+  dev=
+fi
+
+# if the variable is defined in the environment, re-export them for
+# opam to pick them up. Otherwise they are ignored.
+if [ -e "$KISSCACHE" ]; then
+  export KISSCACHE="$KISSCACHE"
+  export OPAMFETCH="$OPAMFETCH"
 fi
 
 # $OPAMSWITCH variable makes the following commands fail if the switch referred
@@ -29,38 +38,48 @@ fi
 opamswitch="$OPAMSWITCH"
 unset OPAMSWITCH
 
-opam repository set-url tezos --dont-select "$opam_repository" || \
-    opam repository add tezos --dont-select "$opam_repository" > /dev/null 2>&1
+echo "Use opam repository commit: $opam_repository_tag"
+opam_repository="https://github.com/ocaml/opam-repository.git#$opam_repository_tag"
+# [set-url] fails when the repository is not registered yet (a fresh opam root),
+# which is expected, so only its output is silenced. [add] is the fallback that
+# must work: let it report, and fail the script if it does not -- otherwise the
+# repository is missing and the build only fails much later, with an unrelated
+# message such as "dune: not found".
+if ! opam repository set-url tezos --dont-select "$opam_repository" > /dev/null 2>&1; then
+  opam repository add tezos --dont-select "$opam_repository"
+fi
 
-opam update --repositories --development
+# Note: there should be no need to 'opam update' since 'opam repository add/set-url'
+# should have fetched already and the repository cannot change since it is
+# a specific commit.
 
 OPAMSWITCH="$opamswitch"
 
 # If $OPAMSWITCH is set to a non-existent switch, such a switch should be created.
 if [ -n "$OPAMSWITCH" ]; then
-    if ! opam env --set-switch > /dev/null; then
-        echo "Creating local switch $OPAMSWITCH..."
-        create_opam_switch "$OPAMSWITCH"
-    else
-        echo "$OPAMSWITCH already exists. Installing dependencies."
-    fi
-    eval "$(opam env --switch="$OPAMSWITCH" --set-switch)"
+  if ! opam env --set-switch > /dev/null; then
+    echo "Creating local switch $OPAMSWITCH..."
+    create_opam_switch "$OPAMSWITCH"
+  else
+    echo "$OPAMSWITCH already exists. Installing dependencies."
+  fi
+  eval "$(opam env --switch="$OPAMSWITCH" --set-switch)"
 else
-    if [ ! -d "$src_dir/_opam" ] ; then
-        create_opam_switch "$src_dir"
-    fi
+  if [ ! -d "$src_dir/_opam" ]; then
+    create_opam_switch "$src_dir"
+  fi
 
-    if [ ! -d "$src_dir/_opam" ] ; then
-        echo "Failed to create the opam switch"
-        exit 1
-    fi
+  if [ ! -d "$src_dir/_opam" ]; then
+    echo "Failed to create the opam switch"
+    exit 1
+  fi
 fi
 
 eval "$(opam env --shell=sh)"
 
 # Check if the default opam repo was set in this switch
 default_switch=
-if opam remote -s | grep -q default ; then
+if opam remote -s | grep -q default; then
   default_switch=yes
 fi
 
@@ -68,42 +87,76 @@ fi
 opam repository remove default > /dev/null 2>&1
 
 if [ "$(ocaml -vnum)" != "$ocaml_version" ]; then
-    # If not removed, automatically installed dependencies would be
-    # (tried to be) rebuilt in their old version with the new compiler
-    # while they will probably be updated (and at least reinstalled)
-    # by the next steps of the script
-    opam remove -a --yes
-    OPAMCLI=2.0 opam install --yes --unlock-base "ocaml-base-compiler.$ocaml_version"
+  # If not removed, automatically installed dependencies would be
+  # (tried to be) rebuilt in their old version with the new compiler
+  # while they will probably be updated (and at least reinstalled)
+  # by the next steps of the script
+  opam remove -a --yes
+  OPAMCLI=2.0 opam install --yes --unlock-base "ocaml-base-compiler.$ocaml_version"
 fi
 
-# Must be done before install_build_deps.raw.sh because install_build_deps.raw.sh installs
-# opam packages that depend on Rust.
+OPAMREQV="2.3.0"
+OPAMV="$(opam --version)"
+
+# Use the opam cache by default
+# Third party packages are too often unreliable
+if [ "$(printf '%s\n' "$OPAMREQV" "$OPAMV" | sort -V | head -n1)" = "$OPAMREQV" ]; then
+  opam option --global 'archive-mirrors="https://opam.ocaml.org/cache"'
+else
+  echo "Your opam version is less than the advised ${OPAMREQV}. The installation may fail and we suggest to upgrade opam."
+  echo "The recommended way to install/upgrade opam is by doing"
+  echo '  bash -c "sh <(curl -fsSL https://opam.ocaml.org/install.sh)"'
+  echo "See: https://opam.ocaml.org/doc/Install.html#Binary-distribution"
+fi
+
+# Must be done before using 'opam install' to install packages that depend on Rust.
 "$script_dir"/install_build_deps.rust.sh
 
 # Opam < 2.1 requires opam-depext as a plugin, later versions include it
 # natively:
 case $(opam --version) in
-    2.0.* )
-        opam install --yes opam-depext ;;
+2.0.*)
+  opam install --yes opam-depext
+  ;;
 esac
 
-"$script_dir"/install_build_deps.raw.sh "$1"
+export OPAMYES="${OPAMYES:=true}"
+
+# install_build_deps.sh calls install_build_deps.rust.sh which checks whether
+# Rust is installed with the right version and explains how to install it if
+# needed, so here we only make opam acknowledge that we have a Rust compiler
+# we installed on our own.
+# If we use opam depext, it will probably not install the right version.
+OPAMASSUMEDEPEXTS=true opam install conf-rust conf-rust-2021
+
+# Opam < 2.1 uses opam-depext as a plugin, later versions provide the option `--depext-only`.
+# We assume Opam >= 2.0.0 (2.0.0 was released in 2018; Debian Buster already had Opam 2.0.3).
+case $(opam --version) in
+2.0.*)
+  opam pin add -n -y --locked=locked octez-deps opam/virtual/ && opam depext octez-deps
+  opam pin remove octez-deps
+  ;;
+*) opam install --depext-only opam/virtual/octez-deps.opam.locked ;;
+esac
+
+opam install opam/virtual/octez-deps.opam.locked --deps-only --criteria="-notuptodate,-changed,-removed"
+
+if [ "$1" = "--tps" ]; then
+  opam install caqti-driver-postgresql
+fi
 
 # add back the default repo if asked to or it was present in the first
 # place.  we add the rank here even if it wasn't there just to be on
 # the safe side
 if [ -n "$default_switch" ] || [ -n "$dev" ]; then
-    opam remote add default --rank=-1 > /dev/null 2>&1 || true
+  opam remote add default --rank=-1 > /dev/null 2>&1 || true
 fi
 
 # install dev dependencies if asked
 if [ -n "$dev" ]; then
-    # Note: ocaml-lsp-server.1.6.0 dependencies are not constrained
-    # enough (for [ppx_yojson_conv_lib] in particular), so we add a
-    # minimal bound to ensure it won’t be picked by opam.
-    # utop is constrained to avoid reinstalling in all the times.
-    opam install --yes opam/virtual/octez-deps.opam opam/virtual/octez-dev-deps.opam --deps-only --criteria="-changed,-removed"
+  # Note: ocaml-lsp-server.1.6.0 dependencies are not constrained
+  # enough (for [ppx_yojson_conv_lib] in particular), so we add a
+  # minimal bound to ensure it won’t be picked by opam.
+  # utop is constrained to avoid reinstalling in all the times.
+  opam install --yes opam/virtual/octez-deps.opam.locked opam/virtual/octez-dev-deps.opam opam/virtual/release-tools-deps.opam --deps-only --criteria="-changed,-removed"
 fi
-
-"$script_dir"/install_sapling_parameters.sh
-

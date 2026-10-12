@@ -24,6 +24,8 @@
 (*                                                                           *)
 (*****************************************************************************)
 
+type tree_instance = ..
+
 type key = string list
 
 type value = bytes
@@ -33,9 +35,9 @@ exception Incorrect_tree_type
 module type S = sig
   type tree
 
-  val select : Tezos_lazy_containers.Lazy_map.tree -> tree
+  val select : tree_instance -> tree
 
-  val wrap : tree -> Tezos_lazy_containers.Lazy_map.tree
+  val wrap : tree -> tree_instance
 
   val remove : tree -> key -> tree Lwt.t
 
@@ -57,12 +59,10 @@ end
 
 type 'tree backend = (module S with type tree = 'tree)
 
-let select :
-    type tree. tree backend -> Tezos_lazy_containers.Lazy_map.tree -> tree =
+let select : type tree. tree backend -> tree_instance -> tree =
  fun (module T) tree -> T.select tree
 
-let wrap :
-    type tree. tree backend -> tree -> Tezos_lazy_containers.Lazy_map.tree =
+let wrap : type tree. tree backend -> tree -> tree_instance =
  fun (module T) tree -> T.wrap tree
 
 let remove : type tree. tree backend -> tree -> key -> tree Lwt.t =
@@ -86,8 +86,7 @@ let hash : type tree. tree backend -> tree -> Context_hash.t =
 let length : type tree. tree backend -> tree -> key -> int Lwt.t =
  fun (module T) tree key -> T.length tree key
 
-let list :
-    type tree.
+let list : type tree.
     tree backend ->
     tree ->
     ?offset:int ->
@@ -98,7 +97,7 @@ let list :
 
 type wrapped_tree = Wrapped_tree : 'tree * 'tree backend -> wrapped_tree
 
-type Tezos_lazy_containers.Lazy_map.tree += Wrapped of wrapped_tree
+type tree_instance += Wrapped of wrapped_tree
 
 module Wrapped : S with type tree = wrapped_tree = struct
   type tree = wrapped_tree
@@ -129,7 +128,8 @@ module Wrapped : S with type tree = wrapped_tree = struct
   let list (Wrapped_tree (t, b)) ?offset ?length key =
     let open Lwt.Syntax in
     let+ list = list b t ?offset ?length key in
-    List.map (fun (step, tree) -> (step, Wrapped_tree (tree, b))) list
+    List.rev
+    @@ List.rev_map (fun (step, tree) -> (step, Wrapped_tree (tree, b))) list
 
   let find (Wrapped_tree (t, b)) key = find b t key
 

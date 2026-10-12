@@ -23,6 +23,13 @@
 (*                                                                           *)
 (*****************************************************************************)
 
+(** Testing
+    -------
+    Component:    Lib_scoru_wasm
+    Invocation:   dune exec src/lib_scoru_wasm/test/main.exe -- --file test_init.ml
+    Subject:      Init tests for the tezos-scoru-wasm library
+*)
+
 open Tezos_scoru_wasm
 open Wasm_utils
 open Tztest_helper
@@ -31,7 +38,7 @@ let test_memory0_export ~version () =
   let open Lwt_result_syntax in
   (* This module does not export its memory therefore it should fail. *)
   let*! bad_module_tree =
-    initial_tree ~version {|
+    initial_state ~version {|
     (module (memory 1))
   |}
   in
@@ -47,7 +54,7 @@ let test_memory0_export ~version () =
   (* This module exports its memory should therefore reach the "unreachable"
      trap which is treated below. *)
   let*! good_module_tree =
-    initial_tree
+    initial_state
       ~version
       {|
         (module
@@ -89,7 +96,7 @@ let test_module_name_size ~version () =
         )|}
       (build size)
   in
-  let*! bad_module_tree = initial_tree ~version (build_module 513) in
+  let*! bad_module_tree = initial_state ~version (build_module 513) in
   let*! bad_module_tree = eval_until_input_requested bad_module_tree in
   let*! bad_module_tree = set_empty_inbox_step 0l bad_module_tree in
   let* stuck, _ = eval_until_stuck bad_module_tree in
@@ -98,7 +105,7 @@ let test_module_name_size ~version () =
       ~expected_kind:`No_fallback_decode
       ~expected_reason:"Names cannot exceed 512 bytes"
       stuck) ;
-  let*! good_module_tree = initial_tree ~version (build_module 512) in
+  let*! good_module_tree = initial_state ~version (build_module 512) in
   let*! good_module_tree = eval_until_input_requested good_module_tree in
   let*! good_module_tree = set_empty_inbox_step 0l good_module_tree in
   let*! tree = eval_until_input_requested good_module_tree in
@@ -127,7 +134,7 @@ let test_imports ~version () =
   let bad_module_name = "external_module" in
   let bad_item_name = "f" in
   let*! bad_module_tree =
-    initial_tree ~version (build_module bad_module_name bad_item_name)
+    initial_state ~version (build_module bad_module_name bad_item_name)
   in
   let*! bad_module_tree = eval_until_input_requested bad_module_tree in
   let*! bad_module_tree = set_empty_inbox_step 0l bad_module_tree in
@@ -150,7 +157,7 @@ let test_imports ~version () =
   in
   let good_module_name = "smart_rollup_core" in
   let*! bad_host_func_tree =
-    initial_tree ~version (build_module good_module_name bad_item_name)
+    initial_state ~version (build_module good_module_name bad_item_name)
   in
   let*! bad_host_func_tree = eval_until_input_requested bad_host_func_tree in
   let*! bad_host_func_tree = set_empty_inbox_step 0l bad_host_func_tree in
@@ -173,7 +180,7 @@ let test_imports ~version () =
   in
   let good_item_name = "read_input" in
   let*! good_module_tree =
-    initial_tree ~version (build_module good_module_name good_item_name)
+    initial_state ~version (build_module good_module_name good_item_name)
   in
   let*! good_module_tree = eval_until_input_requested good_module_tree in
   let*! good_module_tree = set_empty_inbox_step 0l good_module_tree in
@@ -184,7 +191,7 @@ let test_imports ~version () =
 let test_host_func_start_restriction ~version () =
   let open Lwt_result_syntax in
   let*! state =
-    initial_tree
+    initial_state
       ~version
       {|
         (module
@@ -226,7 +233,7 @@ let test_bad_entrypoint_name ~version () =
       )|}
   in
 
-  let*! bad_module_tree = initial_tree ~version module_ in
+  let*! bad_module_tree = initial_state ~version module_ in
   let*! bad_module_tree = eval_until_input_requested bad_module_tree in
   let*! bad_module_tree = set_empty_inbox_step 0l bad_module_tree in
   let* stuck, _ = eval_until_stuck bad_module_tree in
@@ -254,7 +261,7 @@ let test_bad_export ~version () =
       )|}
   in
 
-  let*! bad_module_tree = initial_tree ~version module_ in
+  let*! bad_module_tree = initial_state ~version module_ in
   let*! bad_module_tree = eval_until_input_requested bad_module_tree in
   let*! bad_module_tree = set_empty_inbox_step 0l bad_module_tree in
   let* stuck, _ = eval_until_stuck bad_module_tree in
@@ -272,7 +279,7 @@ let test_bad_export ~version () =
 let test_float32_type ~version () =
   let open Lwt_result_syntax in
   let*! state =
-    initial_tree
+    initial_state
       ~version
       {|
         (module
@@ -298,7 +305,7 @@ let test_float32_type ~version () =
 let test_float64_type ~version () =
   let open Lwt_result_syntax in
   let*! state =
-    initial_tree
+    initial_state
       ~version
       {|
         (module
@@ -324,7 +331,7 @@ let test_float64_type ~version () =
 let test_float_value ~version () =
   let open Lwt_result_syntax in
   let*! state =
-    initial_tree
+    initial_state
       ~version
       {|
         (module
@@ -349,8 +356,7 @@ let test_float_value ~version () =
       stuck)
 
 let tests =
-  tztests_with_pvm
-    ~versions:[V0; V1]
+  tztests_with_all_pvms
     [
       ("init requires memory 0 export", `Quick, test_memory0_export);
       ("names are limited to 512 bytes", `Quick, test_module_name_size);
@@ -364,3 +370,10 @@ let tests =
       ("64 bits float types are forbidden", `Quick, test_float64_type);
       ("float values are forbidden", `Quick, test_float_value);
     ]
+
+let () =
+  Alcotest_lwt.run
+    ~__FILE__
+    "test lib scoru wasm"
+    [("Module Initialisation", tests)]
+  |> Lwt_main.run

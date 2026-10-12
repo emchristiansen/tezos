@@ -26,34 +26,31 @@
 
 type ('a, 'b) lwt_format = ('a, Format.formatter, unit, 'b Lwt.t) format4
 
-class type printer =
-  object
-    method error : ('a, 'b) lwt_format -> 'a
+class type printer = object
+  method error : ('a, 'b) lwt_format -> 'a
 
-    method warning : ('a, unit) lwt_format -> 'a
+  method warning : ('a, unit) lwt_format -> 'a
 
-    method message : ('a, unit) lwt_format -> 'a
+  method message : ('a, unit) lwt_format -> 'a
 
-    method answer : ('a, unit) lwt_format -> 'a
+  method answer : ('a, unit) lwt_format -> 'a
 
-    method log : string -> ('a, unit) lwt_format -> 'a
-  end
+  method log : string -> ('a, unit) lwt_format -> 'a
+end
 
-class type prompter =
-  object
-    method prompt : ('a, string tzresult) lwt_format -> 'a
+class type prompter = object
+  method prompt : ('a, string tzresult) lwt_format -> 'a
 
-    method prompt_password : ('a, Bytes.t tzresult) lwt_format -> 'a
+  method prompt_password : ('a, Bytes.t tzresult) lwt_format -> 'a
 
-    method multiple_password_retries : bool
-  end
+  method multiple_password_retries : bool
+end
 
-class type io =
-  object
-    inherit printer
+class type io = object
+  inherit printer
 
-    inherit prompter
-  end
+  inherit prompter
+end
 
 class simple_printer log =
   let message x = Format.kasprintf (fun msg -> log "stdout" msg) x in
@@ -72,87 +69,79 @@ class simple_printer log =
       fun name -> Format.kasprintf (fun msg -> log name msg)
   end
 
-class type wallet =
-  object
-    method load_passwords : string Lwt_stream.t option
+class type wallet = object
+  method load_passwords : string Lwt_stream.t option
 
-    method read_file : string -> string tzresult Lwt.t
+  method read_file : string -> string tzresult Lwt.t
 
-    method with_lock : (unit -> 'a Lwt.t) -> 'a Lwt.t
+  method with_lock : (unit -> 'a Lwt.t) -> 'a Lwt.t
 
-    method load :
-      string -> default:'a -> 'a Data_encoding.encoding -> 'a tzresult Lwt.t
+  method load :
+    string -> default:'a -> 'a Data_encoding.encoding -> 'a tzresult Lwt.t
 
-    method write :
-      string -> 'a -> 'a Data_encoding.encoding -> unit tzresult Lwt.t
+  method write :
+    string -> 'a -> 'a Data_encoding.encoding -> unit tzresult Lwt.t
 
-    method last_modification_time : string -> float option tzresult Lwt.t
+  method last_modification_time : string -> float option tzresult Lwt.t
 
-    method get_base_dir : string
-  end
+  method get_base_dir : string
+end
 
-class type chain =
-  object
-    method chain : Shell_services.chain
-  end
+class type chain = object
+  method chain : Shell_services.chain
+end
 
-class type block =
-  object
-    method block : Shell_services.block
+class type block = object
+  method block : Shell_services.block
 
-    method confirmations : int option
-  end
+  method confirmations : int option
+end
 
-class type io_wallet =
-  object
-    inherit printer
+class type io_wallet = object
+  inherit printer
 
-    inherit prompter
+  inherit prompter
 
-    inherit wallet
-  end
+  inherit wallet
+end
 
-class type io_rpcs =
-  object
-    inherit printer
+class type io_rpcs = object
+  inherit printer
 
-    inherit prompter
+  inherit prompter
 
-    inherit Tezos_rpc.Context.generic
-  end
+  inherit Tezos_rpc.Context.generic
+end
 
-class type ui =
-  object
-    method sleep : float -> unit Lwt.t
+class type ui = object
+  method sleep : float -> unit Lwt.t
 
-    method exit : 'a. int -> 'a
+  method exit : 'a. int -> 'a
 
-    method now : unit -> Ptime.t
-  end
+  method now : unit -> Ptime.t
+end
 
-class type ux_options =
-  object
-    method verbose_rpc_error_diagnostics : bool
-  end
+class type ux_options = object
+  method verbose_rpc_error_diagnostics : bool
+end
 
-class type full =
-  object
-    inherit printer
+class type full = object
+  inherit printer
 
-    inherit prompter
+  inherit prompter
 
-    inherit wallet
+  inherit wallet
 
-    inherit Tezos_rpc.Context.generic
+  inherit Tezos_rpc.Context.generic
 
-    inherit chain
+  inherit chain
 
-    inherit block
+  inherit block
 
-    inherit ui
+  inherit ui
 
-    inherit ux_options
-  end
+  inherit ux_options
+end
 
 class proxy_context (obj : full) =
   object
@@ -170,24 +159,24 @@ class proxy_context (obj : full) =
 
     method answer : type a. (a, unit) lwt_format -> a = obj#answer
 
-    method call_service
-        : 'm 'p 'q 'i 'o.
-          (([< Resto.meth] as 'm), 'pr, 'p, 'q, 'i, 'o) Tezos_rpc.Service.t ->
-          'p ->
-          'q ->
-          'i ->
-          'o tzresult Lwt.t =
+    method call_service :
+        'm 'p 'q 'i 'o.
+        (([< Resto.meth] as 'm), 'pr, 'p, 'q, 'i, 'o) Tezos_rpc.Service.t ->
+        'p ->
+        'q ->
+        'i ->
+        'o tzresult Lwt.t =
       obj#call_service
 
-    method call_streamed_service
-        : 'm 'p 'q 'i 'o.
-          (([< Resto.meth] as 'm), 'pr, 'p, 'q, 'i, 'o) Tezos_rpc.Service.t ->
-          on_chunk:('o -> unit) ->
-          on_close:(unit -> unit) ->
-          'p ->
-          'q ->
-          'i ->
-          (unit -> unit) tzresult Lwt.t =
+    method call_streamed_service :
+        'm 'p 'q 'i 'o.
+        (([< Resto.meth] as 'm), 'pr, 'p, 'q, 'i, 'o) Tezos_rpc.Service.t ->
+        on_chunk:('o -> unit) ->
+        on_close:(unit -> unit) ->
+        'p ->
+        'q ->
+        'i ->
+        (unit -> unit) tzresult Lwt.t =
       obj#call_streamed_service
 
     method error : type a b. (a, b) lwt_format -> a = obj#error
@@ -229,6 +218,22 @@ class proxy_context (obj : full) =
     method get_base_dir : string = obj#get_base_dir
 
     method verbose_rpc_error_diagnostics = obj#verbose_rpc_error_diagnostics
+  end
+
+(* cctxt -> cctxt with a different node rpc endpoint *)
+class proxy_context_with_rpc (cctxt : full)
+  (rpc_ctxt : Tezos_rpc.Context.generic) :
+  full =
+  object
+    inherit proxy_context cctxt
+
+    method! call_service = rpc_ctxt#call_service
+
+    method! call_streamed_service = rpc_ctxt#call_streamed_service
+
+    method! generic_media_type_call = rpc_ctxt#generic_media_type_call
+
+    method! base = rpc_ctxt#base
   end
 
 let log _ _ = Lwt.return_unit

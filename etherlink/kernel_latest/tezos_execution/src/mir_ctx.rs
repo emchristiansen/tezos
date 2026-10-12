@@ -1,0 +1,3780 @@
+// SPDX-FileCopyrightText: 2024 Nomadic Labs <contact@nomadic-labs.com>
+//
+// SPDX-License-Identifier: MIT
+
+use std::collections::{BTreeMap, BTreeSet};
+
+use crate::account_storage::{
+    Code, TezosAccount, TezosImplicitAccount, TezosOriginatedAccount,
+};
+use crate::context::{address_registry, big_maps::*};
+use crate::get_contract_entrypoint;
+use crate::{
+    consume_storage_read_milligas, consume_storage_write_milligas, contract_from_address,
+    COUNTER_SIZE,
+};
+use mir::parser::Parser;
+use mir::typechecker::{
+    type_props::TypeProperty, typecheck_value, AllowForgedLazyStorageId,
+    MichelineContractScript, MichelineView,
+};
+use mir::{
+    ast::{
+        big_map::{BigMapId, LazyStorage, LazyStorageError},
+        AddressHash, IntoMicheline, Micheline, PublicKeyHash, Type, TypedValue,
+    },
+    context::{AddressRegistryError, CtxTrait, TypecheckingCtx},
+    gas::{interpret_cost, Gas, OutOfGas},
+};
+use num_bigint::{BigInt, BigUint};
+use num_traits::Zero;
+use tezos_crypto_rs::blake2b::digest_256;
+use tezos_crypto_rs::hash::{ChainId, ContractKt1Hash, OperationHash, ScriptExprHash};
+use tezos_data_encoding::types::{Narith, Zarith};
+use tezos_evm_runtime::runtime_keyspaces::RuntimeKeyspaces;
+use tezos_protocol::contract::Contract;
+use tezos_smart_rollup::host::RuntimeError;
+use tezos_smart_rollup::types::Timestamp;
+use tezos_smart_rollup_host::storage::StorageV1;
+use tezos_smart_rollup_host::wasm::WASM_CHUNK_SIZE;
+use tezos_smart_rollup_keyspace::extensions::KeySpaceExtBin;
+use tezos_smart_rollup_keyspace::{
+    Key, KeySpace, KeySpaceError, KeySpaceLoader, ReadKind,
+};
+use tezos_storage::error::StorageReadErrorKind;
+use tezos_tezlink::enc_wrappers::BlockNumber;
+use tezos_tezlink::lazy_storage_diff::{
+    Alloc, BigMapDiff, Copy, LazyStorageDiff, LazyStorageDiffList, StorageDiff, Update,
+};
+use tezos_tezlink::operation_result::{AddressRegistry, TransferError};
+use tezosx_journal::TemporaryBigMapIdAllocator;
+use typed_arena::Arena;
+
+/// The cross-runtime [`tezosx_interfaces::Registry`] specialized to the
+/// concrete journal used throughout the Michelson runtime,
+/// [`tezosx_journal::TezosXJournal`]. Used as a shorthand bound so the many
+/// generic items below need not each spell out the `Journal` associated type.
+pub trait Registry:
+    tezosx_interfaces::Registry<Journal = tezosx_journal::TezosXJournal>
+{
+}
+
+impl<R> Registry for R where
+    R: tezosx_interfaces::Registry<Journal = tezosx_journal::TezosXJournal>
+{
+}
+
+pub struct InterpretContext {
+    lazy_storage_size_diff: Zarith,
+    /// Big-map ids in dump-walk (AST pre-order) order; reversed at receipt time
+    /// to match L1's reverse-AST `lazy_storage_diff` order (L2-1735).
+    big_map_diff_order: Vec<Zarith>,
+}
+
+impl InterpretContext {
+    pub fn new() -> Self {
+        Self {
+            lazy_storage_size_diff: 0.into(),
+            big_map_diff_order: Vec::new(),
+        }
+    }
+
+    /// Accumulate `delta` into the lazy-storage size diff. No-op on
+    /// temporary big-maps.
+    pub fn record_lazy_storage_size_diff(&mut self, id: &BigMapId, delta: &Zarith) {
+        if !id.is_temporary() {
+            self.lazy_storage_size_diff.0 += &delta.0;
+        }
+    }
+
+    /// Return the accumulated lazy-storage size delta and reset it to zero.
+    pub fn take_lazy_storage_size_diff(&mut self) -> Zarith {
+        std::mem::replace(&mut self.lazy_storage_size_diff, 0.into())
+    }
+
+    /// Record a big-map id at the position the dump walk reaches it.
+    pub fn record_big_map_diff_order(&mut self, id: &Zarith) {
+        self.big_map_diff_order.push(id.clone());
+    }
+
+    /// Return the recorded visit order and reset it.
+    pub fn take_big_map_diff_order(&mut self) -> Vec<Zarith> {
+        std::mem::take(&mut self.big_map_diff_order)
+    }
+}
+
+impl Default for InterpretContext {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+pub struct TcCtx<'operation, 'host, Host: KeySpaceLoader + StorageV1> {
+    pub rk: &'operation mut RuntimeKeyspaces<'host, Host, Host::KeySpace>,
+    pub operation_gas: &'operation mut crate::gas::TezlinkOperationGas,
+    pub big_map_diff: BTreeMap<Zarith, StorageDiff>,
+    pub interpret_context: InterpretContext,
+    /// Handle on the operation-wide temporary big map ID counter owned
+    /// by the Michelson journal. A shared handle rather than a borrow
+    /// because [`Ctx`] holds `&mut` on the journal for as long as it
+    /// holds this context, so the two cannot both borrow it.
+    pub temporary_big_map_id_allocator: TemporaryBigMapIdAllocator,
+}
+
+pub struct OperationCtx<'operation> {
+    // In reality, 'source' has a 'batch lifetime. Downgrade it to an
+    // 'operation lifetime is not a problem for the compiler.
+    // However, it could be misleading in terms of comprehension
+    pub source: &'operation TezosImplicitAccount,
+    // The origination nonce is deliberately absent: it lives on the
+    // Michelson journal, which is the operation's single owner for it
+    // (see `MichelsonJournal::next_origination_index`). Keeping a `&mut`
+    // to it here would both alias `Ctx::journal` and reintroduce the
+    // stale-local-copy collision between nested frames.
+    /// MIR internal-operation counter — the replay identity L1 enforces
+    /// for internal operations. Incremented by `operation_counter()`
+    /// each time the contract emits an operation. In the native L1 path
+    /// it starts at 0 per top-level operation; in the cross-runtime path
+    /// it is resumed from (and written back to) the Michelson journal so
+    /// it stays monotonic across reentrant inbound Michelson frames,
+    /// matching L1's single internal-nonce namespace for the manager
+    /// operation's internal-op tree (L2-1676).
+    pub counter: &'operation mut u128,
+    /// MIR operation counters of the internal operations already
+    /// applied within this Michelson frame. `counter` is the replay
+    /// identity L1 enforces: `operation` is `Duplicable`, so a contract
+    /// may `DUP` an `operation` value and emit both copies (same
+    /// counter). They must not both apply — the second is rejected as an
+    /// internal-operation replay (L2-1637). This set is per-frame; it
+    /// catches `DUP` within one Michelson execution, while the monotonic
+    /// `counter` (threaded through the journal, L2-1676) is what keeps
+    /// distinct reentrant frames from ever colliding on an identity.
+    pub applied_counters: BTreeSet<u128>,
+    // 'level', 'now' and 'chain_id' should outlive operation in reality
+    // So having them downcast to 'operation is not a problem
+    pub level: &'operation BlockNumber,
+    pub now: &'operation Timestamp,
+    pub chain_id: &'operation ChainId,
+    /// Raw bytes of the source account's public key (from validation).
+    pub source_public_key: &'operation [u8],
+    pub crac_chain_depth: u32,
+    /// Originator of the inbound CRAC being serviced — carried in
+    /// `X-Tezos-Source` — or `None` for a top-level Michelson transaction.
+    /// May be `Contract::Originated(KT1)` (an EVM alias) or
+    /// `Contract::Implicit(pkh)` (a native Michelson implicit account that
+    /// re-enters Michelson via EVM). The gateway re-injects it (translated)
+    /// as the outbound `X-Tezos-Source` so `tx.origin` stays invariant
+    /// across an `EVM -> Michelson -> EVM` round-trip (L2-1363).
+    pub crac_origin: Option<Contract>,
+    /// Accumulator (in mutez) of storage costs delegated to this
+    /// frame by the CRACs it called.
+    pub delegated_storage_cost: u64,
+}
+
+pub struct ExecCtx {
+    pub sender: AddressHash,
+    pub amount: i64,
+    pub self_address: AddressHash,
+    pub balance: i64,
+    pub contract_account: TezosOriginatedAccount,
+}
+
+pub struct Ctx<'a, 'operation, 'host, Host: StorageV1 + KeySpaceLoader, R: Registry> {
+    pub tc_ctx: &'a mut TcCtx<'operation, 'host, Host>,
+    pub exec_ctx: ExecCtx,
+    pub operation_ctx: &'a mut OperationCtx<'operation>,
+    pub journal: &'a mut tezosx_journal::TezosXJournal,
+    pub registry: &'a R,
+    /// (address, index) pairs registered by INDEX_ADDRESS during this frame,
+    /// in registration order, emitted on the frame's receipt. Frame-scoped: a
+    /// fresh `Ctx` per internal operation keeps each frame's registrations
+    /// separate, and a reverted frame drops them with its `Ctx`.
+    pub address_registry_diff: Vec<AddressRegistry>,
+}
+
+pub struct BlockCtx<'block> {
+    pub level: &'block BlockNumber,
+    pub now: &'block Timestamp,
+    pub chain_id: &'block ChainId,
+    /// Internal operations already recorded in the block, used as the
+    /// cumulative base for L1's per-block internal-operation cap.
+    pub internal_operations_base: u128,
+    /// Whether the Debug tracer is active for this block. Gates per-operation
+    /// trace-subtree promotion (and its `store_has` probe) in
+    /// [validate_and_apply_operation]; when off, no trace data is written so
+    /// promotion is skipped entirely.
+    pub tracing_enabled: bool,
+    /// Whether HTTP-trace capture is enabled for this block. Gates per-operation
+    /// HTTP-trace promotion the same way.
+    pub http_trace_enabled: bool,
+}
+
+pub fn address_from_contract(contract: Contract) -> AddressHash {
+    match contract {
+        Contract::Originated(kt1) => AddressHash::Kt1(kt1),
+        Contract::Implicit(hash) => AddressHash::Implicit(hash),
+    }
+}
+
+impl ExecCtx {
+    pub fn create(
+        host: &mut impl StorageV1,
+        sender_account: &impl TezosAccount,
+        dest_account: &TezosOriginatedAccount,
+        amount: &Narith,
+    ) -> Result<Self, TransferError> {
+        let sender = address_from_contract(sender_account.contract());
+        let amount = amount.0.clone().try_into().map_err(
+            |err: num_bigint::TryFromBigIntError<num_bigint::BigUint>| {
+                TransferError::MirAmountToNarithError(err.to_string())
+            },
+        )?;
+        let self_address = address_from_contract(dest_account.contract());
+        let balance = dest_account
+            .balance(host)
+            .map_err(|_| TransferError::FailedToFetchSenderBalance)?;
+        let balance = balance.0.try_into().map_err(
+            |err: num_bigint::TryFromBigIntError<num_bigint::BigUint>| {
+                TransferError::MirAmountToNarithError(err.to_string())
+            },
+        )?;
+        let contract_account = dest_account.clone();
+        Ok(Self {
+            sender,
+            amount,
+            self_address,
+            balance,
+            contract_account,
+        })
+    }
+}
+
+impl<'a, 'host, Host: KeySpaceLoader + StorageV1> TypecheckingCtx<'a>
+    for TcCtx<'a, 'host, Host>
+{
+    fn gas(&mut self) -> &mut mir::gas::Gas {
+        &mut self.operation_gas.remaining
+    }
+
+    fn lookup_entrypoints(
+        &mut self,
+        address: &AddressHash,
+    ) -> Option<std::collections::HashMap<mir::ast::Entrypoint, mir::ast::Type>> {
+        get_contract_entrypoint(
+            self.rk.host(),
+            address,
+            &mut self.operation_gas.remaining,
+        )
+    }
+
+    fn big_map_get_type(
+        &mut self,
+        id: &BigMapId,
+    ) -> Result<Option<(Type, Type)>, LazyStorageError> {
+        let arena = Arena::new();
+        let key_type_key = key_type_key(id)?;
+        let value_type_key = value_type_key(id)?;
+
+        let Some(encoded_key_type) = self.rk.tez_accounts().get(&key_type_key) else {
+            return Ok(None);
+        };
+
+        let key_type = Micheline::decode_raw(
+            &arena,
+            &encoded_key_type,
+            &mut self.operation_gas.remaining,
+        )??
+        .parse_ty(self.gas())?;
+
+        let Some(encoded_value_type) = self.rk.tez_accounts().get(&value_type_key) else {
+            return Ok(None);
+        };
+        let value_type = Micheline::decode_raw(
+            &arena,
+            &encoded_value_type,
+            &mut self.operation_gas.remaining,
+        )??
+        .parse_ty(self.gas())?;
+
+        Ok(Some((key_type, value_type)))
+    }
+}
+
+impl<'a, Host: KeySpaceLoader + StorageV1, R: Registry> TypecheckingCtx<'a>
+    for Ctx<'_, '_, '_, Host, R>
+{
+    fn gas(&mut self) -> &mut mir::gas::Gas {
+        self.tc_ctx.gas()
+    }
+
+    fn lookup_entrypoints(
+        &mut self,
+        address: &AddressHash,
+    ) -> Option<std::collections::HashMap<mir::ast::Entrypoint, mir::ast::Type>> {
+        self.tc_ctx.lookup_entrypoints(address)
+    }
+
+    fn big_map_get_type(
+        &mut self,
+        id: &BigMapId,
+    ) -> Result<Option<(Type, Type)>, LazyStorageError> {
+        self.tc_ctx.big_map_get_type(id)
+    }
+}
+
+/// Collapse path and storage errors into the non-recoverable
+/// [`AddressRegistryError::HostError`].
+fn registry_error(e: impl std::fmt::Display) -> AddressRegistryError {
+    AddressRegistryError::HostError(e.to_string())
+}
+
+/// Seed the address registry: the null address takes index 0 and the counter
+/// (next free index) starts at 1, as on L1. Seeds exactly once — the counter's
+/// presence marks the registry as seeded, so a second call errors with
+/// [`AddressRegistryError::AlreadySeeded`] rather than overwriting it. Fresh
+/// networks seed at runtime activation; that is the only seeding point.
+///
+/// `tez_accounts` must be the keyspace rooted at `/tez/tez_accounts`: the
+/// registry keys are relative to it. Errors with
+/// [`AddressRegistryError::HostError`] if a keyspace write fails, or if a
+/// stored counter does not decode.
+pub fn init_address_registry(
+    tez_accounts: &mut impl KeySpace,
+) -> Result<(), AddressRegistryError> {
+    if let Some(counter) = tez_accounts
+        .read_nom::<Narith>(&address_registry::COUNTER_KEY)
+        .map_err(registry_error)?
+    {
+        return Err(AddressRegistryError::AlreadySeeded(counter.0));
+    }
+    let zero_entry =
+        address_registry::entry_key(&AddressHash::default()).map_err(registry_error)?;
+    tez_accounts
+        .store_bin(&zero_entry, &Narith(BigUint::from(0u32)))
+        .map_err(registry_error)?;
+    tez_accounts
+        .store_bin(&address_registry::COUNTER_KEY, &Narith(BigUint::from(1u32)))
+        .map_err(registry_error)?;
+    Ok(())
+}
+
+/// Returns the address registry counter, the next free index.
+///
+/// `tez_accounts` must be the `/tez/tez_accounts` keyspace. Errors with
+/// [`AddressRegistryError::HostError`] when the counter is absent or does
+/// not decode. The counter is absent in a registry that is not set up yet
+/// (see [`init_address_registry`]).
+pub fn read_address_counter(
+    tez_accounts: &impl KeySpace,
+) -> Result<BigUint, AddressRegistryError> {
+    Ok(tez_accounts
+        .read_nom::<Narith>(&address_registry::COUNTER_KEY)
+        .map_err(registry_error)?
+        .ok_or_else(|| {
+            registry_error(KeySpaceError::<StorageReadErrorKind>::read(
+                tez_accounts.name(),
+                &address_registry::COUNTER_KEY,
+                ReadKind::Ext(StorageReadErrorKind::NotFound),
+            ))
+        })?
+        .0)
+}
+
+impl<'a, Host: KeySpaceLoader + StorageV1, R: Registry> CtxTrait<'a>
+    for Ctx<'_, 'a, '_, Host, R>
+{
+    fn sender(&self) -> AddressHash {
+        self.exec_ctx.sender.clone()
+    }
+
+    fn source(&self) -> PublicKeyHash {
+        self.operation_ctx.source.pkh().clone()
+    }
+
+    fn amount(&self) -> i64 {
+        self.exec_ctx.amount
+    }
+
+    fn self_address(&self) -> AddressHash {
+        self.exec_ctx.self_address.clone()
+    }
+
+    fn balance(&self) -> i64 {
+        self.exec_ctx.balance
+    }
+
+    fn level(&self) -> BigUint {
+        self.operation_ctx.level.block_number.into()
+    }
+
+    fn min_block_time(&self) -> BigUint {
+        1u32.into()
+    }
+
+    fn chain_id(&self) -> mir::ast::ChainId {
+        self.operation_ctx.chain_id.clone()
+    }
+
+    fn voting_power(&self, _: &PublicKeyHash) -> BigUint {
+        0u32.into()
+    }
+
+    fn now(&self) -> BigInt {
+        i64::from(*self.operation_ctx.now).into()
+    }
+
+    fn total_voting_power(&self) -> BigUint {
+        1u32.into()
+    }
+
+    fn operation_group_hash(&self) -> &OperationHash {
+        self.journal.michelson.operation_hash()
+    }
+
+    fn origination_counter(&mut self) -> u32 {
+        // Claim from the journal — the operation's single origination
+        // nonce — so a native origination and one reached through an
+        // inbound CRAC never land on the same index. Use-then-increment
+        // like L1: the first CREATE_CONTRACT uses index 0.
+        self.journal.michelson.next_origination_index()
+    }
+
+    fn operation_counter(&mut self) -> u128 {
+        let c: &mut u128 = self.operation_ctx.counter;
+        let current = *c;
+        *c += 1;
+        current
+    }
+
+    fn lazy_storage(&mut self) -> Box<&mut dyn LazyStorage<'a>> {
+        Box::new(self.tc_ctx)
+    }
+
+    fn lookup_view_storage_balance(
+        &mut self,
+        contract: &ContractKt1Hash,
+        view_name: &str,
+        arena: &'a Arena<Micheline<'a>>,
+    ) -> Result<
+        Option<(
+            mir::typechecker::MichelineView<Micheline<'a>>,
+            Micheline<'a>,
+            Vec<u8>,
+            i64,
+        )>,
+        mir::context::LookupViewError,
+    > {
+        use mir::context::LookupViewError;
+        // `originated_from_kt1` only builds the key of the contract. It does
+        // not make sure that the contract exists. A failure here means that
+        // `originated_from_kt1` cannot build the key. This function reports
+        // the failure as a host error.
+        let account = crate::context::originated_from_kt1(contract)
+            .map_err(|e| LookupViewError::HostError(e.to_string()))?;
+        // L1 VIEW semantics push `None` when the target KT1 does not
+        // exist at all (cf. `script_interpreter.ml::iview`). Probe
+        // existence explicitly here — if we skipped this and went
+        // straight to `account.code(host)`, a never-originated KT1
+        // would error out on the missing `code` path and we would
+        // propagate that as a hard `HostError`, breaking parity with
+        // L1 for any contract doing
+        //   `VIEW addr "name"; IF_NONE { ... }`
+        // against a possibly-missing KT1.
+        if !account
+            .exists(self.tc_ctx.rk.host())
+            .map_err(|e| LookupViewError::HostError(e.to_string()))?
+        {
+            return Ok(None);
+        }
+        // The contract is originated past this point; any further
+        // failure (read, decode, balance overflow) means corruption or
+        // I/O on a known contract and must surface as an error rather
+        // than impersonate "view not found".
+        let serialized_script = account
+            .code(self.tc_ctx.rk.host())
+            .map_err(|e| LookupViewError::HostError(e.to_string()))?;
+        match serialized_script {
+            Code::Code(serialized_script) => {
+                let decoded = Micheline::decode_raw(
+                    arena,
+                    &serialized_script,
+                    &mut self.tc_ctx.operation_gas.remaining,
+                )??;
+                let MichelineContractScript {
+                    code: _,
+                    parameter_ty: _,
+                    storage_ty,
+                    views,
+                } = decoded.split_script()?;
+                let Some(view) = views.get(view_name) else {
+                    return Ok(None);
+                };
+                let owned_view = MichelineView {
+                    input_type: view.input_type.clone(),
+                    output_type: view.output_type.clone(),
+                    code: view.code.clone(),
+                };
+                let storage = account
+                    .storage(self.tc_ctx.rk.host())
+                    .map_err(|e| LookupViewError::HostError(e.to_string()))?;
+                let balance = account
+                    .balance(self.tc_ctx.rk.host())
+                    .map_err(|e| LookupViewError::HostError(e.to_string()))?;
+                let balance: i64 = balance
+                    .0
+                    .try_into()
+                    .map_err(|_| LookupViewError::BalanceOverflow)?;
+                Ok(Some((owned_view, storage_ty.clone(), storage, balance)))
+            }
+            Code::Enshrined(_) => {
+                // Current enshrined contracts have no views
+                Ok(None)
+            }
+        }
+    }
+
+    fn set_view_context(
+        &mut self,
+        self_address: AddressHash,
+        sender: AddressHash,
+        amount: i64,
+        balance: i64,
+    ) {
+        self.exec_ctx.self_address = self_address;
+        self.exec_ctx.sender = sender;
+        self.exec_ctx.amount = amount;
+        self.exec_ctx.balance = balance;
+    }
+
+    /// Synthesize the gateway's `staticcall_evm` view: when
+    /// `(kt1, name)` matches the TezosX gateway, that view name, and
+    /// the declared `return_type` is `bytes`, build the cross-runtime
+    /// GET to the EVM destination via
+    /// [`dispatch_staticcall_evm_view`](Ctx::dispatch_staticcall_evm_view).
+    /// Any mismatch (wrong KT1, return type, input shape) falls
+    /// through to the standard view-code dispatch by returning
+    /// `None`.
+    ///
+    /// The boundary cost (base + calldata + response payload, in
+    /// milligas) is charged here, mirroring the state-mutating
+    /// `%call_evm` entrypoint. The inner EVM execution cost
+    /// (gas the EVM target spent on its read) is charged by
+    /// `dispatch_staticcall_evm_get` via the
+    /// `X-Tezos-Gas-Consumed` response header.
+    fn try_dispatch_enshrined_view(
+        &mut self,
+        kt1: &ContractKt1Hash,
+        name: &str,
+        input: &TypedValue<'a>,
+        return_type: &Type,
+        // Reserved for future synthetic views that need to
+        // materialize Micheline values; the EVM bridge's output is
+        // a plain byte vector so the arena is unused here.
+        _arena: &'a typed_arena::Arena<Micheline<'a>>,
+    ) -> Option<Result<Option<TypedValue<'a>>, mir::interpreter::InterpretError<'a>>>
+    {
+        let contract = crate::enshrined_contracts::from_kt1(kt1)?;
+        // Gate on [`enshrined_synthetic_views`] so the off-chain
+        // `/script` synthesizer (which mirrors that enumeration) and
+        // the on-chain dispatch below stay in lockstep. An
+        // unenumerated name falls through to the standard view-code
+        // dispatch by returning `None`; an enumerated name that has
+        // no matching arm below trips `unreachable!()` —
+        // [`enshrined_synthetic_views_dispatch_in_sync`] exercises
+        // this for every enumerated view.
+        if !enshrined_synthetic_views(contract)
+            .iter()
+            .any(|(n, _, _)| *n == name)
+        {
+            return None;
+        }
+        match (contract, name) {
+            (
+                crate::enshrined_contracts::EnshrinedContracts::TezosXGateway,
+                "staticcall_evm",
+            ) => self.dispatch_staticcall_evm_view(input, return_type),
+            (
+                crate::enshrined_contracts::EnshrinedContracts::TezosXGateway,
+                "originOf",
+            ) => self.dispatch_origin_of_view(input, return_type),
+            (
+                crate::enshrined_contracts::EnshrinedContracts::TezosXGateway,
+                "resolveAddress",
+            ) => self.dispatch_resolve_address_view(input, return_type),
+            _ => unreachable!(
+                "synthetic view {name:?} on {contract:?} is enumerated in \
+                 enshrined_synthetic_views but has no dispatch arm in \
+                 try_dispatch_enshrined_view"
+            ),
+        }
+    }
+
+    /// Register an address or return its existing index. The entry and
+    /// counter writes are not individually atomic, but `SafeStorage` reverts
+    /// the whole batch on error, so partial writes cannot persist.
+    fn index_address(
+        &mut self,
+        address: &AddressHash,
+    ) -> Result<BigUint, AddressRegistryError> {
+        if let Some(index) = self.get_address_index(address)? {
+            return Ok(index);
+        }
+
+        // Charge for the whole chunk allocation, not only the counter
+        consume_storage_write_milligas(
+            self.tc_ctx.operation_gas,
+            1,
+            WASM_CHUNK_SIZE as u64,
+        )?;
+
+        let entry = address_registry::entry_key(address).map_err(registry_error)?;
+        let counter = read_address_counter(self.tc_ctx.rk.tez_accounts())?;
+        let current = Narith(counter);
+        self.tc_ctx
+            .rk
+            .tez_accounts_mut()
+            .store_bin(&entry, &current)
+            .map_err(registry_error)?;
+
+        self.tc_ctx
+            .rk
+            .tez_accounts_mut()
+            .store_bin(&address_registry::COUNTER_KEY, &Narith(&current.0 + 1u32))
+            .map_err(registry_error)?;
+        // Emit the (address, index) pair on the frame's receipt, like L1's
+        // address_registry_diff.
+        // Sr1 addresses consume an index but are skipped here: the receipt's
+        // `AddressRegistry.address` is a `Contract` (no smart-rollup case),
+        // whereas L1 types the diff with `Destination_repr.t`. Smart rollups
+        // cannot be originated from Michelson, but an sr1 address can still
+        // reach INDEX_ADDRESS as an `address` value.
+        // TODO: https://linear.app/tezos/issue/L2-1813
+        if let Ok(address) = contract_from_address(address.clone()) {
+            self.address_registry_diff.push(AddressRegistry {
+                address,
+                index: Zarith(current.0.clone().into()),
+            });
+        }
+        Ok(current.0)
+    }
+
+    fn get_address_index(
+        &mut self,
+        address: &AddressHash,
+    ) -> Result<Option<BigUint>, AddressRegistryError> {
+        let entry = address_registry::entry_key(address).map_err(registry_error)?;
+        consume_storage_read_milligas(self.tc_ctx.operation_gas, 1, COUNTER_SIZE)?;
+        Ok(self
+            .tc_ctx
+            .rk
+            .tez_accounts()
+            .read_nom::<Narith>(&entry)
+            .map_err(registry_error)?
+            .map(|n| n.0))
+    }
+}
+
+/// Enumeration of the synthetic views exposed by an enshrined
+/// contract, as `(view_name, parameter_type, return_type)` triples.
+///
+/// This is the **single source of truth**:
+/// [`CtxTrait::try_dispatch_enshrined_view`] gates on this list, so a
+/// name absent from it never reaches the dispatch match (the view is
+/// invisible to both off-chain `/script` consumers and the on-chain
+/// hook), while a name present here without a matching dispatch arm
+/// trips `unreachable!()` — see
+/// [`tests::enshrined_synthetic_views_dispatch_in_sync`], which
+/// exercises the hook for every enumerated view.
+///
+/// Returning a `Vec` (rather than a `&'static`) keeps the API simple
+/// for `Type` values, whose `Rc`-wrapped sub-types are not `const`.
+pub fn enshrined_synthetic_views(
+    contract: crate::enshrined_contracts::EnshrinedContracts,
+) -> Vec<(&'static str, Type, Type)> {
+    match contract {
+        crate::enshrined_contracts::EnshrinedContracts::TezosXGateway => vec![
+            // view "staticcall_evm" (pair string bytes) bytes
+            //   Cross-runtime GET to an EVM destination; the real
+            //   implementation lives in
+            //   [`Ctx::dispatch_staticcall_evm_view`]. The view body
+            //   in the synthesized script is `FAILWITH` — the
+            //   stub is for discoverability only.
+            (
+                "staticcall_evm",
+                Type::new_pair(Type::String, Type::Bytes),
+                Type::Bytes,
+            ),
+            // view "originOf" (pair string nat) (or unit (or nat (pair nat string)))
+            (
+                "originOf",
+                Type::new_pair(Type::String, Type::Nat),
+                Type::new_or(
+                    Type::Unit,
+                    Type::new_or(Type::Nat, Type::new_pair(Type::Nat, Type::String)),
+                ),
+            ),
+            // view "resolveAddress" (pair string (pair nat nat)) (option (pair nat string))
+            (
+                "resolveAddress",
+                Type::new_pair(Type::String, Type::new_pair(Type::Nat, Type::Nat)),
+                Type::new_option(Type::new_pair(Type::Nat, Type::String)),
+            ),
+        ],
+    }
+}
+
+impl<'a, Host: KeySpaceLoader + StorageV1, R: Registry> Ctx<'_, 'a, '_, Host, R> {
+    /// Body of the `originOf` arm of
+    /// [`try_dispatch_enshrined_view`](CtxTrait::try_dispatch_enshrined_view).
+    ///
+    /// Input shape: `pair string nat` — `(addr_str, source_runtime_nat)`.
+    /// Return type: `or unit (or nat (pair nat string))`.
+    ///
+    /// Gas: only `Registry::read_origin`'s `consumed` is charged (alias
+    /// lookup + optional EVM code-presence back-stop) via
+    /// `classify_origin_for_view`. No flat per-call constant —
+    /// see [`crate::enshrined_contracts::charge_gateway_base_cost`].
+    ///
+    /// On an invalid `source_runtime` nat, returns
+    /// `Err(InterpretError::FailedWith(...))` with the Michelson payload
+    /// `(Pair "INVALID_RUNTIME_ID" received_nat)` — standard Michelson
+    /// FAILWITH semantics, causing the operation to revert with that value.
+    fn dispatch_origin_of_view(
+        &mut self,
+        input: &TypedValue<'a>,
+        return_type: &Type,
+    ) -> Option<Result<Option<TypedValue<'a>>, mir::interpreter::InterpretError<'a>>>
+    {
+        // Return-type guard: `or unit (or nat (pair nat string))`.
+        if !matches!(
+            return_type,
+            Type::Or(rc) if matches!(
+                rc.as_ref(),
+                (Type::Unit, Type::Or(inner))
+                    if matches!(
+                        inner.as_ref(),
+                        (Type::Nat, Type::Pair(inner2))
+                            if matches!(inner2.as_ref(), (Type::Nat, Type::String))
+                    )
+            )
+        ) {
+            return Some(Ok(None));
+        }
+        // Input shape: `pair string nat`.
+        let (addr_str, source_runtime_nat) = match input {
+            TypedValue::Pair(a, b) => match (a.as_ref(), b.as_ref()) {
+                (TypedValue::String(a), TypedValue::Nat(b)) => (a.as_str(), b),
+                _ => return Some(Ok(None)),
+            },
+            _ => return Some(Ok(None)),
+        };
+        let result = crate::enshrined_contracts::dispatch_origin_of_get(
+            self.tc_ctx.rk,
+            self.tc_ctx.operation_gas,
+            self.registry,
+            addr_str,
+            source_runtime_nat,
+        );
+        Some(result.map(Some))
+    }
+
+    /// Body of the `resolveAddress` arm of
+    /// [`try_dispatch_enshrined_view`](CtxTrait::try_dispatch_enshrined_view).
+    ///
+    /// Input shape: `pair string (pair nat nat)` —
+    /// `(addr_str, (source_runtime_nat, target_runtime_nat))`.
+    /// Return type: `option (pair nat string)`.
+    ///
+    /// Same gas model as `originOf` plus derivation overhead when the
+    /// derivation path is taken.
+    fn dispatch_resolve_address_view(
+        &mut self,
+        input: &TypedValue<'a>,
+        return_type: &Type,
+    ) -> Option<Result<Option<TypedValue<'a>>, mir::interpreter::InterpretError<'a>>>
+    {
+        // Return-type guard: `option (pair nat string)`.
+        if !matches!(
+            return_type,
+            Type::Option(inner) if matches!(
+                inner.as_ref(),
+                Type::Pair(rc) if matches!(rc.as_ref(), (Type::Nat, Type::String))
+            )
+        ) {
+            return Some(Ok(None));
+        }
+        // Input shape: `pair string (pair nat nat)`.
+        let (addr_str, source_runtime_nat, target_runtime_nat) = match input {
+            TypedValue::Pair(a, b) => match (a.as_ref(), b.as_ref()) {
+                (TypedValue::String(a), TypedValue::Pair(s, t)) => {
+                    match (s.as_ref(), t.as_ref()) {
+                        (TypedValue::Nat(s), TypedValue::Nat(t)) => (a.as_str(), s, t),
+                        _ => return Some(Ok(None)),
+                    }
+                }
+                _ => return Some(Ok(None)),
+            },
+            _ => return Some(Ok(None)),
+        };
+        let result = crate::enshrined_contracts::dispatch_resolve_address_get(
+            self.tc_ctx.rk,
+            self.tc_ctx.operation_gas,
+            self.registry,
+            addr_str,
+            source_runtime_nat,
+            target_runtime_nat,
+        );
+        Some(result.map(Some))
+    }
+
+    /// Body of the `staticcall_evm` arm of
+    /// [`try_dispatch_enshrined_view`](CtxTrait::try_dispatch_enshrined_view).
+    /// Type-checks `return_type == bytes`, destructures the
+    /// `(string, bytes)` input, charges the boundary cost, then
+    /// dispatches through
+    /// [`crate::enshrined_contracts::dispatch_staticcall_evm_get`]
+    /// with `self.journal` and `self.registry`. The nested EVM callee's
+    /// `tx.origin` is resolved from the originator captured on the shared
+    /// journal, so it stays the outer EVM originator across the round-trip
+    /// regardless of any durable alias record.
+    fn dispatch_staticcall_evm_view(
+        &mut self,
+        input: &TypedValue<'a>,
+        return_type: &Type,
+    ) -> Option<Result<Option<TypedValue<'a>>, mir::interpreter::InterpretError<'a>>>
+    {
+        if !matches!(return_type, Type::Bytes) {
+            return Some(Ok(None));
+        }
+        let (destination, calldata) = match input {
+            TypedValue::Pair(d, c) => match (d.as_ref(), c.as_ref()) {
+                (TypedValue::String(d), TypedValue::Bytes(c)) => {
+                    (d.as_str(), c.as_slice())
+                }
+                _ => return Some(Ok(None)),
+            },
+            _ => return Some(Ok(None)),
+        };
+        // Destination validation is delegated to the EVM runtime's URL
+        // parser (`parse_ethereum_url`); empty / malformed destinations
+        // surface there as 4xx, which `dispatch_staticcall_evm_get`
+        // then maps to `Ok(None)`. Keeping a single source of truth.
+        let calling_kt1 = match &self.exec_ctx.self_address {
+            AddressHash::Kt1(kt1) => kt1.clone(),
+            _ => return Some(Ok(None)),
+        };
+        if crate::enshrined_contracts::charge_gateway_base_cost(self).is_err()
+            || crate::enshrined_contracts::charge_gateway_payload(self, calldata.len())
+                .is_err()
+        {
+            return Some(Err(mir::interpreter::InterpretError::OutOfGas));
+        }
+        let crac_id_str = self.journal.crac_id().to_string();
+        let timestamp_str = i64::from(*self.operation_ctx.now).to_string();
+        let block_number_str = u32::from(*self.operation_ctx.level).to_string();
+        // Distinct-field split borrows on `self`: `tc_ctx.rk`,
+        // `tc_ctx.operation_gas`, `journal`, `registry`. The dispatcher
+        // consumes them for the call only.
+        let rk: &mut RuntimeKeyspaces<'_, Host, Host::KeySpace> = &mut *self.tc_ctx.rk;
+        let operation_gas: &mut crate::gas::TezlinkOperationGas =
+            self.tc_ctx.operation_gas;
+        let crac_chain_depth = self.operation_ctx.crac_chain_depth;
+        let result = crate::enshrined_contracts::dispatch_staticcall_evm_get(
+            rk,
+            operation_gas,
+            self.registry,
+            self.journal,
+            &calling_kt1,
+            self.operation_ctx.source.pkh(),
+            &crac_id_str,
+            &timestamp_str,
+            &block_number_str,
+            crac_chain_depth,
+            destination,
+            calldata,
+        );
+        if let Ok(Some(ref bytes)) = result {
+            if crate::enshrined_contracts::charge_gateway_payload(self, bytes.len())
+                .is_err()
+            {
+                return Some(Err(mir::interpreter::InterpretError::OutOfGas));
+            }
+        }
+        match result {
+            Ok(Some(bytes)) => Some(Ok(Some(TypedValue::Bytes(bytes)))),
+            Ok(None) => Some(Ok(None)),
+            Err(e) => Some(Err(e)),
+        }
+    }
+}
+
+pub trait HasHost<Host> {
+    fn host(&mut self) -> &mut Host;
+}
+
+pub trait HasContractAccount {
+    fn contract_account(&self) -> &TezosOriginatedAccount;
+}
+
+pub trait HasOperationGas {
+    fn operation_gas(&mut self) -> &mut crate::gas::TezlinkOperationGas;
+}
+
+pub trait HasSourcePublicKey {
+    fn source_public_key(&self) -> &[u8];
+}
+
+pub trait HasCracChainDepth {
+    fn crac_chain_depth(&self) -> u32;
+
+    /// Originator of the inbound CRAC being serviced, if any.
+    /// See [`OperationCtx::crac_origin`].
+    fn crac_origin(&self) -> Option<Contract>;
+}
+
+/// Read and mutate the per-frame accumulator of storage costs
+/// delegated *to* this frame by its sub-executions. See
+/// [`OperationCtx::delegated_storage_cost`] for the semantics.
+pub trait HasDelegatedStorageCost {
+    fn delegated_storage_cost(&self) -> u64;
+
+    /// Increment the accumulator by `v` mutez.
+    fn add_delegated_storage_cost(&mut self, v: u64);
+}
+
+/// Read the runtime classification record for an address.
+/// Handles host and context access so callers can resolve
+/// cross-runtime aliases without separate borrows.
+pub trait HasOriginLookup {
+    fn read_origin_for_address(
+        &self,
+        address: &AddressHash,
+    ) -> Result<Option<tezosx_interfaces::Origin>, tezos_storage::error::Error>;
+}
+
+/// Access the per-operation CRAC journal.
+pub trait HasJournal {
+    fn journal(&mut self) -> &mut tezosx_journal::TezosXJournal;
+}
+
+/// Access the per-operation cross-runtime registry.
+pub trait HasRegistry {
+    type R: Registry;
+    fn registry(&self) -> &Self::R;
+}
+
+/// Atomically expose the storage handle, `journal`, and `registry` as a
+/// tuple of disjoint borrows on the same `ctx`. Required for the
+/// `registry.serve(rk, journal, request)` and
+/// `registry.ensure_alias(rk, journal, ...)` calls where the three
+/// fields must be live simultaneously — sequential `host()`,
+/// `journal()`, `registry()` trait method calls would each hold
+/// `&mut self` exclusively and conflict. Implementers construct the
+/// tuple via direct field access so the borrow checker accepts the
+/// distinct-field split.
+pub trait HasCrossRuntime<'host, Host: StorageV1, KS>: HasJournal + HasRegistry {
+    fn cross_runtime_split(
+        &mut self,
+    ) -> (
+        &mut RuntimeKeyspaces<'host, Host, KS>,
+        &mut tezosx_journal::TezosXJournal,
+        &<Self as HasRegistry>::R,
+    );
+}
+
+impl<'a, 'operation, 'host, Host: KeySpaceLoader + StorageV1, R: Registry>
+    HasContractAccount for Ctx<'a, 'operation, 'host, Host, R>
+{
+    fn contract_account(&self) -> &TezosOriginatedAccount {
+        &self.exec_ctx.contract_account
+    }
+}
+
+impl<'a, 'operation, 'host, Host: KeySpaceLoader + StorageV1, R: Registry> HasHost<Host>
+    for Ctx<'a, 'operation, 'host, Host, R>
+{
+    fn host(&mut self) -> &mut Host {
+        self.tc_ctx.rk.host_mut()
+    }
+}
+
+impl<'a, 'operation, 'host, Host: KeySpaceLoader + StorageV1, R: Registry> HasOriginLookup
+    for Ctx<'a, 'operation, 'host, Host, R>
+{
+    fn read_origin_for_address(
+        &self,
+        address: &AddressHash,
+    ) -> Result<Option<tezosx_interfaces::Origin>, tezos_storage::error::Error> {
+        crate::context::read_origin_for_address(self.tc_ctx.rk.host(), address)
+    }
+}
+
+impl<'a, 'operation, 'host, Host: KeySpaceLoader + StorageV1, R: Registry> HasJournal
+    for Ctx<'a, 'operation, 'host, Host, R>
+{
+    fn journal(&mut self) -> &mut tezosx_journal::TezosXJournal {
+        self.journal
+    }
+}
+
+impl<'a, 'operation, 'host, Host: KeySpaceLoader + StorageV1, R: Registry> HasRegistry
+    for Ctx<'a, 'operation, 'host, Host, R>
+{
+    type R = R;
+    fn registry(&self) -> &Self::R {
+        self.registry
+    }
+}
+
+impl<'a, 'operation, 'host, Host: KeySpaceLoader + StorageV1, R: Registry>
+    HasCrossRuntime<'host, Host, Host::KeySpace> for Ctx<'a, 'operation, 'host, Host, R>
+{
+    fn cross_runtime_split(
+        &mut self,
+    ) -> (
+        &mut RuntimeKeyspaces<'host, Host, Host::KeySpace>,
+        &mut tezosx_journal::TezosXJournal,
+        &R,
+    ) {
+        (&mut *self.tc_ctx.rk, self.journal, self.registry)
+    }
+}
+
+impl<'operation, 'host, Host: KeySpaceLoader + StorageV1> HasOriginLookup
+    for TcCtx<'operation, 'host, Host>
+{
+    fn read_origin_for_address(
+        &self,
+        address: &AddressHash,
+    ) -> Result<Option<tezosx_interfaces::Origin>, tezos_storage::error::Error> {
+        crate::context::read_origin_for_address(self.rk.host(), address)
+    }
+}
+
+impl<Host: KeySpaceLoader + StorageV1, R: Registry> HasOperationGas
+    for Ctx<'_, '_, '_, Host, R>
+{
+    fn operation_gas(&mut self) -> &mut crate::gas::TezlinkOperationGas {
+        self.tc_ctx.operation_gas
+    }
+}
+
+impl<Host: KeySpaceLoader + StorageV1, R: Registry> HasSourcePublicKey
+    for Ctx<'_, '_, '_, Host, R>
+{
+    fn source_public_key(&self) -> &[u8] {
+        self.operation_ctx.source_public_key
+    }
+}
+
+impl<Host: KeySpaceLoader + StorageV1, R: Registry> HasCracChainDepth
+    for Ctx<'_, '_, '_, Host, R>
+{
+    fn crac_chain_depth(&self) -> u32 {
+        self.operation_ctx.crac_chain_depth
+    }
+
+    fn crac_origin(&self) -> Option<Contract> {
+        self.operation_ctx.crac_origin.clone()
+    }
+}
+
+impl<Host: KeySpaceLoader + StorageV1, R: Registry> HasDelegatedStorageCost
+    for Ctx<'_, '_, '_, Host, R>
+{
+    fn delegated_storage_cost(&self) -> u64 {
+        self.operation_ctx.delegated_storage_cost
+    }
+
+    fn add_delegated_storage_cost(&mut self, v: u64) {
+        // Saturating is safe: exceeding `HARD_STORAGE_LIMIT_PER_OPERATION`
+        // makes the operation fail with `OperationQuotaExceeded`.
+        self.operation_ctx.delegated_storage_cost =
+            self.operation_ctx.delegated_storage_cost.saturating_add(v);
+    }
+}
+
+impl<Host: KeySpaceLoader + StorageV1> TcCtx<'_, '_, Host> {
+    /// Insert in the context a big_map diff that represents an allocation
+    fn big_map_diff_alloc(&mut self, id: Zarith, key_type: Vec<u8>, value_type: Vec<u8>) {
+        let allocation = StorageDiff::Alloc(Alloc {
+            updates: vec![],
+            key_type,
+            value_type,
+        });
+        self.big_map_diff.insert(id, allocation);
+    }
+
+    /// Insert in the context a big_map diff that represents an update
+    fn big_map_diff_update(
+        &mut self,
+        id: &Zarith,
+        key_hash: ScriptExprHash,
+        key: Vec<u8>,
+        value: Option<Vec<u8>>,
+    ) {
+        let update = Update {
+            key_hash,
+            key,
+            value,
+        };
+        match self.big_map_diff.get_mut(id) {
+            None => {
+                self.big_map_diff
+                    .insert(id.clone(), StorageDiff::Update(vec![update]));
+            }
+            Some(diff) => diff.push_update(update),
+        }
+    }
+
+    /// Insert in the context a big_map diff that represents a remove
+    fn big_map_diff_remove(&mut self, id: Zarith) {
+        self.big_map_diff.insert(id, StorageDiff::Remove);
+    }
+
+    /// Insert in the context a big_map diff that represents a copy
+    fn big_map_diff_copy(&mut self, id: Zarith, source: Zarith) {
+        self.big_map_diff.insert(
+            id,
+            StorageDiff::Copy(Copy {
+                source,
+                updates: vec![],
+            }),
+        );
+    }
+
+    fn generate_id(&mut self, temporary: bool) -> Result<BigMapId, LazyStorageError> {
+        if temporary {
+            Ok(self.temporary_big_map_id_allocator.allocate().into())
+        } else {
+            let id: BigMapId = self
+                .rk
+                .tez_accounts()
+                .read_nom_or(&NEXT_ID_KEY, 0.into())
+                .map_err(|e| LazyStorageError::NomReadError(e.to_string()))?;
+            self.rk
+                .tez_accounts_mut()
+                .store_bin(&NEXT_ID_KEY, &id.succ())
+                .map_err(storage_error_to_lazy)?;
+            Ok(id)
+        }
+    }
+}
+
+fn remove_big_map<Host: StorageV1>(
+    host: &mut Host,
+    id: &BigMapId,
+) -> Result<(), LazyStorageError> {
+    // The keyspace cannot delete every key under a path, so this uses the raw host.
+    host.store_delete(&big_map_path(id)?)?;
+
+    Ok(())
+}
+
+/// Remove every temporary big map `allocator` handed out.
+///
+/// To be called once the last frame allowed to reach those big maps is over,
+/// otherwise a big map still in use further down the execution path gets
+/// cleared. Takes the allocator itself, so the range covered can only be the
+/// temporary IDs: they run from -1 down to the last one it handed out.
+pub fn clear_temporary_big_maps<Host: StorageV1>(
+    host: &mut Host,
+    allocator: &TemporaryBigMapIdAllocator,
+) -> Result<(), LazyStorageError> {
+    for id in (allocator.last_allocated()..0).rev() {
+        let id: BigMapId = id.into();
+        // An ID can have no storage: the frame that allocated it may have
+        // reverted, and the counter does not roll back with it.
+        match remove_big_map(host, &id) {
+            Ok(()) | Err(LazyStorageError::RuntimeError(RuntimeError::PathNotFound)) => {}
+            Err(err) => return Err(err),
+        }
+    }
+    Ok(())
+}
+
+/// Hashes a Micheline expression using the packed format (with 0x05 prefix)
+/// to match L1's Script_expr_hash.
+/// See: https://gitlab.com/tezos/tezos/-/blob/master/src/proto_023_PtSeouLo/lib_protocol/script_ir_translator.ml#L159
+fn hash_micheline_expr(
+    expr: &Micheline<'_>,
+    gas: &mut mir::gas::Gas,
+) -> Result<ScriptExprHash, LazyStorageError> {
+    let bytes = expr.encode_for_pack()??;
+    // L1 charges the key hash via `hash_comparable_data` -> `hash_bytes`
+    // (`Cost_of.Interpreter.blake2b`). Charge MIR's blake2b model on the
+    // packed key bytes (same model as L1, with the values re-benchmarked by
+    // the re-pricing series, so not the protocol's current cost_N_IBlake2b).
+    let cost = interpret_cost::blake2b(&bytes)
+        .map_err(|_| LazyStorageError::OutOfGasError(OutOfGas))?;
+    gas.consume(cost)?;
+    Ok(digest_256(&bytes).into())
+}
+
+/// Converts a storage failure into a [`LazyStorageError::BinWriteError`]
+/// that holds its message.
+///
+/// [`LazyStorageError`] has no `From` impl for this conversion, because it
+/// belongs to `mir`, and `mir` does not depend on `tezos-storage-latest`.
+fn storage_error_to_lazy(e: impl Into<tezos_storage::error::Error>) -> LazyStorageError {
+    LazyStorageError::BinWriteError(std::rc::Rc::new(
+        tezos_data_encoding::enc::BinError::custom(e.into().to_string()),
+    ))
+}
+
+/// Charge for and read a big_map entry value, returning `None` when absent.
+fn read_big_map_value_metered(
+    operation_gas: &mut crate::gas::TezlinkOperationGas,
+    tez_accounts: &impl KeySpace,
+    key: &Key,
+) -> Result<Option<Vec<u8>>, LazyStorageError> {
+    consume_storage_read_milligas(operation_gas, 1, 0)?; // mem
+    let Some(size) = tez_accounts.value_length(key) else {
+        return Ok(None);
+    };
+    consume_storage_read_milligas(operation_gas, 1, size as u64)?; // get
+    Ok(tez_accounts.get(key))
+}
+
+/// Computes the hash of a big_map key (TypedValue), used for storage path
+/// See [hash_micheline_expr] for details on the hashing format.
+fn hash_key(
+    key: TypedValue<'_>,
+    gas: &mut Gas,
+) -> Result<ScriptExprHash, LazyStorageError> {
+    let parser = Parser::new();
+    let key_micheline = key.into_micheline_optimized_legacy(&parser.arena, gas)?;
+    hash_micheline_expr(&key_micheline, gas)
+}
+
+/// Sort a diff's per-key updates by `key_hash` (`Script_expr_hash`) descending,
+/// matching L1's `Big_map_overlay` fold (`script_ir_translator.ml`).
+fn sort_updates_by_key_hash_desc(storage_diff: &mut StorageDiff) {
+    let updates = match storage_diff {
+        StorageDiff::Update(updates) => updates,
+        StorageDiff::Alloc(alloc) => &mut alloc.updates,
+        StorageDiff::Copy(copy) => &mut copy.updates,
+        StorageDiff::Remove => return,
+    };
+    updates.sort_by(|a, b| {
+        let a: &[u8] = a.key_hash.as_ref();
+        let b: &[u8] = b.key_hash.as_ref();
+        b.cmp(a)
+    });
+}
+
+/// Build an operation's `lazy_storage_diff` receipt in L1's order
+/// (`extract_lazy_storage_diff`): removals first (id descending), then
+/// alloc/update/copy in the reverse of `visit_order` (the dump-walk AST order),
+/// each map's updates key_hash descending (L2-1735).
+pub fn convert_big_map_diff(
+    mut big_map_diff: BTreeMap<Zarith, StorageDiff>,
+    visit_order: Vec<Zarith>,
+) -> Option<LazyStorageDiffList> {
+    if big_map_diff.is_empty() {
+        return None;
+    }
+    let mut alive = vec![];
+    for id in visit_order.into_iter().rev() {
+        let Some(mut storage_diff) = big_map_diff.remove(&id) else {
+            continue;
+        };
+        if matches!(storage_diff, StorageDiff::Remove) {
+            big_map_diff.insert(id, storage_diff);
+            continue;
+        }
+        sort_updates_by_key_hash_desc(&mut storage_diff);
+        alive.push(LazyStorageDiff::BigMap(BigMapDiff { id, storage_diff }));
+    }
+    // Remaining ids are the never-visited dead-id `Remove` set (leading, id
+    // descending); a stray unvisited alive entry only trails defensively.
+    let mut removes = vec![];
+    let mut leftover = vec![];
+    for (id, mut storage_diff) in big_map_diff.into_iter().rev() {
+        if matches!(storage_diff, StorageDiff::Remove) {
+            removes.push(LazyStorageDiff::BigMap(BigMapDiff { id, storage_diff }));
+        } else {
+            sort_updates_by_key_hash_desc(&mut storage_diff);
+            leftover.push(LazyStorageDiff::BigMap(BigMapDiff { id, storage_diff }));
+        }
+    }
+    let mut diff = removes;
+    diff.extend(alive);
+    diff.extend(leftover);
+    Some(LazyStorageDiffList { diff })
+}
+
+/// Flat per-entry forfait L1 charges to cover the on-disk cost of
+/// indexing a big-map entry.
+///
+/// Value from `src/proto_023_PtSeouLo/lib_protocol/lazy_storage_diff.ml`.
+const BYTES_SIZE_FOR_BIG_MAP_KEY: u64 = 65;
+
+/// Flat per-big-map forfait L1 charges to cover the on-disk cost of
+/// the big-map slot itself (independent of entries).
+///
+/// Value from `src/proto_023_PtSeouLo/lib_protocol/lazy_storage_diff.ml`.
+const BYTES_SIZE_FOR_EMPTY: u64 = 33;
+
+/// Read the `total_bytes` counter persisted for a big-map.
+fn total_bytes(
+    tez_accounts: &impl KeySpace,
+    id: &BigMapId,
+) -> Result<Zarith, LazyStorageError> {
+    let key = total_bytes_key(id)?;
+    match tez_accounts.read_nom::<Zarith>(&key) {
+        Ok(Some(total)) => Ok(total),
+        Ok(None) => Err(LazyStorageError::MissingTotalBytes(id.clone())),
+        Err(e) => Err(LazyStorageError::NomReadError(e.to_string())),
+    }
+}
+
+/// Write the `total_bytes` counter persisted for a big-map.
+fn set_total_bytes(
+    tez_accounts: &mut impl KeySpace,
+    id: &BigMapId,
+    value: &Zarith,
+) -> Result<(), LazyStorageError> {
+    let key = total_bytes_key(id)?;
+    tez_accounts
+        .store_bin(&key, value)
+        .map_err(storage_error_to_lazy)?;
+    Ok(())
+}
+
+impl<'a, 'host, Host: KeySpaceLoader + StorageV1> LazyStorage<'a>
+    for TcCtx<'a, 'host, Host>
+{
+    /// The kernel's metered implementation: this is the one that has to bite,
+    /// since the end-of-execution walk runs here over an attacker-shaped value
+    /// inside a 4 GiB heap and against the PVM's tick ceiling.
+    fn consume_gas(&mut self, milligas: u32) -> Result<(), LazyStorageError> {
+        Ok(self.gas().consume(milligas)?)
+    }
+
+    fn big_map_get(
+        &mut self,
+        arena: &'a Arena<Micheline<'a>>,
+        id: &BigMapId,
+        key: &TypedValue,
+        value_type: &Type,
+    ) -> Result<Option<TypedValue<'a>>, LazyStorageError> {
+        let value_key = value_key(id, &hash_key(key.clone(), self.gas())?)?;
+        let Some(encoded_value) = read_big_map_value_metered(
+            self.operation_gas,
+            self.rk.tez_accounts(),
+            &value_key,
+        )?
+        else {
+            return Ok(None);
+        };
+
+        let value = Micheline::decode_raw(
+            arena,
+            &encoded_value,
+            &mut self.operation_gas.remaining,
+        )??;
+        // The value comes from the contract's own committed big_map, so it may
+        // legitimately reference lazy-storage ids it owns.
+        Ok(Some(typecheck_value(
+            &value,
+            self,
+            value_type,
+            AllowForgedLazyStorageId::Yes,
+        )?))
+    }
+
+    fn big_map_mem(
+        &mut self,
+        id: &BigMapId,
+        key: &TypedValue,
+    ) -> Result<bool, LazyStorageError> {
+        let key_hashed = hash_key(key.clone(), self.gas())?;
+        let key = value_key(id, &key_hashed)?;
+        // Mirrors L1's carbonated `Big_map.Contents.mem`.
+        consume_storage_read_milligas(self.operation_gas, 1, 0)?;
+        Ok(self.rk.tez_accounts().contains(&key))
+    }
+
+    fn big_map_update_ref(
+        &mut self,
+        id: &BigMapId,
+        key: &TypedValue<'a>,
+        value: Option<&TypedValue<'a>>,
+    ) -> Result<Zarith, LazyStorageError> {
+        let parser = Parser::new();
+        let micheline_expr = key.clone_into_micheline_optimized_legacy(
+            &parser.arena,
+            self.gas(),
+            Some(TypeProperty::Comparable),
+        )?;
+        // key_encoded: raw Micheline encoding (no 0x05 prefix), used in big_map_diff receipts
+        let key_encoded = micheline_expr.encode(&mut self.operation_gas.remaining)??;
+        // key_hashed: hash of packed encoding (with 0x05 prefix), used for storage path
+        // See: https://gitlab.com/tezos/tezos/-/blob/master/src/proto_023_PtSeouLo/lib_protocol/script_ir_translator.ml#L5563
+        let key_hashed = hash_micheline_expr(&micheline_expr, self.gas())?;
+        let value_key = value_key(id, &key_hashed)?;
+        match value {
+            None => {
+                consume_storage_write_milligas(self.operation_gas, 1, 0)?;
+                let mut lazy_storage_size_diff = Zarith(BigInt::from(0));
+                if let Some(previous_value_size) =
+                    self.rk.tez_accounts().value_length(&value_key)
+                {
+                    let previous_value_size: BigInt = previous_value_size.into();
+                    self.rk.tez_accounts_mut().delete(&value_key);
+
+                    lazy_storage_size_diff = Zarith(
+                        -(BigInt::from(BYTES_SIZE_FOR_BIG_MAP_KEY) + previous_value_size),
+                    );
+                    self.interpret_context
+                        .record_lazy_storage_size_diff(id, &lazy_storage_size_diff);
+                }
+
+                // Write the update in the big_map_diff
+                self.big_map_diff_update(&id.value, key_hashed, key_encoded, None);
+                Ok(lazy_storage_size_diff)
+            }
+            Some(v) => {
+                let arena = Arena::new();
+                let encoded = v
+                    .clone_into_micheline_optimized_legacy(
+                        &arena,
+                        self.gas(),
+                        Some(TypeProperty::BigMapValue),
+                    )?
+                    .encode(&mut self.operation_gas.remaining)??;
+                let new_value_size: BigInt = encoded.len().into();
+                let lazy_storage_size_diff =
+                    match self.rk.tez_accounts().value_length(&value_key) {
+                        None => Zarith(BYTES_SIZE_FOR_BIG_MAP_KEY + new_value_size),
+                        Some(previous_value_size) => {
+                            let previous_value_size: BigInt = previous_value_size.into();
+                            Zarith(new_value_size - previous_value_size)
+                        }
+                    };
+                self.interpret_context
+                    .record_lazy_storage_size_diff(id, &lazy_storage_size_diff);
+
+                // The entry value is L1's carbonated `Big_map.Contents`.
+                consume_storage_write_milligas(
+                    self.operation_gas,
+                    1,
+                    encoded.len() as u64,
+                )?;
+                self.rk
+                    .tez_accounts_mut()
+                    .set(&value_key, &encoded)
+                    .map_err(storage_error_to_lazy)?;
+
+                // Write the update in the big_map_diff
+                self.big_map_diff_update(
+                    &id.value,
+                    key_hashed,
+                    key_encoded,
+                    Some(encoded),
+                );
+                Ok(lazy_storage_size_diff)
+            }
+        }
+    }
+
+    /// One read-modify-write of the counter per big map per batch, matching
+    /// L1's `Lazy_storage_diff.apply_updates` — which also skips the
+    /// round-trip entirely when the batch nets to zero.
+    fn big_map_add_total_bytes(
+        &mut self,
+        id: &BigMapId,
+        delta: &Zarith,
+    ) -> Result<(), LazyStorageError> {
+        if delta.0.is_zero() {
+            return Ok(());
+        }
+        let current = total_bytes(self.rk.tez_accounts(), id)?;
+        set_total_bytes(
+            self.rk.tez_accounts_mut(),
+            id,
+            &Zarith(current.0 + &delta.0),
+        )
+    }
+
+    fn big_map_new(
+        &mut self,
+        key_type: &Type,
+        value_type: &Type,
+        temporary: bool,
+    ) -> Result<BigMapId, LazyStorageError> {
+        let arena = Arena::new();
+        let id = self.generate_id(temporary)?;
+        let key_type_key = key_type_key(&id)?;
+        let value_type_key = value_type_key(&id)?;
+        let key_type_encoded = key_type
+            .into_micheline_optimized_legacy(&arena, self.gas())?
+            .encode(&mut self.operation_gas.remaining)??;
+        let value_type_encoded = value_type
+            .into_micheline_optimized_legacy(&arena, self.gas())?
+            .encode(&mut self.operation_gas.remaining)??;
+        self.rk
+            .tez_accounts_mut()
+            .set(&value_type_key, &value_type_encoded)
+            .map_err(storage_error_to_lazy)?;
+        self.rk
+            .tez_accounts_mut()
+            .set(&key_type_key, &key_type_encoded)
+            .map_err(storage_error_to_lazy)?;
+        set_total_bytes(self.rk.tez_accounts_mut(), &id, &Zarith(BigInt::from(0)))?;
+
+        self.interpret_context.record_lazy_storage_size_diff(
+            &id,
+            &Zarith(BigInt::from(BYTES_SIZE_FOR_EMPTY)),
+        );
+
+        // Write in the diff that there was an allocation
+        self.big_map_diff_alloc(id.value.clone(), key_type_encoded, value_type_encoded);
+        Ok(id)
+    }
+
+    fn big_map_copy(
+        &mut self,
+        id: &BigMapId,
+        temporary: bool,
+    ) -> Result<BigMapId, LazyStorageError> {
+        let dest_id = self.generate_id(temporary)?;
+
+        let src_path = big_map_path(id)?;
+        let dest_path = big_map_path(&dest_id)?;
+
+        // The copy is paid for in *storage burn*, via the `total_bytes(src) + bytes_size_for_empty`
+        // returned by `apply_init`
+        let source_total_bytes = total_bytes(self.rk.tez_accounts(), id)?;
+
+        // The keyspace cannot copy every key under a path, so this uses the raw host.
+        self.rk.host_mut().store_copy(&src_path, &dest_path)?;
+
+        self.interpret_context.record_lazy_storage_size_diff(
+            &dest_id,
+            &Zarith(BigInt::from(BYTES_SIZE_FOR_EMPTY) + source_total_bytes.0),
+        );
+
+        // Write in the diff that there was a copy
+        self.big_map_diff_copy(dest_id.value.clone(), id.value.clone());
+
+        // Kept-and-copied permanent source: keep an (empty) update entry for
+        // the original so it still appears in the receipt, as on L1 (L2-1735).
+        if !temporary && !id.is_temporary() {
+            self.big_map_diff
+                .entry(id.value.clone())
+                .or_insert(StorageDiff::Update(vec![]));
+        }
+        Ok(dest_id)
+    }
+
+    fn big_map_remove(&mut self, id: &BigMapId) -> Result<(), LazyStorageError> {
+        let total = total_bytes(self.rk.tez_accounts(), id)?;
+        self.interpret_context.record_lazy_storage_size_diff(
+            id,
+            &Zarith(-(BigInt::from(BYTES_SIZE_FOR_EMPTY) + total.0)),
+        );
+        remove_big_map(self.rk.host_mut(), id)?;
+
+        // Write in the diff that there was a remove
+        self.big_map_diff_remove(id.value.clone());
+
+        Ok(())
+    }
+
+    fn record_diff_order(&mut self, id: &BigMapId) {
+        self.interpret_context.record_big_map_diff_order(&id.value);
+    }
+}
+
+#[cfg(test)]
+pub mod tests {
+    use tezos_evm_runtime::runtime::MockKernelHost;
+    use tezosx_journal::TezosXHashes;
+
+    use super::*;
+    use crate::gas::TezlinkOperationGas;
+    use mir::ast::big_map::{
+        apply_deferred_big_map_updates, dump_big_map_updates, dump_big_map_walk,
+        remove_unreferenced_big_maps, BigMap, BigMapContent, BigMapFromId, BigMapId,
+    };
+    use mir::ast::{RcTypedValue, Type};
+    use rpds::RedBlackTreeMap;
+
+    fn in_memory_entries<'a>(
+        entries: impl IntoIterator<Item = (TypedValue<'a>, TypedValue<'a>)>,
+    ) -> RedBlackTreeMap<RcTypedValue<'a>, RcTypedValue<'a>> {
+        entries
+            .into_iter()
+            .map(|(k, v)| (RcTypedValue::new(k), RcTypedValue::new(v)))
+            .collect()
+    }
+
+    fn overlay_entries<'a>(
+        entries: impl IntoIterator<Item = (TypedValue<'a>, Option<TypedValue<'a>>)>,
+    ) -> RedBlackTreeMap<RcTypedValue<'a>, Option<RcTypedValue<'a>>> {
+        entries
+            .into_iter()
+            .map(|(k, v)| (RcTypedValue::new(k), v.map(RcTypedValue::new)))
+            .collect()
+    }
+    use std::collections::{BTreeMap, BTreeSet};
+
+    /// Take a big map back out of a dump root without moving out of the
+    /// `Drop`-implementing [TypedValue] (which the compiler forbids): swap an
+    /// empty placeholder in via `&mut`.
+    fn take_big_map<'a>(root: &mut TypedValue<'a>) -> BigMap<'a> {
+        match root {
+            TypedValue::BigMap(m) => {
+                std::mem::replace(m, BigMap::empty(Type::Unit, Type::Unit))
+            }
+            other => panic!("expected BigMap, got {other:?}"),
+        }
+    }
+
+    /// Dump a single standalone big map through [dump_big_map_updates] by
+    /// wrapping it in a value, then unwrap the mutated map back out.
+    fn dump_one<'a, Host: KeySpaceLoader + StorageV1>(
+        ctx: &mut TcCtx<'a, '_, Host>,
+        started: &[BigMapId],
+        map: BigMap<'a>,
+    ) -> BigMap<'a> {
+        let mut root = TypedValue::BigMap(map);
+        dump_big_map_updates(ctx, started, &mut root, false).unwrap();
+        take_big_map(&mut root)
+    }
+
+    #[macro_export]
+    macro_rules! make_default_ctx {
+        ($ctx:ident, $rk:ident) => {
+            $crate::make_default_ctx!(
+                $ctx,
+                $rk,
+                tezosx_journal::TemporaryBigMapIdAllocator::new()
+            );
+        };
+        // Third form for the frames of one operation, which share its allocator.
+        ($ctx:ident, $rk:ident, $temporary_big_map_id_allocator:expr) => {
+            let mut operation_gas = TezlinkOperationGas::default();
+            let mut $ctx = TcCtx {
+                rk: &mut $rk,
+                operation_gas: &mut operation_gas,
+                big_map_diff: BTreeMap::new(),
+                interpret_context: $crate::mir_ctx::InterpretContext::new(),
+                temporary_big_map_id_allocator: $temporary_big_map_id_allocator,
+            };
+        };
+    }
+
+    #[track_caller]
+    fn check_is_dumped_map(map: BigMap, id: BigMapId) {
+        match map.content {
+            BigMapContent::InMemory(_) => panic!("Big map has not been dumped"),
+            BigMapContent::FromId(map) => {
+                assert_eq!((map.id, map.overlay), (id, RedBlackTreeMap::new()))
+            }
+        };
+    }
+
+    pub fn assert_big_map_eq<'a, Host: KeySpaceLoader + StorageV1>(
+        ctx: &mut TcCtx<'a, '_, Host>,
+        arena: &'a Arena<Micheline<'a>>,
+        id: &BigMapId,
+        key_type: Type,
+        value_type: Type,
+        content: BTreeMap<TypedValue<'a>, TypedValue<'a>>,
+    ) {
+        let (stored_key_type, stored_value_type) = ctx
+            .big_map_get_type(id)
+            .expect("Failed to read key and value types from storage")
+            .expect("Big map should be present in storage");
+
+        assert_eq!(stored_key_type, key_type);
+        assert_eq!(stored_value_type, value_type);
+
+        for (key, value) in &content {
+            let stored_value = ctx
+                .big_map_get(arena, id, key, &value_type)
+                .expect("Failed to read value from storage")
+                .expect("Key should be present in storage");
+            assert_eq!(&stored_value, value);
+        }
+    }
+
+    fn assert_big_map_removed<'a, Host: KeySpaceLoader + StorageV1>(
+        ctx: &TcCtx<'a, '_, Host>,
+        id: &BigMapId,
+    ) {
+        let key_type_key = key_type_key(id).unwrap();
+        assert!(
+            !ctx.rk.tez_accounts().contains(&key_type_key),
+            "Key type should have been removed",
+        );
+
+        let value_type_key = value_type_key(id).unwrap();
+        assert!(
+            !ctx.rk.tez_accounts().contains(&value_type_key),
+            "Value type should have been removed",
+        );
+    }
+
+    #[test]
+    fn test_map_from_memory() {
+        let mut host = MockKernelHost::default();
+        let mut rk = RuntimeKeyspaces::init(&mut host).unwrap();
+        make_default_ctx!(storage, rk);
+        let content = BTreeMap::from([
+            (TypedValue::int(1), TypedValue::String("one".into())),
+            (TypedValue::int(2), TypedValue::String("two".into())),
+        ]);
+
+        let map = BigMap {
+            content: BigMapContent::InMemory(in_memory_entries(content.clone())),
+            key_type: Type::Int,
+            value_type: Type::String,
+        };
+        let map = dump_one(&mut storage, &[], map);
+
+        check_is_dumped_map(map, 0.into());
+
+        assert_big_map_eq(
+            &mut storage,
+            &Arena::new(),
+            &0.into(),
+            Type::Int,
+            Type::String,
+            content,
+        );
+    }
+
+    #[test]
+    fn test_map_updates_to_storage() {
+        let mut host = MockKernelHost::default();
+        let mut rk = RuntimeKeyspaces::init(&mut host).unwrap();
+        make_default_ctx!(storage, rk);
+        let map_id = storage
+            .big_map_new(&Type::Int, &Type::String, false)
+            .unwrap();
+        storage
+            .big_map_update(
+                &map_id,
+                TypedValue::int(1),
+                Some(TypedValue::String("a".into())),
+            )
+            .unwrap();
+        storage
+            .big_map_update(
+                &map_id,
+                TypedValue::int(2),
+                Some(TypedValue::String("b".into())),
+            )
+            .unwrap();
+        storage
+            .big_map_update(
+                &map_id,
+                TypedValue::int(3),
+                Some(TypedValue::String("c".into())),
+            )
+            .unwrap();
+
+        storage
+            .big_map_update(&map_id, TypedValue::int(2), None)
+            .unwrap();
+        storage
+            .big_map_update(
+                &map_id,
+                TypedValue::int(3),
+                Some(TypedValue::String("gamma".into())),
+            )
+            .unwrap();
+
+        let expected_content = BTreeMap::from([
+            (TypedValue::int(1), TypedValue::String("a".into())),
+            (TypedValue::int(3), TypedValue::String("gamma".into())),
+        ]);
+
+        assert_big_map_eq(
+            &mut storage,
+            &Arena::new(),
+            &map_id,
+            Type::Int,
+            Type::String,
+            expected_content,
+        );
+    }
+
+    #[test]
+    fn test_copy() {
+        let mut host = MockKernelHost::default();
+        let mut rk = RuntimeKeyspaces::init(&mut host).unwrap();
+        make_default_ctx!(storage, rk);
+        let content = BTreeMap::from([
+            (TypedValue::int(1), TypedValue::String("one".into())),
+            (TypedValue::int(2), TypedValue::String("two".into())),
+        ]);
+
+        let map = BigMap {
+            content: BigMapContent::InMemory(in_memory_entries(content.clone())),
+            key_type: Type::Int,
+            value_type: Type::String,
+        };
+        let map = dump_one(&mut storage, &[], map);
+
+        check_is_dumped_map(map, 0.into());
+
+        let copied_id = storage
+            .big_map_copy(&0.into(), false)
+            .expect("Failed to copy big_map in storage");
+
+        assert_eq!(copied_id, 1.into());
+
+        assert_big_map_eq(
+            &mut storage,
+            &Arena::new(),
+            &copied_id,
+            Type::Int,
+            Type::String,
+            content,
+        );
+    }
+
+    #[test]
+    fn test_remove_big_map() {
+        // Setup the context and big_map for the test
+        let mut host = MockKernelHost::default();
+        let mut rk = RuntimeKeyspaces::init(&mut host).unwrap();
+        make_default_ctx!(storage, rk);
+        let key_type = Type::Int;
+        let value_type = Type::Int;
+        let map_id = storage.big_map_new(&key_type, &value_type, false).unwrap();
+        let key = TypedValue::int(0);
+        let value = TypedValue::int(0);
+        storage
+            .big_map_update(&map_id, key.clone(), Some(value.clone()))
+            .unwrap();
+
+        // Ensure that the big_map is existing
+        let mut content = BTreeMap::new();
+        content.insert(key.clone(), value);
+        let arena = Arena::new();
+        assert_big_map_eq(&mut storage, &arena, &map_id, key_type, value_type, content);
+
+        // Remove the big_map
+        storage.big_map_remove(&map_id).unwrap();
+
+        assert_big_map_removed(&storage, &map_id);
+
+        // Verify that the big_map_mem function returns the expected result
+        assert!(!storage.big_map_mem(&map_id, &TypedValue::int(0)).unwrap());
+    }
+
+    #[test]
+    fn test_remove_with_dump() {
+        let mut host = MockKernelHost::default();
+        let mut rk = RuntimeKeyspaces::init(&mut host).unwrap();
+        make_default_ctx!(storage, rk);
+        // Arena must outlive `map1` so its `BigMap<'_>` destructor can still
+        // borrow from the arena lifetime; values are dropped in reverse
+        // declaration order.
+        let arena = Arena::new();
+        let map_id1 = storage.big_map_new(&Type::Int, &Type::Int, false).unwrap();
+        storage
+            .big_map_update(&map_id1, TypedValue::int(0), Some(TypedValue::int(0)))
+            .unwrap();
+        let map_id2 = storage.big_map_new(&Type::Int, &Type::Int, false).unwrap();
+        storage
+            .big_map_update(&map_id2, TypedValue::int(0), Some(TypedValue::int(0)))
+            .unwrap();
+        let content_diff = BigMapContent::FromId(BigMapFromId {
+            id: map_id1.clone(),
+            overlay: overlay_entries([(TypedValue::int(1), Some(TypedValue::int(1)))]),
+        });
+        let map1 = BigMap {
+            content: content_diff,
+            key_type: Type::Int,
+            value_type: Type::Int,
+        };
+
+        dump_one(&mut storage, &[map_id1.clone(), map_id2.clone()], map1);
+
+        let expected_content = BTreeMap::from([
+            (TypedValue::int(0), TypedValue::int(0)),
+            (TypedValue::int(1), TypedValue::int(1)),
+        ]);
+
+        assert!(!storage.big_map_mem(&map_id2, &TypedValue::int(0)).unwrap());
+
+        assert_big_map_eq(
+            &mut storage,
+            &arena,
+            &map_id1,
+            Type::Int,
+            Type::Int,
+            expected_content,
+        );
+    }
+
+    /// Regression for L2-1636: a big map persisted in the parent storage
+    /// is moved into an outgoing operation while the returned storage no
+    /// longer references it (the parent replaces its storage with a fresh
+    /// `EMPTY_BIG_MAP`). The contract-result dump walks the returned
+    /// storage first, then the operation list, and only then removes
+    /// started ids no longer owned by the returned storage. The operation
+    /// walk must copy the moved-out big map while its durable source still
+    /// exists; the source is removed afterwards.
+    #[test]
+    fn dump_moves_persisted_big_map_into_operation() {
+        let mut host = MockKernelHost::default();
+        let mut rk = RuntimeKeyspaces::init(&mut host).unwrap();
+        make_default_ctx!(storage, rk);
+        let arena = Arena::new();
+
+        // Seed the persisted parent big map S (id 0).
+        let s = storage
+            .big_map_new(&Type::Int, &Type::String, false)
+            .unwrap();
+        assert_eq!(s, 0.into());
+        let s_content = BTreeMap::from([
+            (TypedValue::int(1), TypedValue::String("one".into())),
+            (TypedValue::int(2), TypedValue::String("two".into())),
+        ]);
+        for (key, value) in &s_content {
+            storage
+                .big_map_update(&s, key.clone(), Some(value.clone()))
+                .unwrap();
+        }
+
+        // Returned-storage walk: the parent returns a fresh empty big map
+        // (EMPTY_BIG_MAP) that does not reference S.
+        let returned_storage = BigMap {
+            content: BigMapContent::InMemory(RedBlackTreeMap::new()),
+            key_type: Type::Int,
+            value_type: Type::String,
+        };
+        let mut returned_root = TypedValue::BigMap(returned_storage);
+        let mut seen_in_storage = BTreeSet::new();
+        dump_big_map_walk(
+            &mut storage,
+            &mut returned_root,
+            false,
+            &mut seen_in_storage,
+        )
+        .unwrap();
+        // S is not reachable from the returned storage.
+        assert!(!seen_in_storage.contains(&s));
+
+        // Operation-list walk: the outgoing operation carries S, moved out
+        // of the parent storage. This must succeed: S is still present.
+        let operation_map = BigMap {
+            content: BigMapContent::FromId(BigMapFromId {
+                id: s.clone(),
+                overlay: RedBlackTreeMap::new(),
+            }),
+            key_type: Type::Int,
+            value_type: Type::String,
+        };
+        let mut operation_root = TypedValue::BigMap(operation_map);
+        let mut seen_in_operations = BTreeSet::new();
+        dump_big_map_walk(
+            &mut storage,
+            &mut operation_root,
+            true,
+            &mut seen_in_operations,
+        )
+        .expect("operation walk must copy S before it is removed");
+        let operation_map = take_big_map(&mut operation_root);
+
+        // The operation now references a temporary copy, not S itself, and
+        // that copy carries S's content.
+        let operation_id = match &operation_map.content {
+            BigMapContent::FromId(m) => m.id.clone(),
+            BigMapContent::InMemory(_) => panic!("operation big map was not dumped"),
+        };
+        assert_ne!(operation_id, s);
+        assert!(operation_id.is_temporary());
+        assert_big_map_eq(
+            &mut storage,
+            &arena,
+            &operation_id,
+            Type::Int,
+            Type::String,
+            s_content,
+        );
+
+        // Removal runs last: S, no longer owned by the returned storage, is
+        // dropped from durable storage.
+        remove_unreferenced_big_maps(
+            &mut storage,
+            std::slice::from_ref(&s),
+            &seen_in_storage,
+        )
+        .unwrap();
+        assert!(
+            storage
+                .big_map_get_type(&s)
+                .expect("reading S type must not fail")
+                .is_none(),
+            "S should have been removed from durable storage"
+        );
+    }
+
+    #[test]
+    fn dump_retained_then_moved_big_map_copies_pre_update_state() {
+        let mut host = MockKernelHost::default();
+        let mut rk = RuntimeKeyspaces::init(&mut host).unwrap();
+        make_default_ctx!(storage, rk);
+        let arena = Arena::new();
+
+        let p = storage
+            .big_map_new(&Type::Int, &Type::String, false)
+            .unwrap();
+        assert_eq!(p, 0.into());
+        storage
+            .big_map_update(
+                &p,
+                TypedValue::int(1),
+                Some(TypedValue::String("old".into())),
+            )
+            .unwrap();
+
+        let returned_storage = BigMap {
+            content: BigMapContent::FromId(BigMapFromId {
+                id: p.clone(),
+                overlay: overlay_entries([(
+                    TypedValue::int(1),
+                    Some(TypedValue::String("new".into())),
+                )]),
+            }),
+            key_type: Type::Int,
+            value_type: Type::String,
+        };
+        let mut returned_root = TypedValue::BigMap(returned_storage);
+        let mut seen_in_storage = BTreeSet::new();
+        let deferred_storage = dump_big_map_walk(
+            &mut storage,
+            &mut returned_root,
+            false,
+            &mut seen_in_storage,
+        )
+        .unwrap();
+        assert!(seen_in_storage.contains(&p));
+        assert_eq!(
+            storage
+                .big_map_get(&arena, &p, &TypedValue::int(1), &Type::String)
+                .unwrap(),
+            Some(TypedValue::String("old".into())),
+            "the storage walk must NOT flush P's overlay yet",
+        );
+
+        let operation_map = BigMap {
+            content: BigMapContent::FromId(BigMapFromId {
+                id: p.clone(),
+                overlay: RedBlackTreeMap::new(),
+            }),
+            key_type: Type::Int,
+            value_type: Type::String,
+        };
+        let mut operation_root = TypedValue::BigMap(operation_map);
+        let mut seen_in_operations = BTreeSet::new();
+        let deferred_operations = dump_big_map_walk(
+            &mut storage,
+            &mut operation_root,
+            true,
+            &mut seen_in_operations,
+        )
+        .unwrap();
+        let operation_map = take_big_map(&mut operation_root);
+        let operation_id = match &operation_map.content {
+            BigMapContent::FromId(m) => m.id.clone(),
+            BigMapContent::InMemory(_) => panic!("operation big map was not dumped"),
+        };
+        assert_ne!(operation_id, p);
+        assert!(operation_id.is_temporary());
+
+        apply_deferred_big_map_updates(&mut storage, deferred_operations).unwrap();
+        apply_deferred_big_map_updates(&mut storage, deferred_storage).unwrap();
+
+        assert_eq!(
+            storage
+                .big_map_get(&arena, &operation_id, &TypedValue::int(1), &Type::String)
+                .unwrap(),
+            Some(TypedValue::String("old".into())),
+            "operation copy must observe P's pre-update content, as on L1",
+        );
+        assert_eq!(
+            storage
+                .big_map_get(&arena, &p, &TypedValue::int(1), &Type::String)
+                .unwrap(),
+            Some(TypedValue::String("new".into())),
+            "the storage update is applied last, after the operation copy",
+        );
+    }
+
+    #[test]
+    fn cloning_from_id_big_map_preserves_same_id() {
+        let original = BigMap {
+            content: BigMapContent::FromId(BigMapFromId {
+                id: BigMapId::from(7),
+                overlay: overlay_entries([(
+                    TypedValue::int(1),
+                    Some(TypedValue::String("v".into())),
+                )]),
+            }),
+            key_type: Type::Int,
+            value_type: Type::String,
+        };
+        let duplicated = original.clone();
+        let id_of = |m: &BigMap| match &m.content {
+            BigMapContent::FromId(c) => c.id.clone(),
+            BigMapContent::InMemory(_) => panic!("expected FromId"),
+        };
+        assert_eq!(
+            id_of(&original),
+            id_of(&duplicated),
+            "DUP (Clone) must preserve the big_map id",
+        );
+        assert_eq!(id_of(&duplicated), BigMapId::from(7));
+    }
+
+    // L2-1057: each internal operation carrying the same persisted big_map
+    // gets its own copy, as on L1 (no cross-operation deduplication).
+    #[test]
+    fn operation_big_maps_sharing_a_source_are_copied_independently() {
+        let mut host = MockKernelHost::default();
+        let mut rk = RuntimeKeyspaces::init(&mut host).unwrap();
+        make_default_ctx!(storage, rk);
+
+        let p = storage.big_map_new(&Type::Int, &Type::Int, false).unwrap();
+        storage
+            .big_map_update(&p, TypedValue::int(1), Some(TypedValue::int(1)))
+            .unwrap();
+        storage.big_map_diff.clear();
+        let _ = storage.interpret_context.take_big_map_diff_order();
+
+        let mk = || BigMap {
+            content: BigMapContent::FromId(BigMapFromId {
+                id: p.clone(),
+                overlay: RedBlackTreeMap::new(),
+            }),
+            key_type: Type::Int,
+            value_type: Type::Int,
+        };
+        let mut root =
+            TypedValue::new_pair(TypedValue::BigMap(mk()), TypedValue::BigMap(mk()));
+        let mut seen = BTreeSet::new();
+        dump_big_map_walk(&mut storage, &mut root, true, &mut seen).unwrap();
+        // Extract the two operation big maps back out in AST order (left, right).
+        let (op1, op2) = match &mut root {
+            TypedValue::Pair(l, r) => {
+                (take_big_map(l.make_mut()), take_big_map(r.make_mut()))
+            }
+            other => panic!("expected Pair, got {other:?}"),
+        };
+
+        let id_of = |m: &BigMap| match &m.content {
+            BigMapContent::FromId(c) => c.id.clone(),
+            BigMapContent::InMemory(_) => panic!("expected FromId"),
+        };
+        let (id1, id2) = (id_of(&op1), id_of(&op2));
+        assert_ne!(
+            id1, id2,
+            "each operation must get its own copy id (no dedup)"
+        );
+        assert!(id1.is_temporary() && id2.is_temporary());
+        let copies: Vec<Zarith> = storage
+            .big_map_diff
+            .iter()
+            .filter_map(|(id, d)| match d {
+                StorageDiff::Copy(c) if c.source == p.value => Some(id.clone()),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(copies.len(), 2, "expected one copy per operation, as on L1");
+    }
+
+    /// Root-cause guard for L2-1636: copying a big map whose durable source
+    /// paths have already been removed fails. This is exactly the failure
+    /// the fix avoids by deferring removal until after the operation walk
+    /// has copied the source.
+    #[test]
+    fn dump_copy_after_source_removed_errors() {
+        let mut host = MockKernelHost::default();
+        let mut rk = RuntimeKeyspaces::init(&mut host).unwrap();
+        make_default_ctx!(storage, rk);
+
+        let s = storage
+            .big_map_new(&Type::Int, &Type::String, false)
+            .unwrap();
+        storage
+            .big_map_update(
+                &s,
+                TypedValue::int(1),
+                Some(TypedValue::String("one".into())),
+            )
+            .unwrap();
+
+        // Buggy ordering: the source is removed before the operation copy.
+        storage.big_map_remove(&s).unwrap();
+
+        let operation_map = BigMap {
+            content: BigMapContent::FromId(BigMapFromId {
+                id: s.clone(),
+                overlay: RedBlackTreeMap::new(),
+            }),
+            key_type: Type::Int,
+            value_type: Type::String,
+        };
+        let mut operation_root = TypedValue::BigMap(operation_map);
+        let mut seen = BTreeSet::new();
+        let result =
+            dump_big_map_walk(&mut storage, &mut operation_root, true, &mut seen);
+        assert!(
+            result.is_err(),
+            "copying from a removed source must fail; deferring removal avoids this"
+        );
+    }
+
+    // Alive entries follow reverse-visit order, not id order: after a swap the
+    // walk visits [id 6, id 5] so the receipt is [id 5, id 6] (L2-1735).
+    #[test]
+    fn convert_big_map_diff_alive_follows_reverse_visit_order() {
+        let mut map: BTreeMap<Zarith, StorageDiff> = BTreeMap::new();
+        map.insert(5u64.into(), StorageDiff::Update(vec![]));
+        map.insert(6u64.into(), StorageDiff::Update(vec![]));
+        let visit_order = vec![6u64.into(), 5u64.into()];
+
+        let converted = convert_big_map_diff(map, visit_order).expect("non-empty diff");
+        let ids: Vec<Zarith> = converted
+            .diff
+            .iter()
+            .map(|LazyStorageDiff::BigMap(BigMapDiff { id, .. })| id.clone())
+            .collect();
+
+        assert_eq!(ids, vec![5u64.into(), 6u64.into()]);
+        assert_ne!(ids, vec![6u64.into(), 5u64.into()]);
+    }
+
+    fn empty_nat_unit_alloc() -> StorageDiff {
+        let mut gas = Gas::default();
+        let key_type = mir::ast::Micheline::prim0(mir::lexer::Prim::nat, &mut gas)
+            .unwrap()
+            .encode(&mut Gas::default())
+            .unwrap()
+            .unwrap();
+        let value_type = mir::ast::Micheline::prim0(mir::lexer::Prim::unit, &mut gas)
+            .unwrap()
+            .encode(&mut Gas::default())
+            .unwrap()
+            .unwrap();
+        StorageDiff::Alloc(Alloc {
+            updates: vec![],
+            key_type,
+            value_type,
+        })
+    }
+
+    fn updates_of(diff: &StorageDiff) -> &[Update] {
+        match diff {
+            StorageDiff::Update(updates) => updates,
+            StorageDiff::Alloc(alloc) => &alloc.updates,
+            StorageDiff::Copy(copy) => &copy.updates,
+            StorageDiff::Remove => &[],
+        }
+    }
+
+    fn kind_str(diff: &StorageDiff) -> &'static str {
+        match diff {
+            StorageDiff::Update(_) => "update",
+            StorageDiff::Remove => "remove",
+            StorageDiff::Copy(_) => "copy",
+            StorageDiff::Alloc(_) => "alloc",
+        }
+    }
+
+    #[test]
+    fn lazy_storage_diff_removal_leads_lower_id_alloc() {
+        let alloc = empty_nat_unit_alloc();
+        let mut map: BTreeMap<Zarith, StorageDiff> = BTreeMap::new();
+        map.insert(3u64.into(), StorageDiff::Remove);
+        map.insert(7u64.into(), alloc.clone());
+        let visit_order = vec![7u64.into()];
+
+        let converted = convert_big_map_diff(map, visit_order).expect("non-empty diff");
+
+        let expected = LazyStorageDiffList {
+            diff: vec![
+                LazyStorageDiff::BigMap(BigMapDiff {
+                    id: 3u64.into(),
+                    storage_diff: StorageDiff::Remove,
+                }),
+                LazyStorageDiff::BigMap(BigMapDiff {
+                    id: 7u64.into(),
+                    storage_diff: alloc,
+                }),
+            ],
+        };
+        assert_eq!(
+            converted, expected,
+            "Remove(3) must precede Alloc(7), as on L1"
+        );
+    }
+
+    #[test]
+    fn lazy_storage_diff_removals_grouped_and_descending() {
+        let mut map: BTreeMap<Zarith, StorageDiff> = BTreeMap::new();
+        map.insert(3u64.into(), StorageDiff::Remove);
+        map.insert(5u64.into(), StorageDiff::Remove);
+        map.insert(7u64.into(), empty_nat_unit_alloc());
+        let visit_order = vec![7u64.into()];
+
+        let converted = convert_big_map_diff(map, visit_order).expect("non-empty diff");
+
+        let order: Vec<(Zarith, &str)> = converted
+            .diff
+            .iter()
+            .map(|LazyStorageDiff::BigMap(BigMapDiff { id, storage_diff })| {
+                (id.clone(), kind_str(storage_diff))
+            })
+            .collect();
+        assert_eq!(
+            order,
+            vec![
+                (5u64.into(), "remove"),
+                (3u64.into(), "remove"),
+                (7u64.into(), "alloc"),
+            ],
+            "removals lead in id-descending order, then the alloc"
+        );
+    }
+
+    #[test]
+    fn lazy_storage_diff_updates_sorted_by_key_hash_descending() {
+        let mut host = MockKernelHost::default();
+        let mut rk = RuntimeKeyspaces::init(&mut host).unwrap();
+        make_default_ctx!(ctx, rk);
+        let id = ctx.big_map_new(&Type::Int, &Type::Int, false).unwrap();
+        for k in 0i64..=5 {
+            ctx.big_map_update(&id, TypedValue::int(k), Some(TypedValue::int(k * 10)))
+                .unwrap();
+        }
+
+        let converted = convert_big_map_diff(
+            std::mem::take(&mut ctx.big_map_diff),
+            vec![id.value.clone()],
+        )
+        .expect("non-empty diff");
+        let updates = match converted.diff.as_slice() {
+            [LazyStorageDiff::BigMap(BigMapDiff { storage_diff, .. })] => {
+                updates_of(storage_diff)
+            }
+            _ => panic!("expected exactly one big_map diff"),
+        };
+        let got: Vec<Vec<u8>> = updates
+            .iter()
+            .map(|u| u.key_hash.as_ref().to_vec())
+            .collect();
+
+        let mut gas = Gas::default();
+        let key_hash = |k: i64, gas: &mut Gas| {
+            hash_key(TypedValue::int(k), gas).unwrap().as_ref().to_vec()
+        };
+        let mut expected: Vec<Vec<u8>> =
+            (0i64..=5).map(|k| key_hash(k, &mut gas)).collect();
+        expected.sort();
+        expected.reverse();
+        assert_eq!(
+            got, expected,
+            "updates must be Script_expr_hash descending (L1 order)"
+        );
+
+        let application_order: Vec<Vec<u8>> =
+            (0i64..=5).map(|k| key_hash(k, &mut gas)).collect();
+        assert_ne!(
+            got, application_order,
+            "key-hash descending order must differ from value-ascending application order"
+        );
+    }
+
+    /// Regression test for the existence-probe in
+    /// [`Ctx::lookup_view_storage_balance`]. At L1, calling
+    /// `VIEW addr "name"` on a never-originated KT1 must push
+    /// `V::Option(None)` (cf. `script_interpreter.ml::iview`); the
+    /// trait contract is for `Ok(None)` to surface that case so the
+    /// interpreter then maps it to `V::Option(None)`. This test fires
+    /// the production impl directly against a fresh host and a KT1
+    /// that has never been written, asserting it does not surface the
+    /// missing-`code` durable read as a `LookupViewError::HostError`.
+    #[test]
+    fn lookup_view_storage_balance_returns_none_for_unoriginated_kt1() {
+        use crate::context::implicit_from_public_key_hash;
+        use crate::context::originated_from_kt1;
+        use mir::ast::michelson_address::AddressHash;
+
+        let mut host = MockKernelHost::default();
+        let mut rk = RuntimeKeyspaces::init(&mut host).unwrap();
+        make_default_ctx!(tc_ctx, rk);
+
+        // OperationCtx + ExecCtx are unread by `lookup_view_storage_balance`
+        // but the type system requires a fully constructed `Ctx`. Use
+        // placeholder backing values for everything that is not under test.
+        let bootstrap_pkh =
+            PublicKeyHash::from_b58check("tz1KqTpEZ7Yob7QbPE4Hy4Wo8fHG8LhKxZSx").unwrap();
+        let placeholder_kt1 = ContractKt1Hash::from([0u8; 20]);
+        let source = implicit_from_public_key_hash(&bootstrap_pkh).unwrap();
+        let mut counter = 0u128;
+        let level = BlockNumber { block_number: 0 };
+        let now = Timestamp::from(0);
+        let chain_id = ChainId::from([0, 0, 0, 0]);
+        let source_public_key: Vec<u8> = Vec::new();
+
+        let mut operation_ctx = OperationCtx {
+            source: &source,
+            counter: &mut counter,
+            applied_counters: std::collections::BTreeSet::new(),
+            level: &level,
+            now: &now,
+            chain_id: &chain_id,
+            source_public_key: &source_public_key,
+            crac_chain_depth: 0,
+            crac_origin: None,
+            delegated_storage_cost: 0,
+        };
+
+        let exec_ctx = ExecCtx {
+            sender: AddressHash::Implicit(bootstrap_pkh),
+            amount: 0,
+            self_address: AddressHash::Kt1(placeholder_kt1.clone()),
+            balance: 0,
+            contract_account: originated_from_kt1(&placeholder_kt1).unwrap(),
+        };
+
+        // The test exercises `lookup_view_storage_balance` directly,
+        // not the enshrined-view hook, so journal and registry are
+        // just placeholders that satisfy the type system.
+        let mut journal = tezosx_journal::TezosXJournal::new(
+            tezosx_journal::CracId::new(1, 0),
+            TezosXHashes::zero(),
+            tezos_ethereum::block::BlockConstants::dummy(),
+        );
+        let registry = tezosx_interfaces::testing::UnimplementedRegistry;
+        let mut ctx = Ctx {
+            tc_ctx: &mut tc_ctx,
+            exec_ctx,
+            operation_ctx: &mut operation_ctx,
+            journal: &mut journal,
+            registry: &registry,
+            address_registry_diff: Vec::new(),
+        };
+
+        // A KT1 that the fresh `MockKernelHost` has never seen.
+        let unoriginated_kt1 =
+            ContractKt1Hash::from_base58_check("KT1RJ6PbjHpwc3M5rw5s2Nbmefwbuwbdxton")
+                .unwrap();
+        let arena = Arena::new();
+        let result =
+            ctx.lookup_view_storage_balance(&unoriginated_kt1, "anything", &arena);
+        assert!(
+            matches!(result, Ok(None)),
+            "expected Ok(None) for never-originated KT1, got {result:?}",
+        );
+    }
+
+    fn encoded_size(v: &TypedValue) -> u64 {
+        let arena = Arena::new();
+        let mut gas = Gas::default();
+        v.clone()
+            .into_micheline_optimized_legacy(&arena, &mut gas)
+            .unwrap()
+            .encode(&mut gas)
+            .unwrap()
+            .unwrap()
+            .len() as u64
+    }
+
+    #[test]
+    fn big_map_new_initializes_total_bytes_to_zero() {
+        let mut host = MockKernelHost::default();
+        let mut rk = RuntimeKeyspaces::init(&mut host).unwrap();
+        make_default_ctx!(ctx, rk);
+
+        let id = ctx.big_map_new(&Type::Int, &Type::String, false).unwrap();
+
+        assert_eq!(total_bytes(ctx.rk.tez_accounts(), &id).unwrap(), 0.into());
+    }
+
+    /// Makes sure that `big_map_new` fails on a next-ID counter that does not
+    /// decode, and leaves the counter unchanged.
+    #[test]
+    fn big_map_new_rejects_an_undecodable_next_id() {
+        let mut host = MockKernelHost::default();
+        let mut rk = RuntimeKeyspaces::init(&mut host).unwrap();
+        make_default_ctx!(ctx, rk);
+        ctx.rk.tez_accounts_mut().set(&NEXT_ID_KEY, [0xff]).unwrap();
+
+        assert!(matches!(
+            ctx.big_map_new(&Type::Int, &Type::String, false),
+            Err(LazyStorageError::NomReadError(_))
+        ));
+        assert_eq!(ctx.rk.tez_accounts().get(&NEXT_ID_KEY), Some(vec![0xff]));
+    }
+
+    #[test]
+    fn big_map_update_insert_adds_key_forfait_plus_value_size() {
+        let mut host = MockKernelHost::default();
+        let mut rk = RuntimeKeyspaces::init(&mut host).unwrap();
+        make_default_ctx!(ctx, rk);
+        let id = ctx.big_map_new(&Type::Int, &Type::String, false).unwrap();
+        let value = TypedValue::String("hello".into());
+        let value_size = encoded_size(&value);
+        let old_total_bytes = total_bytes(ctx.rk.tez_accounts(), &id).unwrap();
+
+        ctx.big_map_update(&id, TypedValue::int(1), Some(value))
+            .unwrap();
+
+        assert_eq!(
+            total_bytes(ctx.rk.tez_accounts(), &id).unwrap(),
+            (old_total_bytes.0 + (BYTES_SIZE_FOR_BIG_MAP_KEY + value_size)).into()
+        );
+    }
+
+    #[test]
+    fn big_map_update_overwrite_grows_by_value_diff() {
+        let mut host = MockKernelHost::default();
+        let mut rk = RuntimeKeyspaces::init(&mut host).unwrap();
+        make_default_ctx!(ctx, rk);
+        let id = ctx.big_map_new(&Type::Int, &Type::String, false).unwrap();
+        let small = TypedValue::String("hi".into());
+        let small_size = encoded_size(&small);
+
+        ctx.big_map_update(&id, TypedValue::int(1), Some(small))
+            .unwrap();
+
+        let old_total_bytes = total_bytes(ctx.rk.tez_accounts(), &id).unwrap();
+
+        let big = TypedValue::String("hello, world".into());
+        let big_size = encoded_size(&big);
+
+        ctx.big_map_update(&id, TypedValue::int(1), Some(big))
+            .unwrap();
+
+        assert_eq!(
+            total_bytes(ctx.rk.tez_accounts(), &id).unwrap(),
+            (old_total_bytes.0 + big_size - small_size).into()
+        );
+    }
+
+    #[test]
+    fn big_map_update_overwrite_shrinks_by_value_diff() {
+        let mut host = MockKernelHost::default();
+        let mut rk = RuntimeKeyspaces::init(&mut host).unwrap();
+        make_default_ctx!(ctx, rk);
+        let id = ctx.big_map_new(&Type::Int, &Type::String, false).unwrap();
+        let big = TypedValue::String("hello, world".into());
+        let big_size = encoded_size(&big);
+
+        ctx.big_map_update(&id, TypedValue::int(1), Some(big))
+            .unwrap();
+
+        let old_total_bytes = total_bytes(ctx.rk.tez_accounts(), &id).unwrap();
+
+        let small = TypedValue::String("hi".into());
+        let small_size = encoded_size(&small);
+
+        ctx.big_map_update(&id, TypedValue::int(1), Some(small))
+            .unwrap();
+
+        assert_eq!(
+            total_bytes(ctx.rk.tez_accounts(), &id).unwrap(),
+            (old_total_bytes.0 + small_size - big_size).into()
+        );
+    }
+
+    #[test]
+    fn big_map_update_delete_existing_subtracts_key_forfait_plus_prev_size() {
+        let mut host = MockKernelHost::default();
+        let mut rk = RuntimeKeyspaces::init(&mut host).unwrap();
+        make_default_ctx!(ctx, rk);
+        let id = ctx.big_map_new(&Type::Int, &Type::String, false).unwrap();
+        let value = TypedValue::String("hello".into());
+        let value_size = encoded_size(&value);
+
+        ctx.big_map_update(&id, TypedValue::int(1), Some(value))
+            .unwrap();
+
+        let old_total_bytes = total_bytes(ctx.rk.tez_accounts(), &id).unwrap();
+
+        ctx.big_map_update(&id, TypedValue::int(1), None).unwrap();
+
+        assert_eq!(
+            total_bytes(ctx.rk.tez_accounts(), &id).unwrap(),
+            (old_total_bytes.0 - (BYTES_SIZE_FOR_BIG_MAP_KEY + value_size)).into()
+        );
+    }
+
+    #[test]
+    fn big_map_update_delete_absent_is_noop() {
+        let mut host = MockKernelHost::default();
+        let mut rk = RuntimeKeyspaces::init(&mut host).unwrap();
+        make_default_ctx!(ctx, rk);
+        let id = ctx.big_map_new(&Type::Int, &Type::String, false).unwrap();
+        let old_total_bytes = total_bytes(ctx.rk.tez_accounts(), &id).unwrap();
+
+        ctx.big_map_update(&id, TypedValue::int(42), None).unwrap();
+
+        assert_eq!(
+            total_bytes(ctx.rk.tez_accounts(), &id).unwrap(),
+            old_total_bytes
+        );
+    }
+
+    #[test]
+    fn big_map_copy_replicates_source_total_bytes() {
+        let mut host = MockKernelHost::default();
+        let mut rk = RuntimeKeyspaces::init(&mut host).unwrap();
+        make_default_ctx!(ctx, rk);
+        let src = ctx.big_map_new(&Type::Int, &Type::String, false).unwrap();
+        ctx.big_map_update(
+            &src,
+            TypedValue::int(1),
+            Some(TypedValue::String("a".into())),
+        )
+        .unwrap();
+        ctx.big_map_update(
+            &src,
+            TypedValue::int(2),
+            Some(TypedValue::String("bb".into())),
+        )
+        .unwrap();
+        let src_total = total_bytes(ctx.rk.tez_accounts(), &src).unwrap();
+
+        let dest = ctx.big_map_copy(&src, false).unwrap();
+
+        assert_eq!(
+            total_bytes(ctx.rk.tez_accounts(), &dest).unwrap(),
+            src_total
+        );
+    }
+
+    /// `big_map_copy` duplicates the whole subtree with one `store_copy`
+    /// instead of reading and rewriting each entry, so its gas does not
+    /// scale with the entry count.
+    #[test]
+    fn big_map_copy_gas_is_independent_of_entry_count() {
+        fn copy_gas(entries: usize, value: &str) -> u64 {
+            let mut host = MockKernelHost::default();
+            let mut rk = RuntimeKeyspaces::init(&mut host).unwrap();
+            make_default_ctx!(ctx, rk);
+            let src = ctx.big_map_new(&Type::Int, &Type::String, false).unwrap();
+            for i in 0..entries {
+                ctx.big_map_update(
+                    &src,
+                    TypedValue::int(i as i64),
+                    Some(TypedValue::String(value.into())),
+                )
+                .unwrap();
+            }
+            let before = ctx.operation_gas.total_milligas_consumed();
+            ctx.big_map_copy(&src, false).unwrap();
+            (ctx.operation_gas.total_milligas_consumed() - before) as u64
+        }
+
+        let value = "a fixed-size value";
+
+        assert_eq!(copy_gas(2, value), copy_gas(20, value));
+    }
+
+    /// `big_map_remove` deletes the whole subtree in one `store_delete`, so
+    /// its gas does not scale with the entry count.
+    #[test]
+    fn big_map_remove_gas_is_independent_of_entry_count() {
+        fn remove_gas(entries: usize) -> u64 {
+            let mut host = MockKernelHost::default();
+            let mut rk = RuntimeKeyspaces::init(&mut host).unwrap();
+            make_default_ctx!(ctx, rk);
+            let id = ctx.big_map_new(&Type::Int, &Type::String, false).unwrap();
+            for i in 0..entries {
+                ctx.big_map_update(
+                    &id,
+                    TypedValue::int(i as i64),
+                    Some(TypedValue::String("v".into())),
+                )
+                .unwrap();
+            }
+            let before = ctx.operation_gas.total_milligas_consumed();
+            ctx.big_map_remove(&id).unwrap();
+            (ctx.operation_gas.total_milligas_consumed() - before) as u64
+        }
+
+        assert_eq!(remove_gas(2), remove_gas(20));
+    }
+
+    #[test]
+    fn big_map_update_insert_then_delete_returns_to_zero() {
+        let mut host = MockKernelHost::default();
+        let mut rk = RuntimeKeyspaces::init(&mut host).unwrap();
+        make_default_ctx!(ctx, rk);
+        let id = ctx.big_map_new(&Type::Int, &Type::String, false).unwrap();
+
+        ctx.big_map_update(
+            &id,
+            TypedValue::int(1),
+            Some(TypedValue::String("hello".into())),
+        )
+        .unwrap();
+        ctx.big_map_update(&id, TypedValue::int(1), None).unwrap();
+
+        assert_eq!(
+            total_bytes(ctx.rk.tez_accounts(), &id).unwrap(),
+            0u64.into()
+        );
+    }
+
+    #[test]
+    fn big_map_update_multi_key_cumul_matches_sum() {
+        let mut host = MockKernelHost::default();
+        let mut rk = RuntimeKeyspaces::init(&mut host).unwrap();
+        make_default_ctx!(ctx, rk);
+        let id = ctx.big_map_new(&Type::Int, &Type::String, false).unwrap();
+
+        let values = [
+            TypedValue::String("a".into()),
+            TypedValue::String("bb".into()),
+            TypedValue::String("ccc".into()),
+            TypedValue::String("dddd".into()),
+        ];
+        let mut expected = num_bigint::BigInt::from(0u64);
+        for (i, v) in values.iter().enumerate() {
+            let size = encoded_size(v);
+            ctx.big_map_update(&id, TypedValue::int(i as i64), Some(v.clone()))
+                .unwrap();
+            expected += BYTES_SIZE_FOR_BIG_MAP_KEY + size;
+        }
+
+        assert_eq!(
+            total_bytes(ctx.rk.tez_accounts(), &id).unwrap(),
+            Zarith(expected)
+        );
+    }
+
+    #[test]
+    fn big_map_copy_then_modify_source_leaves_dest_counter_unchanged() {
+        let mut host = MockKernelHost::default();
+        let mut rk = RuntimeKeyspaces::init(&mut host).unwrap();
+        make_default_ctx!(ctx, rk);
+        let src = ctx.big_map_new(&Type::Int, &Type::String, false).unwrap();
+        ctx.big_map_update(
+            &src,
+            TypedValue::int(1),
+            Some(TypedValue::String("a".into())),
+        )
+        .unwrap();
+        let dest = ctx.big_map_copy(&src, false).unwrap();
+        let dest_total_after_copy = total_bytes(ctx.rk.tez_accounts(), &dest).unwrap();
+
+        ctx.big_map_update(
+            &src,
+            TypedValue::int(2),
+            Some(TypedValue::String("bigger value".into())),
+        )
+        .unwrap();
+        ctx.big_map_update(&src, TypedValue::int(1), None).unwrap();
+
+        assert_eq!(
+            total_bytes(ctx.rk.tez_accounts(), &dest).unwrap(),
+            dest_total_after_copy
+        );
+    }
+
+    #[test]
+    fn big_map_realistic_cross_hook_sequence_stays_consistent() {
+        let mut host = MockKernelHost::default();
+        let mut rk = RuntimeKeyspaces::init(&mut host).unwrap();
+        make_default_ctx!(ctx, rk);
+
+        let src = ctx.big_map_new(&Type::Int, &Type::String, false).unwrap();
+        let inserts = [
+            (1i64, TypedValue::String("x".into())),
+            (2, TypedValue::String("yy".into())),
+            (3, TypedValue::String("zzz".into())),
+        ];
+        for (k, v) in inserts.iter() {
+            ctx.big_map_update(&src, TypedValue::int(*k), Some(v.clone()))
+                .unwrap();
+        }
+        let src_total_after_inserts = total_bytes(ctx.rk.tez_accounts(), &src).unwrap();
+
+        let dest = ctx.big_map_copy(&src, false).unwrap();
+
+        ctx.big_map_update(
+            &src,
+            TypedValue::int(1),
+            Some(TypedValue::String("xx".into())),
+        )
+        .unwrap();
+        let extra = encoded_size(&TypedValue::String("xx".into()))
+            - encoded_size(&TypedValue::String("x".into()));
+        assert_eq!(
+            total_bytes(ctx.rk.tez_accounts(), &src).unwrap(),
+            Zarith(src_total_after_inserts.0.clone() + extra)
+        );
+
+        ctx.big_map_update(
+            &dest,
+            TypedValue::int(4),
+            Some(TypedValue::String("wwww".into())),
+        )
+        .unwrap();
+        let added =
+            BYTES_SIZE_FOR_BIG_MAP_KEY + encoded_size(&TypedValue::String("wwww".into()));
+        assert_eq!(
+            total_bytes(ctx.rk.tez_accounts(), &dest).unwrap(),
+            Zarith(src_total_after_inserts.0 + added)
+        );
+
+        ctx.big_map_remove(&src).unwrap();
+        let src_total_bytes_key = total_bytes_key(&src).unwrap();
+        assert!(!ctx.rk.tez_accounts().contains(&src_total_bytes_key));
+
+        assert!(total_bytes(ctx.rk.tez_accounts(), &dest).unwrap().0 > 0u64.into());
+    }
+
+    #[test]
+    fn big_map_update_shrink_then_delete_returns_to_zero() {
+        let mut host = MockKernelHost::default();
+        let mut rk = RuntimeKeyspaces::init(&mut host).unwrap();
+        make_default_ctx!(ctx, rk);
+        let id = ctx.big_map_new(&Type::Int, &Type::String, false).unwrap();
+
+        ctx.big_map_update(
+            &id,
+            TypedValue::int(1),
+            Some(TypedValue::String("hello, world".into())),
+        )
+        .unwrap();
+        ctx.big_map_update(
+            &id,
+            TypedValue::int(1),
+            Some(TypedValue::String("hi".into())),
+        )
+        .unwrap();
+        ctx.big_map_update(&id, TypedValue::int(1), None).unwrap();
+
+        assert_eq!(
+            total_bytes(ctx.rk.tez_accounts(), &id).unwrap(),
+            0u64.into()
+        );
+    }
+
+    #[test]
+    fn big_map_remove_clears_total_bytes_key() {
+        let mut host = MockKernelHost::default();
+        let mut rk = RuntimeKeyspaces::init(&mut host).unwrap();
+        make_default_ctx!(ctx, rk);
+        let id = ctx.big_map_new(&Type::Int, &Type::String, false).unwrap();
+        ctx.big_map_update(
+            &id,
+            TypedValue::int(1),
+            Some(TypedValue::String("hello".into())),
+        )
+        .unwrap();
+        let total_bytes_key = total_bytes_key(&id).unwrap();
+        assert!(ctx.rk.tez_accounts().contains(&total_bytes_key));
+
+        ctx.big_map_remove(&id).unwrap();
+
+        assert!(!ctx.rk.tez_accounts().contains(&total_bytes_key));
+    }
+
+    #[test]
+    fn total_bytes_on_missing_counter_is_an_error() {
+        let mut host = MockKernelHost::default();
+        let mut rk = RuntimeKeyspaces::init(&mut host).unwrap();
+        make_default_ctx!(ctx, rk);
+        let id = ctx.big_map_new(&Type::Int, &Type::String, false).unwrap();
+        ctx.big_map_update(
+            &id,
+            TypedValue::int(0),
+            Some(TypedValue::String("a".into())),
+        )
+        .unwrap();
+
+        let total_bytes_key = total_bytes_key(&id).unwrap();
+        ctx.rk.tez_accounts_mut().delete(&total_bytes_key);
+
+        assert!(
+            matches!(
+                total_bytes(ctx.rk.tez_accounts(), &id),
+                Err(LazyStorageError::MissingTotalBytes(_))
+            ),
+            "an absent counter must surface as MissingTotalBytes"
+        );
+    }
+
+    #[test]
+    fn clear_temporary_big_maps_removes_total_bytes_paths() {
+        let mut host = MockKernelHost::default();
+        let mut rk = RuntimeKeyspaces::init(&mut host).unwrap();
+        make_default_ctx!(ctx, rk);
+        let temp1 = ctx.big_map_new(&Type::Int, &Type::String, true).unwrap();
+        let temp2 = ctx.big_map_new(&Type::Int, &Type::String, true).unwrap();
+        ctx.big_map_update(
+            &temp1,
+            TypedValue::int(1),
+            Some(TypedValue::String("hello".into())),
+        )
+        .unwrap();
+        ctx.big_map_update(
+            &temp2,
+            TypedValue::int(2),
+            Some(TypedValue::String("world".into())),
+        )
+        .unwrap();
+        let key1 = total_bytes_key(&temp1).unwrap();
+        let key2 = total_bytes_key(&temp2).unwrap();
+        assert!(ctx.rk.tez_accounts().contains(&key1));
+        assert!(ctx.rk.tez_accounts().contains(&key2));
+
+        clear_temporary_big_maps(ctx.rk.host_mut(), &ctx.temporary_big_map_id_allocator)
+            .unwrap();
+
+        assert!(!ctx.rk.tez_accounts().contains(&key1));
+        assert!(!ctx.rk.tez_accounts().contains(&key2));
+    }
+
+    /// The frames of one operation share its allocator, so a second frame must
+    /// continue the sequence instead of restarting it (L2-1937), and one clear
+    /// must cover what all of them allocated.
+    #[test]
+    fn temporary_big_map_ids_are_shared_across_frames() {
+        let mut host = MockKernelHost::default();
+        let mut rk = RuntimeKeyspaces::init(&mut host).unwrap();
+        let allocator = tezosx_journal::TemporaryBigMapIdAllocator::new();
+        let outer = {
+            make_default_ctx!(ctx, rk, allocator.clone());
+            ctx.big_map_new(&Type::Int, &Type::String, true).unwrap()
+        };
+        let inner = {
+            make_default_ctx!(ctx, rk, allocator.clone());
+            ctx.big_map_new(&Type::Int, &Type::String, true).unwrap()
+        };
+        assert!(outer.is_temporary() && inner.is_temporary());
+        assert_ne!(outer, inner, "the second frame restarted the sequence");
+
+        clear_temporary_big_maps(rk.host_mut(), &allocator).unwrap();
+
+        for id in [&outer, &inner] {
+            assert!(
+                rk.host()
+                    .store_has(&big_map_path(id).unwrap())
+                    .unwrap()
+                    .is_none(),
+                "clear must remove {id}"
+            );
+        }
+    }
+
+    /// Clearing walks the IDs handed out down to the first one. It must stop
+    /// there: permanent IDs sit on the other side of 0 and progress the other
+    /// way, so walking one ID too far would delete a live big map.
+    #[test]
+    fn clear_temporary_big_maps_spares_permanent_big_maps() {
+        let mut host = MockKernelHost::default();
+        let mut rk = RuntimeKeyspaces::init(&mut host).unwrap();
+        make_default_ctx!(ctx, rk);
+        // Two permanent maps, so one of them has a non-zero ID to walk onto.
+        let _ = ctx.big_map_new(&Type::Int, &Type::String, false).unwrap();
+        let permanent = ctx.big_map_new(&Type::Int, &Type::String, false).unwrap();
+        let permanent_path = big_map_path(&permanent).unwrap();
+
+        // Nothing handed out yet: nothing to clear.
+        clear_temporary_big_maps(ctx.rk.host_mut(), &TemporaryBigMapIdAllocator::new())
+            .unwrap();
+        assert!(ctx.rk.host().store_has(&permanent_path).unwrap().is_some());
+
+        let temporary = ctx.big_map_new(&Type::Int, &Type::String, true).unwrap();
+        clear_temporary_big_maps(ctx.rk.host_mut(), &ctx.temporary_big_map_id_allocator)
+            .unwrap();
+
+        assert!(ctx
+            .rk
+            .host()
+            .store_has(&big_map_path(&temporary).unwrap())
+            .unwrap()
+            .is_none());
+        assert!(
+            ctx.rk.host().store_has(&permanent_path).unwrap().is_some(),
+            "clearing the temporary IDs must spare {permanent}"
+        );
+    }
+
+    /// A frame that reverts keeps its IDs handed out but takes its big maps
+    /// with it, so clearing walks over IDs with nothing in the store.
+    #[test]
+    fn clear_temporary_big_maps_tolerates_absent_big_maps() {
+        let mut host = MockKernelHost::default();
+        let mut rk = RuntimeKeyspaces::init(&mut host).unwrap();
+        make_default_ctx!(ctx, rk);
+        // Cleared last, after the reverted one, so an abort would spare it.
+        let live = ctx.big_map_new(&Type::Int, &Type::String, true).unwrap();
+        let reverted = ctx.big_map_new(&Type::Int, &Type::String, true).unwrap();
+        ctx.rk
+            .host_mut()
+            .store_delete(&big_map_path(&reverted).unwrap())
+            .unwrap();
+
+        clear_temporary_big_maps(ctx.rk.host_mut(), &ctx.temporary_big_map_id_allocator)
+            .unwrap();
+
+        assert!(
+            ctx.rk
+                .host()
+                .store_has(&big_map_path(&live).unwrap())
+                .unwrap()
+                .is_none(),
+            "the absent {reverted} aborted the clearing before {live}"
+        );
+    }
+
+    /// The TezosX gateway exposes three synthetic views today:
+    /// `staticcall_evm`, `originOf`, and `resolveAddress`. This test
+    /// pins the enumeration (names and types) so off-chain consumers
+    /// of the synthesized `/script` get a stable schema; any change to
+    /// the enumeration must also update the matching dispatch arm in
+    /// [`CtxTrait::try_dispatch_enshrined_view`].
+    #[test]
+    fn test_gateway_synthetic_views_enumeration() {
+        let views = enshrined_synthetic_views(
+            crate::enshrined_contracts::EnshrinedContracts::TezosXGateway,
+        );
+        assert_eq!(
+            views,
+            vec![
+                (
+                    "staticcall_evm",
+                    Type::new_pair(Type::String, Type::Bytes),
+                    Type::Bytes,
+                ),
+                (
+                    "originOf",
+                    Type::new_pair(Type::String, Type::Nat),
+                    Type::new_or(
+                        Type::Unit,
+                        Type::new_or(Type::Nat, Type::new_pair(Type::Nat, Type::String),),
+                    ),
+                ),
+                (
+                    "resolveAddress",
+                    Type::new_pair(Type::String, Type::new_pair(Type::Nat, Type::Nat)),
+                    Type::new_option(Type::new_pair(Type::Nat, Type::String)),
+                ),
+            ]
+        );
+    }
+
+    /// Enforce that every view enumerated in
+    /// [`enshrined_synthetic_views`] has a matching dispatch arm in
+    /// [`CtxTrait::try_dispatch_enshrined_view`]. Without this test,
+    /// adding a view to the enumeration without wiring up the
+    /// dispatch arm would silently ship a `view "name" T1 T2`
+    /// declaration in `/script` that the kernel refuses to serve at
+    /// runtime — discoverability would break in the worst possible
+    /// way.
+    ///
+    /// Mechanism: with `return_type = Type::Unit`, the
+    /// `dispatch_staticcall_evm_view` body short-circuits to
+    /// `Some(Ok(None))` before touching gas, the host, or the EVM
+    /// runtime, so we can probe the hook safely with placeholder
+    /// inputs. A missing dispatch arm trips the `unreachable!()` in
+    /// the hook (rather than returning `None`), turning the desync
+    /// into a hard test failure.
+    #[test]
+    fn enshrined_synthetic_views_dispatch_in_sync() {
+        use crate::context::implicit_from_public_key_hash;
+        use crate::context::originated_from_kt1;
+        use crate::enshrined_contracts::EnshrinedContracts;
+        use mir::ast::michelson_address::AddressHash;
+        use tezos_crypto_rs::hash::HashTrait;
+
+        let mut host = MockKernelHost::default();
+        let mut rk = RuntimeKeyspaces::init(&mut host).unwrap();
+        make_default_ctx!(tc_ctx, rk);
+
+        // OperationCtx + ExecCtx fields are unread by the
+        // `return_type = Unit` early-exit path. Use placeholder
+        // values for everything that is not under test.
+        let bootstrap_pkh =
+            PublicKeyHash::from_b58check("tz1KqTpEZ7Yob7QbPE4Hy4Wo8fHG8LhKxZSx").unwrap();
+        let placeholder_kt1 = ContractKt1Hash::from([0u8; 20]);
+        let source = implicit_from_public_key_hash(&bootstrap_pkh).unwrap();
+        let mut counter = 0u128;
+        let level = BlockNumber { block_number: 0 };
+        let now = Timestamp::from(0);
+        let chain_id = ChainId::from([0, 0, 0, 0]);
+        let source_public_key: Vec<u8> = Vec::new();
+
+        let mut operation_ctx = OperationCtx {
+            source: &source,
+            counter: &mut counter,
+            applied_counters: std::collections::BTreeSet::new(),
+            level: &level,
+            now: &now,
+            chain_id: &chain_id,
+            source_public_key: &source_public_key,
+            crac_chain_depth: 0,
+            crac_origin: None,
+            delegated_storage_cost: 0,
+        };
+
+        let exec_ctx = ExecCtx {
+            sender: AddressHash::Implicit(bootstrap_pkh),
+            amount: 0,
+            self_address: AddressHash::Kt1(placeholder_kt1.clone()),
+            balance: 0,
+            contract_account: originated_from_kt1(&placeholder_kt1).unwrap(),
+        };
+
+        let mut journal = tezosx_journal::TezosXJournal::new(
+            tezosx_journal::CracId::new(1, 0),
+            TezosXHashes::zero(),
+            tezos_ethereum::block::BlockConstants::dummy(),
+        );
+        // The synthetic-view dispatcher under test short-circuits on
+        // `Type::Unit` before any registry call, so unwiring all
+        // registry methods catches any future regression where a code
+        // path accidentally starts calling into them.
+        let registry = tezosx_interfaces::testing::UnimplementedRegistry;
+        let mut ctx = Ctx {
+            tc_ctx: &mut tc_ctx,
+            exec_ctx,
+            operation_ctx: &mut operation_ctx,
+            journal: &mut journal,
+            registry: &registry,
+            address_registry_diff: Vec::new(),
+        };
+
+        // Recover each enshrined contract's KT1 from its 22-byte
+        // address-hash encoding (`[0x01][20-byte hash][0x00]`).
+        let arena = Arena::new();
+        for contract in [EnshrinedContracts::TezosXGateway] {
+            let bytes = contract.address_hash_bytes();
+            let kt1 = ContractKt1Hash::try_from_bytes(&bytes[1..21]).unwrap();
+            for (name, _, _) in enshrined_synthetic_views(contract) {
+                let result = ctx.try_dispatch_enshrined_view(
+                    &kt1,
+                    name,
+                    &TypedValue::Unit,
+                    // `Type::Unit` (not `Type::Bytes`) makes the
+                    // `staticcall_evm` body short-circuit to
+                    // `Some(Ok(None))`, avoiding any gas charge or
+                    // EVM runtime call.
+                    &Type::Unit,
+                    &arena,
+                );
+                assert!(
+                    result.is_some(),
+                    "synthetic view {name:?} on {contract:?} is enumerated \
+                     in enshrined_synthetic_views but try_dispatch_enshrined_view \
+                     returned None (no dispatch arm)"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn interpret_context_alloc_permanent_adds_33() {
+        let mut host = MockKernelHost::default();
+        let mut rk = RuntimeKeyspaces::init(&mut host).unwrap();
+        make_default_ctx!(ctx, rk);
+        let _ = ctx.big_map_new(&Type::Int, &Type::String, false).unwrap();
+        assert_eq!(
+            ctx.interpret_context.lazy_storage_size_diff,
+            BYTES_SIZE_FOR_EMPTY.into()
+        );
+    }
+
+    #[test]
+    fn interpret_context_alloc_temporary_is_zero() {
+        let mut host = MockKernelHost::default();
+        let mut rk = RuntimeKeyspaces::init(&mut host).unwrap();
+        make_default_ctx!(ctx, rk);
+        let _ = ctx.big_map_new(&Type::Int, &Type::String, true).unwrap();
+        assert_eq!(ctx.interpret_context.lazy_storage_size_diff, 0.into());
+    }
+
+    #[test]
+    fn interpret_context_insert_permanent_adds_65_plus_value_size() {
+        let mut host = MockKernelHost::default();
+        let mut rk = RuntimeKeyspaces::init(&mut host).unwrap();
+        make_default_ctx!(ctx, rk);
+        let id = ctx.big_map_new(&Type::Int, &Type::String, false).unwrap();
+        let value = TypedValue::String("hello".into());
+        let value_size = encoded_size(&value);
+        ctx.big_map_update(&id, TypedValue::int(1), Some(value))
+            .unwrap();
+        assert_eq!(
+            ctx.interpret_context.lazy_storage_size_diff,
+            (BYTES_SIZE_FOR_EMPTY + BYTES_SIZE_FOR_BIG_MAP_KEY + value_size).into()
+        );
+    }
+
+    #[test]
+    fn interpret_context_overwrite_permanent_adds_value_size_diff() {
+        let mut host = MockKernelHost::default();
+        let mut rk = RuntimeKeyspaces::init(&mut host).unwrap();
+        make_default_ctx!(ctx, rk);
+        let id = ctx.big_map_new(&Type::Int, &Type::String, false).unwrap();
+        let small = TypedValue::String("hi".into());
+        let big = TypedValue::String("hello, world".into());
+        let small_size = encoded_size(&small);
+        let big_size: BigInt = encoded_size(&big).into();
+        ctx.big_map_update(&id, TypedValue::int(1), Some(small))
+            .unwrap();
+        assert_eq!(
+            ctx.interpret_context.lazy_storage_size_diff,
+            (BYTES_SIZE_FOR_EMPTY + BYTES_SIZE_FOR_BIG_MAP_KEY + small_size).into()
+        );
+        ctx.interpret_context.lazy_storage_size_diff = 0.into();
+        ctx.big_map_update(&id, TypedValue::int(1), Some(big))
+            .unwrap();
+        assert_eq!(
+            ctx.interpret_context.lazy_storage_size_diff,
+            (big_size - small_size).into()
+        );
+    }
+
+    #[test]
+    fn interpret_context_delete_permanent_subtracts_65_plus_prev_size() {
+        let mut host = MockKernelHost::default();
+        let mut rk = RuntimeKeyspaces::init(&mut host).unwrap();
+        make_default_ctx!(ctx, rk);
+        let id = ctx.big_map_new(&Type::Int, &Type::String, false).unwrap();
+        let value = TypedValue::String("hello".into());
+        let value_size = encoded_size(&value);
+        ctx.big_map_update(&id, TypedValue::int(1), Some(value))
+            .unwrap();
+        ctx.interpret_context.lazy_storage_size_diff = 0.into();
+        ctx.big_map_update(&id, TypedValue::int(1), None).unwrap();
+        assert_eq!(
+            ctx.interpret_context.lazy_storage_size_diff,
+            Zarith(BigInt::from(
+                -((BYTES_SIZE_FOR_BIG_MAP_KEY + value_size) as i64)
+            ))
+        );
+    }
+
+    #[test]
+    fn interpret_context_copy_permanent_adds_33_plus_source_total() {
+        let mut host = MockKernelHost::default();
+        let mut rk = RuntimeKeyspaces::init(&mut host).unwrap();
+        make_default_ctx!(ctx, rk);
+        let src = ctx.big_map_new(&Type::Int, &Type::String, false).unwrap();
+        let v1 = TypedValue::String("a".into());
+        let v2 = TypedValue::String("bb".into());
+        let v1_size = encoded_size(&v1);
+        let v2_size = encoded_size(&v2);
+        ctx.big_map_update(&src, TypedValue::int(1), Some(v1))
+            .unwrap();
+        ctx.big_map_update(&src, TypedValue::int(2), Some(v2))
+            .unwrap();
+        let src_total = (2 * BYTES_SIZE_FOR_BIG_MAP_KEY + v1_size + v2_size) as i64;
+        ctx.interpret_context.lazy_storage_size_diff = 0.into();
+        let _dest = ctx.big_map_copy(&src, false).unwrap();
+        assert_eq!(
+            ctx.interpret_context.lazy_storage_size_diff,
+            Zarith(BigInt::from(BYTES_SIZE_FOR_EMPTY as i64 + src_total))
+        );
+    }
+
+    #[test]
+    fn interpret_context_copy_promotes_temp_to_perm_adds_33_plus_total() {
+        let mut host = MockKernelHost::default();
+        let mut rk = RuntimeKeyspaces::init(&mut host).unwrap();
+        make_default_ctx!(ctx, rk);
+        // Create a temporary big-map and fill it — no accumulator activity
+        // for the alloc nor the updates (the id is in the temp range).
+        let temp_src = ctx.big_map_new(&Type::Int, &Type::String, true).unwrap();
+        let v1 = TypedValue::String("a".into());
+        let v2 = TypedValue::String("bb".into());
+        let v1_size = encoded_size(&v1);
+        let v2_size = encoded_size(&v2);
+        ctx.big_map_update(&temp_src, TypedValue::int(1), Some(v1))
+            .unwrap();
+        ctx.big_map_update(&temp_src, TypedValue::int(2), Some(v2))
+            .unwrap();
+        assert_eq!(
+            ctx.interpret_context.lazy_storage_size_diff,
+            Zarith(BigInt::from(0)),
+            "alloc and updates on a temp big-map must not accumulate"
+        );
+
+        let src_total = (2 * BYTES_SIZE_FOR_BIG_MAP_KEY + v1_size + v2_size) as i64;
+        // Promote temp -> permanent. This is what MIR's
+        // `dump_big_map_updates` does at the contract-storage boundary
+        // when the final storage references a freshly-allocated
+        // big-map: it calls `big_map_copy(temp_id, temporary=false)`.
+        let _perm_dest = ctx.big_map_copy(&temp_src, false).unwrap();
+        assert_eq!(
+            ctx.interpret_context.lazy_storage_size_diff,
+            Zarith(BigInt::from(BYTES_SIZE_FOR_EMPTY as i64 + src_total)),
+            "temp→perm promotion must contribute 33 + total_bytes(temp_src)"
+        );
+    }
+
+    #[test]
+    fn interpret_context_copy_temporary_is_zero() {
+        let mut host = MockKernelHost::default();
+        let mut rk = RuntimeKeyspaces::init(&mut host).unwrap();
+        make_default_ctx!(ctx, rk);
+        let src = ctx.big_map_new(&Type::Int, &Type::String, false).unwrap();
+        ctx.interpret_context.lazy_storage_size_diff = 0.into();
+        let _dest = ctx.big_map_copy(&src, true).unwrap();
+        assert_eq!(
+            ctx.interpret_context.lazy_storage_size_diff,
+            Zarith(BigInt::from(0))
+        );
+    }
+
+    #[test]
+    fn interpret_context_remove_permanent_subtracts_33_plus_total() {
+        let mut host = MockKernelHost::default();
+        let mut rk = RuntimeKeyspaces::init(&mut host).unwrap();
+        make_default_ctx!(ctx, rk);
+        let id = ctx.big_map_new(&Type::Int, &Type::String, false).unwrap();
+        let value = TypedValue::String("hello".into());
+        let value_size = encoded_size(&value);
+        ctx.big_map_update(&id, TypedValue::int(1), Some(value))
+            .unwrap();
+        ctx.interpret_context.lazy_storage_size_diff = 0.into();
+        ctx.big_map_remove(&id).unwrap();
+        assert_eq!(
+            ctx.interpret_context.lazy_storage_size_diff,
+            Zarith(BigInt::from(
+                -((BYTES_SIZE_FOR_EMPTY + BYTES_SIZE_FOR_BIG_MAP_KEY + value_size)
+                    as i64)
+            ))
+        );
+    }
+
+    #[test]
+    fn interpret_context_update_on_temporary_skipped() {
+        let mut host = MockKernelHost::default();
+        let mut rk = RuntimeKeyspaces::init(&mut host).unwrap();
+        make_default_ctx!(ctx, rk);
+        let id = ctx.big_map_new(&Type::Int, &Type::String, true).unwrap();
+        ctx.big_map_update(
+            &id,
+            TypedValue::int(1),
+            Some(TypedValue::String("hi".into())),
+        )
+        .unwrap();
+        assert_eq!(
+            ctx.interpret_context.lazy_storage_size_diff,
+            Zarith(BigInt::from(0))
+        );
+    }
+
+    #[test]
+    fn interpret_context_clear_temporaries_does_not_touch_accumulator() {
+        let mut host = MockKernelHost::default();
+        let mut rk = RuntimeKeyspaces::init(&mut host).unwrap();
+        make_default_ctx!(ctx, rk);
+        let perm = ctx.big_map_new(&Type::Int, &Type::String, false).unwrap();
+        ctx.big_map_update(
+            &perm,
+            TypedValue::int(1),
+            Some(TypedValue::String("perm".into())),
+        )
+        .unwrap();
+        let _ = ctx.big_map_new(&Type::Int, &Type::String, true).unwrap();
+        let before_clear = ctx.interpret_context.lazy_storage_size_diff.clone();
+        clear_temporary_big_maps(ctx.rk.host_mut(), &ctx.temporary_big_map_id_allocator)
+            .unwrap();
+        assert_eq!(
+            ctx.interpret_context.lazy_storage_size_diff, before_clear,
+            "clear_temporary_big_maps must not touch the accumulator",
+        );
+    }
+
+    #[test]
+    fn interpret_context_take_resets_to_zero() {
+        let mut host = MockKernelHost::default();
+        let mut rk = RuntimeKeyspaces::init(&mut host).unwrap();
+        make_default_ctx!(ctx, rk);
+        let _ = ctx.big_map_new(&Type::Int, &Type::String, false).unwrap();
+        let first = ctx.interpret_context.take_lazy_storage_size_diff();
+        assert!(first.0 > BigInt::from(0));
+        let second = ctx.interpret_context.take_lazy_storage_size_diff();
+        assert_eq!(second, Zarith(BigInt::from(0)));
+    }
+
+    #[test]
+    fn address_registry_seeding() {
+        use tezos_smart_rollup_host::path::RefPath;
+
+        // Pinned layout: seeded networks hold exactly these bytes, so the
+        // helpers must keep resolving to them.
+        const NULL_ENTRY_PATH: RefPath = RefPath::assert_from(
+            b"/tez/tez_accounts/address_registry/00000000000000000000000000000000000000000000",
+        );
+        const COUNTER_PATH: RefPath =
+            RefPath::assert_from(b"/tez/tez_accounts/address_registry/counter");
+
+        let mut host = MockKernelHost::default();
+        let mut rk = RuntimeKeyspaces::init(&mut host).unwrap();
+        // An unseeded registry has no counter: the read errors rather than
+        // seeding on demand.
+        assert!(super::read_address_counter(rk.tez_accounts()).is_err());
+
+        // Seeding installs null@0 and the next-free counter at 1.
+        super::init_address_registry(rk.tez_accounts_mut()).unwrap();
+        assert_eq!(
+            rk.host_mut().store_read_all(&NULL_ENTRY_PATH).unwrap(),
+            [0x00]
+        );
+        assert_eq!(rk.host_mut().store_read_all(&COUNTER_PATH).unwrap(), [0x01]);
+        assert_eq!(
+            super::read_address_counter(rk.tez_accounts()).unwrap(),
+            BigUint::from(1u32)
+        );
+
+        // Seeding is one-shot: a second call errors instead of overwriting.
+        assert_eq!(
+            super::init_address_registry(rk.tez_accounts_mut()),
+            Err(AddressRegistryError::AlreadySeeded(BigUint::from(1u32)))
+        );
+        assert_eq!(rk.host_mut().store_read_all(&COUNTER_PATH).unwrap(), [0x01]);
+    }
+
+    #[test]
+    fn mock_ctx_address_registry() {
+        // In-memory registry mirroring the standalone Ctx: null at 0, first
+        // user address at 1, idempotent indexing, read-only get.
+        use super::mock::MockCtx;
+        use crate::test_utils::MockRegistry;
+        use tezosx_journal::{CracId, TezosXJournal};
+        let mut host = MockKernelHost::default();
+        let mut rk = RuntimeKeyspaces::init(&mut host).unwrap();
+        let mut journal = TezosXJournal::new(
+            CracId::new(1, 0),
+            TezosXHashes::zero(),
+            tezos_ethereum::block::BlockConstants::dummy(),
+        );
+        let registry = MockRegistry::new("KT1_mock_alias".to_string());
+        let sender: AddressHash =
+            "tz1KqTpEZ7Yob7QbPE4Hy4Wo8fHG8LhKxZSx".try_into().unwrap();
+        let mut ctx = MockCtx::new(&mut rk, &mut journal, &registry, sender, 0);
+        let null = AddressHash::default();
+        let addr: AddressHash =
+            "tz1Nw5nr152qddEjKT2dKBH8XcBMDAg72iLw".try_into().unwrap();
+        assert_eq!(ctx.get_address_index(&null), Ok(Some(BigUint::from(0u32))));
+        assert_eq!(ctx.get_address_index(&addr), Ok(None));
+        assert_eq!(ctx.index_address(&addr), Ok(BigUint::from(1u32)));
+        assert_eq!(ctx.index_address(&addr), Ok(BigUint::from(1u32)));
+        assert_eq!(ctx.get_address_index(&addr), Ok(Some(BigUint::from(1u32))));
+    }
+}
+
+#[cfg(test)]
+pub(crate) mod mock {
+    use super::*;
+    use crate::context::originated_from_kt1;
+    use mir::ast::{ByteReprTrait, Entrypoint};
+    use num_bigint::BigInt;
+    use std::collections::HashMap;
+    use tezos_crypto_rs::hash::HashTrait;
+
+    /// Mock execution context for testing enshrined contracts.
+    /// Implements CtxTrait and HasHost with configurable values.
+    ///
+    /// Lifetimes are decoupled (handle, journal, registry and host
+    /// independently) so tests can construct `MockCtx` from a long-lived
+    /// host and shorter-lived journal/registry locals without forcing the
+    /// borrow checker to unify them under a single `'a`.
+    pub struct MockCtx<'rk, 'j, 'r, 'host, Host: StorageV1, KS, R: Registry> {
+        pub rk: &'rk mut RuntimeKeyspaces<'host, Host, KS>,
+        pub journal: &'j mut tezosx_journal::TezosXJournal,
+        pub registry: &'r R,
+        pub sender: AddressHash,
+        pub amount: i64,
+        pub level: BigUint,
+        pub now: BigInt,
+        pub operation_group_hash: OperationHash,
+        pub operation_gas: crate::gas::TezlinkOperationGas,
+        pub contract_account: TezosOriginatedAccount,
+        pub operation_counter: u128,
+        pub crac_chain_depth: u32,
+        pub crac_origin: Option<Contract>,
+        pub delegated_storage_cost: u64,
+        /// In-memory registry mirroring the standalone [`super::Ctx`].
+        pub address_registry: HashMap<AddressHash, BigUint>,
+    }
+
+    impl<'rk, 'j, 'r, 'host, Host: StorageV1, KS, R: Registry>
+        MockCtx<'rk, 'j, 'r, 'host, Host, KS, R>
+    {
+        pub fn new(
+            rk: &'rk mut RuntimeKeyspaces<'host, Host, KS>,
+            journal: &'j mut tezosx_journal::TezosXJournal,
+            registry: &'r R,
+            sender: AddressHash,
+            amount: i64,
+        ) -> Self {
+            Self {
+                rk,
+                journal,
+                registry,
+                sender,
+                amount,
+                level: 1u32.into(),
+                now: 0.into(),
+                operation_group_hash: OperationHash::from([0u8; 32]),
+                operation_gas: crate::gas::TezlinkOperationGas::default(),
+                operation_counter: 0,
+                contract_account: originated_from_kt1(&ContractKt1Hash::from([0u8; 20]))
+                    .unwrap(),
+                crac_chain_depth: 0,
+                crac_origin: None,
+                delegated_storage_cost: 0,
+                // Null address pre-registered at index 0, as in `Ctx`.
+                address_registry: HashMap::from([(
+                    AddressHash::default(),
+                    BigUint::from(0u32),
+                )]),
+            }
+        }
+    }
+
+    impl<'rk, 'j, 'r, 'host, Host: StorageV1, KS, R: Registry> HasCracChainDepth
+        for MockCtx<'rk, 'j, 'r, 'host, Host, KS, R>
+    {
+        fn crac_chain_depth(&self) -> u32 {
+            self.crac_chain_depth
+        }
+
+        fn crac_origin(&self) -> Option<Contract> {
+            self.crac_origin.clone()
+        }
+    }
+
+    impl<'rk, 'j, 'r, 'host, Host: StorageV1, KS, R: Registry> HasDelegatedStorageCost
+        for MockCtx<'rk, 'j, 'r, 'host, Host, KS, R>
+    {
+        fn delegated_storage_cost(&self) -> u64 {
+            self.delegated_storage_cost
+        }
+
+        fn add_delegated_storage_cost(&mut self, v: u64) {
+            self.delegated_storage_cost = self.delegated_storage_cost.saturating_add(v);
+        }
+    }
+
+    impl<'rk, 'j, 'r, 'host, Host: StorageV1, KS, R: Registry> HasJournal
+        for MockCtx<'rk, 'j, 'r, 'host, Host, KS, R>
+    {
+        fn journal(&mut self) -> &mut tezosx_journal::TezosXJournal {
+            self.journal
+        }
+    }
+
+    impl<'rk, 'j, 'r, 'host, Host: StorageV1, KS, R: Registry> HasRegistry
+        for MockCtx<'rk, 'j, 'r, 'host, Host, KS, R>
+    {
+        type R = R;
+        fn registry(&self) -> &Self::R {
+            self.registry
+        }
+    }
+
+    impl<'rk, 'j, 'r, 'host, Host: StorageV1, KS, R: Registry>
+        HasCrossRuntime<'host, Host, KS> for MockCtx<'rk, 'j, 'r, 'host, Host, KS, R>
+    {
+        fn cross_runtime_split(
+            &mut self,
+        ) -> (
+            &mut RuntimeKeyspaces<'host, Host, KS>,
+            &mut tezosx_journal::TezosXJournal,
+            &R,
+        ) {
+            (&mut *self.rk, self.journal, self.registry)
+        }
+    }
+
+    impl<'rk, 'j, 'r, 'host, Host: StorageV1, KS, R: Registry> HasOriginLookup
+        for MockCtx<'rk, 'j, 'r, 'host, Host, KS, R>
+    {
+        fn read_origin_for_address(
+            &self,
+            address: &AddressHash,
+        ) -> Result<Option<tezosx_interfaces::Origin>, tezos_storage::error::Error>
+        {
+            crate::context::read_origin_for_address(self.rk.host(), address)
+        }
+    }
+
+    impl<'rk, 'j, 'r, 'host, Host: StorageV1, KS, R: Registry> HasHost<Host>
+        for MockCtx<'rk, 'j, 'r, 'host, Host, KS, R>
+    {
+        fn host(&mut self) -> &mut Host {
+            self.rk.host_mut()
+        }
+    }
+
+    impl<'rk, 'j, 'r, 'host, Host: StorageV1, KS, R: Registry> HasContractAccount
+        for MockCtx<'rk, 'j, 'r, 'host, Host, KS, R>
+    {
+        fn contract_account(&self) -> &TezosOriginatedAccount {
+            &self.contract_account
+        }
+    }
+
+    impl<'rk, 'j, 'r, 'host, Host: StorageV1, KS, R: Registry> HasOperationGas
+        for MockCtx<'rk, 'j, 'r, 'host, Host, KS, R>
+    {
+        fn operation_gas(&mut self) -> &mut crate::gas::TezlinkOperationGas {
+            &mut self.operation_gas
+        }
+    }
+
+    impl<'rk, 'j, 'r, 'host, Host: StorageV1, KS, R: Registry> HasSourcePublicKey
+        for MockCtx<'rk, 'j, 'r, 'host, Host, KS, R>
+    {
+        fn source_public_key(&self) -> &[u8] {
+            &[]
+        }
+    }
+
+    impl<'a, 'rk, 'j, 'r, 'host, Host: StorageV1, KS, R: Registry> TypecheckingCtx<'a>
+        for MockCtx<'rk, 'j, 'r, 'host, Host, KS, R>
+    {
+        fn gas(&mut self) -> &mut mir::gas::Gas {
+            &mut self.operation_gas.remaining
+        }
+
+        fn lookup_entrypoints(
+            &mut self,
+            _address: &AddressHash,
+        ) -> Option<HashMap<Entrypoint, Type>> {
+            None
+        }
+
+        fn big_map_get_type(
+            &mut self,
+            _id: &BigMapId,
+        ) -> Result<Option<(Type, Type)>, LazyStorageError> {
+            Ok(None)
+        }
+    }
+
+    impl<'a, 'rk, 'j, 'r, 'host, Host: StorageV1, KS, R: Registry> CtxTrait<'a>
+        for MockCtx<'rk, 'j, 'r, 'host, Host, KS, R>
+    {
+        fn sender(&self) -> AddressHash {
+            self.sender.clone()
+        }
+
+        fn source(&self) -> PublicKeyHash {
+            PublicKeyHash::from_b58check("tz1KqTpEZ7Yob7QbPE4Hy4Wo8fHG8LhKxZSx").unwrap()
+        }
+
+        fn amount(&self) -> i64 {
+            self.amount
+        }
+
+        fn self_address(&self) -> AddressHash {
+            // KT1BEqzn5Wx8uJrZNvuS9DVHmLvG9td3fDLi
+            AddressHash::from_bytes(&[
+                0x01, 0x29, 0x58, 0x93, 0x60, 0xad, 0xf1, 0x56, 0x94, 0xac, 0x33, 0x0d,
+                0xe5, 0x9f, 0x46, 0x44, 0x15, 0xb5, 0xf7, 0xea, 0x69, 0x00,
+            ])
+            .unwrap()
+        }
+
+        fn balance(&self) -> i64 {
+            0
+        }
+
+        fn level(&self) -> BigUint {
+            self.level.clone()
+        }
+
+        fn min_block_time(&self) -> BigUint {
+            1u32.into()
+        }
+
+        fn chain_id(&self) -> ChainId {
+            ChainId::try_from_bytes(&[0u8; 4]).unwrap()
+        }
+
+        fn voting_power(&self, _: &PublicKeyHash) -> BigUint {
+            0u32.into()
+        }
+
+        fn now(&self) -> BigInt {
+            self.now.clone()
+        }
+
+        fn total_voting_power(&self) -> BigUint {
+            1u32.into()
+        }
+
+        fn operation_group_hash(&self) -> &OperationHash {
+            &self.operation_group_hash
+        }
+
+        fn origination_counter(&mut self) -> u32 {
+            0
+        }
+
+        fn operation_counter(&mut self) -> u128 {
+            let current = self.operation_counter;
+            self.operation_counter += 1;
+            current
+        }
+
+        fn lazy_storage(&mut self) -> Box<&mut dyn LazyStorage<'a>> {
+            unimplemented!("MockCtx does not support lazy_storage")
+        }
+
+        fn lookup_view_storage_balance(
+            &mut self,
+            _contract: &ContractKt1Hash,
+            _name: &str,
+            _arena: &'a Arena<Micheline<'a>>,
+        ) -> Result<
+            Option<(MichelineView<Micheline<'a>>, Micheline<'a>, Vec<u8>, i64)>,
+            mir::context::LookupViewError,
+        > {
+            Ok(None)
+        }
+
+        fn set_view_context(
+            &mut self,
+            _self_address: AddressHash,
+            _sender: AddressHash,
+            _amount: i64,
+            _balance: i64,
+        ) {
+            // MockCtx does not support views
+        }
+
+        fn index_address(
+            &mut self,
+            address: &AddressHash,
+        ) -> Result<BigUint, mir::context::AddressRegistryError> {
+            if let Some(index) = self.address_registry.get(address) {
+                return Ok(index.clone());
+            }
+            let index = BigUint::from(self.address_registry.len());
+            self.address_registry.insert(address.clone(), index.clone());
+            Ok(index)
+        }
+
+        fn get_address_index(
+            &mut self,
+            address: &AddressHash,
+        ) -> Result<Option<BigUint>, mir::context::AddressRegistryError> {
+            Ok(self.address_registry.get(address).cloned())
+        }
+    }
+}

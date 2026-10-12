@@ -54,6 +54,14 @@ end
 (** Builds a new Hash type using Blake2B. *)
 module Make_minimal (Name : Name) : S.MINIMAL_HASH
 
+(** Builds a new Hash type using Blake2B, with the necessary functions for
+    conversion. *)
+module Make_minimal_with_data (Name : Name) : sig
+  include S.MINIMAL_HASH
+
+  include S.RAW_DATA with type t := t
+end
+
 module type Register = sig
   val register_encoding :
     prefix:string ->
@@ -68,20 +76,22 @@ module Make (Register : Register) (Name : PrefixedName) : S.HASH
 
 (**/**)
 
-module Make_merkle_tree (R : sig
-  val register_encoding :
-    prefix:string ->
-    length:int ->
-    to_raw:('a -> string) ->
-    of_raw:(string -> 'a option) ->
-    wrap:('a -> Base58.data) ->
-    'a Base58.encoding
-end)
-(K : PrefixedName) (Contents : sig
-  type t
+module Make_merkle_tree
+    (R : sig
+      val register_encoding :
+        prefix:string ->
+        length:int ->
+        to_raw:('a -> string) ->
+        of_raw:(string -> 'a option) ->
+        wrap:('a -> Base58.data) ->
+        'a Base58.encoding
+    end)
+    (K : PrefixedName)
+    (Contents : sig
+      type t
 
-  val to_bytes : t -> Bytes.t
-end) : S.MERKLE_TREE with type elt = Contents.t
+      val to_bytes : t -> Bytes.t
+    end) : S.MERKLE_TREE with type elt = Contents.t
 
 module Generic_Merkle_tree (H : sig
   type t

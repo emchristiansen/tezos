@@ -24,8 +24,13 @@
 (* DEALINGS IN THE SOFTWARE.                                                 *)
 (*                                                                           *)
 (*****************************************************************************)
+let version_value = "alpha_current"
+
+let version = "v1"
 
 let mainnet_id = Chain_id.of_b58check_exn "NetXdQprcVkpaWU"
+
+let shadownet_id = Chain_id.of_b58check_exn "NetXsqzbfFenSTS"
 
 (* The fitness version number was:
    - "\000" until and including proto 004
@@ -59,7 +64,16 @@ let michelson_maximum_type_size = 2001
 
 (* This constant declares the number of subcaches used by the cache
    mechanism (see {Context.Cache}). *)
-let cache_layout_size = 3
+let cache_layout_size = 5
+
+(* /!\ Several parts of the codebase may assume that
+   [denunciation_period = 1] and [slashing_delay = 1] **without being
+   parametrized using these constants**. So if they are ever modified,
+   the codebase needs to be examined extensively; searching for places
+   that use these constants is not enough. *)
+let denunciation_period = 1
+
+let slashing_delay = denunciation_period
 
 (* The {!Sc_rollups.wrapped_proof_encoding} uses unbounded sub-encodings.
    To avoid attacks through too large proofs and long decoding times on public
@@ -114,7 +128,9 @@ let fixed_encoding =
           max_allowed_global_constant_depth,
           cache_layout_size,
           michelson_maximum_type_size ),
-        ( sc_max_wrapped_proof_binary_size,
+        ( denunciation_period,
+          slashing_delay,
+          sc_max_wrapped_proof_binary_size,
           sc_rollup_message_size_limit,
           sc_rollup_max_number_of_messages_per_level ) ))
     (fun ( ( _proof_of_work_nonce_size,
@@ -127,9 +143,12 @@ let fixed_encoding =
              _max_allowed_global_constant_depth,
              _cache_layout_size,
              _michelson_maximum_type_size ),
-           ( _sc_max_wrapped_proof_binary_size,
+           ( _denunciation_period,
+             _slashing_delay,
+             _sc_max_wrapped_proof_binary_size,
              _sc_rollup_message_size_limit,
-             _sc_rollup_number_of_messages_per_level ) ) -> ())
+             _sc_rollup_number_of_messages_per_level ) )
+       -> ())
     (merge_objs
        (obj10
           (req "proof_of_work_nonce_size" uint8)
@@ -142,23 +161,12 @@ let fixed_encoding =
           (req "max_allowed_global_constants_depth" int31)
           (req "cache_layout_size" uint8)
           (req "michelson_maximum_type_size" uint16))
-       (obj3
+       (obj5
+          (req "denunciation_period" uint8)
+          (req "slashing_delay" uint8)
           (req "smart_rollup_max_wrapped_proof_binary_size" int31)
           (req "smart_rollup_message_size_limit" int31)
           (req "smart_rollup_max_number_of_messages_per_level" n)))
-
-let fixed = ()
-
-type t = {fixed : fixed; parametric : Constants_parametric_repr.t}
-
-let all_of_parametric parametric = {fixed; parametric}
-
-let encoding =
-  let open Data_encoding in
-  conv
-    (fun {fixed; parametric} -> (fixed, parametric))
-    (fun (fixed, parametric) -> {fixed; parametric})
-    (merge_objs fixed_encoding Constants_parametric_repr.encoding)
 
 type error += Invalid_protocol_constants of string (* `Permanent *)
 
@@ -175,213 +183,448 @@ let () =
     (fun reason -> Invalid_protocol_constants reason)
 
 let check_constants constants =
+  let open Result_syntax in
   let open Constants_parametric_repr in
-  error_unless
-    Period_repr.(constants.minimal_block_delay > zero)
-    (Invalid_protocol_constants
-       "The minimal block delay must be greater than zero")
-  >>? fun () ->
-  error_unless
-    Period_repr.(constants.delay_increment_per_round > zero)
-    (Invalid_protocol_constants
-       "The delay increment per round must be greater than zero")
-  >>? fun () ->
-  error_unless
-    Compare.Int.(constants.consensus_committee_size > 0)
-    (Invalid_protocol_constants
-       "The consensus committee size must be strictly greater than 0.")
-  >>? fun () ->
-  error_unless
-    Compare.Int.(
-      constants.consensus_threshold >= 0
-      && constants.consensus_threshold <= constants.consensus_committee_size)
-    (Invalid_protocol_constants
-       "The consensus threshold must be greater than or equal to 0 and less \
-        than or equal to the consensus commitee size.")
-  >>? fun () ->
-  error_unless
-    (let Ratio_repr.{numerator; denominator} =
-       constants.minimal_participation_ratio
-     in
-     Compare.Int.(numerator >= 0 && denominator > 0))
-    (Invalid_protocol_constants
-       "The minimal participation ratio must be a non-negative valid ratio.")
-  >>? fun () ->
-  error_unless
-    Compare.Int.(
-      constants.minimal_participation_ratio.numerator
-      <= constants.minimal_participation_ratio.denominator)
-    (Invalid_protocol_constants
-       "The minimal participation ratio must be less than or equal to 100%.")
-  >>? fun () ->
-  error_unless
-    Compare.Int.(constants.max_slashing_period > 0)
-    (Invalid_protocol_constants
-       "The unfreeze delay must be strictly greater than 0.")
-  >>? fun () ->
-  (* The [frozen_deposits_percentage] should be a percentage *)
-  error_unless
-    Compare.Int.(
-      constants.frozen_deposits_percentage > 0
-      && constants.frozen_deposits_percentage <= 100)
-    (Invalid_protocol_constants
-       "The frozen percentage ratio must be strictly greater than 0 and less \
-        or equal than 100.")
-  >>? fun () ->
-  error_unless
-    Tez_repr.(constants.double_baking_punishment >= zero)
-    (Invalid_protocol_constants
-       "The double baking punishment must be non-negative.")
-  >>? fun () ->
-  error_unless
-    (let Ratio_repr.{numerator; denominator} =
-       constants.ratio_of_frozen_deposits_slashed_per_double_endorsement
-     in
-     Compare.Int.(numerator >= 0 && denominator > 0))
-    (Invalid_protocol_constants
-       "The ratio of frozen deposits ratio slashed per double endorsement must \
-        be a non-negative valid ratio.")
-  >>? fun () ->
-  error_unless
-    (let snapshot_frequence =
-       Int32.div constants.blocks_per_cycle constants.blocks_per_stake_snapshot
-     in
-     Compare.Int32.(
-       snapshot_frequence > Int32.zero
-       && snapshot_frequence < Int32.of_int (1 lsl 16)))
-    (Invalid_protocol_constants
-       "The ratio blocks_per_cycle per blocks_per_stake_snapshot should be \
-        between 1 and 65535")
-  >>? fun () ->
-  error_unless
-    Compare.Int32.(
-      constants.nonce_revelation_threshold > Int32.zero
-      && constants.nonce_revelation_threshold < constants.blocks_per_cycle)
-    (Invalid_protocol_constants
-       "The nonce revelation threshold must be strictly smaller than \
-        blocks_per_cycle and strictly positive.")
-  >>? fun () ->
-  error_unless
-    Compare.Int64.(
-      let threshold = Int64.of_int32 constants.nonce_revelation_threshold in
-      let block = Period_repr.to_seconds constants.minimal_block_delay in
-      let ips =
-        (* We reduce the ips for short blocks_per_commitment so that we have
-           low difficulty during tests *)
-        if Compare.Int32.(constants.blocks_per_commitment > 32l) then
-          Int64.of_int 200_000
-        else Int64.one
-      in
-      let factor = Int64.of_int 5 in
-      let difficulty = Int64.(mul (mul ips factor) (mul threshold block)) in
-      constants.vdf_difficulty > difficulty)
-    (Invalid_protocol_constants
-       "The VDF difficulty must be strictly greater than the product of the \
-        nonce_revelation_threshold, the minimial_block_delay, a benchmark of \
-        modulo squaring in class groups and a security threshold.")
-  >>? fun () ->
-  error_unless
-    Compare.Int.(constants.sc_rollup.origination_size >= 0)
-    (Invalid_protocol_constants
-       "The smart rollup origination size must be non-negative.")
-  >>? fun () ->
-  error_unless
-    Compare.Int.(constants.sc_rollup.challenge_window_in_blocks >= 0)
-    (Invalid_protocol_constants
-       "The smart rollup challenge window in blocks must be non-negative.")
-  >>? fun () ->
-  error_unless
-    Tez_repr.(constants.sc_rollup.stake_amount >= zero)
-    (Invalid_protocol_constants
-       "The smart rollup max stake amount must be non-negative.")
-  >>? fun () ->
-  error_unless
-    Compare.Int.(constants.sc_rollup.commitment_period_in_blocks > 0)
-    (Invalid_protocol_constants
-       "The smart rollup commitment period in blocks must be strictly greater \
-        than 0.")
-  >>? fun () ->
-  error_unless
-    (let sc_rollup_max_lookahead_in_blocks =
-       constants.sc_rollup.max_lookahead_in_blocks
-     in
-     Compare.Int32.(
-       sc_rollup_max_lookahead_in_blocks
-       > Int32.of_int constants.sc_rollup.commitment_period_in_blocks
-       && (* Check that [smart_rollup_challenge_window_in_blocks <
-             smart_rollup_max_lookahead_in_blocks]. Otherwise committers would be
-             forced to commit at an artificially slow rate, affecting the
-             throughput of the rollup. *)
-       sc_rollup_max_lookahead_in_blocks
-       > Int32.of_int constants.sc_rollup.challenge_window_in_blocks))
-    (Invalid_protocol_constants
-       "The smart rollup max lookahead in blocks must be greater than \
-        [smart_rollup_commitment_period_in_blocks] and \
-        [smart_rollup_challenge_window_in_blocks].")
-  >>? fun () ->
-  error_unless
-    Compare.Int.(
-      constants.dal.number_of_slots > 0 && constants.dal.number_of_slots <= 256)
-    (Invalid_protocol_constants
-       "The number of data availability slot must be between 1 and 256")
-  >>? fun () ->
-  error_unless
-    Compare.Int32.(
-      constants.dal.blocks_per_epoch > 0l
-      && constants.dal.blocks_per_epoch <= constants.blocks_per_cycle
-      && Int32.rem constants.blocks_per_cycle constants.dal.blocks_per_epoch
-         = 0l)
-    (Invalid_protocol_constants
-       "The epoch length must be between 1 and blocks_per_cycle, and \
-        blocks_per_epoch must divide blocks_per_cycle.")
-  >>? fun () ->
-  error_unless
-    Compare.Int.(
-      constants.sc_rollup.max_number_of_stored_cemented_commitments > 0)
-    (Invalid_protocol_constants
-       "The number of maximum stored cemented commitments must be strictly \
-        positive")
-  >>? fun () -> Result.return_unit
+  let* () =
+    error_unless
+      Period_repr.(constants.minimal_block_delay > zero)
+      (Invalid_protocol_constants
+         "The minimal block delay must be greater than zero")
+  in
+  let* () =
+    (* Allowing [delay_increment_per_round] = 0 is intended only for test
+       environments. This value MUST be strictly positive on any actual
+       network to ensure strictly increasing round durations, as required by
+       Tenderbake. *)
+    error_unless
+      Period_repr.(constants.delay_increment_per_round >= zero)
+      (Invalid_protocol_constants
+         "The delay increment per round must be non-negative")
+  in
+  let* () =
+    error_unless
+      Compare.Int.(constants.consensus_committee_size > 0)
+      (Invalid_protocol_constants
+         "The consensus committee size must be strictly greater than 0.")
+  in
+  let* () =
+    error_unless
+      Compare.Int.(
+        constants.consensus_threshold_size >= 0
+        && constants.consensus_threshold_size
+           <= constants.consensus_committee_size)
+      (Invalid_protocol_constants
+         "The consensus threshold must be greater than or equal to 0 and less \
+          than or equal to the consensus commitee size.")
+  in
+  let* () =
+    error_unless
+      (let Ratio_repr.{numerator; denominator} =
+         constants.minimal_participation_ratio
+       in
+       Compare.Int.(numerator >= 0 && denominator > 0))
+      (Invalid_protocol_constants
+         "The minimal participation ratio must be a non-negative valid ratio.")
+  in
+  let* () =
+    error_unless
+      Compare.Int.(
+        constants.minimal_participation_ratio.numerator
+        <= constants.minimal_participation_ratio.denominator)
+      (Invalid_protocol_constants
+         "The minimal participation ratio must be less than or equal to 100%.")
+  in
+  (* The [limit_of_delegation_over_baking] should be non-negative. *)
+  let* () =
+    error_unless
+      Compare.Int.(constants.limit_of_delegation_over_baking >= 0)
+      (Invalid_protocol_constants
+         "The delegation over baking limit must be greater than or equal to 0.")
+  in
+  let* () =
+    error_unless
+      Compare.Int32.(
+        constants.nonce_revelation_threshold > Int32.zero
+        && constants.nonce_revelation_threshold < constants.blocks_per_cycle)
+      (Invalid_protocol_constants
+         "The nonce revelation threshold must be strictly smaller than \
+          blocks_per_cycle and strictly positive.")
+  in
+  let* () =
+    let benchmark_ips = Int64.of_int 200_000 in
+    let difficulty period_in_blocks ~ips ~factor =
+      let block_time = Period_repr.to_seconds constants.minimal_block_delay in
+      let period = Int64.mul period_in_blocks block_time in
+      Int64.(mul (mul ips (of_int factor)) period)
+    in
+    let* () =
+      error_unless
+        Compare.Int64.(
+          let ips =
+            (* We reduce the ips for short blocks_per_commitment so that we have
+               low difficulty during tests *)
+            if Compare.Int32.(constants.blocks_per_commitment > 32l) then
+              benchmark_ips
+            else Int64.one
+          in
+          let difficulty =
+            difficulty
+              (Int64.of_int32 constants.nonce_revelation_threshold)
+              ~ips
+              ~factor:5
+          in
+          constants.vdf_difficulty >= difficulty)
+        (Invalid_protocol_constants
+           "The VDF difficulty must be greater than the number of modulo \
+            squarings in class groups that can be done on the faster CPU \
+            during the nonce revelation period.")
+    in
+    error_unless
+      Compare.Int64.(
+        let difficulty =
+          difficulty
+            (Int64.of_int32 constants.blocks_per_cycle)
+            ~ips:benchmark_ips
+            ~factor:1
+        in
+        constants.vdf_difficulty < difficulty)
+      (Invalid_protocol_constants
+         "The VDF difficulty must be strictly smaller than the number of \
+          modulo squarings in class groups that can be done on the benchmark \
+          CPU during one cycle.")
+  in
+  let* () =
+    error_unless
+      Compare.Int.(constants.sc_rollup.origination_size >= 0)
+      (Invalid_protocol_constants
+         "The smart rollup origination size must be non-negative.")
+  in
+  let* () =
+    error_unless
+      Compare.Int.(constants.sc_rollup.challenge_window_in_blocks >= 0)
+      (Invalid_protocol_constants
+         "The smart rollup challenge window in blocks must be non-negative.")
+  in
+  let* () =
+    error_unless
+      Tez_repr.(constants.sc_rollup.stake_amount >= zero)
+      (Invalid_protocol_constants
+         "The smart rollup max stake amount must be non-negative.")
+  in
+  let* () =
+    error_unless
+      Compare.Int.(constants.sc_rollup.commitment_period_in_blocks > 0)
+      (Invalid_protocol_constants
+         "The smart rollup commitment period in blocks must be strictly \
+          greater than 0.")
+  in
+  let* () =
+    error_unless
+      (let sc_rollup_max_lookahead_in_blocks =
+         constants.sc_rollup.max_lookahead_in_blocks
+       in
+       Compare.Int32.(
+         sc_rollup_max_lookahead_in_blocks
+         > Int32.of_int constants.sc_rollup.commitment_period_in_blocks
+         &&
+         (* Check that [smart_rollup_challenge_window_in_blocks <
+               smart_rollup_max_lookahead_in_blocks]. Otherwise committers would be
+               forced to commit at an artificially slow rate, affecting the
+               throughput of the rollup. *)
+         sc_rollup_max_lookahead_in_blocks
+         > Int32.of_int constants.sc_rollup.challenge_window_in_blocks))
+      (Invalid_protocol_constants
+         "The smart rollup max lookahead in blocks must be greater than \
+          [smart_rollup_commitment_period_in_blocks] and \
+          [smart_rollup_challenge_window_in_blocks].")
+  in
+  let* () =
+    error_unless
+      Compare.Int.(
+        constants.dal.number_of_slots > 0
+        && constants.dal.number_of_slots <= 256)
+      (Invalid_protocol_constants
+         "The number of data availability slot must be between 1 and 256")
+  in
+  let* () =
+    error_unless
+      Compare.Int.(constants.dal.attestation_lag > 1)
+      (Invalid_protocol_constants
+         "The attestation_lag must be strictly greater than 1, because only \
+          slot headers in finalized blocks are attested.")
+  in
+  let* () =
+    error_unless
+      Compare.Int.(
+        List.compare_length_with constants.dal.attestation_lags 1 >= 0)
+      (Invalid_protocol_constants
+         "The attestation_lags must contain at least one element.")
+  in
+  let* () =
+    let last_lag =
+      Option.value ~default:0 @@ List.hd
+      @@ List.rev constants.dal.attestation_lags
+    in
+    error_unless
+      Compare.Int.(last_lag = constants.dal.attestation_lag)
+      (Invalid_protocol_constants
+         "The last element of attestation_lags must equal attestation_lag.")
+  in
+  let* () =
+    let rec is_sorted = function
+      | [] | [_] -> true
+      | h1 :: h2 :: tl -> Compare.Int.(h1 < h2) && is_sorted (h2 :: tl)
+    in
+    error_unless
+      (is_sorted constants.dal.attestation_lags)
+      (Invalid_protocol_constants
+         "The attestation_lags list must be ordered increasingly.")
+  in
+  let* () =
+    error_unless
+      Compare.Int.(
+        constants.dal.cryptobox_parameters.number_of_shards
+        <= constants.consensus_committee_size)
+      (Invalid_protocol_constants
+         "The DAL committee must be a subset of the Tenderbake committee.")
+  in
+  let* () =
+    error_unless
+      Q.(constants.dal.rewards_ratio < one)
+      (Invalid_protocol_constants
+         "The DAL rewards_ratio should be strictly less than one.")
+  in
+  let* () =
+    error_unless
+      Compare.Int.(
+        constants.sc_rollup.max_number_of_stored_cemented_commitments > 0)
+      (Invalid_protocol_constants
+         "The number of maximum stored cemented commitments must be strictly \
+          positive")
+  in
+  let* () =
+    error_unless
+      Compare.Int.(
+        constants.cache_stake_distribution_cycles
+        = constants.consensus_rights_delay + slashing_delay + 2)
+      (Invalid_protocol_constants
+         (Format.sprintf
+            "We should have cache_stake_distribution_cycles (%d) = \
+             consensus_rights_delay (%d) + slashing_delay (%d) + 2."
+            constants.cache_stake_distribution_cycles
+            constants.consensus_rights_delay
+            slashing_delay))
+  in
+  let* () =
+    error_unless
+      Compare.Int.(
+        constants.cache_sampler_state_cycles
+        = constants.cache_stake_distribution_cycles)
+      (Invalid_protocol_constants
+         (Format.sprintf
+            "The number cached cycles for the sampler state (%d) and for the \
+             stake distribution (%d) should currently be the same."
+            constants.cache_sampler_state_cycles
+            constants.cache_stake_distribution_cycles))
+  in
+  let* () =
+    error_unless
+      Compare.Int.(
+        constants.cache_stake_info_cycles
+        = constants.cache_stake_distribution_cycles)
+      (Invalid_protocol_constants
+         (Format.sprintf
+            "The number cached cycles for the stake info (%d) and for the \
+             stake distribution (%d) should currently be the same."
+            constants.cache_stake_info_cycles
+            constants.cache_stake_distribution_cycles))
+  in
+  let* () =
+    error_unless
+      Compare.Int.(
+        constants.cache_swrr_selected_distribution_cycles
+        = constants.cache_stake_distribution_cycles)
+      (Invalid_protocol_constants
+         (Format.sprintf
+            "The number cached cycles for the SWRR selection (%d) and for the \
+             stake distribution (%d) should currently be the same."
+            constants.cache_swrr_selected_distribution_cycles
+            constants.cache_stake_distribution_cycles))
+  in
+  Result.return_unit
 
 module Generated = struct
   type t = {
-    consensus_threshold : int;
-    baking_reward_fixed_portion : Tez_repr.t;
-    baking_reward_bonus_per_slot : Tez_repr.t;
-    endorsing_reward_per_slot : Tez_repr.t;
-    liquidity_baking_subsidy : Tez_repr.t;
+    consensus_threshold_size : int;
+    issuance_weights : Constants_parametric_repr.issuance_weights;
   }
 
-  let generate ~consensus_committee_size ~blocks_per_minute =
-    let consensus_threshold = (consensus_committee_size * 2 / 3) + 1 in
-    (* As in previous protocols, we set the maximum total rewards per minute to
-       be 80 tez. *)
-    let rewards_per_minute = Tez_repr.(mul_exn one 80) in
-    let rewards_per_block =
-      Ratio_repr.(
-        Tez_repr.(
-          div_exn
-            (mul_exn rewards_per_minute blocks_per_minute.denominator)
-            blocks_per_minute.numerator))
+  let generate ~consensus_committee_size ~dal_rewards_ratio =
+    (* The weights are expressed in [(256 * 80)]th of the total
+       reward, because it is the smallest proportion used so far *)
+    (* let f = consensus_committee_size / 3 in *)
+    let consensus_threshold_size = (consensus_committee_size * 2 / 3) + 1 in
+    let bonus_committee_size =
+      consensus_committee_size - consensus_threshold_size
     in
-    let rewards_half = Tez_repr.(div_exn rewards_per_block 2) in
-    let rewards_quarter = Tez_repr.(div_exn rewards_per_block 4) in
-    let bonus_committee_size = consensus_committee_size - consensus_threshold in
+    let base_total_issued_per_minute = Tez_repr.of_mutez_exn 80_007_812L in
+    let reward_parts_whole =
+      20480
+      (* = 256 * 80 *)
+    in
+    let reward_parts_half =
+      10240
+      (* = reward_parts_whole / 2 *)
+    in
+    let reward_parts_quarter =
+      5120
+      (* = reward_parts_whole / 4 *)
+    in
+    let baking_reward_fixed_portion_weight =
+      (* 1/4 or 1/2 *)
+      if Compare.Int.(bonus_committee_size <= 0) then
+        (* a fortiori, consensus_committee_size < 4 *)
+        reward_parts_half
+      else reward_parts_quarter
+    in
+    let baking_reward_bonus_weight =
+      (* 1/4 or 0 *)
+      if Compare.Int.(bonus_committee_size <= 0) then 0
+      else reward_parts_quarter
+    in
+    let attesting_reward_weight =
+      (* 1/2 *)
+      reward_parts_half
+    in
+    (* All block (baking + attesting) rewards sum to 1 ( *256*80 ) *)
+    let seed_nonce_revelation_tip_weight = (* 1/20480 *) 1 in
+    let vdf_revelation_tip_weight = (* 1/20480 *) 1 in
+    let sum_non_dal_weights =
+      reward_parts_whole + seed_nonce_revelation_tip_weight
+      + vdf_revelation_tip_weight
+    in
+    (* Compute the weight of DAL rewards such that these represent
+       [dal_rewards_ratio] of the total rewards. *)
+    let dal_rewards_weight =
+      let open Q in
+      div
+        (mul (of_int sum_non_dal_weights) dal_rewards_ratio)
+        (sub one dal_rewards_ratio)
+      |> to_int
+    in
     {
-      consensus_threshold;
-      baking_reward_fixed_portion =
-        (if Compare.Int.(bonus_committee_size <= 0) then
-         (* a fortiori, consensus_committee_size < 4 *)
-         rewards_half
-        else rewards_quarter);
-      baking_reward_bonus_per_slot =
-        (if Compare.Int.(bonus_committee_size <= 0) then Tez_repr.zero
-        else Tez_repr.div_exn rewards_quarter bonus_committee_size);
-      endorsing_reward_per_slot =
-        Tez_repr.div_exn rewards_half consensus_committee_size;
-      liquidity_baking_subsidy = Tez_repr.div_exn rewards_per_block 16;
+      consensus_threshold_size;
+      issuance_weights =
+        {
+          base_total_issued_per_minute;
+          (* 80.007812 tez/minute *)
+          baking_reward_fixed_portion_weight;
+          baking_reward_bonus_weight;
+          attesting_reward_weight;
+          dal_rewards_weight;
+          seed_nonce_revelation_tip_weight;
+          vdf_revelation_tip_weight;
+        };
     }
 end
+
+module Derived = struct
+  (** Number of full cycles after which the issuance rate -- computed
+      from current stake over total supply -- will be used.
+
+      That is, the issuance rate corresponding to the staking ratio at
+      the end of cycle n takes effect at the beginning of cycle n +
+      issuance_modification_delay + 1.
+
+      We use consensus_rights_delay so that the issuance rate in one
+      cycle corresponds to the "active" baking power. *)
+  let issuance_modification_delay ~(parametric : Constants_parametric_repr.t) =
+    parametric.consensus_rights_delay
+
+  (** Number of full cycles between the declaration of a new consensus
+      key by a delegate and when it has to be used to sign on behalf of
+      the delegate.
+
+      That is, a key registered at any time during cycle n has to be
+      used from cycle n + consensus_key_activation_delay + 1 on. *)
+  let consensus_key_activation_delay ~(parametric : Constants_parametric_repr.t)
+      =
+    parametric.consensus_rights_delay
+
+  (** Number of full cycles to wait for an unstake request to become
+      finalizable.
+
+      That is, if the unstake is requested in cycle n, then it
+      becomes finalizable at the beginning of cycle n +
+      unstake_finalization_delay + 1.
+
+      The exact waiting time depends on when the unstake operation
+      happened inside cycle n, but it is always at least n +
+      unstake_finalization_delay cycles and less than n +
+      unstake_finalization_delay + 1 cycles. *)
+  let unstake_finalization_delay ~(parametric : Constants_parametric_repr.t) =
+    parametric.consensus_rights_delay + slashing_delay
+
+  type t = {
+    issuance_modification_delay : int;
+    consensus_key_activation_delay : int;
+    unstake_finalization_delay : int;
+  }
+
+  let encoding : t Data_encoding.encoding =
+    let open Data_encoding in
+    conv
+      (fun {
+             issuance_modification_delay;
+             consensus_key_activation_delay;
+             unstake_finalization_delay;
+           }
+         ->
+        ( issuance_modification_delay,
+          consensus_key_activation_delay,
+          unstake_finalization_delay ))
+      (fun ( issuance_modification_delay,
+             consensus_key_activation_delay,
+             unstake_finalization_delay )
+         ->
+        {
+          issuance_modification_delay;
+          consensus_key_activation_delay;
+          unstake_finalization_delay;
+        })
+      (obj3
+         (req "issuance_modification_delay" uint8)
+         (req "consensus_key_activation_delay" uint8)
+         (req "unstake_finalization_delay" uint8))
+
+  let of_parametric parametric =
+    {
+      issuance_modification_delay = issuance_modification_delay ~parametric;
+      consensus_key_activation_delay =
+        consensus_key_activation_delay ~parametric;
+      unstake_finalization_delay = unstake_finalization_delay ~parametric;
+    }
+end
+
+let fixed = ()
+
+type t = {
+  fixed : fixed;
+  parametric : Constants_parametric_repr.t;
+  derived : Derived.t;
+}
+
+let all_of_parametric parametric =
+  {fixed; parametric; derived = Derived.of_parametric parametric}
+
+let encoding =
+  let open Data_encoding in
+  conv
+    (fun {fixed; parametric; derived} -> ((fixed, parametric), derived))
+    (fun ((fixed, parametric), derived) -> {fixed; parametric; derived})
+    (merge_objs
+       (merge_objs fixed_encoding Constants_parametric_repr.encoding)
+       Derived.encoding)
 
 let cache_layout p =
   Constants_parametric_repr.
@@ -389,4 +632,6 @@ let cache_layout p =
       p.cache_script_size;
       p.cache_stake_distribution_cycles;
       p.cache_sampler_state_cycles;
+      p.cache_stake_info_cycles;
+      p.cache_swrr_selected_distribution_cycles;
     ]

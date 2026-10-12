@@ -62,8 +62,8 @@ for ``List.map``
        'a list ->
        ('b list, 'trace list) result Lwt.t
 
-Check out `the online documentation of
-Lwtreslib <../api/odoc/_html/tezos-lwt-result-stdlib/Tezos_lwt_result_stdlib/Lwtreslib/index.html>`__
+Check out :package-api:`the online documentation of
+Lwtreslib <octez-libs/tezos_lwt_result_stdlib.html>`
 for a description of the semantic and naming convention.
 
 In addition to shadowing existing modules, ``Lwtreslib`` also exports
@@ -213,8 +213,7 @@ you are registering:
 
 -  ``Permanent``: is for irremediable failures, i.e., failures that
    happen and will always happen whatever the context. E.g.,
-   `originating a
-   contract <https://tezos.gitlab.io/alpha/glossary.html?highlight=originate#origination>`__
+   :ref:`originating a contract <def_origination_alpha>`
    that does not type-check is a permanent error. This is used by the
    shell to mark the data as invalid.
 
@@ -302,8 +301,8 @@ Note that if you are calling an Lwt function, you have to use ``Lwt.catch`` or
      (function
        | exc -> Lwt_result_syntax.fail (Cannot_destruct_json_value exc))
 
-The error monad provides `several helpers functions for catching exceptions
-<https://tezos.gitlab.io/api/odoc/_html/tezos-error-monad/Tezos_error_monad/Error_monad/index.html#catching-exceptions>`__.
+The error monad provides :package-api:`several helpers functions for catching exceptions
+<octez-libs/Tezos_error_monad/Error_monad/index.html#catching-exceptions>`.
 
 ::
 

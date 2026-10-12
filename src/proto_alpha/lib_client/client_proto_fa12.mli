@@ -97,7 +97,7 @@ val call_contract :
   ?dry_run:bool ->
   ?verbose_signing:bool ->
   ?branch:int ->
-  source:public_key_hash ->
+  source:Implicit_account_repr.t ->
   src_pk:public_key ->
   src_sk:Client_keys.sk_uri ->
   contract:Contract_hash.t ->
@@ -105,6 +105,7 @@ val call_contract :
   tez_amount:Tez.t ->
   ?fee:Tez.t ->
   ?gas_limit:Gas.Arith.integral ->
+  ?safety_guard:Gas.Arith.integral ->
   ?storage_limit:Z.t ->
   ?counter:Manager_counter.t ->
   fee_parameter:Injection.fee_parameter ->
@@ -135,7 +136,7 @@ val inject_token_transfer_batch :
   ?dry_run:bool ->
   ?verbose_signing:bool ->
   sender:Contract.t ->
-  source:public_key_hash ->
+  source:Implicit_account_repr.t ->
   src_pk:public_key ->
   src_sk:Client_keys.sk_uri ->
   token_transfers:token_transfer list ->
@@ -144,6 +145,7 @@ val inject_token_transfer_batch :
   ?default_fee:Tez.t ->
   ?default_gas_limit:Gas.Arith.integral ->
   ?default_storage_limit:Z.t ->
+  ?safety_guard:Gas.Arith.integral ->
   unit ->
   unit tzresult Lwt.t
 
@@ -152,11 +154,11 @@ val run_view_action :
   full ->
   chain:Shell_services.chain ->
   block:Shell_services.block ->
-  ?source:Contract.t ->
+  sender:Contract.t option ->
   contract:Contract_hash.t ->
   action:action ->
-  ?payer:Signature.public_key_hash ->
-  ?gas:Gas.Arith.integral ->
+  payer:Implicit_account_repr.t option ->
+  gas:Gas.Arith.integral option ->
   unparsing_mode:Script_ir_unparser.unparsing_mode ->
   unit ->
   Script.expr tzresult Lwt.t

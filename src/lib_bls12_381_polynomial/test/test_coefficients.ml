@@ -28,20 +28,10 @@ let rec non_null_int bound =
   let r = Random.int bound in
   if r = 0 then non_null_int bound else r
 
-let rec repeat n f =
-  if n <= 0 then
-    let f () = () in
-    f
-  else (
-    f () ;
-    repeat (n - 1) f)
-
 module Scalar = Bls12_381.Fr
-
-module Domain = Tezos_bls12_381_polynomial_internal.Domain.Domain_unsafe
-
-module Poly = Tezos_bls12_381_polynomial_internal.Polynomial
-module Evaluations = Tezos_bls12_381_polynomial_internal.Evaluations
+module Domain = Octez_bls12_381_polynomial.Domain
+module Poly = Octez_bls12_381_polynomial.Polynomial
+module Evaluations = Octez_bls12_381_polynomial.Evaluations
 
 let raises_invalid_arg f =
   try
@@ -62,18 +52,20 @@ let test_equal () =
   assert (Poly.(equal zero (make [|0; 0|])))
 
 let test_copy () =
-  let module C = Poly.Polynomial_impl in
+  let module C = Octez_bls12_381_polynomial.Internal_for_tests.Polynomial_unsafe
+  in
   let make a = C.of_dense (Array.map Scalar.of_string a) in
   let p = make [|"0"; "1"; "2"; "0"|] in
   assert (C.equal (C.copy p) p) ;
-  assert (C.equal (C.copy ~offset:1 p) (make [|"1"; "2"; "0"|])) ;
-  assert (C.equal (C.copy ~offset:1 ~len:2 p) (make [|"1"; "2"|])) ;
-  assert (C.equal (C.copy ~len:2 p) (make [|"0"; "1"|])) ;
-  assert (raises_invalid_arg (fun () -> C.copy ~len:5 p)) ;
-  assert (raises_invalid_arg (fun () -> C.copy ~offset:(-2) p)) ;
-  assert (raises_invalid_arg (fun () -> C.copy ~offset:(C.length p) p)) ;
+  assert (C.equal (C.copy_carray ~offset:1 p) (make [|"1"; "2"; "0"|])) ;
+  assert (C.equal (C.copy_carray ~offset:1 ~len:2 p) (make [|"1"; "2"|])) ;
+  assert (C.equal (C.copy_carray ~len:2 p) (make [|"0"; "1"|])) ;
+  assert (raises_invalid_arg (fun () -> C.copy_carray ~len:5 p)) ;
+  assert (raises_invalid_arg (fun () -> C.copy_carray ~offset:(-2) p)) ;
+  assert (raises_invalid_arg (fun () -> C.copy_carray ~offset:(C.length p) p)) ;
   assert (
-    raises_invalid_arg (fun () -> C.copy ~offset:(C.length p - 1) ~len:2 p))
+    raises_invalid_arg (fun () ->
+        C.copy_carray ~offset:(C.length p - 1) ~len:2 p))
 
 let test_split_poly () =
   let make a = Poly.of_dense (Array.map Scalar.of_string a) in
@@ -249,7 +241,9 @@ let test_evaluation_fft_random_values_with_smaller_polynomial ~power () =
     Poly.generate_biased_random_polynomial (Random.int (power - 1))
   in
   let expected_results =
-    Array.map (Poly.evaluate polynomial) (Domain.to_array domain)
+    let w = Domain.get domain 1 in
+    Array.init (Domain.length domain) (fun i ->
+        Poly.evaluate polynomial (Scalar.pow w (Z.of_int i)))
   in
   let results = Evaluations.(evaluation_fft domain polynomial |> to_array) in
   assert (Array.for_all2 Scalar.eq results expected_results)
@@ -290,23 +284,25 @@ let tests =
       test_case
         "evaluation at any point of the zero polynomial"
         `Quick
-        (repeat 100 test_eval_random_point_zero_polynomial);
+        (Helpers.repeat 100 test_eval_random_point_zero_polynomial);
       test_case
         "evaluation at any point of a random constant polynomial"
         `Quick
-        (repeat 100 test_eval_random_point_constant_polynomial);
+        (Helpers.repeat 100 test_eval_random_point_constant_polynomial);
       test_case
         "evaluation at zero of a random constant polynomial"
         `Quick
-        (repeat 100 test_eval_at_zero_point_of_random_constant_polynomial);
+        (Helpers.repeat
+           100
+           test_eval_at_zero_point_of_random_constant_polynomial);
       test_case
         "evaluation at zero of the zero polynomial"
         `Quick
-        (repeat 100 test_eval_at_zero_of_zero_polynomial);
+        (Helpers.repeat 100 test_eval_at_zero_of_zero_polynomial);
       test_case
         "evaluation at any point of the polynomial X"
         `Quick
-        (repeat 100 test_eval_x_to_random_point);
+        (Helpers.repeat 100 test_eval_x_to_random_point);
       test_case
         "of_coeff_to_dense_vectors"
         `Quick
@@ -314,20 +310,20 @@ let tests =
       test_case
         "test properties nullifier 0 * P = P * 0 = 0"
         `Quick
-        (repeat 10 test_multiply_by_zero_is_zero);
+        (Helpers.repeat 10 test_multiply_by_zero_is_zero);
       test_case
         "test properties commutativity p * q = p * q"
         `Quick
-        (repeat 10 test_communitativity);
+        (Helpers.repeat 10 test_communitativity);
       test_case
         "test properties distributivity and communtativity a p * b q = (a * b) \
          (p * q) = (b p) * (a q) = p * (a * b) q"
         `Quick
-        (repeat 10 test_distributivity);
+        (Helpers.repeat 10 test_distributivity);
       test_case
         "test interpolation with only roots"
         `Quick
-        (repeat 10 (test_interpolation_fft_with_only_roots ~power:32));
+        (Helpers.repeat 10 (test_interpolation_fft_with_only_roots ~power:32));
       test_case
         "test evaluation with zero polynomial"
         `Quick
@@ -335,14 +331,14 @@ let tests =
       test_case
         "test evaluation with smaller polynomial"
         `Quick
-        (repeat
+        (Helpers.repeat
            10
            (test_evaluation_fft_random_values_with_smaller_polynomial
               ~power:1024));
       (*       test_case *)
       (*         "test evaluation with larger polynomial" *)
       (*         `Quick *)
-      (*         (repeat *)
+      (*         (Helpers.repeat *)
       (*            10 *)
       (*            (test_evaluation_fft_random_values_with_larger_polynomial *)
       (*               ~generator *)

@@ -23,6 +23,9 @@
 (*                                                                           *)
 (*****************************************************************************)
 
+(* This module is deprecated, use [Qcheck2_helpers_no_alcotest] and
+   [Qcheck_tezt]. *)
+
 (** Wrap QCheck tests into Alcotest. *)
 val qcheck_wrap :
   ?verbose:bool ->
@@ -247,5 +250,15 @@ val test_roundtrip :
   title:string ->
   gen:'a QCheck2.Gen.t ->
   eq:('a -> 'a -> bool) ->
+  'a Data_encoding.t ->
+  QCheck2.Test.t
+
+(** Test the roundtripness of two encodings in binary formats. *)
+val test_roundtrip_through_binary :
+  count:int ->
+  title:string ->
+  gen:'a QCheck2.Gen.t ->
+  eq:('a -> 'a -> bool) ->
+  'a Data_encoding.t ->
   'a Data_encoding.t ->
   QCheck2.Test.t

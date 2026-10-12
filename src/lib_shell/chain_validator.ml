@@ -38,6 +38,10 @@ module Name = struct
   let equal = Chain_id.equal
 end
 
+module Profiler = struct
+  include (val Profiler.wrap Shell_profiling.chain_validator_profiler)
+end
+
 module Request = struct
   include Request
 
@@ -46,7 +50,6 @@ module Request = struct
         peer : P2p_peer_id.t option;
         (* The peer who sent the block if it was not injected locally. *)
         block : Store.Block.t;
-        resulting_context_hash : Context_hash.t;
       }
         -> (update, error trace) t
     | Notify_branch : P2p_peer.Id.t * Block_locator.t -> (unit, Empty.t) t
@@ -88,8 +91,8 @@ module Types = struct
        with a known head. Because the chain validator does not handle
        directly these messages, this is done through callbacks. *)
     synchronisation_state : Synchronisation_heuristic.Bootstrapping.t;
-    valid_block_input : Store.Block.t Lwt_watcher.input;
-    new_head_input : Store.Block.t Lwt_watcher.input;
+    received_block_input : Block_hash.t Lwt_watcher.input;
+    new_head_input : (Block_hash.t * Block_header.t) Lwt_watcher.input;
     mutable child : (state * (unit -> unit Lwt.t (* shutdown *))) option;
     prevalidator : Prevalidator.t option ref;
     active_peers : (Peer_validator.t, Empty.t) P2p_peer.Error_table.t;
@@ -155,20 +158,10 @@ let check_and_update_synchronisation_state w (hash, block) peer_id : unit Lwt.t
   else Lwt.return_unit
 
 (* Called for every validated block. *)
-let notify_new_block w peer {Block_validator.block; resulting_context_hash} =
+let notify_new_block w peer {Block_validator.block; _} =
   let nv = Worker.state w in
-  Option.iter
-    (fun id ->
-      List.assoc ~equal:Chain_id.equal id (Worker.list table)
-      |> Option.iter (fun w ->
-             let nv = Worker.state w in
-             Lwt_watcher.notify nv.valid_block_input block))
-    nv.parameters.parent ;
-  Lwt_watcher.notify nv.valid_block_input block ;
   Lwt_watcher.notify nv.parameters.global_valid_block_input block ;
-  Worker.Queue.push_request_now
-    w
-    (Validated {peer; block; resulting_context_hash})
+  Worker.Queue.push_request_now w (Validated {peer; block})
 
 let with_activated_peer_validator w peer_id f =
   let open Lwt_syntax in
@@ -197,43 +190,17 @@ let with_activated_peer_validator w peer_id f =
       | Worker_types.Launching _ ->
           return_ok_unit)
 
-let may_update_protocol_level chain_store block resulting_context_hash =
-  let open Lwt_result_syntax in
-  let* pred = Store.Block.read_predecessor chain_store block in
-  let prev_proto_level = Store.Block.proto_level pred in
-  let new_proto_level = Store.Block.proto_level block in
-  if Compare.Int.(prev_proto_level < new_proto_level) then
-    let context_index =
-      Store.context_index (Store.Chain.global_store chain_store)
-    in
-    let* resulting_context =
-      protect (fun () ->
-          let*! c =
-            Context_ops.checkout_exn context_index resulting_context_hash
-          in
-          return c)
-    in
-    let*! new_protocol = Context_ops.get_protocol resulting_context in
-    let* (module NewProto) = Registered_protocol.get_result new_protocol in
-    Store.Chain.may_update_protocol_level
-      chain_store
-      ~pred
-      ~protocol_level:new_proto_level
-      ~expect_predecessor_context:
-        (NewProto.expected_context_hash = Predecessor_resulting_context)
-      (block, new_protocol)
-  else return_unit
-
-let may_switch_test_chain w active_chains spawn_child block =
+let may_switch_test_chain w active_chains spawn_child chain_store block =
   let open Lwt_result_syntax in
   let nv = Worker.state w in
   let may_create_child block test_protocol expiration forking_block_hash =
     let block_header = Store.Block.header block in
+    let* context = Store.Block.context chain_store block in
     let genesis_hash =
-      Tezos_context_disk.Context.compute_testchain_genesis forking_block_hash
+      Context_ops.compute_testchain_genesis context forking_block_hash
     in
     let testchain_id =
-      Tezos_context_disk.Context.compute_testchain_chain_id genesis_hash
+      Context_ops.compute_testchain_chain_id context genesis_hash
     in
     let*! activated =
       match nv.child with
@@ -295,7 +262,6 @@ let may_switch_test_chain w active_chains spawn_child block =
                     Lwt_watcher.notify
                       nv.parameters.global_valid_block_input
                       new_genesis_block ;
-                    Lwt_watcher.notify nv.valid_block_input new_genesis_block ;
                     return testchain_store
                 | Error
                     (Block_validator_errors.Missing_test_protocol
@@ -350,51 +316,34 @@ let may_switch_test_chain w active_chains spawn_child block =
       let*! () = Events.(emit could_not_switch_testchain) err in
       Lwt.return_unit
 
-let broadcast_head w ~previous block =
-  let open Lwt_syntax in
-  let nv = Worker.state w in
-  if not (is_bootstrapped nv) then Lwt.return_unit
-  else
-    let* successor =
-      let* o =
-        Store.Block.read_predecessor_opt nv.parameters.chain_store block
-      in
-      match o with
-      | None -> Lwt.return_true
-      | Some predecessor -> Lwt.return (Store.Block.equal predecessor previous)
-    in
-    if successor then (
-      Distributed_db.Advertise.current_head nv.chain_db block ;
-      Lwt.return_unit)
-    else Distributed_db.Advertise.current_branch nv.chain_db
-
-let safe_get_prevalidator_filter hash =
-  let open Lwt_syntax in
-  match Shell_plugin.find_filter hash with
-  | Some filter -> return_ok filter
-  | None -> (
-      match Registered_protocol.get hash with
-      | None ->
-          (* FIXME. *)
-          (* This should not happen: it should be handled in the validator. *)
-          failwith
-            "chain_validator: missing protocol '%a' for the current block."
-            Protocol_hash.pp_short
-            hash
-      | Some (module Proto : Registered_protocol.T) ->
-          let* () = Events.(emit prevalidator_filter_not_found) hash in
-          return_ok
-            (module Shell_plugin.No_filter (Proto) : Shell_plugin.FILTER))
-
 let instantiate_prevalidator parameters set_prevalidator block chain_db =
   let open Lwt_syntax in
   let* r =
     let open Lwt_result_syntax in
-    let* new_protocol =
+    let* new_protocol_hash =
       Store.Block.protocol_hash parameters.chain_store block
     in
-    let* filter = safe_get_prevalidator_filter new_protocol in
-    Prevalidator.create parameters.prevalidator_limits filter chain_db
+    let* proto =
+      Protocol_plugin.proto_with_validation_plugin
+        ~block_hash:(Store.Block.hash block)
+        new_protocol_hash
+    in
+    (* Plug the environment and context_ops profilers to the instances plugged
+       to the mempool profiler since operations happening in the mempool also
+       include environment and context_ops operations. *)
+    let instances =
+      Tezos_profiler.Profiler.plugged Shell_profiling.mempool_profiler
+    in
+    List.iter
+      Tezos_protocol_environment.Environment_profiler.Environment_profiler.plug
+      instances ;
+    let context_instances =
+      Tezos_profiler.Profiler.plugged Shell_profiling.mempool_profiler
+    in
+    List.iter
+      Tezos_protocol_environment.Environment_profiler.Context_ops_profiler.plug
+      context_instances ;
+    Prevalidator.create parameters.prevalidator_limits proto chain_db
   in
   match r with
   | Error errs ->
@@ -525,8 +474,35 @@ let may_synchronise_context synchronisation_state chain_store =
     Context_ops.sync context_index
   else Lwt.return_unit
 
+let[@warning "-32"] profiling_section =
+  let profilers =
+    Shell_profiling.
+      [
+        p2p_reader_profiler;
+        requester_profiler;
+        block_validator_profiler;
+        chain_validator_profiler;
+        peer_validator_profiler;
+        rpc_server_profiler;
+      ]
+  in
+  let section_makers =
+    let equal x y =
+      match (x, y) with
+      | `On_launch, `On_launch -> true
+      | `Block x, `Block y when Store.Block.equal x y -> true
+      | _ -> false
+    in
+    let to_string = function
+      | `On_launch -> "ON_LAUNCH"
+      | `Block b -> Block_hash.to_b58check (Store.Block.hash b)
+    in
+    List.map (Tezos_profiler.Profiler.section_maker equal to_string) profilers
+  in
+  fun section -> List.iter (fun f -> f section) section_makers
+
 let on_validation_request w peer start_testchain active_chains spawn_child block
-    resulting_context_hash =
+    =
   let open Lwt_result_syntax in
   let*! () =
     Option.iter_s
@@ -545,16 +521,17 @@ let on_validation_request w peer start_testchain active_chains spawn_child block
   if not accepted_head then return Ignored_head
   else
     let* previous = Store.Chain.set_head chain_store block in
-    let*! () = broadcast_head w ~previous block in
-    let* () =
-      may_update_protocol_level chain_store block resulting_context_hash
+    () [@profiler.overwrite profiling_section (`Block block, [])] ;
+    let () =
+      if is_bootstrapped nv then
+        Distributed_db.Advertise.current_head nv.chain_db block
     in
     let*! () =
       if start_testchain then
-        may_switch_test_chain w active_chains spawn_child block
+        may_switch_test_chain w active_chains spawn_child chain_store block
       else Lwt.return_unit
     in
-    Lwt_watcher.notify nv.new_head_input block ;
+    Lwt_watcher.notify nv.new_head_input (Store.Block.hash block, block_header) ;
     let is_head_increment =
       Block_hash.equal head_hash block_header.shell.predecessor
     in
@@ -585,14 +562,26 @@ let on_notify_branch w peer_id locator =
       Peer_validator.notify_branch pv locator ;
       return_ok_unit)
 
-let on_notify_head w peer_id (hash, header) mempool =
+let on_notify_head w peer_id (block_hash, header) mempool =
   let open Lwt_syntax in
   let nv = Worker.state w in
-  let* () = check_and_update_synchronisation_state w (hash, header) peer_id in
+  let* () =
+    check_and_update_synchronisation_state w (block_hash, header) peer_id
+  in
+  let* current_head = Store.Chain.current_head nv.parameters.chain_store in
   let* (r : (_, Empty.t) result) =
-    with_activated_peer_validator w peer_id (fun pv ->
-        Peer_validator.notify_head pv hash header ;
-        return_ok_unit)
+    (* To minimize unnecessary calls to notify_head, we do nothing
+       when the received block is actually the current head or it's
+       predecessor. *)
+    if
+      Store.Block.hash current_head <> block_hash
+      && Store.Block.predecessor current_head <> block_hash
+    then (
+      Lwt_watcher.notify nv.received_block_input block_hash ;
+      with_activated_peer_validator w peer_id (fun pv ->
+          Peer_validator.notify_head pv block_hash header ;
+          return_ok_unit))
+    else return_ok_unit
   in
   match r with
   | Ok () -> (
@@ -613,6 +602,15 @@ let on_disconnection w peer_id =
       let*! pv in
       match pv with
       | Ok pv ->
+          (* Shutting down the peer validator will indirectly trigger
+             a disconnection. However, the disconnection can be
+             effective only after the peer validator is shutdown (see
+             {!val:Peer_validator.on_close}). This is a defensive
+             mechanism so that if the disconnection takes too much
+             time (even though it is not supposed to happen), the
+             validation is not stuck. In any case, the peer validator
+             is removed from the active peers (see
+             {!val:with_activated_peer_validator}). *)
           let*! () = Peer_validator.shutdown pv in
           return_unit)
 
@@ -622,7 +620,7 @@ let on_request (type a b) w start_testchain active_chains spawn_child
   Prometheus.Counter.inc_one
     nv.parameters.metrics.worker_counters.worker_request_count ;
   match req with
-  | Request.Validated {peer; block; resulting_context_hash} ->
+  | Request.Validated {peer; block} ->
       on_validation_request
         w
         peer
@@ -630,12 +628,32 @@ let on_request (type a b) w start_testchain active_chains spawn_child
         active_chains
         spawn_child
         block
-        resulting_context_hash
+      [@profiler.span_s
+        {verbosity = Notice; metadata = [("prometheus", "")]}
+          ["on_validation_request"]]
   | Request.Notify_branch (peer_id, locator) ->
-      on_notify_branch w peer_id locator
+      on_notify_branch
+        w
+        peer_id
+        locator
+      [@profiler.span_s
+        {verbosity = Notice; metadata = [("prometheus", "")]}
+          ["on_notify_branch"]]
   | Request.Notify_head (peer_id, hash, header, mempool) ->
-      on_notify_head w peer_id (hash, header) mempool
-  | Request.Disconnection peer_id -> on_disconnection w peer_id
+      on_notify_head
+        w
+        peer_id
+        (hash, header)
+        mempool
+      [@profiler.span_s
+        {verbosity = Notice; metadata = [("prometheus", "")]} ["on_notify_head"]]
+  | Request.Disconnection peer_id ->
+      on_disconnection
+        w
+        peer_id
+      [@profiler.span_s
+        {verbosity = Notice; metadata = [("prometheus", "")]}
+          ["on_disconnection"]]
 
 let collect_proto ~metrics (chain_store, block) =
   let open Lwt_syntax in
@@ -651,7 +669,7 @@ let collect_proto ~metrics (chain_store, block) =
              does not exist *)
           let* (module Metrics_plugin) =
             let* protocol = Store.Block.protocol_hash_exn chain_store block in
-            Shell_plugin.safe_find_metrics protocol
+            Protocol_plugin.safe_find_metrics protocol
           in
           let fitness = Store.Block.fitness block in
           let* () =
@@ -742,11 +760,24 @@ let on_completion (type a b) w (req : (a, b) Request.t) (update : a)
         match update with
         | Ignored_head -> Events.(emit ignore_head) (block_hash, level)
         | Branch_switch -> Events.(emit branch_switch) (block_hash, level)
-        | Head_increment -> Events.(emit head_increment) (block_hash, level)
+        | Head_increment ->
+            if
+              Synchronisation_heuristic.Bootstrapping.is_bootstrapped
+                nv.synchronisation_state
+            then Events.(emit head_increment) (block_hash, level)
+            else if Int32.rem level 50l = 0l then
+              (* Display a bootstrapping status message every 50 blocks *)
+              let now = Time.System.now () in
+              let block_time = Time.System.of_protocol_exn timestamp in
+              Chain_validator_events.(emit bootstrap_head_increment)
+                (level, Ptime.diff now block_time)
+            else Lwt.return_unit
       in
       Events.(emit block_info) (timestamp, fitness)
-  | Request.Notify_head (peer_id, _, _, _) -> Events.(emit notify_head) peer_id
-  | Request.Notify_branch (peer_id, _) -> Events.(emit notify_branch) peer_id
+  | Request.Notify_head (peer_id, block_hash, _, _) ->
+      Events.(emit notify_head) (peer_id, block_hash)
+  | Request.Notify_branch (peer_id, locator) ->
+      Events.(emit notify_branch) (peer_id, locator.head_hash)
   | Request.Disconnection peer_id -> Events.(emit disconnection) peer_id
 
 let on_close w =
@@ -797,10 +828,8 @@ let may_load_protocols parameters =
 type launch_error = error trace
 
 let on_launch w _ parameters =
+  () [@profiler.overwrite profiling_section (`On_launch, [])] ;
   let open Lwt_result_syntax in
-  let* () = may_load_protocols parameters in
-  let valid_block_input = Lwt_watcher.create_input () in
-  let new_head_input = Lwt_watcher.create_input () in
   let notify_branch peer_id locator =
     Worker.Queue.push_request_now w (Notify_branch (peer_id, locator))
   in
@@ -816,6 +845,10 @@ let on_launch w _ parameters =
       parameters.chain_store
       {notify_branch; notify_head; disconnection}
   in
+  (* Fetching unknown protocols requires the DDB to be active. *)
+  let* () = may_load_protocols parameters in
+  let received_block_input = Lwt_watcher.create_input () in
+  let new_head_input = Lwt_watcher.create_input () in
   let prevalidator = ref None in
   let when_status_changes status =
     let*! () = Events.(emit synchronisation_status) status in
@@ -832,7 +865,7 @@ let on_launch w _ parameters =
             head
             chain_db
         else Lwt.return_unit
-    | _ -> Lwt.return_unit
+    | Synchronisation_heuristic.Not_synchronised -> Lwt.return_unit
   in
   let synchronisation_state =
     Synchronisation_heuristic.Bootstrapping.create
@@ -851,7 +884,7 @@ let on_launch w _ parameters =
     {
       parameters;
       chain_db;
-      valid_block_input;
+      received_block_input;
       new_head_input;
       synchronisation_state;
       active_peers = P2p_peer.Error_table.create 50;
@@ -909,7 +942,9 @@ let rec create ~start_testchain ~active_chains ?parent ~block_validator_process
 
     let on_close = on_close
 
-    let on_error = on_error
+    let on_error w status req err =
+      Lwt_result.bind (on_error w status req err) (fun () ->
+          Lwt_result.return `Continue)
 
     let on_completion = on_completion
 
@@ -1011,10 +1046,10 @@ let validate_block w ?force hash block operations =
   let* () = assert_fitness_increases ?force w block in
   let* () = assert_checkpoint w (hash, block.Block_header.shell.level) in
   let*! v =
-    Block_validator.validate
+    Block_validator.validate_and_apply
       ~canceler:(Worker.canceler w)
       ~notify_new_block:(notify_new_block w None)
-      ~precheck_and_notify:true
+      ~advertise_after_validation:true
       nv.parameters.block_validator
       nv.chain_db
       hash
@@ -1023,7 +1058,7 @@ let validate_block w ?force hash block operations =
   in
   match v with
   | Valid -> return_unit
-  | Invalid errs | Invalid_after_precheck errs -> Lwt.return_error errs
+  | Invalid errs | Inapplicable_after_validation errs -> Lwt.return_error errs
 
 let bootstrapped w =
   let state = Worker.state w in
@@ -1043,9 +1078,28 @@ let force_bootstrapped w b =
     state.synchronisation_state
     b
 
-let valid_block_watcher w =
-  let {valid_block_input; _} = Worker.state w in
-  Lwt_watcher.create_stream valid_block_input
+let active_peers_heads w =
+  let open Lwt_syntax in
+  let state = Worker.state w in
+  P2p_peer.Error_table.fold_promises
+    (fun peer_id pv acc ->
+      let* acc in
+      let* pv in
+      match pv with
+      | Error _ ->
+          (* Ignoring peer validators with error status. *) Lwt.return acc
+      | Ok pv ->
+          let block_hash, head = Peer_validator.get_last_advertised_head pv in
+          Lwt.return
+            (Chain_services.
+               {peer_id; block_hash; block_level = head.shell.level}
+            :: acc))
+    state.active_peers
+    Lwt.return_nil
+
+let received_block_watcher w =
+  let {received_block_input; _} = Worker.state w in
+  Lwt_watcher.create_stream received_block_input
 
 let new_head_watcher w =
   let {new_head_input; _} = Worker.state w in

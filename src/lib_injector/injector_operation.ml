@@ -27,42 +27,123 @@ open Injector_sigs
 
 module Make (O : PARAM_OPERATION) :
   INJECTOR_OPERATION with type operation = O.t = struct
-  module Hash =
-    Tezos_crypto.Blake2B.Make
-      (Tezos_crypto.Base58)
-      (struct
-        let name = "injector_operation_hash"
-
-        let title = "An identifier (hash) for an operation in the injector"
-
-        let b58check_prefix = "\064\007\206" (* iop(53) *)
-
-        let size = None
-      end)
-
-  let () =
-    Tezos_crypto.Base58.check_encoded_prefix Hash.b58check_encoding "iop" 53
-
   type operation = O.t
 
-  type hash = Hash.t
+  type id = Id.t
 
-  type t = {hash : hash; operation : O.t}
+  type errors = {count : int; last_error : tztrace option}
 
-  let hash_inner_operation op =
-    Hash.hash_bytes [Data_encoding.Binary.to_bytes_exn O.encoding op]
+  type t = {
+    id : id;
+    order : Z.t option;
+    counter : Z.t;
+    operation : O.t;
+    scope : Opentelemetry.Scope.t option;
+    mutable errors : errors;
+  }
 
-  let make operation =
-    let hash = hash_inner_operation operation in
-    {hash; operation}
+  let hash_inner_operation nonce op =
+    Id.hash_string
+      [
+        Option.fold ~none:"" ~some:Z.to_bits nonce;
+        Data_encoding.Binary.to_string_exn O.encoding op;
+      ]
+
+  let counter = ref Z.zero
+
+  let no_errors = {count = 0; last_error = None}
+
+  let make ?order ?scope operation =
+    let nonce_for_hash_id =
+      if not @@ O.unique operation then Some !counter else None
+    in
+    let id = hash_inner_operation nonce_for_hash_id operation in
+    let op =
+      {id; order; counter = !counter; operation; scope; errors = no_errors}
+    in
+    counter := Z.succ !counter ;
+    op
+
+  let errors_encoding =
+    let open Data_encoding in
+    conv
+      (fun {count; last_error} -> (count, last_error))
+      (fun (count, last_error) -> {count; last_error})
+    @@ obj2 (req "count" int31) (opt "last_error" trace_encoding)
+
+  let scope_encoding =
+    let open Data_encoding in
+    conv_with_guard
+      (fun ({trace_id; span_id; _} : Opentelemetry.Scope.t) ->
+        Opentelemetry.Trace_context.Traceparent.to_value
+          ~trace_id
+          ~parent_id:span_id
+          ())
+      (fun s ->
+        let open Result_syntax in
+        let+ trace_id, span_id =
+          Opentelemetry.Trace_context.Traceparent.of_value s
+        in
+        Opentelemetry.Scope.make ~trace_id ~span_id ())
+      string
 
   let encoding =
     let open Data_encoding in
     conv
-      (fun {hash; operation} -> (hash, operation))
-      (fun (hash, operation) -> {hash; operation})
-    @@ obj2 (req "hash" Hash.encoding) (req "operation" O.encoding)
+      (fun {id; order; counter; operation; scope; errors} ->
+        (id, order, counter, operation, scope, errors))
+      (fun (id, order, counter, operation, scope, errors) ->
+        {id; order; counter; operation; scope; errors})
+    @@ obj6
+         (req "id" Id.encoding)
+         (opt "order" n)
+         (req "counter" n)
+         (req "operation" O.encoding)
+         (opt "traceparent" scope_encoding)
+         (dft "errors" errors_encoding no_errors)
 
-  let pp ppf {hash; operation} =
-    Format.fprintf ppf "%a (%a)" O.pp operation Hash.pp hash
+  let pp ppf {id; order; operation; errors; _} =
+    let pp_errors ppf errors =
+      if errors.count = 0 then ()
+      else Format.fprintf ppf " [%d errors]" errors.count
+    in
+    let pp_order =
+      Format.pp_print_option @@ fun ppf ->
+      Format.fprintf ppf " [priority order %a]" Z.pp_print
+    in
+    Format.fprintf
+      ppf
+      "%a%a (%a)%a"
+      O.pp
+      operation
+      pp_order
+      order
+      Id.pp
+      id
+      pp_errors
+      errors
+
+  let register_error op error_trace =
+    op.errors <- {count = op.errors.count + 1; last_error = Some error_trace}
+
+  let id {id; _} = id
+
+  (* Compare operations with the following logic:
+
+       - Operations without an explicit `order` or lesser than operations with
+         one
+       - The value of `order` is used to compare two operations with `order` set;
+       - Otherwise, use the timestamp to compare *)
+  let compare op1 op2 =
+    let op_compare = O.compare op1.operation op2.operation in
+    if not (op_compare = 0) then op_compare
+    else
+      let counter_cmp () = Z.compare op1.counter op2.counter in
+      match (op1.order, op2.order) with
+      | Some o1, Some o2 ->
+          let cmp = Z.compare o1 o2 in
+          if cmp = 0 then counter_cmp () else cmp
+      | None, None -> counter_cmp ()
+      | Some _p, _ -> -1
+      | _, Some _p -> 1
 end

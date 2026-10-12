@@ -45,7 +45,8 @@ let gc_stat_encoding =
            compactions;
            top_heap_words;
            stack_size;
-         } ->
+         }
+       ->
       ( ( minor_words,
           promoted_words,
           major_words,
@@ -71,7 +72,8 @@ let gc_stat_encoding =
                fragments,
                compactions,
                top_heap_words,
-               stack_size ) ) ) ->
+               stack_size ) ) )
+       ->
       {
         minor_words;
         promoted_words;
@@ -167,8 +169,20 @@ module S = struct
       ~query:Tezos_rpc.Query.empty
       ~output:proc_stat_encoding
       Tezos_rpc.Path.(root / "stats" / "memory")
+
+  let gc_full =
+    Tezos_rpc.Service.post_service
+      ~description:
+        "Trigger a full OCaml garbage collection cycle. This endpoint must be \
+         used with care."
+      ~query:Tezos_rpc.Query.empty
+      ~input:Data_encoding.unit
+      ~output:Data_encoding.unit
+      Tezos_rpc.Path.(root / "gc" / "full")
 end
 
 let gc ctxt = Tezos_rpc.Context.make_call S.gc ctxt () () ()
 
 let memory ctxt = Tezos_rpc.Context.make_call S.memory ctxt () () ()
+
+let gc_full ctxt = Tezos_rpc.Context.make_call S.gc_full ctxt () () ()

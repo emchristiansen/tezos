@@ -24,72 +24,63 @@
 (*                                                                           *)
 (*****************************************************************************)
 
-open RPC_directory_helpers
+open Context_wrapper.Irmin
+module Storage = Wasm_2_0_0_irmin_state.Storage
 
-(** Durable part of the storage of this PVM. *)
-module type Durable_state = sig
-  type state
+module Block_directory = Rpc_directory.Make_block_directory (struct end)
 
-  (** [value_length state key] returns the length of data stored
-        for the [key] in the durable storage of the PVM state [state], if any. *)
-  val value_length : state -> string -> int64 option Lwt.t
+let get_state (node_ctxt : _ Node_context.t) block_hash =
+  let open Lwt_result_syntax in
+  let* ctxt = Node_context.checkout_context node_ctxt block_hash in
+  let*! state = Context.PVMState.find ctxt in
+  match state with
+  | None -> failwith "No state"
+  | Some state -> return !(of_node_pvmstate state)
 
-  (** [lookup state key] returns the data stored
-        for the [key] in the durable storage of the PVM state [state], if any. *)
-  val lookup : state -> string -> bytes option Lwt.t
-
-  (** [subtrees state key] returns subtrees
-        for the [key] in the durable storage of the PVM state [state].
-        Empty list in case if path doesn't exist. *)
-  val list : state -> string -> string list Lwt.t
-end
-
-module Make_RPC (Durable_state : Durable_state with type state = Context.tree) =
-struct
-  module Block_directory = Make_directory (struct
-    include Sc_rollup_services.Global.Block
-
-    type context = Node_context.ro * Block_hash.t
-
-    let context_of_prefix node_ctxt (((), block) : prefix) =
-      let open Lwt_result_syntax in
-      let+ block = Block_directory_helpers.block_of_prefix node_ctxt block in
-      (Node_context.readonly node_ctxt, block)
-  end)
-
-  let get_state (node_ctxt : _ Node_context.t) block_hash =
-    let open Lwt_result_syntax in
-    let* ctxt = Node_context.checkout_context node_ctxt block_hash in
-    let*! state = Context.PVMState.find ctxt in
-    match state with None -> failwith "No state" | Some state -> return state
-
-  let register () =
-    let open Protocol.Alpha_context.Sc_rollup in
-    ( Block_directory.register0
-        (Sc_rollup_services.Global.Block.durable_state_value Kind.Wasm_2_0_0)
-    @@ fun (node_ctxt, block) {key} () ->
-      let open Lwt_result_syntax in
-      let* state = get_state node_ctxt block in
-      let*! value = Durable_state.lookup state key in
-      return value ) ;
-
-    ( Block_directory.register0
-        (Sc_rollup_services.Global.Block.durable_state_length Kind.Wasm_2_0_0)
-    @@ fun (node_ctxt, block) {key} () ->
-      let open Lwt_result_syntax in
-      let* state = get_state node_ctxt block in
-      let*! leng = Durable_state.value_length state key in
-      return leng ) ;
-
-    Block_directory.register0
-      (Sc_rollup_services.Global.Block.durable_state_subkeys Kind.Wasm_2_0_0)
-    @@ fun (node_ctxt, block) {key} () ->
+let register () =
+  let open Protocol.Alpha_context.Sc_rollup in
+  ( Block_directory.register0
+      (Sc_rollup_services.Block.durable_state_value Kind.Wasm_2_0_0)
+  @@ fun (node_ctxt, block) {key} () ->
     let open Lwt_result_syntax in
     let* state = get_state node_ctxt block in
-    let*! subkeys = Durable_state.list state key in
-    return subkeys
+    let*! value = Storage.find_value state key in
+    return value ) ;
 
-  let build_directory =
-    register () ;
-    Block_directory.build_directory
-end
+  ( Block_directory.register0
+      (Sc_rollup_services.Block.durable_state_length Kind.Wasm_2_0_0)
+  @@ fun (node_ctxt, block) {key} () ->
+    let open Lwt_result_syntax in
+    let* state = get_state node_ctxt block in
+    let*! length = Storage.value_length state key in
+    return length ) ;
+
+  ( Block_directory.register0
+      (Sc_rollup_services.Block.durable_state_subkeys Kind.Wasm_2_0_0)
+  @@ fun (node_ctxt, block) {key} () ->
+    let open Lwt_result_syntax in
+    let* state = get_state node_ctxt block in
+    let*! subkeys = Storage.list state key in
+    return subkeys ) ;
+
+  Block_directory.register0
+    (Sc_rollup_services.Block.durable_state_values Kind.Wasm_2_0_0)
+  @@ fun (node_ctxt, block) {key} () ->
+  let open Lwt_result_syntax in
+  let* state = get_state node_ctxt block in
+  let*! subkeys = Storage.list state key in
+  let*! bindings =
+    List.filter_map_s
+      (fun subkey ->
+        let open Lwt_syntax in
+        let+ value =
+          Storage.find_value state (String.concat "/" [key; subkey])
+        in
+        match value with None -> None | Some value -> Some (subkey, value))
+      subkeys
+  in
+  return bindings
+
+let build_sub_directory node_ctxt =
+  register () ;
+  Block_directory.build_sub_directory node_ctxt

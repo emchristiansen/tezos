@@ -1,0 +1,25 @@
+[
+  {
+    "file": "tezt/tests/dal.ml",
+    "title": "Alpha: Testing DAL rollup and node with L1 (Refutation where the faulty node timeouts)",
+    "tags": [
+      "admin_client",
+      "alpha",
+      "client",
+      "dal",
+      "dal_echo_kernel",
+      "dal_node",
+      "memory_hungry",
+      "node",
+      "slow",
+      "smart_rollup_installer",
+      "smart_rollup_node",
+      "tezos2"
+    ],
+    "successful_runs": {
+      "total_time": "641479418",
+      "count": "1"
+    },
+    "peak_memory_usage": 4220350000
+  }
+]

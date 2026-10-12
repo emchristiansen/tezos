@@ -28,7 +28,7 @@ to one provided by another node under the user’s control, or by
 relying on social cues to obtain a hash from a large number of trusted
 parties which are unlikely to be colluding.
 
-For instance, one may use one or more Tezos block explorers in the :ref:`Tezos community <tezos_community>` to check whether this block hash matches an existing block.
+For instance, one may use one or more :ref:`Tezos block explorers <block_explorers>` to check whether this block hash matches an existing block.
 
 After that careful selection and verification of the imported block
 hash, you can trust the node with the rest of the procedure. In
@@ -138,17 +138,17 @@ snapshot file name can be given as an additional argument. For example:
 
 .. note::
 
-   If your node's current storage was created with Octez v13 (or
-   earlier), it is not compatible with the context pruning storage
-   layout, and therefore it is no longer possible to export a storage
-   snapshot.
+   If your node's current storage was created with Octez v13.0 (or
+   earlier versions), it is not compatible with the context pruning
+   storage layout, and therefore it is no longer possible to export a
+   storage snapshot.
 
    In order to benefit from recent storage features and optimizations,
    it is strongly recommended to restart your node with the latest
    Octez version and with a fresh, up-to-date storage -- either by
    importing a recent snapshot (that is, exported by an Octez node
-   version >= v13 and <v15), or by bootstrapping from scratch if this
-   is not possible.
+   version >= v13.0), or by bootstrapping from scratch if this is not
+   possible.
 
 Rolling export
 ~~~~~~~~~~~~~~
@@ -204,10 +204,8 @@ can be exported from a given history mode node.
 Snapshot providers
 ~~~~~~~~~~~~~~~~~~
 
-There are several services providing node snapshots. They create snapshots
+There may be several services providing node snapshots. They create snapshots
 of their nodes on a regular basis (usually daily) and make them available for
 download. These include:
 
-* `XTZ-Shots <https://xtz-shots.io/mainnet/>`_
-* `Lambs on acid <https://lambsonacid.nl/>`_
-* `Marigold snapshots <https://snapshots.tezos.marigold.dev/>`_
+* `Tzinit snapshots <https://snapshots.tzinit.org/>`_

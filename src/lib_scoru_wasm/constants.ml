@@ -67,4 +67,31 @@ let reboot_counter_key =
 
 let version_key = Durable.key_of_string_exn "/readonly/wasm_version"
 
+(* Sentinel written by the kernel under [/kernel/env] to request
+   activation of the NDS (new durable storage) at the next reboot.
+   Read and cleared by the PVM at the [Padding] reboot boundary.
+   [/kernel/env] is the designated namespace for kernel->PVM control
+   flags (alongside [/kernel/env/reboot]). *)
+let activate_nds_flag_key = Durable.key_of_string_exn "/kernel/env/activate_nds"
+
 let stack_size_limit = 300
+
+let nairobi_name = "nairobi_017"
+
+let oxford_name = "oxford_018"
+
+let parisb_name = "paris_019"
+
+let parisc_name = "paris_020"
+
+let proto_quebec_name = "quebec_021"
+
+let proto_r022_name = "r022_022"
+
+let proto_s023_name = "s023_023"
+
+let proto_t024_name = "t024_024"
+
+let proto_u025_name = "u025_025"
+
+let proto_alpha_name = "alpha_current"

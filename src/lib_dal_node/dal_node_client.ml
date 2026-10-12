@@ -25,10 +25,11 @@
 
 open Tezos_dal_node_services
 
-class type cctxt =
-  object
-    inherit Tezos_rpc.Context.generic
-  end
+module Profiler = (val Profiler.wrap Dal_profiler.dal_profiler)
+
+class type cctxt = object
+  inherit Tezos_rpc.Context.generic
+end
 
 class unix_cctxt ~rpc_config : cctxt =
   object
@@ -43,15 +44,48 @@ let make_unix_cctxt endpoint =
   let rpc_config =
     {Tezos_rpc_http_client_unix.RPC_client_unix.default_config with endpoint}
   in
-  new unix_cctxt ~rpc_config
+  let cctxt = new unix_cctxt ~rpc_config in
+  new Octez_telemetry.Rpc_context.with_telemetry
+    ~service_name:"DAL_node_client"
+    cctxt
 
 let call (cctxt : #cctxt) = cctxt#call_service
 
-let get_slot cctxt header =
-  call cctxt Services.get_commitment_slot ((), header) () ()
+let get_slot_pages cctxt (slot_id : Types.slot_id) =
+  call
+    cctxt
+    Services.get_slot_pages
+    (((), slot_id.slot_level), slot_id.slot_index)
+    ()
+    ()
 
-let get_shard cctxt header shard_index =
-  call cctxt Services.shard (((), header), shard_index) () ()
+let get_slot_page_proof cctxt (slot_id : Types.slot_id) page_index =
+  call
+    cctxt
+    Services.get_slot_page_proof
+    ((((), slot_id.slot_level), slot_id.slot_index), page_index)
+    ()
+    ()
 
-let get_slot_pages cctxt header =
-  call cctxt Services.slot_pages ((), header) () ()
+let post_slot cctxt ?slot_index slot =
+  let query =
+    object
+      method padding = '\000'
+
+      method slot_index = slot_index
+    end
+  in
+  (call
+     cctxt
+     Services.post_slot
+     ()
+     query
+     slot [@profiler.aggregate_s {verbosity = Notice} "post_slot"])
+
+let get_slot_status cctxt (slot_id : Types.slot_id) =
+  call
+    cctxt
+    Services.get_slot_status
+    (((), slot_id.slot_level), slot_id.slot_index)
+    ()
+    ()

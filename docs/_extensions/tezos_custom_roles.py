@@ -23,6 +23,7 @@ def setup(app):
     app.add_role('opam', opam_role)
     app.add_role('src', src_role)
     app.add_role('gl', gitlab_role)
+    app.add_role('default', default_role)
     global OPAM_CACHE
     if OPAM_CACHE is not None:
         raise ValueError('package_role: opam cache already set!!!')
@@ -165,7 +166,7 @@ def src_role(_name, rawtext, text, lineno, inliner, options={}, _content=[]):
     if not Path(TEZOS_HOME, file).exists():
         msg = [
             inliner.reporter.warning(
-                f'source file {file} does not exist in the repo', line=lineno
+                f'source file {file} doesn\'t exist in the repo', line=lineno
             )
         ]
     else:
@@ -181,4 +182,32 @@ def src_role(_name, rawtext, text, lineno, inliner, options={}, _content=[]):
     else:  # most likely a directory
         url = project_url + "/-/tree/" + branch + "/" + src
     node = nodes.reference(rawtext, text, refuri=url, **options)
+    return [node], msg
+
+
+def default_role(
+    _name, rawtext, _text, lineno, inliner, options={}, _content=[]
+):
+    """Implement the default role. This role warns on the usage of single
+    backticks and points to preferred alternatives."""
+
+    node = nodes.Text(rawtext, **options)
+
+    file = inliner.document.current_source
+
+    # skip automatically generated pages
+    if re.match(".*[.]txt$", file):
+        return [node], []
+
+    # raise a warning
+    msg = [
+        inliner.reporter.warning(
+            (
+                f'undefined syntax: {rawtext}, '
+                + 'use ``...``, *...*, **...**, "...", :math:`...`, etc.'
+            ),
+            line=lineno,
+        )
+    ]
+
     return [node], msg

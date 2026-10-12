@@ -184,11 +184,11 @@ let list_contract_labels cctxt ~chain ~block =
           Public_key_hash.rev_find cctxt m >>=? function
           | None -> return ""
           | Some nm -> (
-              RawContractAlias.find_opt cctxt nm >>=? function
+              Raw_contract_alias.find_opt cctxt nm >>=? function
               | None -> return (" (known as " ^ nm ^ ")")
               | Some _ -> return (" (known as key:" ^ nm ^ ")")))
       | None -> (
-          RawContractAlias.rev_find cctxt h >>=? function
+          Raw_contract_alias.rev_find cctxt h >>=? function
           | None -> return ""
           | Some nm -> return (" (known as " ^ nm ^ ")")))
       >>=? fun nm ->
@@ -238,7 +238,7 @@ let register_as_delegate cctxt ~chain ~block ?confirmations ?dry_run
     (Some source)
 
 let save_contract ~force cctxt alias_name contract =
-  RawContractAlias.add ~force cctxt alias_name contract >>=? fun () ->
+  Raw_contract_alias.add ~force cctxt alias_name contract >>=? fun () ->
   message_added_contract cctxt alias_name >>= fun () -> return_unit
 
 let build_origination_operation ?fee ?gas_limit ?storage_limit ~initial_storage
@@ -375,10 +375,10 @@ type batch_transfer_operation = {
 let batch_transfer_operation_encoding =
   let open Data_encoding in
   conv
-    (fun {destination; fee; gas_limit; storage_limit; amount; arg; entrypoint} ->
-      (destination, fee, gas_limit, storage_limit, amount, arg, entrypoint))
-    (fun (destination, fee, gas_limit, storage_limit, amount, arg, entrypoint) ->
-      {destination; fee; gas_limit; storage_limit; amount; arg; entrypoint})
+    (fun {destination; fee; gas_limit; storage_limit; amount; arg; entrypoint}
+       -> (destination, fee, gas_limit, storage_limit, amount, arg, entrypoint))
+    (fun (destination, fee, gas_limit, storage_limit, amount, arg, entrypoint)
+       -> {destination; fee; gas_limit; storage_limit; amount; arg; entrypoint})
     (obj7
        (req "destination" string)
        (opt "fee" string)
@@ -459,8 +459,8 @@ let activate_account (cctxt : #full) ~chain ~block ?confirmations ?dry_run
   let sk = Signature.Of_V0.secret_key sk in
   Tezos_signer_backends.Unencrypted.make_pk pk >>?= fun pk_uri ->
   (if encrypted then
-   Tezos_signer_backends.Encrypted.prompt_twice_and_encrypt cctxt sk
-  else Tezos_signer_backends.Unencrypted.make_sk sk >>?= return)
+     Tezos_signer_backends.Encrypted.prompt_twice_and_encrypt cctxt sk
+   else Tezos_signer_backends.Unencrypted.make_sk sk >>?= return)
   >>=? fun sk_uri ->
   Client_keys_v0.register_key cctxt ?force (pkh, pk_uri, sk_uri) name
   >>=? fun () ->
@@ -521,7 +521,7 @@ let get_ballots_info (cctxt : #full) ~chain ~block =
 let get_period_info ?(successor = false) (cctxt : #full) ~chain ~block =
   let cb = (chain, block) in
   (if successor then Alpha_services.Voting.successor_period
-  else Alpha_services.Voting.current_period)
+   else Alpha_services.Voting.current_period)
     cctxt
     cb
   >>=? fun voting_period ->

@@ -3,6 +3,7 @@
 (* Open Source License                                                       *)
 (* Copyright (c) 2018 Dynamic Ledger Solutions, Inc. <contact@tezos.com>     *)
 (* Copyright (c) 2019-2021 Nomadic Labs, <contact@nomadic-labs.com>          *)
+(* Copyright (c) 2024 TriliTech <contact@trili.tech>                         *)
 (*                                                                           *)
 (* Permission is hereby granted, free of charge, to any person obtaining a   *)
 (* copy of this software and associated documentation files (the "Software"),*)
@@ -25,6 +26,9 @@
 (*****************************************************************************)
 
 type net_config
+
+val load_config_from_url :
+  Uri.t -> Config_file.blockchain_network tzresult Lwt.t
 
 (* NOTE: Some fields are not documented.
  *       Please help complete it if you can. *)
@@ -53,6 +57,8 @@ type t = {
   discovery_addr : string option;
   rpc_listen_addrs : string list;
       (** a list of addresses to listen to RPC requests on *)
+  external_rpc_listen_addrs : string list;
+      (** a list of addresses to listen to RPC requests on *)
   private_mode : bool;
       (** enables the private mode, see
           https://tezos.gitlab.io/user/node-configuration.html#private-node *)
@@ -60,16 +66,17 @@ type t = {
       (** If [disable_p2p_maintenance] is [true] the p2p layer will not open or
           close connections by itself. This flag is intended to be used for
           testing and debugging. *)
+  disable_p2p_swap : bool;
+      (** If [disable_p2p_swap] is [true] the p2p layer will neither initiate a
+          swap of connections with its neighbors nor answer to a swap request.
+          This flag is intended to be used for testing and debugging. *)
   disable_mempool : bool;
-  disable_mempool_precheck : bool;
-      (** If [disable_mempool_precheck] is [true] operations are executed by
-          the protocol before behing propagated. This flag is intended to be
-          used for testing and debugging. *)
   enable_testchain : bool;
   cors_origins : string list;
   cors_headers : string list;
   rpc_tls : Config_file.tls option;
-  log_output : Lwt_log_sink_unix.Output.t option;
+  log_output : Logs_simple_config.Output.t option;
+  log_coloring : bool option;
   bootstrap_threshold : int option;
   history_mode : History_mode.t option;
   synchronisation_threshold : int option;
@@ -78,16 +85,26 @@ type t = {
       (** a list of RPC listening addresses for which a full
           access should be granted *)
   media_type : Media_type.Command_line.t;
+  max_active_rpc_connections : RPC_server.Max_active_rpc_connections.t;
   metrics_addr : string list;
   operation_metadata_size_limit :
     Shell_limits.operation_metadata_size_limit option;
       (** maximum operation metadata size allowed to be stored on disk *)
+  enable_http_cache_headers : bool option;
+      (** Adds Cache-control header directives to RPC responses for queries
+          that are relative to the head block. *)
+  disable_context_pruning : bool option;
+  storage_maintenance_delay : Storage_maintenance.delay option;
 }
 
 val process_command : unit tzresult Lwt.t -> unit Cmdliner.Term.ret
 
 module Term : sig
   val args : t Cmdliner.Term.t
+
+  val listen_addr : string option Cmdliner.Term.t
+
+  val advertised_net_port : int option Cmdliner.Term.t
 
   val data_dir : string option Cmdliner.Term.t
 
@@ -99,7 +116,16 @@ end
 
 val read_config_file : t -> Config_file.t tzresult Lwt.t
 
-val read_data_dir : t -> string tzresult Lwt.t
+(* Returns the [data_dir] and [config_file] from either [config_file]
+   (configuration file value) or [data_dir] (command line value), if
+   any. Otherwise, returns the default values. If both the
+   [config_file] and [data_dir] are given, the [data_dir] overrides
+   the value from the [config_file]. *)
+val resolve_data_dir_and_config_file :
+  ?data_dir:string ->
+  ?config_file:string ->
+  unit ->
+  (string * Config_file.t, tztrace) result Lwt.t
 
 (** Modify a node's network configuration.
 

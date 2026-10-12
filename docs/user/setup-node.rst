@@ -1,14 +1,17 @@
 Setting up the node
 ===================
 
-A node in the Tezos network provides different configuration possibilities:
+For running a node in the Tezos network with a basic setup, see the introductory :ref:`section on running the node <start_node>`.
+
+This section describes different configuration possibilities provided by the Octez node:
 
 - tune various parameters of the node using flexible combinations of: a configuration file, command-line options, and environment variables
+- configure routing
 - specify the Tezos network to connect to, which can be the Mainnet or different test networks.
 - configure the amount of history kept by the node according to different tradeoffs, using history modes
 - rapidly catch up with a given (main or test) network by loading network snapshots
-- set up one or several proxy servers to decrease the load of the node by serving some RPC requests themselves
 - set up infrastructure for continuosly monitoring the node to help spotting operational or efficiency issues
+- set up infrastructure for continuosly monitoring the chain consensus spotting operational or efficiency issues
 
 These possibilities are described in the following pages.
 
@@ -16,6 +19,11 @@ These possibilities are described in the following pages.
    :maxdepth: 2
 
    node-configuration
+
+.. toctree::
+   :maxdepth: 2
+
+   routing
 
 .. toctree::
    :maxdepth: 2
@@ -35,9 +43,9 @@ These possibilities are described in the following pages.
 .. toctree::
    :maxdepth: 2
 
-   proxy-server
+   node-monitoring
 
 .. toctree::
    :maxdepth: 2
 
-   node-monitoring
+   teztale

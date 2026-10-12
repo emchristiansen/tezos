@@ -43,7 +43,6 @@
     tooling perspective.  *)
 type t =
   | Contract of Contract_repr.t
-  | Tx_rollup of Tx_rollup_repr.t
   | Sc_rollup of Sc_rollup_repr.t
   | Zk_rollup of Zk_rollup_repr.t
 
@@ -62,3 +61,7 @@ val pp : Format.formatter -> t -> unit
 val in_memory_size : t -> Cache_memory_helpers.sint
 
 type error += Invalid_destination_b58check of string
+
+val rpc_arg : t RPC_arg.arg
+
+module Index : Storage_description.INDEX with type t = t

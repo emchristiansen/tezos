@@ -28,8 +28,10 @@
    -------
    Component:    Client
    Invocation:   dune exec tezt/tests/main.exe -- --file normalize.ml
-   Subject:      Regression tests for the "normalize data" command.
+   Subject:      Regression tests for Michelson normalization commands.
 *)
+
+let team = Tag.layer1
 
 let hooks = Tezos_regression.hooks
 
@@ -39,7 +41,8 @@ let test_normalize_unparsing_mode =
   Protocol.register_regression_test
     ~__FILE__
     ~title:"Test normalize in unparsing mode"
-    ~tags:["client"; "normalize"]
+    ~tags:[team; "client"; "normalize"]
+    ~uses_node:false
   @@ fun protocol ->
   let* client = Client.init_mockup ~protocol () in
   let data = "{Pair 0 3 6 9; Pair 1 (Pair 4 (Pair 7 10)); {2; 5; 8; 11}}" in
@@ -52,22 +55,57 @@ let test_normalize_unparsing_mode =
   in
   unit
 
-let test_normalize_legacy_flag =
+let test_normalize_stack =
   Protocol.register_regression_test
     ~__FILE__
-    ~title:"Test normalize with legacy flag"
-    ~tags:["client"; "normalize"]
+    ~title:"Test Michelson stack normalization"
+    ~tags:[team; "client"; "normalize"]
+    ~uses_node:false
+    ~supports:(From_protocol 17)
   @@ fun protocol ->
   let* client = Client.init_mockup ~protocol () in
-  let data = "{Elt %a 0 1}" in
-  let typ = "map nat nat" in
+  let stack_elt ty v = sf "Stack_elt %s %s" ty v in
+  let elt1 = stack_elt "(pair nat nat nat nat)" "(Pair 0 3 6 9)" in
+  let elt2 =
+    stack_elt
+      "(pair nat (pair nat (pair nat nat)))"
+      "(Pair 1 (Pair 4 (Pair 7 10)))"
+  in
+  let elt3 = stack_elt "(pair nat nat (pair nat nat))" "{2; 5; 8; 11}" in
   let* () =
-    let* _ = Client.normalize_data client ~legacy:true ~hooks ~data ~typ in
-    unit
+    modes
+    |> Lwt_list.iter_s @@ fun mode ->
+       [[]; [elt1]; [elt1; elt2]; [elt1; elt2; elt3]]
+       |> Lwt_list.iter_s @@ fun stack ->
+          let print_stack fmt =
+            Format.fprintf
+              fmt
+              "{%a}"
+              (Format.pp_print_list
+                 ~pp_sep:(fun fmt () -> Format.pp_print_string fmt "; ")
+                 Format.pp_print_string)
+          in
+          let stack = Format.asprintf "%a" print_stack stack in
+          let* _ = Client.normalize_stack client ~hooks ?mode ~stack in
+          unit
   in
   let* () =
-    Client.spawn_normalize_data client ~legacy:false ~hooks ~data ~typ
-    |> Process.check_error ~msg:(rex "unexpected annotation.")
+    modes
+    |> Lwt_list.iter_s @@ fun mode ->
+       [
+         "";
+         "{";
+         "0";
+         "{Stack_elt}";
+         "{Stack_elt nat}";
+         "{Stack_elt 0 nat}";
+         "{Stack_elt nat 0 1}";
+         "Stack_elt nat 0";
+         "{Stack_elt nat 0; Stack_elt}";
+       ]
+       |> Lwt_list.iter_s @@ fun stack ->
+          Client.spawn_normalize_stack client ~hooks ?mode ~stack
+          |> Process.check_error
   in
   unit
 
@@ -75,7 +113,8 @@ let test_normalize_script =
   Protocol.register_regression_test
     ~__FILE__
     ~title:"Test normalize script"
-    ~tags:["client"; "normalize"]
+    ~tags:[team; "client"; "normalize"]
+    ~uses_node:false
   @@ fun protocol ->
   let* client = Client.init_mockup ~protocol () in
   let script =
@@ -93,7 +132,8 @@ let test_normalize_type =
   Protocol.register_regression_test
     ~__FILE__
     ~title:"Test normalize type"
-    ~tags:["client"; "normalize"]
+    ~tags:[team; "client"; "normalize"]
+    ~uses_node:false
   @@ fun protocol ->
   let* client = Client.init_mockup ~protocol () in
   let* () =
@@ -115,6 +155,6 @@ let test_normalize_type =
 
 let register ~protocols =
   test_normalize_unparsing_mode protocols ;
-  test_normalize_legacy_flag protocols ;
+  test_normalize_stack protocols ;
   test_normalize_script protocols ;
   test_normalize_type protocols

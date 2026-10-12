@@ -80,9 +80,10 @@ module type T = sig
         ('m, 'pr, 'p, 'q, 'i, 'o) Tezos_rpc.Service.t
        and type Error_monad.shell_tztrace = Error_monad.tztrace
        and type 'a Error_monad.shell_tzresult = ('a, Error_monad.tztrace) result
-       and type Timelock.chest = Tezos_crypto.Timelock.chest
-       and type Timelock.chest_key = Tezos_crypto.Timelock.chest_key
-       and type Timelock.opening_result = Tezos_crypto.Timelock.opening_result
+       and type Timelock.chest = Tezos_crypto.Timelock_legacy.chest
+       and type Timelock.chest_key = Tezos_crypto.Timelock_legacy.chest_key
+       and type Timelock.opening_result =
+        Tezos_crypto.Timelock_legacy.opening_result
        and module Sapling = Tezos_sapling.Core.Validator_legacy
        and type Bls_signature.pk = Bls12_381_signature.MinPk.pk
 
@@ -130,21 +131,19 @@ module type T = sig
        and type application_state = P.validation_state
 
   class ['chain, 'block] proto_rpc_context :
-    Tezos_rpc.Context.t
-    -> (unit, (unit * 'chain) * 'block) RPC_path.t
-    -> ['chain * 'block] RPC_context.simple
+    Tezos_rpc.Context.t ->
+    (unit, (unit * 'chain) * 'block) RPC_path.t ->
+    ['chain * 'block] RPC_context.simple
 
   class ['block] proto_rpc_context_of_directory :
-    ('block -> RPC_context.t)
-    -> RPC_context.t RPC_directory.t
-    -> ['block] RPC_context.simple
+    ('block -> RPC_context.t) ->
+    RPC_context.t RPC_directory.t ->
+    ['block] RPC_context.simple
 end
 
-module Make (Param : sig
-  val name : string
-end)
-() :
-  T
-    with type Updater.validation_result = validation_result
-     and type Updater.quota = quota
-     and type Updater.rpc_context = rpc_context
+module Make
+    (Param : sig
+      val name : string
+    end)
+    () :
+  T with type Updater.quota = quota and type Updater.rpc_context = rpc_context

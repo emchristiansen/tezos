@@ -82,7 +82,7 @@ module Functions (S : FOREIGN) = struct
     module Compiler = struct
       let is_available =
         foreign
-          "wasmer_is_compiler_available"
+          "wasmer_is_backend_available"
           (Types.Wasmer.Compiler.t @-> returning bool)
     end
 
@@ -95,6 +95,16 @@ module Functions (S : FOREIGN) = struct
       let bulk_memory =
         foreign
           "wasmer_features_bulk_memory"
+          (ptr Types.Wasmer.Features.t @-> bool @-> returning bool)
+
+      let exceptions =
+        foreign
+          "wasmer_features_exceptions"
+          (ptr Types.Wasmer.Features.t @-> bool @-> returning bool)
+
+      let extended_const =
+        foreign
+          "wasmer_features_extended_const"
           (ptr Types.Wasmer.Features.t @-> bool @-> returning bool)
 
       let memory64 =
@@ -122,6 +132,11 @@ module Functions (S : FOREIGN) = struct
           "wasmer_features_reference_types"
           (ptr Types.Wasmer.Features.t @-> bool @-> returning bool)
 
+      let relaxed_simd =
+        foreign
+          "wasmer_features_relaxed_simd"
+          (ptr Types.Wasmer.Features.t @-> bool @-> returning bool)
+
       let simd =
         foreign
           "wasmer_features_simd"
@@ -135,6 +150,11 @@ module Functions (S : FOREIGN) = struct
       let threads =
         foreign
           "wasmer_features_threads"
+          (ptr Types.Wasmer.Features.t @-> bool @-> returning bool)
+
+      let wide_arithmetic =
+        foreign
+          "wasmer_features_wide_arithmetic"
           (ptr Types.Wasmer.Features.t @-> bool @-> returning bool)
     end
 
@@ -152,7 +172,7 @@ module Functions (S : FOREIGN) = struct
 
     let set_compiler =
       foreign
-        "wasm_config_set_compiler"
+        "wasm_config_set_backend"
         (ptr Types.Config.t @-> Types.Wasmer.Compiler.t @-> returning void)
 
     let set_features =
@@ -256,6 +276,9 @@ module Functions (S : FOREIGN) = struct
       foreign
         "wasm_extern_as_memory"
         (ptr Types.Extern.t @-> returning (ptr Types.Memory.t))
+
+    let delete =
+      foreign "wasm_extern_delete" (ptr Types.Extern.t @-> returning void)
   end
 
   (** Functions with the [wasm_extern_vec_] prefix *)
@@ -278,6 +301,9 @@ module Functions (S : FOREIGN) = struct
       foreign
         "wasm_functype_results"
         (ptr Types.Functype.t @-> returning (ptr Types.Valtype.Vec.t))
+
+    let delete =
+      foreign "wasm_functype_delete" (ptr Types.Functype.t @-> returning void)
   end
 
   (** Functions with the [wasm_func_] prefix *)
@@ -374,6 +400,8 @@ module Functions (S : FOREIGN) = struct
       foreign
         "wasm_trap_message"
         (ptr Types.Trap.t @-> ptr Types.Message.t @-> returning void)
+
+    let delete = foreign "wasm_trap_delete" (ptr Types.Trap.t @-> returning void)
   end
 
   (** Functions with the [wasm_externtype_] prefix *)
@@ -416,6 +444,11 @@ module Functions (S : FOREIGN) = struct
       foreign
         "wasm_exporttype_type"
         (ptr Types.Exporttype.t @-> returning (ptr Types.Externtype.t))
+
+    let delete =
+      foreign
+        "wasm_exporttype_delete"
+        (ptr Types.Exporttype.t @-> returning void)
   end
 
   (** Functions with the [wasm_exporttype_vec_] prefix *)

@@ -152,15 +152,14 @@ module Context = struct
     | _ -> err_implementation_mismatch ~expected:c.impl_name ~got:t.impl_name
 
   let find_tree
-      (Context
-        {ops = (module Ops) as ops; ctxt; equality_witness; impl_name; _}) key =
+      (Context {ops = (module Ops) as ops; ctxt; equality_witness; impl_name; _})
+      key =
     let open Lwt_syntax in
     let+ t = Ops.find_tree ctxt key in
     Option.map (fun tree -> Tree {ops; tree; equality_witness; impl_name}) t
 
   let list
-      (Context
-        {ops = (module Ops) as ops; ctxt; equality_witness; impl_name; _})
+      (Context {ops = (module Ops) as ops; ctxt; equality_witness; impl_name; _})
       ?offset ?length key =
     let open Lwt_syntax in
     let+ ls = Ops.list ctxt ?offset ?length key in
@@ -174,9 +173,8 @@ module Context = struct
   let length (Context {ops = (module Ops); ctxt; _}) key = Ops.length ctxt key
 
   let fold ?depth
-      (Context
-        {ops = (module Ops) as ops; ctxt; equality_witness; impl_name; _}) key
-      ~order ~init ~f =
+      (Context {ops = (module Ops) as ops; ctxt; equality_witness; impl_name; _})
+      key ~order ~init ~f =
     Ops.fold ?depth ctxt key ~order ~init ~f:(fun k v acc ->
         let v = Tree {ops; tree = v; equality_witness; impl_name} in
         f k v acc)
@@ -193,7 +191,8 @@ module Context = struct
 
     let of_value
         (Context
-          {ops = (module Ops) as ops; ctxt; equality_witness; impl_name; _}) v =
+           {ops = (module Ops) as ops; ctxt; equality_witness; impl_name; _}) v
+        =
       let open Lwt_syntax in
       let+ tree = Ops.Tree.of_value ctxt v in
       Tree {ops; tree; equality_witness; impl_name}
@@ -205,7 +204,7 @@ module Context = struct
 
     let empty
         (Context
-          {ops = (module Ops) as ops; equality_witness; ctxt; impl_name; _}) =
+           {ops = (module Ops) as ops; equality_witness; ctxt; impl_name; _}) =
       let empty = Ops.Tree.empty ctxt in
       Tree {ops; equality_witness; tree = empty; impl_name}
 
@@ -257,8 +256,7 @@ module Context = struct
       Ops.Tree.length tree key
 
     let fold ?depth
-        (Tree
-          {ops = (module Ops) as ops; tree = t; equality_witness; impl_name})
+        (Tree {ops = (module Ops) as ops; tree = t; equality_witness; impl_name})
         key ~order ~init ~f =
       Ops.Tree.fold ?depth t key ~order ~init ~f:(fun k v acc ->
           let v = Tree {ops; tree = v; equality_witness; impl_name} in
@@ -629,12 +627,6 @@ module Context = struct
             observe start_loading_cache_lazily stop_loading_cache_lazily
             @@ fun () -> load_on_demand ctxt cache builder)
 
-    let ensure_valid_recycling (Context ctxt) cache =
-      let open Lwt_syntax in
-      let* layout = get_cache_layout (Context ctxt) in
-      if Environment_cache.compatible_layout cache layout then Lwt.return cache
-      else Lwt.return (Environment_cache.from_layout layout)
-
     let key_rank (Context ctxt) key = Environment_cache.key_rank ctxt.cache key
 
     let cache_size (Context ctxt) ~cache_index =
@@ -674,14 +666,19 @@ module Context = struct
         else
           (*
 
-             The client of [load_cache] has provided a cache that is not
-             the cache of the predecessor but the predecessor and the
-             block have a common ancestor. Therefore, the inherited
-             cache is supposed to contain many entries that can be
-             recycled to build the new cache.
+             The provided in-memory cache is not the predecessor's (for
+             instance after a reorg, where the last-applied block is on a
+             sibling branch). In that case we do not recycle its entries:
+             an entry could otherwise be reused for a key whose
+             [cache_nonce] matches the committed one while its value
+             differs. We rebuild the cache from the committed context,
+             exactly as the [`Load] source does. The [`Inherited] fast path
+             above (equal hashes) keeps linear application cheap; only this
+             less common case pays a full rebuild.
 
           *)
-          let* cache = Cache.ensure_valid_recycling (Context ctxt) cache in
+          let* layout = Cache.get_cache_layout (Context ctxt) in
+          let cache = Environment_cache.from_layout layout in
           Cache.load_cache (Context ctxt) cache `Load builder
     | (`Load | `Lazy) as mode ->
         let* layout = Cache.get_cache_layout (Context ctxt) in
@@ -769,13 +766,35 @@ module Register (C : S) = struct
   let ops = (module C : S with type t = 'ctxt and type tree = 'tree)
 end
 
-type validation_result = {
+type legacy_validation_result = {
   context : Context.t;
   fitness : Fitness.t;
   message : string option;
   max_operations_ttl : int;
   last_allowed_fork_level : Int32.t;
 }
+
+type validation_result = {
+  context : Context.t;
+  fitness : Fitness.t;
+  message : string option;
+  max_operations_ttl : int;
+  last_finalized_block_level : Int32.t;
+  last_preserved_block_level : Int32.t;
+}
+
+let lift_legacy_validation_result
+    (legacy_validation_result : legacy_validation_result) : validation_result =
+  {
+    context = legacy_validation_result.context;
+    fitness = legacy_validation_result.fitness;
+    message = legacy_validation_result.message;
+    max_operations_ttl = legacy_validation_result.max_operations_ttl;
+    last_finalized_block_level =
+      legacy_validation_result.last_allowed_fork_level;
+    last_preserved_block_level =
+      legacy_validation_result.last_allowed_fork_level;
+  }
 
 type quota = {max_size : int; max_op : int option}
 

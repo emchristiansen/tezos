@@ -37,20 +37,20 @@ open Alpha_context
     parameter). *)
 type 'kind internal_operation_contents =
   | Transaction : {
-      amount : Tez.tez;
+      amount : Tez.t;
       parameters : Script.lazy_expr;
       entrypoint : Entrypoint.t;
       destination : Destination.t;
     }
       -> Kind.transaction internal_operation_contents
   | Origination : {
-      delegate : Signature.Public_key_hash.t option;
-      script : Script.t;
-      credit : Tez.tez;
+      delegate : Implicit_account_repr.t option;
+      script : Script.michelson_with_storage;
+      credit : Tez.t;
     }
       -> Kind.origination internal_operation_contents
   | Delegation :
-      Signature.Public_key_hash.t option
+      Implicit_account_repr.t option
       -> Kind.delegation internal_operation_contents
   | Event : {
       ty : Script.expr;
@@ -60,7 +60,7 @@ type 'kind internal_operation_contents =
       -> Kind.event internal_operation_contents
 
 type 'kind internal_operation = {
-  source : Destination.t;
+  sender : Destination.t;
   operation : 'kind internal_operation_contents;
   nonce : int;
 }
@@ -87,12 +87,7 @@ type successful_transaction_result =
       storage_size : Z.t;
       paid_storage_size_diff : Z.t;
       allocated_destination_contract : bool;
-    }
-  | Transaction_to_tx_rollup_result of {
-      ticket_hash : Ticket_hash.t;
-      balance_updates : Receipt.balance_updates;
-      consumed_gas : Gas.Arith.fp;
-      paid_storage_size_diff : Z.t;
+      address_registry_diff : Address_registry.diff list;
     }
   | Transaction_to_sc_rollup_result of {
       consumed_gas : Gas.Arith.fp;
@@ -125,6 +120,7 @@ type _ successful_internal_operation_result =
       -> Kind.origination successful_internal_operation_result
   | IDelegation_result : {
       consumed_gas : Gas.Arith.fp;
+      balance_updates : Receipt.balance_updates;
     }
       -> Kind.delegation successful_internal_operation_result
   | IEvent_result : {

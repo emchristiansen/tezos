@@ -25,53 +25,77 @@
 (*                                                                           *)
 (*****************************************************************************)
 
-(** This module maintains the storage related to slashing of delegates for
-   double signing. In particular, it is responsible for maintaining the
-   {!Storage.Slashed_deposits} table.  *)
+(** This module handles the slashing of delegates for double signing.
 
-(** Returns true if the given delegate has already been slashed
-    for double baking for the given level. *)
-val already_slashed_for_double_baking :
+    It is behind the {!Alpha_context} abstraction: some functions are
+    re-exported in {!Alpha_context.Delegate}.
+
+    This module is responsible for maintaining the
+    {!Storage.Contract.Slashed_deposits} table. It also interacts
+    heavily with {!Pending_denunciations_storage}.
+*)
+
+(** The [reward_and_burn] type embeds amounts involved when slashing a
+    delegate for double attesting or double baking. *)
+type reward_and_burn = {reward : Tez_repr.t; amount_to_burn : Tez_repr.t}
+
+(** The [punishing_amounts] type embeds amounts involved when slashing a
+    delegate for double attesting or double baking. *)
+type punishing_amounts = {
+  staked : reward_and_burn;
+  unstaked : (Cycle_repr.t * reward_and_burn) list;
+}
+
+(** Record in the context that the given delegate is both marked for
+    slashing for the given misbehaviour, and forbidden from taking
+    part in the consensus process (baking/attesting).
+
+    [operation_hash] corresponds to the denunciation that prompted
+    this punishment. The level argument is the level of the duplicate
+    blocks, or the level that the duplicate (pre)attestations point
+    to, **not** the level of the block that contains the denunciation.
+
+    This function asserts that the delegate has not already been
+    denounced for the same misbehaviour at the same level. Indeed, if
+    this were the case, then the current denunciation operation should
+    have been rejected by {!Validate}. *)
+val punish_double_signing :
   Raw_context.t ->
-  Signature.Public_key_hash.t ->
-  Level_repr.t ->
-  bool tzresult Lwt.t
+  operation_hash:Operation_hash.t ->
+  Misbehaviour_repr.t ->
+  Implicit_account_repr.t ->
+  rewarded:Implicit_account_repr.t ->
+  Raw_context.t tzresult Lwt.t
 
-(** Returns true if the given delegate has already been slashed
-    for double preendorsing or double endorsing for the given level. *)
-val already_slashed_for_double_endorsing :
-  Raw_context.t ->
-  Signature.Public_key_hash.t ->
-  Level_repr.t ->
-  bool tzresult Lwt.t
+(** Applies pending denunciations in {!Storage.Pending_denunciations}
+    at the end of a cycle. The applicable denunciations are those that
+    point to a misbehavior whose max slashable period is ending.
+    (because [max_slashable_period = 2], the misbehavior must be
+    in the previous cycle).
 
-(** Burn some frozen deposit for a delegate at a given level and
-    record in the context that the given delegate has now been slashed
-    for double endorsing for the given level.
+    The denunciations are applied in chronological order of misbehaviour.
+    This function slashes the misbehaving bakers, by a proportion defined
+    in {!Slash_percentage}, and updates the respective
+    {!Storage.Contract.Slashed_deposits}. The applied denunciations are
+    removed from the storage.
 
-    Returns the burned amount.
+    It returns the updated context, and all the balance updates,
+    which includes slashes for the bakers, the stakers, and the rewards
+    for the denouncers.
+*)
+val apply_and_clear_denunciations :
+  Raw_context.t -> (Raw_context.t * Receipt_repr.balance_updates) tzresult Lwt.t
 
-    Fails with [Unrequired_denunciation] if the given delegate has
-    already been slashed for double endorsing for the given level.  *)
-val punish_double_endorsing :
-  Raw_context.t ->
-  Signature.Public_key_hash.t ->
-  Level_repr.t ->
-  (Raw_context.t * Tez_repr.t * Receipt_repr.balance_updates) tzresult Lwt.t
+module For_RPC : sig
+  (** [get_estimated_shared_pending_slashed_amount ctxt delegate]
+      returns the estimated shared pending slashed amount of the given [delegate]
+      according to the currently available denunciations. *)
+  val get_estimated_shared_pending_slashed_amount :
+    Raw_context.t -> Implicit_account_repr.t -> Tez_repr.t tzresult Lwt.t
 
-(** Burn some frozen deposit for a delegate at a given level and
-    record in the context that the given delegate has now been slashed
-    for double baking for the given level.
-
-    Returns the burned amount.
-
-    Fails with [Unrequired_denunciation] if the given delegate has
-    already been slashed for double baking for the given level.  *)
-val punish_double_baking :
-  Raw_context.t ->
-  Signature.Public_key_hash.t ->
-  Level_repr.t ->
-  (Raw_context.t * Tez_repr.t * Receipt_repr.balance_updates) tzresult Lwt.t
-
-val clear_outdated_slashed_deposits :
-  Raw_context.t -> new_cycle:Cycle_repr.t -> Raw_context.t Lwt.t
+  (** [get_estimated_own_pending_slashed_amount ctxt contract]
+      returns the estimated own pending slashed amount of the given [contract]
+      according to the currently available denunciations. *)
+  val get_estimated_own_pending_slashed_amount :
+    Raw_context.t -> Contract_repr.t -> Tez_repr.t tzresult Lwt.t
+end

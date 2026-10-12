@@ -47,14 +47,15 @@ let manager_pass = `PManager
 
 let all_passes = [`PConsensus; `PAnonymous; `PVote; `PManager]
 
-let consensus_kinds = [`KPreendorsement; `KEndorsement; `KDal_attestation]
+let all_non_manager_passes = [`PConsensus; `PAnonymous; `PVote]
+
+let consensus_kinds = [`KPreattestation; `KAttestation]
 
 let anonymous_kinds =
   [
     `KSeed_nonce_revelation;
     `KVdf_revelation;
-    `KDouble_endorsement;
-    `KDouble_preendorsement;
+    `KDouble_consensus_operation;
     `KDouble_baking;
     `KActivate_account;
   ]
@@ -72,7 +73,7 @@ let manager_kinds =
     `KIncrease_paid_storage;
     `KRegister_global_constant;
     `KTransfer_ticket;
-    `KDal_publish_slot_header;
+    `KDal_publish_commitment;
     `KSc_rollup_originate;
     `KSc_rollup_add_messages;
     `KSc_rollup_cement;
@@ -94,13 +95,13 @@ let pp_kind fmt k =
     fmt
     "%s"
     (match k with
-    | `KPreendorsement -> "KPreendorsement"
-    | `KEndorsement -> "KEndorsement"
+    | `KPreattestation -> "KPreattestation"
+    | `KAttestation -> "KAttestation"
     | `KDal_attestation -> "KDal_attestation"
     | `KSeed_nonce_revelation -> "KSeed_nonce_revelation"
     | `KVdf_revelation -> "KVdf_revelation"
-    | `KDouble_endorsement -> "KDouble_endorsement"
-    | `KDouble_preendorsement -> "KDouble_preendorsement"
+    | `KDouble_consensus_operation -> "KDouble_consensus_operation"
+    | `KDouble_preattestation -> "KDouble_preattestation"
     | `KDouble_baking -> "KDouble_baking"
     | `KActivate_account -> "KActivate_account"
     | `KProposals -> "KProposals"
@@ -149,24 +150,37 @@ let random_keys =
 let random_tz1 =
   let open QCheck2.Gen in
   let+ str = string_size (pure Signature.Ed25519.Public_key_hash.size) in
-  (Ed25519 (Signature.Ed25519.Public_key_hash.of_string_exn str)
-    : public_key_hash)
+  (* FIXME-PA *)
+  Implicit_account_repr.Forbidden.of_pkh
+    (Ed25519 (Signature.Ed25519.Public_key_hash.of_string_exn str))
 
 let random_tz2 =
   let open QCheck2.Gen in
   let+ str = string_size (pure Signature.Secp256k1.Public_key_hash.size) in
-  (Secp256k1 (Signature.Secp256k1.Public_key_hash.of_string_exn str)
-    : public_key_hash)
+  (* FIXME-PA *)
+  Implicit_account_repr.Forbidden.of_pkh
+    (Secp256k1 (Signature.Secp256k1.Public_key_hash.of_string_exn str))
 
 let random_tz3 =
   let open QCheck2.Gen in
   let+ str = string_size (pure Signature.P256.Public_key_hash.size) in
-  (P256 (Signature.P256.Public_key_hash.of_string_exn str) : public_key_hash)
+  (* FIXME-PA *)
+  Implicit_account_repr.Forbidden.of_pkh
+    (P256 (Signature.P256.Public_key_hash.of_string_exn str))
 
 let random_tz4 =
   let open QCheck2.Gen in
   let+ str = string_size (pure Signature.Bls.Public_key_hash.size) in
-  (Bls (Signature.Bls.Public_key_hash.of_string_exn str) : public_key_hash)
+  (* FIXME-PA *)
+  Implicit_account_repr.Forbidden.of_pkh
+    (Bls (Signature.Bls.Public_key_hash.of_string_exn str))
+
+let random_tz5 =
+  let open QCheck2.Gen in
+  let+ str = string_size (pure Signature.Mldsa44.Public_key_hash.size) in
+  (* FIXME-PA *)
+  Implicit_account_repr.Forbidden.of_pkh
+    (Mldsa44 (Signature.Mldsa44.Public_key_hash.of_string_exn str))
 
 let random_pkh =
   let open QCheck2.Gen in
@@ -176,6 +190,7 @@ let random_pkh =
   | Secp256k1 -> random_tz2
   | P256 -> random_tz3
   | Bls -> random_tz4
+  | Mldsa44 -> random_tz5
 
 let random_pk =
   let open QCheck2.Gen in
@@ -202,6 +217,9 @@ let random_signature =
       let+ seed = random_seed in
       let _, _, sk = Signature.generate_key ~algo:Bls ~seed () in
       Signature.sign sk Bytes.empty
+  | Some Mldsa44 ->
+      let+ str = string_size (pure Signature.Mldsa44.size) in
+      (Mldsa44 (Signature.Mldsa44.of_string_exn str) : Signature.t)
 
 let random_signature =
   let open QCheck2.Gen in
@@ -213,6 +231,7 @@ let random_signature =
         of_secp256k1 Signature.Secp256k1.zero;
         of_p256 Signature.P256.zero;
         of_bls Signature.Bls.zero;
+        of_mldsa44 Signature.Mldsa44.zero;
         Unknown (Bytes.make 64 '\000');
       ]
     ()
@@ -266,9 +285,7 @@ let random_shell : Tezos_base.Operation.shell_header QCheck2.Gen.t =
 let gen_slot =
   let open QCheck2.Gen in
   let+ i = small_nat in
-  match Slot.Internal_for_tests.of_int i with
-  | Ok slot -> slot
-  | Error _ -> assert false
+  match Slot.of_int i with Ok slot -> slot | Error _ -> assert false
 
 let gen_level =
   let open QCheck2.Gen in
@@ -376,22 +393,15 @@ let generate_operation gen_op =
   let+ op = generate_op gen_op in
   Operation.pack op
 
-let generate_preendorsement =
+let generate_preattestation =
   let open QCheck2.Gen in
   let+ cc = generate_consensus_content in
-  Preendorsement cc
+  Preattestation cc
 
-let generate_endorsement =
+let generate_attestation =
   let open QCheck2.Gen in
   let+ cc = generate_consensus_content in
-  Endorsement cc
-
-let generate_dal_attestation =
-  let open QCheck2.Gen in
-  let+ attestor = random_pkh in
-  Dal_attestation
-    Dal.Attestation.
-      {attestor; attestation = Dal.Attestation.empty; level = Raw_level.root}
+  Attestation {consensus_content = cc; dal_content = None}
 
 let generate_vdf_revelation =
   let open QCheck2.Gen in
@@ -404,17 +414,17 @@ let generate_seed_nonce_revelation =
   let+ nonce = random_nonce in
   Seed_nonce_revelation {level; nonce}
 
-let generate_double_preendorsement =
+let generate_double_consensus_operation =
   let open QCheck2.Gen in
-  let* op1 = generate_op generate_preendorsement in
-  let+ op2 = generate_op generate_preendorsement in
-  Double_preendorsement_evidence {op1; op2}
-
-let generate_double_endorsement =
-  let open QCheck2.Gen in
-  let* op1 = generate_op generate_endorsement in
-  let+ op2 = generate_op generate_endorsement in
-  Double_endorsement_evidence {op1; op2}
+  (* TODO: https://gitlab.com/tezos/tezos/-/issues/7971
+     Generate any combination of preattestation, attestation,
+     attestation with DAL, attestations aggregate, preattestations
+     aggregate *)
+  let generate_consensus_operation = generate_preattestation in
+  let* slot = gen_slot in
+  let* op1 = generate_op generate_consensus_operation in
+  let+ op2 = generate_op generate_consensus_operation in
+  Double_consensus_operation_evidence {slot; op1; op2}
 
 let generate_double_baking =
   let open QCheck2.Gen in
@@ -426,7 +436,12 @@ let generate_activate_account =
   let open QCheck2.Gen in
   let* activation_code = random_code in
   let+ id = random_tz1 in
-  let id = match id with Signature.Ed25519 pkh -> pkh | _ -> assert false in
+  (* FIXME-PA *)
+  let id =
+    match Implicit_account_repr.Forbidden.to_pkh id with
+    | Signature.Ed25519 pkh -> pkh
+    | _ -> assert false
+  in
   Activate_account {id; activation_code}
 
 let random_period =
@@ -471,8 +486,13 @@ let generate_manager_operation ?source gen_manop =
 
 let generate_reveal =
   let open QCheck2.Gen in
-  let+ pk = random_pk in
-  Reveal pk
+  let+ _, pk, sk = random_keys in
+  let proof =
+    match sk with
+    | Bls sk -> Signature.Bls.of_bytes_opt (Signature.Bls.pop_prove sk)
+    | _ -> None
+  in
+  Reveal {public_key = pk; proof}
 
 let generate_transaction =
   let open QCheck2.Gen in
@@ -519,26 +539,23 @@ let generate_transfer_ticket =
   let entrypoint = Entrypoint.default in
   Transfer_ticket {contents; ty; ticketer; amount; destination; entrypoint}
 
-let generate_dal_publish_slot_header =
-  let published_level = Alpha_context.Raw_level.of_int32_exn Int32.zero in
+let generate_dal_publish_commitment =
   let slot_index = Alpha_context.Dal.Slot_index.zero in
   let commitment = Alpha_context.Dal.Slot.Commitment.zero in
   let commitment_proof = Alpha_context.Dal.Slot.Commitment_proof.zero in
   let slot_header =
-    Alpha_context.Dal.Operations.Publish_slot_header.
-      {published_level; slot_index; commitment; commitment_proof}
+    Alpha_context.Dal.Operations.Publish_commitment.
+      {slot_index; commitment; commitment_proof}
   in
-  QCheck2.Gen.pure (Dal_publish_slot_header slot_header)
+  QCheck2.Gen.pure (Dal_publish_commitment slot_header)
 
 let generate_sc_rollup_originate =
   let kind = Sc_rollup.Kind.Example_arith in
   let boot_sector = "" in
   let parameters_ty = Script.lazy_expr (Expr.from_string "1") in
-  let origination_proof =
-    Lwt_main.run (Sc_rollup_helpers.compute_origination_proof ~boot_sector kind)
-  in
+  let whitelist = None in
   QCheck2.Gen.pure
-    (Sc_rollup_originate {kind; boot_sector; origination_proof; parameters_ty})
+    (Sc_rollup_originate {kind; boot_sector; parameters_ty; whitelist})
 
 let generate_sc_rollup_add_messages =
   let open QCheck2.Gen in
@@ -561,8 +578,7 @@ let sc_dummy_commitment =
 let generate_sc_rollup_cement =
   let open QCheck2.Gen in
   let+ rollup = random_sc_rollup in
-  let commitment = Sc_rollup.Commitment.hash_uncarbonated sc_dummy_commitment in
-  Sc_rollup_cement {rollup; commitment}
+  Sc_rollup_cement {rollup}
 
 let generate_sc_rollup_publish =
   let open QCheck2.Gen in
@@ -617,8 +633,8 @@ let generator_of ?source = function
       generate_manager_operation ?source generate_register_global_constant
   | `KTransfer_ticket ->
       generate_manager_operation ?source generate_transfer_ticket
-  | `KDal_publish_slot_header ->
-      generate_manager_operation ?source generate_dal_publish_slot_header
+  | `KDal_publish_commitment ->
+      generate_manager_operation ?source generate_dal_publish_commitment
   | `KSc_rollup_originate ->
       generate_manager_operation ?source generate_sc_rollup_originate
   | `KSc_rollup_add_messages ->
@@ -637,6 +653,23 @@ let generator_of ?source = function
         generate_sc_rollup_execute_outbox_message
   | `KSc_rollup_recover_bond ->
       generate_manager_operation ?source generate_sc_rollup_recover_bond
+
+let generate_non_manager_operation =
+  let open QCheck2.Gen in
+  let* pass = oneofl all_non_manager_passes in
+  let* kind = oneofl (pass_to_operation_kinds pass) in
+  match kind with
+  | `KPreattestation -> generate_operation generate_preattestation
+  | `KAttestation -> generate_operation generate_attestation
+  | `KSeed_nonce_revelation -> generate_operation generate_seed_nonce_revelation
+  | `KVdf_revelation -> generate_operation generate_vdf_revelation
+  | `KDouble_consensus_operation ->
+      generate_operation generate_double_consensus_operation
+  | `KDouble_baking -> generate_operation generate_double_baking
+  | `KActivate_account -> generate_operation generate_activate_account
+  | `KProposals -> generate_operation generate_proposals
+  | `KBallot -> generate_operation generate_ballot
+  | `KManager -> assert false
 
 let generate_manager_operation batch_size =
   let open QCheck2.Gen in
@@ -699,15 +732,13 @@ let generate_operation =
   let* kind = oneofl (pass_to_operation_kinds pass) in
   let+ packed_operation =
     match kind with
-    | `KPreendorsement -> generate_operation generate_preendorsement
-    | `KEndorsement -> generate_operation generate_endorsement
-    | `KDal_attestation -> generate_operation generate_dal_attestation
+    | `KPreattestation -> generate_operation generate_preattestation
+    | `KAttestation -> generate_operation generate_attestation
     | `KSeed_nonce_revelation ->
         generate_operation generate_seed_nonce_revelation
     | `KVdf_revelation -> generate_operation generate_vdf_revelation
-    | `KDouble_endorsement -> generate_operation generate_double_endorsement
-    | `KDouble_preendorsement ->
-        generate_operation generate_double_preendorsement
+    | `KDouble_consensus_operation ->
+        generate_operation generate_double_consensus_operation
     | `KDouble_baking -> generate_operation generate_double_baking
     | `KActivate_account -> generate_operation generate_activate_account
     | `KProposals -> generate_operation generate_proposals

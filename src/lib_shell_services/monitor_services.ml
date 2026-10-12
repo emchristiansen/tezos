@@ -100,20 +100,6 @@ module S = struct
     |+ multi_field "chain" Chain_services.chain_arg (fun t -> t#chains)
     |> seal
 
-  let legacy_valid_blocks =
-    Tezos_rpc.Service.get_service
-      ~description:
-        "(Deprecated) Monitor all blocks that are successfully applied by the \
-         node, disregarding whether they were selected as the new head or not."
-      ~query:validated_or_apply_blocks_query
-      ~output:
-        (merge_objs
-           (obj2
-              (req "chain_id" Chain_id.encoding)
-              (req "hash" Block_hash.encoding))
-           Block_header.encoding)
-      Tezos_rpc.Path.(path / "valid_blocks")
-
   let validated_blocks =
     Tezos_rpc.Service.get_service
       ~description:
@@ -145,10 +131,13 @@ module S = struct
 
   let heads_query =
     let open Tezos_rpc.Query in
-    query (fun next_protocols ->
+    query (fun protocols next_protocols ->
         object
+          method protocols = protocols
+
           method next_protocols = next_protocols
         end)
+    |+ multi_field "protocol" Protocol_hash.rpc_arg (fun t -> t#protocols)
     |+ multi_field "next_protocol" Protocol_hash.rpc_arg (fun t ->
            t#next_protocols)
     |> seal
@@ -165,6 +154,14 @@ module S = struct
            Block_header.encoding)
       Tezos_rpc.Path.(path / "heads" /: Chain_services.chain_arg)
 
+  let received_blocks =
+    Tezos_rpc.Service.get_service
+      ~description:
+        "Monitor all newly received blocks that are not yet known by the store."
+      ~query:Tezos_rpc.Query.empty
+      ~output:(obj1 (req "hash" Block_hash.encoding))
+      Tezos_rpc.Path.(path / "received_blocks" /: Chain_services.chain_arg)
+
   let protocols =
     Tezos_rpc.Service.get_service
       ~description:
@@ -173,14 +170,6 @@ module S = struct
       ~query:Tezos_rpc.Query.empty
       ~output:Protocol_hash.encoding
       Tezos_rpc.Path.(path / "protocols")
-
-  (* DEPRECATED: use [version] from "version_services" instead. *)
-  let commit_hash =
-    Tezos_rpc.Service.get_service
-      ~description:"DEPRECATED: use `version` instead."
-      ~query:Tezos_rpc.Query.empty
-      ~output:string
-      Tezos_rpc.Path.(path / "commit_hash")
 
   let active_chains =
     Tezos_rpc.Service.get_service
@@ -195,21 +184,6 @@ end
 open Tezos_rpc.Context
 
 let bootstrapped ctxt = make_streamed_call S.bootstrapped ctxt () () ()
-
-let legacy_valid_blocks ctxt ?(chains = [`Main]) ?(protocols = [])
-    ?(next_protocols = []) () =
-  make_streamed_call
-    S.legacy_valid_blocks
-    ctxt
-    ()
-    (object
-       method chains = chains
-
-       method protocols = protocols
-
-       method next_protocols = next_protocols
-    end)
-    ()
 
 let validated_blocks ctxt ?(chains = [`Main]) ?(protocols = [])
     ?(next_protocols = []) () =
@@ -241,18 +215,21 @@ let applied_blocks ctxt ?(chains = [`Main]) ?(protocols = [])
     end)
     ()
 
-let heads ctxt ?(next_protocols = []) chain =
+let received_blocks ctxt chain =
+  make_streamed_call S.received_blocks ctxt ((), chain) () ()
+
+let heads ctxt ?(protocols = []) ?(next_protocols = []) chain =
   make_streamed_call
     S.heads
     ctxt
     ((), chain)
     (object
+       method protocols = protocols
+
        method next_protocols = next_protocols
     end)
     ()
 
 let protocols ctxt = make_streamed_call S.protocols ctxt () () ()
-
-let commit_hash ctxt = make_call S.commit_hash ctxt () () ()
 
 let active_chains ctxt = make_streamed_call S.active_chains ctxt () () ()

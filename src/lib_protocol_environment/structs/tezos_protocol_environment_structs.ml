@@ -19,6 +19,7 @@ module V0 = struct
   module Error_monad_infix_globals = V0_error_monad_infix_globals
   module Error_monad_trace_eval = V0_error_monad_trace_eval
   module RPC_directory = V0_RPC_directory
+  module Legacy_logging = V0_legacy_logging
 end
 
 module V1 = struct
@@ -44,6 +45,7 @@ module V1 = struct
   module Error_monad_infix_globals = V0_error_monad_infix_globals
   module Error_monad_trace_eval = V0_error_monad_trace_eval
   module RPC_directory = V0_RPC_directory
+  module Legacy_logging = V0_legacy_logging
 end
 
 module V2 = struct
@@ -68,6 +70,7 @@ module V2 = struct
   module Error_monad_infix_globals = V0_error_monad_infix_globals
   module Error_monad_trace_eval = V0_error_monad_trace_eval
   module RPC_directory = V0_RPC_directory
+  module Legacy_logging = V0_legacy_logging
 end
 
 module V3 = struct
@@ -106,6 +109,7 @@ module V6 = struct
   module Bounded = V5_bounded
   module RPC_directory = V0_RPC_directory
   module Seq = V3_seq_monad
+  module Wasm_pvm_machine = V6_wasm_pvm_machine
 end
 
 module V7 = struct
@@ -114,6 +118,7 @@ module V7 = struct
   module Array = V7_array
   module Plonk = V7_plonk
   module Seq = V3_seq_monad
+  module Wasm_pvm_machine = V6_wasm_pvm_machine
 end
 
 module V8 = struct
@@ -122,6 +127,7 @@ module V8 = struct
   module Array = V7_array
   module Plonk = V8_plonk
   module Seq = V3_seq_monad
+  module Wasm_pvm_machine = V6_wasm_pvm_machine
 end
 
 module V9 = struct
@@ -130,4 +136,14 @@ module V9 = struct
   module Array = V7_array
   module Plonk = V8_plonk
   module Seq = V9_seq_monad
+  module Wasm_pvm_machine = V6_wasm_pvm_machine
 end
+
+module V10 = V9
+module V11 = V10
+module V12 = V11
+module V13 = V12
+module V14 = V13
+module V15 = V14
+module V16 = V15
+module V17 = V16

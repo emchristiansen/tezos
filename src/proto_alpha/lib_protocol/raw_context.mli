@@ -78,6 +78,10 @@ type root = t
 val protocol_migration_internal_message :
   Sc_rollup_inbox_message_repr.internal_inbox_message
 
+(** Serialized version of {!protocol_migration_internal_message}. *)
+val protocol_migration_serialized_message :
+  Sc_rollup_inbox_message_repr.serialized
+
 (** Retrieves the state of the database and gives its abstract view.
     It also returns wether this is the first block validated
     with this version of the protocol. *)
@@ -85,16 +89,33 @@ val prepare :
   level:Int32.t ->
   predecessor_timestamp:Time.t ->
   timestamp:Time.t ->
+  all_bakers_attest_first_level:Level_repr.t option ->
   Context.t ->
   t tzresult Lwt.t
 
-type previous_protocol = Genesis of Parameters_repr.t | Mumbai_016
+type previous_protocol =
+  | Genesis of Parameters_repr.t
+  | Alpha
+  | (* Alpha predecessor *) U025 (* Alpha predecessor *)
 
+(** Prepares the context for the first block of the protocol.
+
+    Among other things, this sets the constant values that will be
+    used during the whole lifetime of the protocol. By default,
+    constant values are copied over from the previous protocol when
+    applicable, but any exceptions to this rule happen in this
+    function.
+
+    See {!Constants_parametric_repr} for instructions on how to add or
+    modify a constant.
+*)
 val prepare_first_block :
   level:int32 ->
   timestamp:Time.t ->
+  Chain_id.t ->
   Context.t ->
-  (previous_protocol * t) tzresult Lwt.t
+  (previous_protocol * Constants_parametric_previous_repr.t option * t) tzresult
+  Lwt.t
 
 val activate : t -> Protocol_hash.t -> t Lwt.t
 
@@ -109,8 +130,6 @@ val predecessor_timestamp : t -> Time.t
 val current_timestamp : t -> Time.t
 
 val constants : t -> Constants_parametric_repr.t
-
-val tx_rollup : t -> Constants_parametric_repr.tx_rollup
 
 val sc_rollup : t -> Constants_parametric_repr.sc_rollup
 
@@ -242,9 +261,11 @@ val record_non_consensus_operation_hash : t -> Operation_hash.t -> t
 val non_consensus_operations : t -> Operation_hash.t list
 
 type consensus_pk = {
-  delegate : Signature.Public_key_hash.t;
+  delegate : Implicit_account_repr.t;
   consensus_pk : Signature.Public_key.t;
   consensus_pkh : Signature.Public_key_hash.t;
+  companion_pk : Bls.Public_key.t option;
+  companion_pkh : Bls.Public_key_hash.t option;
 }
 
 val consensus_pk_encoding : consensus_pk Data_encoding.t
@@ -256,7 +277,10 @@ val record_dictator_proposal_seen : t -> t
 val dictator_proposal_seen : t -> bool
 
 (** [init_sampler_for_cycle ctxt cycle seed state] caches the seeded stake
-    sampler (a.k.a. [seed, state]) for [cycle] in memory for quick access. *)
+    sampler (a.k.a. [seed, state]) for [cycle] in memory for quick access.
+
+    @return [Error Sampler_already_set] if the sampler was already
+    cached. *)
 val init_sampler_for_cycle :
   t -> Cycle_repr.t -> Seed_repr.seed -> consensus_pk Sampler.t -> t tzresult
 
@@ -267,7 +291,7 @@ val init_sampler_for_cycle :
     the [read] function and then cached in [ctxt] like
     [init_sampler_for_cycle]. *)
 val sampler_for_cycle :
-  read:(t -> (Seed_repr.seed * consensus_pk Sampler.t) tzresult Lwt.t) ->
+  read:(t -> (t * Seed_repr.seed * consensus_pk Sampler.t) tzresult Lwt.t) ->
   t ->
   Cycle_repr.t ->
   (t * Seed_repr.seed * consensus_pk Sampler.t) tzresult Lwt.t
@@ -275,10 +299,43 @@ val sampler_for_cycle :
 (* The stake distribution is stored both in [t] and in the cache. It
    may be sufficient to only store it in the cache. *)
 val stake_distribution_for_current_cycle :
-  t -> Tez_repr.t Signature.Public_key_hash.Map.t tzresult
+  t -> Stake_repr.t Implicit_account_repr.Map.t tzresult
+
+(** Like [stake_distribution_for_current_cycle] but returns [None] rather than
+    an error. *)
+val find_stake_distribution_for_current_cycle :
+  t -> Stake_repr.t Implicit_account_repr.Map.t option
 
 val init_stake_distribution_for_current_cycle :
-  t -> Tez_repr.t Signature.Public_key_hash.Map.t -> t
+  t -> Stake_repr.t Implicit_account_repr.Map.t -> t
+
+type delegate_stake_info = {consensus_pk : consensus_pk; stake_weight : Int64.t}
+
+type stake_info = {
+  total_stake_weight : Int64.t;
+  delegates : delegate_stake_info list;
+}
+
+val delegate_stake_info_encoding : delegate_stake_info Data_encoding.encoding
+
+val stake_info_encoding : stake_info Data_encoding.encoding
+
+(** Returns the reward coefficient for the current cycle
+    This value is equal to the value in {!Storage.Issuance_coeff} if it exists,
+    or equal to [Q.one] otherwise. *)
+val reward_coeff_for_current_cycle : t -> Q.t
+
+(** Updates the reward coefficient for the current cycle.
+    This update should only be called once per cycle. It is done in
+    [Adaptive_issuance_storage] *)
+val update_reward_coeff_for_current_cycle : t -> Q.t -> t
+
+(** Returns the first level at which all bakers attest is active.
+    Returns [None] if it is not set to activate yet. *)
+val all_bakers_attest_first_level : t -> Level_repr.t option
+
+(** Set the feature flag of all bakers attest. *)
+val set_all_bakers_attest_first_level : t -> Level_repr.t -> t
 
 module Internal_for_tests : sig
   val add_level : t -> int -> t
@@ -286,10 +343,19 @@ module Internal_for_tests : sig
   val add_cycles : t -> int -> t
 end
 
+type consensus_power = {
+  consensus_key : consensus_pk;
+  attesting_power : Attesting_power_repr.t;
+}
+
 module type CONSENSUS = sig
   type t
 
   type 'value slot_map
+
+  type 'value level_map
+
+  type 'value raw_level_map
 
   type slot_set
 
@@ -297,81 +363,109 @@ module type CONSENSUS = sig
 
   type round
 
-  type consensus_pk
+  type attesting_power
 
-  (** Returns a map where each endorser's pkh is associated to the
-     list of its endorsing slots (in decreasing order) for a given
-     level. *)
-  val allowed_endorsements : t -> (consensus_pk * int) slot_map
+  (** Info on the power of a given member of the consensus committee.
+      Contains a consensus_pk, its attesting power and its DAL power. *)
+  type consensus_power
 
-  (** Returns a map where each endorser's pkh is associated to the
-     list of its endorsing slots (in decreasing order) for a given
-     level. *)
-  val allowed_preendorsements : t -> (consensus_pk * int) slot_map
+  (** Returns a map where from the initial slot of each attester in the TB
+      committee for a given level, to the attester's public key and its
+      consensus power and DAL power. *)
+  val allowed_attestations : t -> consensus_power slot_map option
 
-  (** [endorsement power ctx] returns the endorsement power of the
+  (** See {!allowed_attestations}. *)
+  val allowed_preattestations : t -> consensus_power slot_map option
+
+  (** Returns a map that associates a level with a slot map.
+      The slot map links a delegate's public key to a tuple containing
+      (minimal_slot, voting_power, dal_power). See {!allowed_attestations} *)
+  val allowed_consensus : t -> consensus_power slot_map level_map option
+
+  val delegate_to_shard_count :
+    t -> int Implicit_account_repr.Map.t raw_level_map
+
+  (** [shard_count_map ctxt ~committee_level] returns the
+      delegate-to-shard-count map for the given [committee_level],
+      or [None] if the level is not present in the pre-computed map. *)
+  val shard_count_map :
+    t ->
+    committee_level:Raw_level_repr.t ->
+    int Implicit_account_repr.Map.t option
+
+  (** Returns the set of delegates that are not allowed to bake or
+      attest blocks; i.e., delegates which have zero frozen deposit
+      due to a previous slashing. *)
+  val forbidden_delegates : t -> Implicit_account_repr.Set.t
+
+  (** Missing pre-computed map by first slot. This error should not happen. *)
+  type error += Slot_map_not_found of {loc : string}
+
+  (** [attestation power ctx] returns the attestation power and stake of the
      current block. *)
-  val current_endorsement_power : t -> int
+  val current_attesting_power : t -> attesting_power
 
-  (** Initializes the map of allowed endorsements and preendorsements,
-     this function must be called only once and before applying
-     any consensus operation.  *)
+  (** Initializes the map of allowed attestations and preattestations, this
+      function must be called only once and before applying any consensus
+      operation. *)
   val initialize_consensus_operation :
     t ->
-    allowed_endorsements:(consensus_pk * int) slot_map ->
-    allowed_preendorsements:(consensus_pk * int) slot_map ->
+    allowed_attestations:consensus_power slot_map option ->
+    allowed_preattestations:consensus_power slot_map option ->
+    allowed_consensus:consensus_power slot_map level_map option ->
+    delegate_to_shard_count:int Implicit_account_repr.Map.t raw_level_map ->
     t
 
-  (** [record_grand_parent_endorsement ctx pkh] records an
-      grand_parent_endorsement for the current block. This is only
-      useful for the partial construction mode. *)
-  val record_grand_parent_endorsement :
-    t -> Signature.Public_key_hash.t -> t tzresult
+  (** [record_attestation ctx ~initial_slot ~power] records an
+     attestation for the current block.
 
-  (** [record_endorsement ctx ~initial_slot ~power] records an
-     endorsement for the current block.
-
-      The endorsement should be valid in the sense that
-      [Int_map.find_opt initial_slot allowed_endorsement ctx = Some
+      The attestation should be valid in the sense that
+      [Int_map.find_opt initial_slot allowed_attestation ctx = Some
       (pkh, power)].  *)
-  val record_endorsement : t -> initial_slot:slot -> power:int -> t tzresult
+  val record_attestation :
+    t -> initial_slot:slot -> power:attesting_power -> t tzresult
 
-  (** [record_preendorsement ctx ~initial_slot ~power round
-     payload_hash power] records a preendorsement for a proposal at
+  (** [record_preattestation ctx ~initial_slot ~power round
+     payload_hash power] records a preattestation for a proposal at
      [round] with payload [payload_hash].
 
-      The preendorsement should be valid in the sense that
-     [Int_map.find_opt initial_slot allowed_preendorsement ctx = Some
+      The preattestation should be valid in the sense that
+     [Int_map.find_opt initial_slot allowed_preattestation ctx = Some
      (pkh, power)].  *)
-  val record_preendorsement :
-    t -> initial_slot:slot -> power:int -> round -> t tzresult
+  val record_preattestation :
+    t -> initial_slot:slot -> power:attesting_power -> round -> t tzresult
 
-  val endorsements_seen : t -> slot_set
+  (** [forbid_delegate ctx delegate] adds [delegate] to the set of
+      forbidden delegates, which prevents this delegate from baking or
+      attesting. *)
+  val forbid_delegate : t -> Implicit_account_repr.t -> t
 
-  (** [get_preendorsements_quorum_round ctx] returns [None] if no
-     preendorsement are included in the current block. Otherwise,
-     return [Some r] where [r] is the round of the preendorsements
+  (** [set_forbidden_delegate ctx delegates] sets [delegates] as the
+      current forbidden delegates. *)
+  val set_forbidden_delegates : t -> Implicit_account_repr.Set.t -> t
+
+  val attestations_seen : t -> slot_set
+
+  (** [get_preattestations_quorum_round ctx] returns [None] if no
+     preattestation are included in the current block. Otherwise,
+     return [Some r] where [r] is the round of the preattestations
      included in the block. *)
-  val get_preendorsements_quorum_round : t -> round option
+  val get_preattestations_quorum_round : t -> round option
 
-  (** [set_preendorsements_quorum_round ctx round] sets the round for
-     preendorsements included in this block. This function should be
+  (** [set_preattestations_quorum_round ctx round] sets the round for
+     preattestations included in this block. This function should be
      called only once.
 
       This function is only used in [Full_construction] mode.  *)
-  val set_preendorsements_quorum_round : t -> round -> t
+  val set_preattestations_quorum_round : t -> round -> t
 
   (** [locked_round_evidence ctx] returns the round of the recorded
-     preendorsements as well as their power. *)
-  val locked_round_evidence : t -> (round * int) option
+     preattestations as well as their power. *)
+  val locked_round_evidence : t -> (round * attesting_power) option
 
-  val set_endorsement_branch : t -> Block_hash.t * Block_payload_hash.t -> t
+  val set_attestation_branch : t -> Block_hash.t * Block_payload_hash.t -> t
 
-  val endorsement_branch : t -> (Block_hash.t * Block_payload_hash.t) option
-
-  val set_grand_parent_branch : t -> Block_hash.t * Block_payload_hash.t -> t
-
-  val grand_parent_branch : t -> (Block_hash.t * Block_payload_hash.t) option
+  val attestation_branch : t -> (Block_hash.t * Block_payload_hash.t) option
 end
 
 module Consensus :
@@ -379,17 +473,12 @@ module Consensus :
     with type t := t
      and type slot := Slot_repr.t
      and type 'a slot_map := 'a Slot_repr.Map.t
+     and type 'a level_map := 'a Level_repr.Map.t
+     and type 'a raw_level_map := 'a Raw_level_repr.Map.t
      and type slot_set := Slot_repr.Set.t
      and type round := Round_repr.t
-     and type consensus_pk := consensus_pk
-
-module Tx_rollup : sig
-  val add_message :
-    t ->
-    Tx_rollup_repr.t ->
-    Tx_rollup_message_hash_repr.t ->
-    t * Tx_rollup_inbox_repr.Merkle.root
-end
+     and type attesting_power := Attesting_power_repr.t
+     and type consensus_power := consensus_power
 
 module Sc_rollup_in_memory_inbox : sig
   val current_messages : t -> Sc_rollup_inbox_merkelized_payload_hashes_repr.t
@@ -401,87 +490,90 @@ end
 module Dal : sig
   type cryptobox = Dal.t
 
-  val make : t -> cryptobox tzresult
+  val make_cryptobox : Dal.parameters -> cryptobox tzresult
 
-  val number_of_slots : t -> int
+  val make : t -> (t * cryptobox) tzresult
 
-  (** [record_attested_shards ctxt attestation shards] records that the
-     list of shards [shards] were attested (declared available by some
-     attestor). The function assumes that a shard belongs to the
-     interval [0; number_of_shards - 1]. Otherwise, for each shard
-     outside this interval, it is a no-op. *)
-  val record_attested_shards : t -> Dal_attestation_repr.t -> int list -> t
+  (** [committee_level_of ctxt ~attested_level ~lag] computes the shard
+      assignment level, aka as committee level, for the slots published at
+      [attested_level - lag], referred to as [published_level].
 
-  (** [register_slot_header ctxt slot_header] returns a new context
-     where the new candidate [slot] have been taken into
-     account. Returns [Some (ctxt,updated)] where [updated=true] if
-     the candidate is registered. [Some (ctxt,false)] if another
-     candidate was already registered previously. Returns an error if
-     the slot is invalid. *)
-  val register_slot_header : t -> Dal_slot_repr.Header.t -> t tzresult
+      The committee level for a given [published_level] is defined
+      as [published_level + attestation_lag - 1].
 
-  (** [candidates ctxt] returns the current list of slot for which
-     there is at least one candidate. *)
-  val candidates : t -> Dal_slot_repr.Header.t list
+      It returns [None] if [published_level] is negative. *)
+  val committee_level_of :
+    t -> attested_level:Raw_level_repr.t -> lag:int -> Raw_level_repr.t option
 
-  (** [is_slot_index_attested ctxt slot_index] returns [true] if the
-     [slot_index] is declared available by the protocol. [false]
-     otherwise. If the [index] is out of the interval
-     [0;number_of_slots - 1], returns [false]. *)
-  val is_slot_index_attested : t -> Dal_slot_index_repr.t -> bool
+  (** [slot_accountability ctxt] returns the current DAL slot accountability
+      tracker from [ctxt].
 
-  (** [shards_of_attestor ctxt ~attestor] returns the shard assignment
-     of the DAL committee of the current level for [attestor]. This
-     function never returns an empty list. *)
-  val shards_of_attestor :
-    t -> attestor:Signature.Public_key_hash.t -> int list option
+      The accountability structure keeps track of which shards have been
+      attested by which delegates for each slot index, allowing the protocol to
+      determine whether a slot has received enough attestations to be considered
+      available. *)
+  val slot_accountability : t -> Dal_attestations_repr.Accountability.t
 
-  (** The DAL committee is a subset of the Tenderbake committee.  A
-     shard from [0;number_of_shards] is associated to a public key
-     hash. For efficiency reasons, the committee is both:
-     a mapping from public key hashes to shards and
-     a mapping from shards to public key hashes.
-     The DAL committee ensures the shards associated to the
-     same public key hash are contiguous. The list of shards is
-     represented as two natural numbers [(initial, power)] which
-     encodes the list of shards:
-     [initial; initial + 1; ... ; initial + power - 1].
+  (** [record_slot_accountability ctxt accountability] stores the given
+      [accountability] state in [ctxt] and returns the updated context. *)
+  val record_slot_accountability :
+    t -> Dal_attestations_repr.Accountability.t -> t
 
-      This data-type ensures the following invariants:
+  (** [slot_fee_market ctxt] returns the current DAL slot fee market tracker from [ctxt].
 
-      - \forall pkh shard, find pkh_to_shards pkh = Some (start,n) ->
-     \forall i, i \in [start; start + n - 1] -> find shard_to_pkh i
-     = Some pkh
+      The tracker registers slot candidates during block application. *)
+  val slot_fee_market : t -> Dal_slot_repr.Slot_market.t
 
-      - forall pkh shard, find shard_to_pkh shard = Some pkh ->
-     \exists (start,n), find pkh_to_shards pkh = Some (start,n) /\
-     start <= shard <= start + n - 1
+  (** [record_slot_fee_market ctxt slot_fee_market] returns the context updated with the the given [slot_fee_market]. *)
+  val record_slot_fee_market : t -> Dal_slot_repr.Slot_market.t -> t
 
-      - Given an attestor, all its shard assignments are contiguous
-     *)
-  type committee = {
-    pkh_to_shards :
-      (Dal_attestation_repr.shard_index * int) Signature.Public_key_hash.Map.t;
-    shard_to_pkh : Signature.Public_key_hash.t Dal_attestation_repr.Shard_map.t;
-  }
+  (** [record_attestation ctxt ~tb_slot attestation] records that the delegate
+      with Tenderbake slot [tb_slot] emitted [attestation]. *)
+  val record_attestation :
+    t -> tb_slot:Slot_repr.t -> Dal_attestations_repr.t -> t
 
-  (** [compute_committee ctxt pkh_from_tenderbake_slot] computes the
-     DAL committee using the [pkh_from_tenderbake_slot] function. This
-     functions takes into account the fact that the DAL committee and
-     the Tenderbake committee may have different sizes. If the DAL
-     committee is smaller, then we simply take a projection of the
-     Tenderbake committee for the first [n] slots. If the DAL
-     committee is larger, shards are computed modulo the Tenderbake
-     committee. Slots assignments are reordered for a given a public
-     key hash to ensure all the slots (or shards in the context of
-     DAL) shards are contiguous (see {!type:committee}). *)
-  val compute_committee :
-    t ->
-    (Slot_repr.t -> (t * Signature.Public_key_hash.t) tzresult Lwt.t) ->
-    committee tzresult Lwt.t
+  (** [attestations] returns the recorded attestations *)
+  val attestations : t -> Dal_attestations_repr.t Slot_repr.Map.t
 
-  (** [init_committee ctxt committee] returns a context where the
-     [committee] is cached. The committee is expected to be the one
-     for the current level. *)
-  val init_committee : t -> committee -> t
+  (** [get_accountability ctxt] returns the current block's accountability data,
+      which contains the attestation information accumulated during this block. *)
+  val get_accountability : t -> Dal_attestations_repr.Accountability.t
+
+  (* Check whether the DAL feature flag is set and return the error
+     {!Dal_feature_disabled} if not. *)
+  val assert_feature_enabled : t -> unit tzresult
+
+  (* [only_if_dal_feature_enabled ctxt ~default f] executes [f ctxt] if the DAL
+     feature flag is enabled and otherwise [default ctxt]. *)
+  val only_if_feature_enabled : t -> default:(t -> 'a) -> (t -> 'a) -> 'a
+
+  (* Check whether the DAL incentives flag is set and return the error
+     {!Dal_incentives_disabled} if not. *)
+  val assert_incentives_enabled : t -> unit tzresult
+
+  (* [only_if_dal_incentives_enabled ctxt ~default f] executes [f ctxt] if the
+     DAL incentives flag is enabled and otherwise [default ctxt]. *)
+  val only_if_incentives_enabled : t -> default:(t -> 'a) -> (t -> 'a) -> 'a
+
+  (* Check whether the DAL dynamic lag flag is set and return the error
+     {!Dal_dynamic_lag_disabled} if not. *)
+  val assert_dynamic_lag_enabled : t -> unit tzresult
+
+  (* [only_if_dal_dynamic_lag_enabled ctxt ~default f] executes [f ctxt] if the
+     DAL dynamic flag is enabled and otherwise [default ctxt]. *)
+  val only_if_dynamic_lag_enabled : t -> default:(t -> 'a) -> (t -> 'a) -> 'a
+end
+
+module Address_registry : sig
+  (** Type representing the addition of an address in the registry.
+      - [address]: The address added in the storage.
+      - [index]: The index newly associated to the address.
+
+      This type is used in transaction receipts.
+  *)
+  type diff = {address : Destination_repr.t; index : Z.t}
+
+  val register_diff : t -> diff -> t
+
+  val get_diffs : t -> diff list
 end

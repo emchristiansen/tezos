@@ -200,7 +200,8 @@ class unix_ui : Client_context.ui =
   end
 
 class unix_full ~base_dir ~chain ~block ~confirmations ~password_filename
-  ~rpc_config ~verbose_rpc_error_diagnostics : Client_context.full =
+  ~rpc_config ~verbose_rpc_error_diagnostics :
+  Client_context.full =
   object
     inherit unix_logger ~base_dir
 
@@ -225,7 +226,8 @@ class unix_full ~base_dir ~chain ~block ~confirmations ~password_filename
   end
 
 class unix_mockup ~base_dir ~mem_only ~mockup_env ~chain_id ~rpc_context
-  ~protocol_data : Client_context.full =
+  ~protocol_data :
+  Client_context.full =
   object
     inherit unix_logger ~base_dir
 
@@ -250,11 +252,12 @@ class unix_mockup ~base_dir ~mem_only ~mockup_env ~chain_id ~rpc_context
 
     method confirmations = None
 
-    method verbose_rpc_error_diagnostics = true
+    method verbose_rpc_error_diagnostics = false
   end
 
 class unix_proxy ~base_dir ?protocol ~chain ~block ~confirmations
-  ~password_filename ~rpc_config ~mode () : Client_context.full =
+  ~password_filename ~rpc_config ~mode () :
+  Client_context.full =
   object
     inherit unix_logger ~base_dir
 
@@ -279,5 +282,25 @@ class unix_proxy ~base_dir ?protocol ~chain ~block ~confirmations
 
     method confirmations = confirmations
 
-    method verbose_rpc_error_diagnostics = true
+    method verbose_rpc_error_diagnostics = false
+  end
+
+(** Create a new client context with a different RPC endpoint.
+
+    Returns a new context that inherits from the given [cctxt] but uses
+    the specified [endpoint] for RPC calls. *)
+let with_endpoint cctxt rpc_config endpoint =
+  let rpc_config =
+    Tezos_rpc_http_client_unix.RPC_client_unix.{rpc_config with endpoint}
+  in
+  let rpc_ctxt =
+    new Tezos_rpc_http_client_unix.RPC_client_unix.http_ctxt
+      rpc_config
+      (Media_type.Command_line.of_command_line rpc_config.media_type)
+  in
+  object
+    inherit
+      Client_context.proxy_context_with_rpc
+        cctxt
+        (rpc_ctxt :> Tezos_rpc.Context.generic)
   end

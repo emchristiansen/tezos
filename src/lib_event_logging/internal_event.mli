@@ -45,18 +45,24 @@ type level = Debug | Info | Notice | Warning | Error | Fatal
 
 (** Module to manipulate values of type {!level}.  *)
 module Level : sig
+  exception Not_a_level of string
+
   (** Alias of {!level}. *)
   type t = level
 
   (** The default level is {!Info}. *)
   val default : t
 
-  (** Cast the level to a value of {!Lwt_log_core.level}. *)
-  val to_lwt_log : t -> Lwt_log_core.level
-
   val to_string : t -> string
 
-  val of_string : string -> t option
+  (** [opt_to_string o] will return [to_string o] if [t] is [Some o] and ["none"] otherwise  *)
+  val opt_to_string : t option -> string
+
+  (** [of_string_exn s] will
+      - return [Some level] if [s] represents a {!level},
+      - return [None] if [s] is ["none"]
+      - raise Not_a_level if [s] is not a proper level *)
+  val of_string_exn : string -> t option
 
   val encoding : t Data_encoding.t
 
@@ -73,8 +79,7 @@ module Section : sig
   (** Build a {!Section.t} by replacing special characters with ['_']. *)
   val make_sanitized : string list -> t
 
-  (** Make the equivalent {!Lwt_log} section.  *)
-  val to_lwt_log : t -> Lwt_log_core.section
+  val append : t -> string -> t
 
   (** [is_prefix ~prefix p] checks that [p] starts with [~prefix].  *)
   val is_prefix : prefix:t -> t -> bool
@@ -89,10 +94,14 @@ module Section : sig
 end
 
 (** All the section that has been registered. Currently, sections are registered
-    by the `Simple` module and the `Legacy_logging` module. *)
+    by the `Simple`. *)
 val get_registered_sections : unit -> string Seq.t
 
 val register_section : Section.t -> unit
+
+(** Alternative colors usable in console logs. Yellow and Red are already used
+  for Warning/alerts log levels*)
+type alternative_color = Magenta | Cyan | Green | Blue
 
 (** Parameters defining an inspectable type of events. *)
 module type EVENT_DEFINITION = sig
@@ -107,6 +116,12 @@ module type EVENT_DEFINITION = sig
   (** Defines the identifier for the event. Names should be unique and
       are restricted to alphanumeric characters or [".@-_+=,~"].*)
   val name : string
+
+  (** Defines the bare identifier for the event.
+
+      Since [name] can be prefixed by the section, [simple_name] holds
+      the unmodified [name] provided when creating an event.*)
+  val simple_name : string
 
   (** A display-friendly text which describes what the event means. *)
   val doc : string
@@ -124,6 +139,8 @@ module type EVENT_DEFINITION = sig
 
   (** Return the preferred {!type-level} for a given event instance. *)
   val level : level
+
+  val alternative_color : alternative_color option
 end
 
 (** Events created with {!Make} provide the {!EVENT} API. *)
@@ -133,6 +150,10 @@ module type EVENT = sig
   (** Output an event of type {!t}, if no sinks are listening the
       function won't be applied. *)
   val emit : ?section:Section.t -> t -> unit tzresult Lwt.t
+
+  (** Registers an event of type {!t} to be output when event sinks activate.
+      Does not output anything if called after sink activation. *)
+  val emit_at_top_level : ?section:Section.t -> t -> unit
 end
 
 (** Build an event from an event-definition. *)
@@ -167,8 +188,10 @@ end
 
 (** Access to all the event definitions registered with {!Make}. *)
 module All_definitions : sig
-  (** Get the list of all the known definitions. *)
-  val get : unit -> Generic.definition list
+  (** Get the list of all the known definitions. If [filter] is
+  defined, use it to filter the returned events. *)
+  val get :
+    ?filter:(Generic.definition -> bool) -> unit -> Generic.definition list
 
   (** Find the definition matching on the given name. *)
   val find : (string -> bool) -> Generic.definition option
@@ -199,12 +222,17 @@ module Simple : sig
         let inject =
           Internal_event.Simple.declare_2
             ~name: "inject"
+            ~section:["foo"; "bar"]
+            ~prefix_name_with_sections:false
             ~msg: "injected block {hash}"
             ("level", int)
             ("hash", string)
       ]
       You must declare events only once for a given name.
       Usually you should thus declare them as global variables.
+
+      A way to enforce name uniqueness is to set [prefix_name_with_sections] to [true].
+      In the example above, this would compute a new event name of the form "foo.bar.inject".
 
       There is one [declare_n] function for each number [n] of parameters.
       For instance, the above example uses [declare_2] because
@@ -249,6 +277,9 @@ module Simple : sig
   (** Emit an instance of an event. *)
   val emit : 'a t -> 'a -> unit Lwt.t
 
+  (** Emit an instance of an event if called at toplevel *)
+  val emit_at_top_level : 'a t -> 'a -> unit
+
   (** Emit an instance of an event but do not wait for completion. Only use if
       you really need to not wait for logging resolution before continuing. May
       cause increased memory usage and out-of-order log messages. *)
@@ -256,7 +287,9 @@ module Simple : sig
 
   (** Declare an event with no parameters. *)
   val declare_0 :
+    ?alternative_color:alternative_color ->
     ?section:string list ->
+    ?prefix_name_with_section:bool ->
     name:string ->
     msg:string ->
     ?level:level ->
@@ -265,7 +298,9 @@ module Simple : sig
 
   (** Declare an event with one parameter. *)
   val declare_1 :
+    ?alternative_color:alternative_color ->
     ?section:string list ->
+    ?prefix_name_with_section:bool ->
     name:string ->
     msg:string ->
     ?level:level ->
@@ -275,7 +310,9 @@ module Simple : sig
 
   (** Declare an event with two parameters. *)
   val declare_2 :
+    ?alternative_color:alternative_color ->
     ?section:string list ->
+    ?prefix_name_with_section:bool ->
     name:string ->
     msg:string ->
     ?level:level ->
@@ -287,7 +324,9 @@ module Simple : sig
 
   (** Declare an event with three parameters. *)
   val declare_3 :
+    ?alternative_color:alternative_color ->
     ?section:string list ->
+    ?prefix_name_with_section:bool ->
     name:string ->
     msg:string ->
     ?level:level ->
@@ -301,7 +340,9 @@ module Simple : sig
 
   (** Declare an event with four parameters. *)
   val declare_4 :
+    ?alternative_color:alternative_color ->
     ?section:string list ->
+    ?prefix_name_with_section:bool ->
     name:string ->
     msg:string ->
     ?level:level ->
@@ -317,7 +358,9 @@ module Simple : sig
 
   (** Declare an event with five parameters. *)
   val declare_5 :
+    ?alternative_color:alternative_color ->
     ?section:string list ->
+    ?prefix_name_with_section:bool ->
     name:string ->
     msg:string ->
     ?level:level ->
@@ -335,7 +378,9 @@ module Simple : sig
 
   (** Declare an event with six parameters. *)
   val declare_6 :
+    ?alternative_color:alternative_color ->
     ?section:string list ->
+    ?prefix_name_with_section:bool ->
     name:string ->
     msg:string ->
     ?level:level ->
@@ -355,7 +400,9 @@ module Simple : sig
 
   (** Declare an event with seven parameters. *)
   val declare_7 :
+    ?alternative_color:alternative_color ->
     ?section:string list ->
+    ?prefix_name_with_section:bool ->
     name:string ->
     msg:string ->
     ?level:level ->
@@ -377,7 +424,9 @@ module Simple : sig
 
   (** Declare an event with eight parameters. *)
   val declare_8 :
+    ?alternative_color:alternative_color ->
     ?section:string list ->
+    ?prefix_name_with_section:bool ->
     name:string ->
     msg:string ->
     ?level:level ->
@@ -458,72 +507,9 @@ end
 
 (** {3 Common Event Definitions } *)
 
-(** The debug-event is meant for emitting (temporarily)
-    semi-structured data in the event stream. *)
-module Debug_event : sig
-  type t = {message : string; attachment : Data_encoding.Json.t}
-
-  val make : ?attach:Data_encoding.Json.t -> string -> t
-
-  include EVENT with type t := t
-end
-
 (** The worker logger is meant for use with {!Lwt_utils.worker}. *)
 module Lwt_worker_logger : sig
   (** [on_event status] emits an event of type [t] and matches
       the signature required by {!Lwt_utils.worker}. *)
   val on_event : string -> [`Started | `Ended | `Failed of string] -> unit Lwt.t
-end
-
-(** {3 Compatibility With Legacy Logging } *)
-
-(** The module {!Legacy_logging} replaces the previous
-    [Logging.Make_*] functors by injecting the non-structured logs
-    into the event-logging framework.
-    {b Please do not use for new modules.} *)
-module Legacy_logging : sig
-  module Make : functor
-    (_ : sig
-       val name : string
-     end)
-    -> sig
-    val debug : ('a, Format.formatter, unit, unit) format4 -> 'a
-
-    val log_info : ('a, Format.formatter, unit, unit) format4 -> 'a
-
-    val log_notice : ('a, Format.formatter, unit, unit) format4 -> 'a
-
-    val warn : ('a, Format.formatter, unit, unit) format4 -> 'a
-
-    val log_error : ('a, Format.formatter, unit, unit) format4 -> 'a
-
-    val fatal_error : ('a, Format.formatter, unit, unit) format4 -> 'a
-
-    val lwt_debug : ('a, Format.formatter, unit, unit Lwt.t) format4 -> 'a
-
-    val lwt_log_info : ('a, Format.formatter, unit, unit Lwt.t) format4 -> 'a
-
-    val lwt_log_notice : ('a, Format.formatter, unit, unit Lwt.t) format4 -> 'a
-
-    val lwt_warn : ('a, Format.formatter, unit, unit Lwt.t) format4 -> 'a
-
-    val lwt_log_error : ('a, Format.formatter, unit, unit Lwt.t) format4 -> 'a
-
-    val lwt_fatal_error : ('a, Format.formatter, unit, unit Lwt.t) format4 -> 'a
-  end
-end
-
-(** {3 Common Event-Sink Definitions } *)
-
-(** The lwt-sink outputs pretty-printed renderings of events to the
-    lwt-log logging framework (see the {!Lwt_log_core} module).
-
-    It is activated {i by default} in {!Internal_event_unix.Configuration.default}
-    (in any case it can be activated with [TEZOS_EVENTS_CONFIG="lwt-log://"]. To
-    configure further how the sink outputs to a file or the user's
-    terminal, one needs to use the [TEZOS_LOG] variable (see also the module
-    {!Lwt_log_sink_unix}).
-*)
-module Lwt_log_sink : sig
-  val uri_scheme : string
 end

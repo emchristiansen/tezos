@@ -1,38 +1,37 @@
 ; This file was automatically generated, do not edit.
 ; Edit file manifest/main.ml instead.
 
-(env (_ (env-vars (NODE_PRELOAD hacl-wasm,ocaml-bls12-381,secp256k1-wasm))))
-
 (library
  (name tezos_base)
- (public_name tezos-base)
+ (public_name octez-libs.base)
  (instrumentation (backend bisect_ppx))
  (libraries
-  tezos-stdlib
-  tezos-crypto
-  data-encoding
-  tezos-error-monad
-  tezos-rpc
-  tezos-micheline
-  tezos-event-logging
+  octez-libs.version
+  octez-libs.stdlib
+  octez-libs.crypto
+  octez-libs.data-encoding
+  octez-libs.error-monad-legacy
+  octez-libs.error-monad
+  octez-libs.rpc
+  octez-libs.micheline
+  octez-libs.event-logging
   ptime
   ptime.clock.os
+  mtime
   ezjsonm
   lwt
   ipaddr
   uri)
- (js_of_ocaml (javascript_files ptime.js))
  (flags
   (:standard)
   -open Tezos_stdlib
   -open Data_encoding
+  -open Tezos_error_monad_legacy
   -open Tezos_error_monad
   -open Tezos_error_monad.TzLwtreslib
   -open Tezos_micheline
   -open Tezos_event_logging))
 
-(ocamllex point_parser)
+(documentation (package octez-libs))
 
-(rule
- (targets ptime.js)
- (action (copy %{lib:ptime.clock.os:runtime.js} ptime.js)))
+(ocamllex point_parser)

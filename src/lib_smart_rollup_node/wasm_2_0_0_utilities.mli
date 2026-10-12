@@ -1,0 +1,46 @@
+(*****************************************************************************)
+(*                                                                           *)
+(* SPDX-License-Identifier: MIT                                              *)
+(* Copyright (c) 2023 Nomadic Labs <contact@nomadic-labs.com>                *)
+(*                                                                           *)
+(*****************************************************************************)
+
+(** [decode_storage state] decodes the WASM PVM durable storage held in the
+    node PVM [state]. *)
+val decode_storage :
+  _ Context.pvmstate ->
+  Tezos_scoru_wasm.Wasm_pvm_state.Internal_state.pvm_storage Lwt.t
+
+(** [dump_durable_storage ~block ~data_dir ~file] writes to [file] the current
+    state of the WASM PVM from [data_dir], that is the state of the WASM PVM
+    for the given [block]. *)
+val dump_durable_storage :
+  block:Tezos_shell_services.Block_services.block ->
+  data_dir:string ->
+  file:string ->
+  unit tzresult Lwt.t
+
+(** [patch_durable_storage ~data_dir ~key ~value] adds [value] to
+    [key] into the durable storage of PVM state. If the value exists
+    it's replaced. *)
+val patch_durable_storage :
+  data_dir:string -> key:string -> value:string -> unit tzresult Lwt.t
+
+(** Exception raised when the fast execution engine panics and
+    [fallback_to_slow_vm] is [false]. *)
+exception Fast_execution_panic of exn
+
+(** Hooks to be used for the WASM PVM. When [fallback_to_slow_vm] is [false],
+    the node will exit instead of falling back to the slow VM interpreter when
+    the fast execution engine fails. *)
+val hooks :
+  check_invalid_kernel:bool ->
+  fallback_to_slow_vm:bool ->
+  Tezos_scoru_wasm.Hooks.t
+
+(** [preload_kernel node_ctxt header] preloads the kernel for the given block
+    header. Returns [true] if the kernel was preloaded, or [false] if the
+    block's context is not available on disk (e.g. with sparse commit
+    strategies). *)
+val preload_kernel :
+  _ Node_context.t -> Sc_rollup_block.header -> bool tzresult Lwt.t

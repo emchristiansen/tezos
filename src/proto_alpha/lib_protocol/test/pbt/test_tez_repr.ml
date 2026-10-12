@@ -26,13 +26,13 @@
 (** Testing
     -------
     Component:    Protocol Library
-    Invocation:   dune exec \
-                  src/proto_alpha/lib_protocol/test/pbt/test_tez_repr.exe
+    Invocation:   dune exec src/proto_alpha/lib_protocol/test/pbt/main.exe \
+                  -- --file test_tez_repr.ml
     Subject:      Operations in Tez_repr
 *)
 
 open Protocol.Alpha_context
-open Test_tez
+open Tez_helpers
 
 let z_mutez_min = Z.zero
 
@@ -120,17 +120,19 @@ let test_coherent_add =
     (prop_binop ( +? ) Z.( + ))
 
 let test_coherent_div =
+  let ( /! ) a b = Ok (a /! b) in
   QCheck2.Test.make
-    ~name:"Tez.(/?) is coherent w.r.t. Z.(/)"
+    ~name:"Tez.( /! ) is coherent w.r.t. Z.(/)"
     QCheck2.Gen.(pair gen_tez_sizes gen_ui64_sizes)
     (fun (a, b) ->
       QCheck2.assume (b > 0L) ;
-      prop_binop64 ( /? ) Z.( / ) (a, b))
+      prop_binop64 ( /! ) Z.( / ) (a, b))
 
 let tests =
   [test_coherent_mul; test_coherent_sub; test_coherent_add; test_coherent_div]
 
 let () =
   Alcotest.run
-    "protocol > pbt > tez_repr"
-    [(Protocol.name ^ ": Tez_repr", Qcheck2_helpers.qcheck_wrap tests)]
+    ~__FILE__
+    Protocol.name
+    [("Tez_repr", Qcheck2_helpers.qcheck_wrap tests)]

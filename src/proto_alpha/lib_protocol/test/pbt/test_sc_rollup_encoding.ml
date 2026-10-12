@@ -26,8 +26,8 @@
 (** Testing
     -------
     Component:    Protocol Library
-    Invocation:   dune exec \
-                  src/proto_alpha/lib_protocol/test/pbt/test_sc_rollup_encoding.exe
+    Invocation:   dune exec src/proto_alpha/lib_protocol/test/pbt/main.exe \
+                  -- --file test_sc_rollup_encoding.ml
     Subject:      SC rollup encoding
 *)
 
@@ -90,12 +90,12 @@ let gen_inbox level =
   let* tail = small_list gen_msg in
   let payloads = hd :: tail in
   let witness_and_inbox =
-    let open Result_syntax in
+    let open Result_wrap_syntax in
     let inbox = Sc_rollup_helpers.dumb_init_repr level in
-    Environment.wrap_tzresult
+    wrap
     @@
     let witness = Sc_rollup_inbox_repr.init_witness_no_history in
-    let* witness =
+    let witness =
       Sc_rollup_inbox_repr.add_info_per_level_no_history
         ~predecessor_timestamp:Time.Protocol.epoch
         ~predecessor:Block_hash.zero
@@ -109,24 +109,86 @@ let gen_inbox level =
     let* witness =
       Sc_rollup_inbox_repr.add_messages_no_history input_messages witness
     in
-    Sc_rollup_inbox_repr.finalize_inbox_level_no_history inbox witness
+    return (Sc_rollup_inbox_repr.finalize_inbox_level_no_history inbox witness)
   in
   return
-  @@ (witness_and_inbox |> function
-      | Ok v -> v
-      | Error e ->
-          Stdlib.failwith (Format.asprintf "%a" Error_monad.pp_print_trace e))
+  @@ ( witness_and_inbox |> function
+       | Ok v -> v
+       | Error e ->
+           Stdlib.failwith (Format.asprintf "%a" Error_monad.pp_print_trace e)
+     )
 
 module Index = Dal_slot_index_repr
+
+let pack_slots_headers_by_level list =
+  let module ML = Map.Make (Raw_level_repr) in
+  let module SSH = Set.Make (struct
+    type t =
+      Dal_slot_repr.Header.t
+      * Contract_repr.t
+      * Dal_attestations_repr.Accountability.attestation_status
+
+    let compare (a, _, _) (b, _, _) =
+      let open Dal_slot_repr.Header in
+      Dal_slot_index_repr.compare a.id.index b.id.index
+  end) in
+  let map =
+    List.fold_left
+      (fun map
+           (( Dal_slot_repr.Header.{id = {published_level; _}; _},
+              _publisher,
+              _status ) as sh)
+         ->
+        let l =
+          ML.find published_level map |> Option.value ~default:SSH.empty
+        in
+        ML.add published_level (SSH.add sh l) map)
+      ML.empty
+      list
+  in
+  match ML.max_binding_opt map with
+  | None -> [] (* map is empty *)
+  | Some (max_level, _) ->
+      let rec loop counter map =
+        if Raw_level_repr.(counter >= max_level) then map
+        else
+          let counter = Raw_level_repr.succ counter in
+          let map =
+            if ML.mem counter map then map else ML.add counter SSH.empty map
+          in
+          loop counter map
+      in
+      loop Raw_level_repr.root map
+      |> ML.bindings
+      |> List.map (fun (k, ssh) -> (k, SSH.elements ssh))
+
+let gen_pkh =
+  let pkh_sig, _, _ = Signature.generate_key ~algo:Ed25519 () in
+  (* FIXME-PA *)
+  Gen.return (Implicit_account_repr.Forbidden.of_pkh pkh_sig)
 
 let gen_dal_slots_history () =
   let open Gen in
   let open Dal_slot_repr in
-  (* Generate a list of (level * confirmed slot ID). *)
-  let* list = small_list (pair small_nat small_nat) in
+  let constants : Alpha_context.Constants.Parametric.t =
+    Tezos_protocol_alpha_parameters.Default_parameters.constants_test
+  in
+  let number_of_slots = constants.dal.number_of_slots in
+  (* Generate a list of (level * confirmed slot ID * public key hash *
+     attestation flag). *)
+  let* list = small_list (quad small_nat small_nat gen_pkh bool) in
   let list =
     List.rev_map
-      (fun (level, slot_index) ->
+      (fun (level, slot_index, publisher, is_proto_attested) ->
+        let attestation_status =
+          Dal_attestations_repr.Accountability.
+            {
+              attested_shards = (if is_proto_attested then 1 else 0);
+              total_shards = 1;
+              is_proto_attested;
+              attesters = Implicit_account_repr.Set.empty;
+            }
+        in
         let published_level =
           Raw_level_repr.(
             (* use succ to avoid having a published_level = 0, as it's the
@@ -134,26 +196,53 @@ let gen_dal_slots_history () =
             succ @@ try of_int32_exn (Int32.of_int level) with _ -> root)
         in
         let index =
-          Index.of_int_opt slot_index |> Option.value ~default:Index.zero
+          Index.of_int_opt ~number_of_slots slot_index
+          |> Option.value ~default:Index.zero
         in
-        Header.{id = {published_level; index}; commitment = Commitment.zero})
+        ( Header.{id = {published_level; index}; commitment = Commitment.zero},
+          Contract_repr.Implicit publisher,
+          attestation_status ))
       list
   in
-  let list =
-    (* Sort the list in the right ordering before adding slots to slots_history. *)
-    List.sort_uniq
-      (fun {Header.id = a; _} {id = b; _} ->
-        let c = Raw_level_repr.compare a.published_level b.published_level in
-        if c <> 0 then c else Index.compare a.index b.index)
-      list
+  let rec loop history = function
+    | [] -> return history
+    | (published_level, slot_headers) :: llist -> (
+        let slot_headers =
+          (* Sort the list in the right ordering before adding slots to slots_history. *)
+          List.sort_uniq
+            (fun ({Header.id = a; _}, _publisher, _status)
+                 ({id = b; _}, _publisher, _status)
+               ->
+              let c =
+                Raw_level_repr.compare a.published_level b.published_level
+              in
+              if c <> 0 then c else Index.compare a.index b.index)
+            slot_headers
+        in
+        let slots =
+          List.map
+            (fun (header, publisher, status) ->
+              (header, publisher, Some status))
+            slot_headers
+        in
+        History.(
+          update_skip_list
+            history
+            (History_cache.empty ~capacity:0L)
+            ~published_level
+            ~number_of_slots
+            ~attestation_lag:Legacy
+            ~slots
+            ~fill_unpublished_gaps:false)
+        |> function
+        | Ok (history, _cache) -> loop history llist
+        | Error e ->
+            return
+            @@ Stdlib.failwith
+                 (Format.asprintf "%a" Error_monad.pp_print_trace
+                 @@ Environment.wrap_tztrace e))
   in
-  History.(add_confirmed_slot_headers_no_cache genesis list) |> function
-  | Ok v -> return v
-  | Error e ->
-      return
-      @@ Stdlib.failwith
-           (Format.asprintf "%a" Error_monad.pp_print_trace
-           @@ Environment.wrap_tztrace e)
+  pack_slots_headers_by_level list |> loop History.genesis
 
 let gen_inbox_history_proof inbox_level =
   let open Gen in
@@ -232,7 +321,8 @@ let gen_inbox_message =
     (* We won't test the encoding of these values. It's out of scope. *)
     let payload = Script_repr.unit in
     let sender = Contract_hash.zero in
-    let source = Signature.Public_key_hash.zero in
+    (* FIXME-PA *)
+    let source = Implicit_account_repr.zero in
     (* But the encoding of the rollup's address is our problem. *)
     let+ destination = gen_rollup in
     Internal (Transfer {payload; sender; source; destination})
@@ -292,5 +382,6 @@ let tests =
 
 let () =
   Alcotest.run
-    "SC rollup encoding"
-    [(Protocol.name ^ ": roundtrip", qcheck_wrap tests)]
+    ~__FILE__
+    (Protocol.name ^ ": SC rollup encoding")
+    [(": roundtrip", qcheck_wrap tests)]

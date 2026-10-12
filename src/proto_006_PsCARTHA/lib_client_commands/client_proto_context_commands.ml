@@ -202,7 +202,7 @@ let commands network () =
           ()
         >>=? fun {timestamp = v; _} ->
         (if seconds then cctxt#message "%Ld" (Time.Protocol.to_seconds v)
-        else cctxt#message "%s" (Time.Protocol.to_notation v))
+         else cctxt#message "%s" (Time.Protocol.to_notation v))
         >>= fun () -> return_unit);
     command
       ~group
@@ -221,7 +221,7 @@ let commands network () =
       ~desc:"Get the balance of a contract."
       no_options
       (prefixes ["get"; "balance"; "for"]
-      @@ ContractAlias.destination_param ~name:"src" ~desc:"source contract"
+      @@ Contract_alias.destination_param ~name:"src" ~desc:"source contract"
       @@ stop)
       (fun () (_, contract) (cctxt : Protocol_client_context.full) ->
         get_balance cctxt ~chain:cctxt#chain ~block:cctxt#block contract
@@ -233,7 +233,7 @@ let commands network () =
       ~desc:"Get the storage of a contract."
       no_options
       (prefixes ["get"; "contract"; "storage"; "for"]
-      @@ ContractAlias.destination_param ~name:"src" ~desc:"source contract"
+      @@ Contract_alias.destination_param ~name:"src" ~desc:"source contract"
       @@ stop)
       (fun () (_, contract) (cctxt : Protocol_client_context.full) ->
         get_storage cctxt ~chain:cctxt#chain ~block:cctxt#block contract
@@ -253,9 +253,14 @@ let commands network () =
       @@ prefixes ["of"; "type"]
       @@ Tezos_clic.param ~name:"type" ~desc:"type of the key" data_parameter
       @@ prefix "in"
-      @@ ContractAlias.destination_param ~name:"src" ~desc:"source contract"
+      @@ Contract_alias.destination_param ~name:"src" ~desc:"source contract"
       @@ stop)
-      (fun () key key_type (_, contract) (cctxt : Protocol_client_context.full) ->
+      (fun ()
+           key
+           key_type
+           (_, contract)
+           (cctxt : Protocol_client_context.full)
+         ->
         get_contract_big_map_value
           cctxt
           ~chain:cctxt#chain
@@ -298,7 +303,7 @@ let commands network () =
       ~desc:"Get the code of a contract."
       no_options
       (prefixes ["get"; "contract"; "code"; "for"]
-      @@ ContractAlias.destination_param ~name:"src" ~desc:"source contract"
+      @@ Contract_alias.destination_param ~name:"src" ~desc:"source contract"
       @@ stop)
       (fun () (_, contract) (cctxt : Protocol_client_context.full) ->
         get_script cctxt ~chain:cctxt#chain ~block:cctxt#block contract
@@ -325,7 +330,7 @@ let commands network () =
       (prefixes ["get"; "contract"; "entrypoint"; "type"; "of"]
       @@ Tezos_clic.string ~name:"entrypoint" ~desc:"the entrypoint to describe"
       @@ prefixes ["for"]
-      @@ ContractAlias.destination_param ~name:"src" ~desc:"source contract"
+      @@ Contract_alias.destination_param ~name:"src" ~desc:"source contract"
       @@ stop)
       (fun () entrypoint (_, contract) (cctxt : Protocol_client_context.full) ->
         Michelson_v1_entrypoints.contract_entrypoint_type
@@ -344,7 +349,7 @@ let commands network () =
       ~desc:"Get the entrypoint list of a contract."
       no_options
       (prefixes ["get"; "contract"; "entrypoints"; "for"]
-      @@ ContractAlias.destination_param ~name:"src" ~desc:"source contract"
+      @@ Contract_alias.destination_param ~name:"src" ~desc:"source contract"
       @@ stop)
       (fun () (_, contract) (cctxt : Protocol_client_context.full) ->
         Michelson_v1_entrypoints.list_contract_entrypoints
@@ -361,7 +366,7 @@ let commands network () =
       ~desc:"Get the list of unreachable paths in a contract's parameter type."
       no_options
       (prefixes ["get"; "contract"; "unreachable"; "paths"; "for"]
-      @@ ContractAlias.destination_param ~name:"src" ~desc:"source contract"
+      @@ Contract_alias.destination_param ~name:"src" ~desc:"source contract"
       @@ stop)
       (fun () (_, contract) (cctxt : Protocol_client_context.full) ->
         Michelson_v1_entrypoints.list_contract_unreachables
@@ -378,7 +383,7 @@ let commands network () =
       ~desc:"Get the delegate of a contract."
       no_options
       (prefixes ["get"; "delegate"; "for"]
-      @@ ContractAlias.destination_param ~name:"src" ~desc:"source contract"
+      @@ Contract_alias.destination_param ~name:"src" ~desc:"source contract"
       @@ stop)
       (fun () (_, contract) (cctxt : Protocol_client_context.full) ->
         Client_proto_contracts.get_delegate
@@ -410,7 +415,7 @@ let commands network () =
          fee_cap_arg
          burn_cap_arg)
       (prefixes ["set"; "delegate"; "for"]
-      @@ ContractAlias.destination_param ~name:"src" ~desc:"source contract"
+      @@ Contract_alias.destination_param ~name:"src" ~desc:"source contract"
       @@ prefix "to"
       @@ Public_key_hash.source_param
            ~name:"dlgt"
@@ -427,7 +432,8 @@ let commands network () =
              burn_cap )
            (_, contract)
            delegate
-           (cctxt : Protocol_client_context.full) ->
+           (cctxt : Protocol_client_context.full)
+         ->
         let fee_parameter =
           {
             Injection.minimal_fees;
@@ -494,7 +500,7 @@ let commands network () =
          fee_cap_arg
          burn_cap_arg)
       (prefixes ["withdraw"; "delegate"; "from"]
-      @@ ContractAlias.destination_param ~name:"src" ~desc:"source contract"
+      @@ Contract_alias.destination_param ~name:"src" ~desc:"source contract"
       @@ stop)
       (fun ( fee,
              dry_run,
@@ -506,7 +512,8 @@ let commands network () =
              fee_cap,
              burn_cap )
            (_, contract)
-           (cctxt : Protocol_client_context.full) ->
+           (cctxt : Protocol_client_context.full)
+         ->
         let fee_parameter =
           {
             Injection.minimal_fees;
@@ -579,13 +586,13 @@ let commands network () =
          fee_cap_arg
          burn_cap_arg)
       (prefixes ["originate"; "contract"]
-      @@ RawContractAlias.fresh_alias_param
+      @@ Raw_contract_alias.fresh_alias_param
            ~name:"new"
            ~desc:"name of the new contract"
       @@ prefix "transferring"
       @@ tez_param ~name:"qty" ~desc:"amount taken from source"
       @@ prefix "from"
-      @@ ContractAlias.destination_param
+      @@ Contract_alias.destination_param
            ~name:"src"
            ~desc:"name of the source contract"
       @@ prefix "running"
@@ -614,8 +621,10 @@ let commands network () =
            balance
            (_, source)
            program
-           (cctxt : Protocol_client_context.full) ->
-        RawContractAlias.of_fresh cctxt force alias_name >>=? fun alias_name ->
+           (cctxt : Protocol_client_context.full)
+         ->
+        Raw_contract_alias.of_fresh cctxt force alias_name
+        >>=? fun alias_name ->
         Lwt.return (Micheline_parser.no_parsing_error program)
         >>=? fun {expanded = code; _} ->
         match Contract.is_implicit source with
@@ -688,11 +697,11 @@ let commands network () =
       (prefixes ["transfer"]
       @@ tez_param ~name:"qty" ~desc:"amount taken from source"
       @@ prefix "from"
-      @@ ContractAlias.destination_param
+      @@ Contract_alias.destination_param
            ~name:"src"
            ~desc:"name of the source contract"
       @@ prefix "to"
-      @@ ContractAlias.destination_param
+      @@ Contract_alias.destination_param
            ~name:"dst"
            ~desc:"name/literal of the destination contract"
       @@ stop)
@@ -714,7 +723,8 @@ let commands network () =
            amount
            (_, source)
            (_, destination)
-           cctxt ->
+           cctxt
+         ->
         transfer_command
           amount
           source
@@ -755,11 +765,11 @@ let commands network () =
          burn_cap_arg
          entrypoint_arg)
       (prefixes ["call"]
-      @@ ContractAlias.destination_param
+      @@ Contract_alias.destination_param
            ~name:"dst"
            ~desc:"name/literal of the destination contract"
       @@ prefix "from"
-      @@ ContractAlias.destination_param
+      @@ Contract_alias.destination_param
            ~name:"src"
            ~desc:"name of the source contract"
       @@ stop)
@@ -780,7 +790,8 @@ let commands network () =
              entrypoint )
            (_, destination)
            (_, source)
-           cctxt ->
+           cctxt
+         ->
         let amount = Tez.zero in
         transfer_command
           amount
@@ -816,7 +827,7 @@ let commands network () =
          fee_cap_arg
          burn_cap_arg)
       (prefixes ["reveal"; "key"; "for"]
-      @@ ContractAlias.alias_param
+      @@ Contract_alias.alias_param
            ~name:"src"
            ~desc:"name of the source contract"
       @@ stop)
@@ -830,7 +841,8 @@ let commands network () =
              fee_cap,
              burn_cap )
            (_, source)
-           cctxt ->
+           cctxt
+         ->
         match Contract.is_implicit source with
         | None -> failwith "only implicit accounts can be revealed"
         | Some source ->
@@ -886,7 +898,8 @@ let commands network () =
              fee_cap,
              burn_cap )
            src_pkh
-           cctxt ->
+           cctxt
+         ->
         Client_keys_v0.get_key cctxt src_pkh >>=? fun (_, src_pk, src_sk) ->
         let fee_parameter =
           {
@@ -1028,7 +1041,8 @@ let commands network () =
         @@ stop)
         (fun (confirmations, predecessors, branch)
              operation_hash
-             (ctxt : Protocol_client_context.full) ->
+             (ctxt : Protocol_client_context.full)
+           ->
           Client_confirmations.wait_for_operation_inclusion
             ctxt
             ~chain:ctxt#chain
@@ -1056,7 +1070,10 @@ let commands network () =
                       Error_monad.failwith "Invalid operation hash: '%s'" x
                   | Some hash -> return hash))
         @@ stop)
-        (fun predecessors operation_hash (ctxt : Protocol_client_context.full) ->
+        (fun predecessors
+             operation_hash
+             (ctxt : Protocol_client_context.full)
+           ->
           display_receipt_for_operation
             ctxt
             ~chain:ctxt#chain
@@ -1100,7 +1117,7 @@ let commands network () =
               ~long:"force"
               ()))
         (prefixes ["submit"; "proposals"; "for"]
-        @@ ContractAlias.destination_param
+        @@ Contract_alias.destination_param
              ~name:"delegate"
              ~desc:"the delegate who makes the proposal"
         @@ seq_of_param
@@ -1115,7 +1132,8 @@ let commands network () =
         (fun (dry_run, verbose_signing, force)
              (_name, source)
              proposals
-             (cctxt : Protocol_client_context.full) ->
+             (cctxt : Protocol_client_context.full)
+           ->
           match Contract.is_implicit source with
           | None -> failwith "only implicit accounts can submit proposals"
           | Some src_pkh -> (
@@ -1158,8 +1176,8 @@ let commands network () =
                     error
                       "There %s: %a."
                       (if Compare.List_length_with.(dups = 1) then
-                       "is a duplicate proposal"
-                      else "are duplicate proposals")
+                         "is a duplicate proposal"
+                       else "are duplicate proposals")
                       Format.(
                         pp_print_list
                           ~pp_sep:(fun ppf () -> pp_print_string ppf ", ")
@@ -1196,8 +1214,8 @@ let commands network () =
                   cctxt#message
                     "There %s with the submission:%t"
                     (if Compare.List_length_with.(!errors = 1) then
-                     "is an issue"
-                    else "are issues")
+                       "is an issue"
+                     else "are issues")
                     Format.(
                       fun ppf ->
                         pp_print_cut ppf () ;
@@ -1216,10 +1234,11 @@ let commands network () =
               in
               check_proposals proposals >>=? fun all_valid ->
               (if all_valid then cctxt#message "All proposals are valid."
-              else if force then
-                cctxt#message
-                  "Some proposals are not valid, but `--force` was used."
-              else cctxt#error "Submission failed because of invalid proposals.")
+               else if force then
+                 cctxt#message
+                   "Some proposals are not valid, but `--force` was used."
+               else
+                 cctxt#error "Submission failed because of invalid proposals.")
               >>= fun () ->
               submit_proposals
                 ~dry_run
@@ -1243,8 +1262,8 @@ let commands network () =
                         Format.pp_print_text
                         (String.split_on_char ' ' msg
                         |> List.filter (function
-                               | "" | "\n" -> false
-                               | _ -> true)
+                             | "" | "\n" -> false
+                             | _ -> true)
                         |> String.concat " "
                         |> String.map (function '\n' | '\t' -> ' ' | c -> c))
                   | el -> cctxt#message "Error:@ %a" pp_print_trace el)
@@ -1254,7 +1273,7 @@ let commands network () =
         ~desc:"Submit a ballot"
         (args2 verbose_signing_switch dry_run_switch)
         (prefixes ["submit"; "ballot"; "for"]
-        @@ ContractAlias.destination_param
+        @@ Contract_alias.destination_param
              ~name:"delegate"
              ~desc:"the delegate who votes"
         @@ param
@@ -1281,7 +1300,8 @@ let commands network () =
              (_name, source)
              proposal
              ballot
-             (cctxt : Protocol_client_context.full) ->
+             (cctxt : Protocol_client_context.full)
+           ->
           match Contract.is_implicit source with
           | None -> failwith "only implicit accounts can submit ballot"
           | Some src_pkh ->
@@ -1350,8 +1370,8 @@ let commands network () =
                           p
                           w
                           (if List.mem ~equal:Protocol_hash.equal p known_protos
-                          then ""
-                          else "not "))
+                           then ""
+                           else "not "))
                       ranks ;
                     pp_close_box ppf ())
               >>= fun () -> return_unit

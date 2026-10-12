@@ -29,20 +29,20 @@ open Apply_operation_result
 
 type 'kind internal_operation_contents =
   | Transaction : {
-      amount : Tez.tez;
+      amount : Tez.t;
       parameters : Script.lazy_expr;
       entrypoint : Entrypoint.t;
       destination : Destination.t;
     }
       -> Kind.transaction internal_operation_contents
   | Origination : {
-      delegate : Signature.Public_key_hash.t option;
-      script : Script.t;
-      credit : Tez.tez;
+      delegate : Implicit_account_repr.t option;
+      script : Script.michelson_with_storage;
+      credit : Tez.t;
     }
       -> Kind.origination internal_operation_contents
   | Delegation :
-      Signature.Public_key_hash.t option
+      Implicit_account_repr.t option
       -> Kind.delegation internal_operation_contents
   | Event : {
       ty : Script.expr;
@@ -57,7 +57,7 @@ type packed_internal_operation_contents =
       -> packed_internal_operation_contents
 
 type 'kind internal_operation = {
-  source : Destination.t;
+  sender : Destination.t;
   operation : 'kind internal_operation_contents;
   nonce : int;
 }
@@ -66,7 +66,7 @@ type packed_internal_operation =
   | Internal_operation : 'kind internal_operation -> packed_internal_operation
 
 let internal_operation (type kind)
-    ({source; operation; nonce} : kind Script_typed_ir.internal_operation) :
+    ({sender; operation; nonce} : kind Script_typed_ir.internal_operation) :
     kind internal_operation =
   let operation : kind internal_operation_contents =
     match operation with
@@ -94,15 +94,6 @@ let internal_operation (type kind)
             destination = Contract (Originated destination);
             amount;
             entrypoint;
-            parameters = Script.lazy_expr unparsed_parameters;
-          }
-    | Transaction_to_tx_rollup {destination; unparsed_parameters; _} ->
-        Transaction
-          {
-            destination = Tx_rollup destination;
-            (* Dummy amount used for the external untyped view of internal transactions *)
-            amount = Tez.zero;
-            entrypoint = Entrypoint.deposit;
             parameters = Script.lazy_expr unparsed_parameters;
           }
     | Transaction_to_sc_rollup {destination; entrypoint; unparsed_parameters; _}
@@ -133,7 +124,7 @@ let internal_operation (type kind)
         Origination {delegate; script; credit}
     | Delegation delegate -> Delegation delegate
   in
-  {source; operation; nonce}
+  {sender; operation; nonce}
 
 let packed_internal_operation (Script_typed_ir.Internal_operation op) =
   Internal_operation (internal_operation op)
@@ -151,12 +142,7 @@ type successful_transaction_result =
       storage_size : Z.t;
       paid_storage_size_diff : Z.t;
       allocated_destination_contract : bool;
-    }
-  | Transaction_to_tx_rollup_result of {
-      ticket_hash : Ticket_hash.t;
-      balance_updates : Receipt.balance_updates;
-      consumed_gas : Gas.Arith.fp;
-      paid_storage_size_diff : Z.t;
+      address_registry_diff : Address_registry.diff list;
     }
   | Transaction_to_sc_rollup_result of {
       consumed_gas : Gas.Arith.fp;
@@ -188,6 +174,7 @@ type _ successful_internal_operation_result =
       -> Kind.origination successful_internal_operation_result
   | IDelegation_result : {
       consumed_gas : Gas.Arith.fp;
+      balance_updates : Receipt.balance_updates;
     }
       -> Kind.delegation successful_internal_operation_result
   | IEvent_result : {
@@ -239,12 +226,21 @@ module Internal_operation = struct
         -> 'kind case
 
   let transaction_contract_variant_cases =
+    let case = function
+      | Tag tag ->
+          (* The tag was used by old variant. It have been removed in
+             protocol proposal O, it can be unblocked in the future. *)
+          let to_tx_rollup_reserved_tag = 1 in
+          assert (Compare.Int.(tag <> to_tx_rollup_reserved_tag)) ;
+          case (Tag tag)
+      | _ as c -> case c
+    in
     union
       [
         case
           ~title:"To_contract"
           (Tag 0)
-          (obj9
+          (obj10
              (opt "storage" Script.expr_encoding)
              (dft "balance_updates" Receipt.balance_updates_encoding [])
              (dft "ticket_receipt" Ticket_receipt.encoding [])
@@ -253,7 +249,8 @@ module Internal_operation = struct
              (dft "storage_size" z Z.zero)
              (dft "paid_storage_size_diff" z Z.zero)
              (dft "allocated_destination_contract" bool false)
-             (opt "lazy_storage_diff" Lazy_storage.encoding))
+             (opt "lazy_storage_diff" Lazy_storage.encoding)
+             (dft "address_registry_diff" (list Address_registry.encoding) []))
           (function
             | Transaction_to_contract_result
                 {
@@ -266,6 +263,7 @@ module Internal_operation = struct
                   storage_size;
                   paid_storage_size_diff;
                   allocated_destination_contract;
+                  address_registry_diff;
                 } ->
                 Some
                   ( storage,
@@ -276,7 +274,8 @@ module Internal_operation = struct
                     storage_size,
                     paid_storage_size_diff,
                     allocated_destination_contract,
-                    lazy_storage_diff )
+                    lazy_storage_diff,
+                    address_registry_diff )
             | _ -> None)
           (fun ( storage,
                  balance_updates,
@@ -286,7 +285,9 @@ module Internal_operation = struct
                  storage_size,
                  paid_storage_size_diff,
                  allocated_destination_contract,
-                 lazy_storage_diff ) ->
+                 lazy_storage_diff,
+                 address_registry_diff )
+             ->
             Transaction_to_contract_result
               {
                 storage;
@@ -298,39 +299,7 @@ module Internal_operation = struct
                 storage_size;
                 paid_storage_size_diff;
                 allocated_destination_contract;
-              });
-        case
-          ~title:"To_tx_rollup"
-          (Tag 1)
-          (obj4
-             (dft "balance_updates" Receipt.balance_updates_encoding [])
-             (dft "consumed_milligas" Gas.Arith.n_fp_encoding Gas.Arith.zero)
-             (req "ticket_hash" Ticket_hash.encoding)
-             (req "paid_storage_size_diff" n))
-          (function
-            | Transaction_to_tx_rollup_result
-                {
-                  balance_updates;
-                  consumed_gas;
-                  ticket_hash;
-                  paid_storage_size_diff;
-                } ->
-                Some
-                  ( balance_updates,
-                    consumed_gas,
-                    ticket_hash,
-                    paid_storage_size_diff )
-            | _ -> None)
-          (fun ( balance_updates,
-                 consumed_gas,
-                 ticket_hash,
-                 paid_storage_size_diff ) ->
-            Transaction_to_tx_rollup_result
-              {
-                balance_updates;
-                consumed_gas;
-                ticket_hash;
-                paid_storage_size_diff;
+                address_registry_diff;
               });
         case
           ~title:"To_smart_rollup"
@@ -344,7 +313,7 @@ module Internal_operation = struct
             | _ -> None)
           (function
             | consumed_gas, ticket_receipt ->
-                Transaction_to_sc_rollup_result {consumed_gas; ticket_receipt});
+            Transaction_to_sc_rollup_result {consumed_gas; ticket_receipt});
       ]
 
   let transaction_case =
@@ -404,8 +373,8 @@ module Internal_operation = struct
         encoding =
           obj3
             (req "balance" Tez.encoding)
-            (opt "delegate" Signature.Public_key_hash.encoding)
-            (req "script" Script.encoding);
+            (opt "delegate" Implicit_account_repr.encoding)
+            (req "script" Script.michelson_with_storage_encoding);
         iselect : Kind.origination iselect =
           (function
           | Internal_operation_result
@@ -431,7 +400,7 @@ module Internal_operation = struct
            external tools such as indexers. *)
         tag = 3;
         name = "delegation";
-        encoding = obj1 (opt "delegate" Signature.Public_key_hash.encoding);
+        encoding = obj1 (opt "delegate" Implicit_account_repr.encoding);
         iselect : Kind.delegation iselect =
           (function
           | Internal_operation_result
@@ -465,7 +434,8 @@ module Internal_operation = struct
           | _ -> None);
         select =
           (function
-          | Internal_operation_contents (Event _ as op) -> Some op | _ -> None);
+          | Internal_operation_contents (Event _ as op) -> Some op
+          | _ -> None);
         proj =
           (function
           | Event {ty; tag; payload} ->
@@ -511,11 +481,13 @@ end
 let internal_operation_encoding : packed_internal_operation Data_encoding.t =
   def "apply_internal_results.alpha.operation_result"
   @@ conv
-       (fun (Internal_operation {source; operation; nonce}) ->
-         ((source, nonce), Internal_operation_contents operation))
-       (fun ((source, nonce), Internal_operation_contents operation) ->
-         Internal_operation {source; operation; nonce})
+       (fun (Internal_operation {sender; operation; nonce}) ->
+         ((sender, nonce), Internal_operation_contents operation))
+       (fun ((sender, nonce), Internal_operation_contents operation) ->
+         Internal_operation {sender; operation; nonce})
        (merge_objs
+          (* TODO: https://gitlab.com/tezos/tezos/-/issues/710
+             Rename the "source" field into "sender" *)
           (obj2 (req "source" Destination.encoding) (req "nonce" uint16))
           Internal_operation.encoding)
 
@@ -636,13 +608,14 @@ module Internal_operation_result = struct
               paid_storage_size_diff,
               lazy_storage_diff ))
       ~kind:Kind.Origination_manager_kind
-      ~inj:
-        (fun ( balance_updates,
-               originated_contracts,
-               consumed_gas,
-               storage_size,
-               paid_storage_size_diff,
-               lazy_storage_diff ) ->
+      ~inj:(fun
+          ( balance_updates,
+            originated_contracts,
+            consumed_gas,
+            storage_size,
+            paid_storage_size_diff,
+            lazy_storage_diff )
+        ->
         IOrigination_result
           {
             lazy_storage_diff;
@@ -658,14 +631,19 @@ module Internal_operation_result = struct
       ~op_case:Internal_operation.delegation_case
       ~encoding:
         Data_encoding.(
-          obj1 (dft "consumed_milligas" Gas.Arith.n_fp_encoding Gas.Arith.zero))
+          obj2
+            (dft "consumed_milligas" Gas.Arith.n_fp_encoding Gas.Arith.zero)
+            (dft "balance_updates" Receipt.balance_updates_encoding []))
       ~select:(function
         | Successful_internal_operation_result (IDelegation_result _ as op) ->
             Some op
         | _ -> None)
       ~kind:Kind.Delegation_manager_kind
-      ~proj:(function IDelegation_result {consumed_gas} -> consumed_gas)
-      ~inj:(fun consumed_gas -> IDelegation_result {consumed_gas})
+      ~proj:(function
+        | IDelegation_result {consumed_gas; balance_updates} ->
+            (consumed_gas, balance_updates))
+      ~inj:(fun (consumed_gas, balance_updates) ->
+        IDelegation_result {consumed_gas; balance_updates})
 
   let event_case =
     make
@@ -692,6 +670,8 @@ let internal_operation_result_encoding :
     case
       (Tag op_case.tag)
       ~title:op_case.name
+      (* TODO: https://gitlab.com/tezos/tezos/-/issues/710
+         Rename the "source" field into "sender" *)
       (merge_objs
          (obj3
             (req "kind" (constant op_case.name))
@@ -701,10 +681,10 @@ let internal_operation_result_encoding :
       (fun op ->
         match ires_case.iselect op with
         | Some (op, res) ->
-            Some (((), op.source, op.nonce), (ires_case.proj op.operation, res))
+            Some (((), op.sender, op.nonce), (ires_case.proj op.operation, res))
         | None -> None)
-      (fun (((), source, nonce), (op, res)) ->
-        let op = {source; operation = ires_case.inj op; nonce} in
+      (fun (((), sender, nonce), (op, res)) ->
+        let op = {sender; operation = ires_case.inj op; nonce} in
         Internal_operation_result (op, res))
   in
   def "apply_internal_results.alpha.operation_result"

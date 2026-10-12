@@ -25,6 +25,7 @@
 
 open Snapshots_events
 open Store_types
+open Tezos_context_ops
 
 type error +=
   | Incompatible_history_mode of {
@@ -88,9 +89,14 @@ type error +=
       stored : History_mode.t;
     }
   | Inconsistent_imported_block of Block_hash.t * Block_hash.t
-  | Wrong_snapshot_file of {filename : string}
   | Invalid_chain_store_export of Chain_id.t * string
   | Cannot_export_snapshot_format
+  | Cannot_checkout_imported_context of Context_hash.t
+  | Cannot_encode_floating_block of {
+      hash : Block_hash.t;
+      error : Data_encoding.Binary.write_error;
+    }
+  | Invalid_snapshot_member of string
 
 let () =
   let open Data_encoding in
@@ -294,6 +300,22 @@ let () =
     (fun (kind, path) -> Cannot_read {kind; path}) ;
   register_error_kind
     `Permanent
+    ~id:"snapshots.invalid_snapshot_member"
+    ~title:"Invalid snapshot archive member"
+    ~description:
+      "A snapshot archive member has a path that resolves outside the \
+       destination directory."
+    ~pp:(fun ppf path ->
+      Format.fprintf
+        ppf
+        "Snapshot archive contains a member with path %S that resolves outside \
+         the destination directory."
+        path)
+    Data_encoding.(obj1 (req "path" string))
+    (function Invalid_snapshot_member path -> Some path | _ -> None)
+    (fun path -> Invalid_snapshot_member path) ;
+  register_error_kind
+    `Permanent
     ~id:"snapshot.inconsistent_floating_store"
     ~title:"Inconsistent floating store"
     ~description:"The floating block store is inconsistent."
@@ -482,15 +504,27 @@ let () =
     ~description:
       "The imported chain is inconsistent with the target data directory."
     ~pp:(fun ppf (expected, got) ->
+      let get_chain_name_info chain_name =
+        let chain_name =
+          Format.asprintf "%a" Distributed_db_version.Name.pp chain_name
+        in
+        (* We assume the chain_name to be formatted as "TEZOS_<CHAIN-NAME>_<TIMESTAMP>". *)
+        match String.split '_' chain_name with
+        | _ :: chain_name :: _ -> String.lowercase_ascii chain_name
+        | _ -> chain_name
+      in
+      let expected_chain_name = get_chain_name_info expected in
+      let chain_name = get_chain_name_info got in
       Format.fprintf
         ppf
-        "The chain name contained in the snapshot file (%a) is not consistent \
-         with the network configured in the targeted data directory (%a). \
-         Please check your configuration file."
-        Distributed_db_version.Name.pp
-        expected
-        Distributed_db_version.Name.pp
-        got)
+        "@[<v 2>The chain name contained in the snapshot file (%s) is not \
+         consistent with the network configured in the targeted data directory \
+         (%s). Please check your configuration file. If your configuration \
+         file is not set, you should use the following command first:@,\
+         'octez-node config init --network <NETWORK> --data-dir <DATA_DIR>'.@,\
+         See documentation for help.@."
+        expected_chain_name
+        chain_name)
     (obj2
        (req "expected" Distributed_db_version.Name.encoding)
        (req "got" Distributed_db_version.Name.encoding))
@@ -545,20 +579,6 @@ let () =
     (fun (got, exp) -> Inconsistent_imported_block (got, exp)) ;
   register_error_kind
     `Permanent
-    ~id:"Snapshot.wrong_snapshot_file"
-    ~title:"Wrong snapshot file"
-    ~description:"Error while opening snapshot file"
-    ~pp:(fun ppf filename ->
-      Format.fprintf
-        ppf
-        "Failed to read snapshot file %s. The provided file is inconsistent or \
-         is from Octez 12 (or before) and it cannot be imported anymore."
-        filename)
-    Data_encoding.(obj1 (req "filename" string))
-    (function Wrong_snapshot_file {filename} -> Some filename | _ -> None)
-    (fun filename -> Wrong_snapshot_file {filename}) ;
-  register_error_kind
-    `Permanent
     ~id:"Snapshot.invalid_chain_store_export"
     ~title:"Invalid chain store export"
     ~description:"Error while exporting snapshot"
@@ -592,7 +612,42 @@ let () =
          exports. ")
     unit
     (function Cannot_export_snapshot_format -> Some () | _ -> None)
-    (fun () -> Cannot_export_snapshot_format)
+    (fun () -> Cannot_export_snapshot_format) ;
+  register_error_kind
+    `Permanent
+    ~id:"Snapshot.cannot_checkout_imported_context"
+    ~title:"Cannot checkout imported context"
+    ~description:"Cannot checkout imported context"
+    ~pp:(fun ppf h ->
+      Format.fprintf
+        ppf
+        "Cannot checkout imported context %a. The imported data directory is \
+         incorrect."
+        Context_hash.pp
+        h)
+    (obj1 (req "context_hash" Context_hash.encoding))
+    (function Cannot_checkout_imported_context h -> Some h | _ -> None)
+    (fun h -> Cannot_checkout_imported_context h) ;
+  register_error_kind
+    `Permanent
+    ~id:"Snapshot.cannot_encode_floating_block"
+    ~title:"Cannot encode floating block"
+    ~description:"Failed to encode a floating block during snapshot export."
+    ~pp:(fun ppf (hash, error) ->
+      Format.fprintf
+        ppf
+        "Failed to encode floating block %a during snapshot export: %a."
+        Block_hash.pp
+        hash
+        Data_encoding.Binary.pp_write_error
+        error)
+    (obj2
+       (req "block_hash" Block_hash.encoding)
+       (req "error" Data_encoding.Binary.write_error_encoding))
+    (function
+      | Cannot_encode_floating_block {hash; error} -> Some (hash, error)
+      | _ -> None)
+    (fun (hash, error) -> Cannot_encode_floating_block {hash; error})
 
 (* This module handles snapshot's versioning system. *)
 module Version = struct
@@ -607,32 +662,37 @@ module Version = struct
    * - 1: snapshot exported with storage 0.0.1 to 0.0.4
    * - 2: snapshot exported with storage 0.0.4 to 0.0.6
    * - 3: snapshot exported with storage 0.0.7
-   * - 4: snapshot exported with storage 0.0.8 to current
+   * - 4: snapshot exported with storage 0.0.8
    * - 5: snapshot exported with new protocol tables and "à la GC"
-       context (storage 2.0 to current)*)
+       context (storage 2.0)
+   * - 6: new context representation introduced by irmin 3.7.2
+   * - 7: fix tar snapshots corrupted generation
+   * - 8: change cemented files offset format to 64 bits
+   * - 9: export target predecessor contains metadata
+   *)
 
-  let legacy_version = 4
+  (* Used for old snapshot format versions *)
+  let _legacy_version = None
 
-  let current_version = 5
+  let current_version = 9
 
   (* List of versions that are supported *)
-  let supported_versions =
-    [(legacy_version, `Legacy); (current_version, `Current)]
+  let supported_versions = [(current_version, `Current)]
 
   let is_supported version =
     match List.assq_opt version supported_versions with
     | Some _ -> true
     | None -> false
 
-  (* Returns true if the given version is considered as legacy. *)
-  let is_legacy version =
+  (* Returns true if the given version uses a legacy data format. *)
+  let is_legacy_format version =
     let open Lwt_result_syntax in
     match List.assq_opt version supported_versions with
     | None ->
         tzfail
           (Inconsistent_version_import
              {expected = List.map fst supported_versions; got = version})
-    | Some `Legacy -> return_true
+    | Some `Legacy_format -> return_true
     | Some _ -> return_false
 end
 
@@ -648,6 +708,11 @@ let snapshot_rw_file_perm = 0o644
 let snapshot_ro_file_perm = 0o444
 
 let snapshot_dir_perm = 0o755
+
+(* The [cemented_buffer_size] is used to enhance performance while
+   copying cemented cycles. This hardcoded value is designed to
+   provide good performance across a wide range of architectures. *)
+let cemented_buffer_size = 4096 * 1024
 
 module Snapshot_metadata = struct
   type metadata = {
@@ -672,62 +737,12 @@ module Snapshot_metadata = struct
          (req "level" int32)
          (req "timestamp" Time.Protocol.encoding))
 
-  type legacy_metadata = {
-    chain_name : Distributed_db_version.Name.t;
-    history_mode : History_mode.t;
-    block_hash : Block_hash.t;
-    level : Int32.t;
-    timestamp : Time.Protocol.t;
-    context_elements : int;
-  }
-
-  let legacy_metadata_encoding =
-    let open Data_encoding in
-    conv
-      (fun {
-             chain_name;
-             history_mode;
-             block_hash;
-             level;
-             timestamp;
-             context_elements;
-           } ->
-        ( chain_name,
-          history_mode,
-          block_hash,
-          level,
-          timestamp,
-          context_elements ))
-      (fun ( chain_name,
-             history_mode,
-             block_hash,
-             level,
-             timestamp,
-             context_elements ) ->
-        {
-          chain_name;
-          history_mode;
-          block_hash;
-          level;
-          timestamp;
-          context_elements;
-        })
-      (obj6
-         (req "chain_name" Distributed_db_version.Name.encoding)
-         (req "mode" History_mode.encoding)
-         (req "block_hash" Block_hash.encoding)
-         (req "level" int32)
-         (req "timestamp" Time.Protocol.encoding)
-         (req "context_elements" int31))
-
-  type t = Current of metadata | Legacy of legacy_metadata
+  type t = Current of metadata
 
   let pp ppf metadata =
     let chain_name, block_hash, level, history_mode, timestamp =
       match metadata with
       | Current {chain_name; block_hash; level; history_mode; timestamp} ->
-          (chain_name, block_hash, level, history_mode, timestamp)
-      | Legacy {chain_name; block_hash; level; history_mode; timestamp; _} ->
           (chain_name, block_hash, level, history_mode, timestamp)
     in
     Format.fprintf
@@ -743,29 +758,15 @@ module Snapshot_metadata = struct
       History_mode.pp_short
       history_mode
 
-  let get_block_hash = function
-    | Current {block_hash; _} -> block_hash
-    | Legacy {block_hash; _} -> block_hash
+  let get_block_hash = function Current {block_hash; _} -> block_hash
 
-  let get_chain_name = function
-    | Current {chain_name; _} -> chain_name
-    | Legacy {chain_name; _} -> chain_name
+  let get_chain_name = function Current {chain_name; _} -> chain_name
 
-  let get_history_mode = function
-    | Current {history_mode; _} -> history_mode
-    | Legacy {history_mode; _} -> history_mode
+  let get_history_mode = function Current {history_mode; _} -> history_mode
 
   let read_metadata ~metadata_file =
     let open Lwt_result_syntax in
     let read_json json = Data_encoding.Json.destruct metadata_encoding json in
-    let* json = Lwt_utils_unix.Json.read_file metadata_file in
-    return (read_json json)
-
-  let read_legacy_metadata ~metadata_file =
-    let open Lwt_result_syntax in
-    let read_json json =
-      Data_encoding.Json.destruct legacy_metadata_encoding json
-    in
     let* json = Lwt_utils_unix.Json.read_file metadata_file in
     return (read_json json)
 end
@@ -784,18 +785,7 @@ module Snapshot_header = struct
          "snapshot_header"
          (merge_objs Version.encoding Snapshot_metadata.metadata_encoding))
 
-  type snapshot_header_legacy = Version.t * Snapshot_metadata.legacy_metadata
-
-  let snapshot_header_legacy_encoding =
-    let open Data_encoding in
-    obj1
-      (req
-         "snapshot_header"
-         (merge_objs
-            Version.encoding
-            Snapshot_metadata.legacy_metadata_encoding))
-
-  type t = Current of snapshot_header | Legacy of snapshot_header_legacy
+  type t = Current of snapshot_header
 
   let pp ppf = function
     | Current (version, metadata) ->
@@ -805,29 +795,15 @@ module Snapshot_header = struct
           Snapshot_metadata.pp
           (Snapshot_metadata.Current metadata)
           version
-    | Legacy (version, metadata) ->
-        Format.fprintf
-          ppf
-          "%a (snapshot version %d)"
-          Snapshot_metadata.pp
-          (Snapshot_metadata.Legacy metadata)
-          version
 
   let to_json = function
     | Current snapshot_header ->
         Data_encoding.Json.construct snapshot_header_encoding snapshot_header
-    | Legacy snapshot_header ->
-        Data_encoding.Json.construct
-          snapshot_header_legacy_encoding
-          snapshot_header
 
-  let get_version = function
-    | Current (version, _) -> version
-    | Legacy (version, _) -> version
+  let get_version = function Current (version, _) -> version
 
   let get_metadata = function
     | Current (_, metadata) -> Snapshot_metadata.Current metadata
-    | Legacy (_, metadata) -> Snapshot_metadata.Legacy metadata
 end
 
 type snapshot_format = Tar | Raw
@@ -847,6 +823,7 @@ type block_data = {
   block_header : Block_header.t;
   operations : Operation.t list list;
   predecessor_header : Block_header.t;
+  predecessor_max_operations_ttl : int;
   predecessor_block_metadata_hash : Block_metadata_hash.t option;
   predecessor_ops_metadata_hash : Operation_metadata_list_list_hash.t option;
   resulting_context_hash : Context_hash.t;
@@ -859,90 +836,51 @@ let block_data_encoding =
            block_header;
            operations;
            predecessor_header;
+           predecessor_max_operations_ttl;
            predecessor_block_metadata_hash;
            predecessor_ops_metadata_hash;
            resulting_context_hash;
-         } ->
+         }
+       ->
       ( operations,
         block_header,
         predecessor_header,
+        predecessor_max_operations_ttl,
         predecessor_block_metadata_hash,
         predecessor_ops_metadata_hash,
         resulting_context_hash ))
     (fun ( operations,
            block_header,
            predecessor_header,
+           predecessor_max_operations_ttl,
            predecessor_block_metadata_hash,
            predecessor_ops_metadata_hash,
-           resulting_context_hash ) ->
+           resulting_context_hash )
+       ->
       {
         block_header;
         operations;
         predecessor_header;
+        predecessor_max_operations_ttl;
         predecessor_block_metadata_hash;
         predecessor_ops_metadata_hash;
         resulting_context_hash;
       })
-    (obj6
+    (obj7
        (req "operations" (list (list (dynamic_size Operation.encoding))))
        (req "block_header" (dynamic_size Block_header.encoding))
        (req "predecessor_header" (dynamic_size Block_header.encoding))
+       (req "predecessor_max_operations_ttl" int31)
        (opt "predecessor_block_metadata_hash" Block_metadata_hash.encoding)
        (opt
           "predecessor_ops_metadata_hash"
           Operation_metadata_list_list_hash.encoding)
        (req " resulting_context_hash" Context_hash.encoding))
 
-type legacy_block_data = {
-  block_header : Block_header.t;
-  operations : Operation.t list list;
-  predecessor_header : Block_header.t;
-  predecessor_block_metadata_hash : Block_metadata_hash.t option;
-  predecessor_ops_metadata_hash : Operation_metadata_list_list_hash.t option;
-}
-
-let legacy_block_data_encoding =
-  let open Data_encoding in
-  conv
-    (fun {
-           block_header;
-           operations;
-           predecessor_header;
-           predecessor_block_metadata_hash;
-           predecessor_ops_metadata_hash;
-         } ->
-      ( operations,
-        block_header,
-        predecessor_header,
-        predecessor_block_metadata_hash,
-        predecessor_ops_metadata_hash ))
-    (fun ( operations,
-           block_header,
-           predecessor_header,
-           predecessor_block_metadata_hash,
-           predecessor_ops_metadata_hash ) ->
-      {
-        block_header;
-        operations;
-        predecessor_header;
-        predecessor_block_metadata_hash;
-        predecessor_ops_metadata_hash;
-      })
-    (obj5
-       (req "operations" (list (list (dynamic_size Operation.encoding))))
-       (req "block_header" (dynamic_size Block_header.encoding))
-       (req "predecessor_header" (dynamic_size Block_header.encoding))
-       (opt "predecessor_block_metadata_hash" Block_metadata_hash.encoding)
-       (opt
-          "predecessor_ops_metadata_hash"
-          Operation_metadata_list_list_hash.encoding))
-
 let default_snapshot_filename (metadata : Snapshot_metadata.t) =
   let chain_name, block_hash, level, history_mode =
     match metadata with
     | Current {chain_name; block_hash; level; history_mode; _} ->
-        (chain_name, block_hash, level, history_mode)
-    | Legacy {chain_name; block_hash; level; history_mode; _} ->
         (chain_name, block_hash, level, history_mode)
   in
   (* The generated filename follows this pattern:
@@ -980,10 +918,9 @@ let ensure_valid_tmp_snapshot_path snapshot_tmp_dir =
         return_unit)
       (function
         | _ ->
-            fail_when
-              exists
-              (Cannot_remove_tmp_export_directory
-                 (Naming.dir_path snapshot_tmp_dir)))
+        fail_when
+          exists
+          (Cannot_remove_tmp_export_directory (Naming.dir_path snapshot_tmp_dir)))
   else return_unit
 
 let ensure_valid_export_path =
@@ -1000,522 +937,6 @@ let clean_all paths =
           else Lwt_unix.unlink path))
     paths
 
-(* This module allows to create a tar archive by adding files to it,
-   one by one. It can be seen as a list of contiguous files (made of a
-   header followed by a raw data) closed by a specific end of file
-   flag. *)
-module Onthefly : sig
-  (* The type of a file contained in the tar archive. It is basically
-     a header and a raw data. *)
-  type file
-
-  (* The type of an output tar archive. *)
-  type o
-
-  (* The type of an input tar archive. *)
-  type i
-
-  (* output utilities *)
-
-  (* [open_out ~file] opens a tar archive as an output archive located at
-     [file]. *)
-  val open_out : file:string -> o Lwt.t
-
-  (* [close_out tar] closes an output tar archive. *)
-  val close_out : o -> unit Lwt.t
-
-  (* [add_raw_and_finalize tar ~f ~filename] exposes a file
-     descriptor of the tar archive through [f] to be able to write
-     arbitrary data in the [tar]. When [f] terminates, a valid tar
-     header referenced by [filename] is written *)
-  val add_raw_and_finalize :
-    o -> f:(Lwt_unix.file_descr -> 'a Lwt.t) -> filename:string -> 'a Lwt.t
-
-  (* [add_file_and_finalize tar ~file ~filename] copies the [file], and
-     reference it through the given [filename], into a [tar]. It handles all
-     specific operations an returns a handler ready to be enriched. *)
-  val add_file_and_finalize : o -> file:string -> filename:string -> unit Lwt.t
-
-  (* [add_directory_and_finalize ?archive_prefix tar ~dir_path] copies
-     the [dir_path] and all its sub directories or files into a
-     [tar]. By default, the tar archive file path are similar to the
-     [dir_path]. They can be overridden using the [archive_prefix].
-     It handles all specific operations an returns a handler ready to
-     be enriched.
-     For example,
-     if the directory `/path/to/data` contains 2 files `a` and `b`:
-     With the default behaviour, the tar will contain two files:
-         - `/path/to/data/a`
-         - `/path/to/data/b`
-     If the archive_prefix is given with value `local_path`, the tar
-     archive will contain:
-        - `local_path/a`
-        - `local_path/b`
-  *)
-  val add_directory_and_finalize :
-    ?archive_prefix:string -> o -> dir_path:string -> unit Lwt.t
-
-  (* input utilities *)
-
-  (* [open_out ~file] opens a tar archive as an input archive located at
-     [file]. *)
-  val open_in : file:string -> i Lwt.t
-
-  (* [close_in tar] closes an input tar archive. *)
-  val close_in : i -> unit Lwt.t
-
-  (* [list_files tar] returns the list of files contained in the
-     [tar]. *)
-  val list_files : i -> file list Lwt.t
-
-  (* [get_file tar ~filename] returns the first occurrence of the
-     file name [filename] from [tar]. *)
-  val get_file : i -> filename:string -> file option Lwt.t
-
-  (* [get_filename file] returns the file name of a [file] contained
-     in a tar. *)
-  val get_filename : file -> string
-
-  (* [get_file_size file] returns the file size of a [file] contained
-     in a tar. *)
-  val get_file_size : file -> int64
-
-  (* [get_raw_input_fd tar] returns the file descriptor to read
-     directly in the tar file. It is no recommended to use it. *)
-  val get_raw_input_fd : i -> Lwt_unix.file_descr
-
-  (* [get_raw_file_ofs file] returns the position offset, from the
-     beginning of the tar archive, of the given [file]. *)
-  val get_raw_file_ofs : file -> int64
-
-  (* [find_file tar ~filename] returns the file corresponding to the
-     given [filename] within the given [tar]. *)
-  val find_file : i -> filename:string -> file option Lwt.t
-
-  (* [find_files_with_common_path tar ~pattern] returns, from the [tar] all
-      the files matching the given [pattern]. *)
-  val find_files_with_common_path : i -> pattern:string -> file list Lwt.t
-
-  (* [read_raw tar file] returns a file descriptor on the [tar] file
-     which is pointing toward the data of the given [file] *)
-  val read_raw : i -> file -> Lwt_unix.file_descr Lwt.t
-
-  (* [load_file tar file] loads the [file] from the [tar] and returns
-     it as bytes.
-     Warning, this function loads the whole data in
-     memory. *)
-  val load_file : i -> file -> string Lwt.t
-
-  (* [load_from_filename tar ~filename] loads the file with the name
-     [filename] from the given [tar] and returns it as
-     bytes.
-     Warning, this function loads the whole data in memory *)
-  val load_from_filename : i -> filename:string -> string option Lwt.t
-
-  (* [copy_to_file tar file ~dst] copies the [file] from the [tar]
-     into new file designated by [dst]. *)
-  val copy_to_file : i -> file -> dst:string -> unit Lwt.t
-end = struct
-  include Tar
-
-  module Reader = struct
-    type in_channel = Lwt_unix.file_descr
-
-    type 'a t = 'a Lwt.t
-
-    let really_read fd = Lwt_cstruct.(complete (read fd))
-
-    let skip (ifd : Lwt_unix.file_descr) (n : int) =
-      let open Lwt_syntax in
-      let buffer_size = 32768 in
-      let buffer = Cstruct.create buffer_size in
-      let rec loop (n : int) =
-        if n <= 0 then Lwt.return ()
-        else
-          let amount = min n buffer_size in
-          let block = Cstruct.sub buffer 0 amount in
-          let* () = really_read ifd block in
-          loop (n - amount)
-      in
-      loop n
-  end
-
-  module Writer = struct
-    type out_channel = Lwt_unix.file_descr
-
-    type 'a t = 'a Lwt.t
-
-    let really_write fd = Lwt_cstruct.(complete (write fd))
-  end
-
-  module HR = Tar.HeaderReader (Lwt) (Reader)
-  module HW = Tar.HeaderWriter (Lwt) (Writer)
-
-  type file = {header : Tar.Header.t; data_ofs : Int64.t}
-
-  type o = {
-    mutable current_pos : Int64.t;
-    mutable data_pos : Int64.t;
-    fd : Lwt_unix.file_descr;
-  }
-
-  let open_out ~file =
-    let open Lwt_syntax in
-    let* fd =
-      Lwt_unix.openfile file Unix.[O_WRONLY; O_CREAT] snapshot_rw_file_perm
-    in
-    let data_pos = Int64.of_int Header.length in
-    let* _ = Lwt_unix.LargeFile.lseek fd data_pos SEEK_SET in
-    Lwt.return {current_pos = 0L; data_pos; fd}
-
-  (* Writes the double zero blocks to close the archive, as it is
-     defined in the RFC.*)
-  let close_out t =
-    let open Lwt_syntax in
-    let* _eof = Lwt_unix.LargeFile.lseek t.fd t.current_pos SEEK_SET in
-    let* () = Writer.really_write t.fd Tar.Header.zero_block in
-    let* () = Writer.really_write t.fd Tar.Header.zero_block in
-    Lwt_unix.close t.fd
-
-  (* Builds a tar header for the given sequence of bytes *)
-  let header_of_bytes ?level ~filename ~data_size (file : Lwt_unix.file_descr) :
-      Header.t Lwt.t =
-    let open Lwt_syntax in
-    let level =
-      match level with None -> Tar.Header.V7 | Some level -> level
-    in
-    (* Use Posix by default instead of V7? *)
-    let* stat = Lwt_unix.LargeFile.fstat file in
-    let* pwent = Lwt_unix.getpwuid stat.Lwt_unix.LargeFile.st_uid in
-    let* grent = Lwt_unix.getgrgid stat.Lwt_unix.LargeFile.st_gid in
-    let file_mode = stat.Lwt_unix.LargeFile.st_perm in
-    let user_id = stat.Lwt_unix.LargeFile.st_uid in
-    let group_id = stat.Lwt_unix.LargeFile.st_gid in
-    let mod_time = Int64.of_float stat.Lwt_unix.LargeFile.st_mtime in
-    let link_indicator = Tar.Header.Link.Normal in
-    let link_name = "" in
-    let uname = if level = V7 then "" else pwent.Lwt_unix.pw_name in
-    let gname = if level = V7 then "" else grent.Lwt_unix.gr_name in
-    let devmajor =
-      if level = Ustar then stat.Lwt_unix.LargeFile.st_dev else 0
-    in
-    let devminor =
-      if level = Ustar then stat.Lwt_unix.LargeFile.st_rdev else 0
-    in
-    Lwt.return
-      (Tar.Header.make
-         ~file_mode
-         ~user_id
-         ~group_id
-         ~mod_time
-         ~link_indicator
-         ~link_name
-         ~uname
-         ~gname
-         ~devmajor
-         ~devminor
-         filename
-         data_size)
-
-  (* [finalize tar ~bytes_written ~filename] writes the header
-     corresponding to the quantity of data given through
-     [bytes_written] in the [tar]. Then, it finalizes the file and returns a new
-     handle. The file descriptor of that handle is positioned to allow
-     writing data. *)
-  let finalize t ~bytes_written ~filename =
-    let open Lwt_syntax in
-    (* Build the header based of the bytes_written *)
-    let* header = header_of_bytes ~filename ~data_size:bytes_written t.fd in
-    let header_length = Int64.of_int Header.length in
-    (* Compute and right the adequate padding for finalizing a block data *)
-    let c = Tar.Header.zero_padding header in
-    let zero_padding = Cstruct.to_bytes c in
-    let zero_padding_length = Bytes.length zero_padding in
-    (* Make sure that the fd position is after the written data *)
-    let* _ =
-      Lwt_unix.LargeFile.lseek
-        t.fd
-        (Int64.add t.data_pos bytes_written)
-        SEEK_SET
-    in
-    let* _ = Lwt_unix.write t.fd zero_padding 0 zero_padding_length in
-    (* Go back to the header position to write it *)
-    let* _ = Lwt_unix.LargeFile.lseek t.fd t.current_pos SEEK_SET in
-    let* () = HW.write header t.fd in
-    let next_block_start =
-      Int64.(
-        add
-          (add t.current_pos header_length)
-          (add bytes_written (of_int zero_padding_length)))
-    in
-    let next_data_pos = Int64.(add next_block_start header_length) in
-    (* Set fd position to be ready for next data write *)
-    let* _ = Lwt_unix.LargeFile.lseek t.fd next_data_pos SEEK_SET in
-    t.current_pos <- next_block_start ;
-    t.data_pos <- next_data_pos ;
-    Lwt.return_unit
-
-  let add_raw_and_finalize t ~f ~filename =
-    let open Lwt_syntax in
-    let* res =
-      Lwt.catch
-        (fun () -> f t.fd)
-        (function
-          | exn ->
-              (* Rewind file descriptor to the start of the current data
-                 slot. Then, the next write will overwrite the corrupted
-                 data. *)
-              let* _ = Lwt_unix.LargeFile.lseek t.fd t.data_pos SEEK_SET in
-              Lwt.fail exn)
-    in
-    let* eor = Lwt_unix.LargeFile.lseek t.fd 0L SEEK_CUR in
-    let bytes_written = Int64.sub eor t.data_pos in
-    let* () = finalize t ~bytes_written ~filename in
-    Lwt.return res
-
-  let copy_n ifd ofd n =
-    let open Lwt_syntax in
-    let block_size = 32768 in
-    let buffer = Cstruct.create block_size in
-    let rec loop remaining =
-      if remaining = 0L then Lwt.return ()
-      else
-        let this = Int64.(to_int (min (of_int block_size) remaining)) in
-        let block = Cstruct.sub buffer 0 this in
-        let* () = Reader.really_read ifd block in
-        let* () = Writer.really_write ofd block in
-        loop Int64.(sub remaining (of_int this))
-    in
-    loop n
-
-  let add_file_and_finalize tar ~file ~filename =
-    let open Lwt_syntax in
-    let* fd = Lwt_unix.openfile file [Unix.O_RDONLY] snapshot_ro_file_perm in
-    let* stat = Lwt_unix.LargeFile.fstat fd in
-    let file_size = stat.st_size in
-    let* () = copy_n fd tar.fd file_size in
-    let* () = finalize tar ~bytes_written:file_size ~filename in
-    let* () = Lwt_unix.close fd in
-    Lwt.return_unit
-
-  let rec readdir dir_handler =
-    let open Lwt_syntax in
-    Option.catch_os
-      ~catch_only:(function End_of_file -> true | _ -> false)
-      (fun () ->
-        let* d = Lwt_unix.readdir dir_handler in
-        match d with
-        | filename
-          when filename = Filename.current_dir_name
-               || filename = Filename.parent_dir_name ->
-            readdir dir_handler
-        | any -> Lwt.return_some any)
-
-  let enumerate path =
-    let open Lwt_syntax in
-    let rec aux prefix dir_handler acc =
-      let* o = readdir dir_handler in
-      match o with
-      | Some any ->
-          let full_path = Filename.concat prefix any in
-          if Sys.is_directory full_path then
-            let* new_dir_handler = Lwt_unix.opendir full_path in
-            let* sub_folder = aux full_path new_dir_handler [] in
-            let* () = Lwt_unix.closedir new_dir_handler in
-            aux prefix dir_handler (sub_folder @ acc)
-          else aux prefix dir_handler (full_path :: acc)
-      | None -> Lwt.return acc
-    in
-    let* dir_handler = Lwt_unix.opendir path in
-    let* res = aux path dir_handler [] in
-    let* () = Lwt_unix.closedir dir_handler in
-    Lwt.return res
-
-  let add_directory_and_finalize ?archive_prefix tar ~dir_path =
-    let open Lwt_syntax in
-    let dir_prefix = Filename.dirname dir_path in
-    let* file_paths = enumerate dir_path in
-    let archive_prefix = Option.value archive_prefix ~default:dir_prefix in
-    let files =
-      let dir_length = String.length dir_prefix in
-      List.map
-        (fun file_path ->
-          let filename =
-            String.sub
-              file_path
-              (dir_length + 1)
-              String.(length file_path - dir_length - 1)
-          in
-          (file_path, filename))
-        file_paths
-    in
-    List.iter_s
-      (fun (file, filename) ->
-        add_file_and_finalize
-          tar
-          ~file
-          ~filename:Filename.(concat archive_prefix filename))
-      files
-
-  type i = {
-    mutable current_pos : Int64.t;
-    mutable data_pos : Int64.t;
-    fd : Lwt_unix.file_descr;
-    mutable files : file list option;
-  }
-
-  let open_in ~file =
-    let open Lwt_syntax in
-    let* fd = Lwt_unix.openfile file Unix.[O_RDONLY] snapshot_ro_file_perm in
-    let data_pos = Int64.of_int Header.length in
-    let files = None in
-    Lwt.return {current_pos = 0L; data_pos; fd; files}
-
-  let close_in t = Lwt_unix.close t.fd
-
-  (*[list_files tar] returns the list of files contained in the
-     [tar]. *)
-  let list_files t =
-    let open Lwt_syntax in
-    let* _ = Lwt_unix.LargeFile.lseek t.fd 0L SEEK_SET in
-    (* This implementation is way faster than the one implemented in
-       Tar_lwt_unix.Archive.list function which reads the whole file
-    *)
-    let rec loop pos acc =
-      let* _ = Lwt_unix.LargeFile.lseek t.fd pos SEEK_SET in
-      let* _ = Lwt_unix.lseek t.fd 0 SEEK_CUR in
-      let* r = HR.read t.fd in
-      match r with
-      | Error `Eof -> Lwt.return (List.rev acc)
-      | Ok hdr ->
-          (* Header length can be 1024 if extended *)
-          let* data_pos = Lwt_unix.LargeFile.lseek t.fd 0L SEEK_CUR in
-          let header_length = Int64.sub data_pos pos in
-          let file_size = hdr.Tar.Header.file_size in
-          let padding =
-            Int64.of_int (Tar.Header.compute_zero_padding_length hdr)
-          in
-          let next_header = Int64.(add (add file_size padding) header_length) in
-          let* _ = Lwt_unix.LargeFile.lseek t.fd next_header SEEK_SET in
-          let h = {header = hdr; data_ofs = data_pos} in
-          loop (Int64.add pos next_header) (h :: acc)
-    in
-    loop 0L []
-
-  let update_files t files = t.files <- Some files
-
-  let may_update_files t files =
-    match t.files with Some _ -> () | None -> update_files t files
-
-  let get_files t =
-    let open Lwt_syntax in
-    match t.files with
-    | Some files -> Lwt.return files
-    | None ->
-        let* files = list_files t in
-        update_files t files ;
-        Lwt.return files
-
-  let get_file tar ~filename =
-    let open Lwt_syntax in
-    let* files = get_files tar in
-    Lwt.return
-      (List.find_opt (fun {header; _} -> header.file_name = filename) files)
-
-  let get_filename {header; _} = header.Tar.Header.file_name
-
-  let get_file_size {header; _} = header.Tar.Header.file_size
-
-  (*[get_raw tar file] loads the [file] from [tar] in memory *)
-  let get_raw t {header; data_ofs} =
-    let open Lwt_syntax in
-    let* _ = Lwt_unix.LargeFile.lseek t.fd data_ofs SEEK_SET in
-    let data_size = Int64.to_int header.file_size in
-    let buf = Bytes.create data_size in
-    let* _ = Lwt_unix.read t.fd buf 0 data_size in
-    Lwt.return (Bytes.unsafe_to_string buf)
-
-  let get_raw_input_fd {fd; _} = fd
-
-  let get_raw_file_ofs {data_ofs; _} = data_ofs
-
-  let find_file t ~filename =
-    let open Lwt_syntax in
-    (* If the files were already listed, there is no need to read the whole tar archive.*)
-    match t.files with
-    | Some _ -> get_file t ~filename
-    | None ->
-        let* _ = Lwt_unix.LargeFile.lseek t.fd 0L SEEK_SET in
-        let rec loop pos acc =
-          let* _ = Lwt_unix.LargeFile.lseek t.fd pos SEEK_SET in
-          let* _ = Lwt_unix.lseek t.fd 0 SEEK_CUR in
-          let* r = HR.read t.fd in
-          match r with
-          | Error `Eof ->
-              (* If the end of file is reached, all the files were
-                 enumerated without finding the expected one. In this case,
-                 the files are updated. *)
-              may_update_files t acc ;
-              Lwt.return_none
-          | Ok hdr ->
-              (* Header length can be 1024 if extended *)
-              let* data_pos = Lwt_unix.LargeFile.lseek t.fd 0L SEEK_CUR in
-              if hdr.file_name = filename then
-                Lwt.return_some {header = hdr; data_ofs = data_pos}
-              else
-                let header_length = Int64.sub data_pos pos in
-                let file_size = hdr.Tar.Header.file_size in
-                let padding =
-                  Int64.of_int (Tar.Header.compute_zero_padding_length hdr)
-                in
-                let next_header =
-                  Int64.(add (add file_size padding) header_length)
-                in
-                let* _ = Lwt_unix.LargeFile.lseek t.fd next_header SEEK_SET in
-                let h = {header = hdr; data_ofs = data_pos} in
-                loop (Int64.add pos next_header) (h :: acc)
-        in
-        loop 0L []
-
-  let find_files_with_common_path t ~pattern =
-    let open Lwt_syntax in
-    let* files = get_files t in
-    let pattern = Re.compile (Re.Perl.re pattern) in
-    Lwt.return
-      (List.filter
-         (fun {header; _} -> Re.execp pattern header.Tar.Header.file_name)
-         files)
-
-  let read_raw t {data_ofs; _} =
-    let open Lwt_syntax in
-    let* _ = Lwt_unix.LargeFile.lseek t.fd data_ofs SEEK_SET in
-    Lwt.return t.fd
-
-  let load_file t file = get_raw t file
-
-  let load_from_filename t ~filename =
-    let open Lwt_syntax in
-    let* o = get_file t ~filename in
-    match o with
-    | Some hd ->
-        let* str = get_raw t hd in
-        Lwt.return_some str
-    | None -> Lwt.return_none
-
-  let copy_to_file tar {header; data_ofs} ~dst =
-    let open Lwt_syntax in
-    let* _ = Lwt_unix.LargeFile.lseek tar.fd data_ofs SEEK_SET in
-    let* fd =
-      Lwt_unix.openfile
-        dst
-        Unix.[O_WRONLY; O_CREAT; O_TRUNC]
-        snapshot_rw_file_perm
-    in
-    Lwt.finalize
-      (fun () -> copy_n tar.fd fd header.Tar.Header.file_size)
-      (fun () -> Lwt_unix.close fd)
-end
-
 module type EXPORTER = sig
   type t
 
@@ -1524,14 +945,15 @@ module type EXPORTER = sig
   val write_block_data :
     t ->
     predecessor_header:Block_header.t ->
+    predecessor_max_operations_ttl:int ->
     predecessor_block_metadata_hash:Block_metadata_hash.t option ->
     predecessor_ops_metadata_hash:Operation_metadata_list_list_hash.t option ->
     export_block:Store.Block.t ->
     resulting_context_hash:Context_hash.t ->
-    unit Lwt.t
+    unit tzresult Lwt.t
 
   val export_context :
-    t -> Context.index -> Context_hash.t -> unit tzresult Lwt.t
+    t -> Context_ops.index -> Context_hash.t -> unit tzresult Lwt.t
 
   val copy_cemented_block :
     t -> file:string -> start_level:int32 -> end_level:int32 -> unit Lwt.t
@@ -1604,14 +1026,16 @@ module Raw_exporter : EXPORTER = struct
         snapshot_protocol_dir;
       }
 
-  let write_block_data t ~predecessor_header ~predecessor_block_metadata_hash
-      ~predecessor_ops_metadata_hash ~export_block ~resulting_context_hash =
-    let open Lwt_syntax in
+  let write_block_data t ~predecessor_header ~predecessor_max_operations_ttl
+      ~predecessor_block_metadata_hash ~predecessor_ops_metadata_hash
+      ~export_block ~resulting_context_hash =
+    let open Lwt_result_syntax in
     let block_data =
       {
         block_header = Store.Block.header export_block;
         operations = Store.Block.operations export_block;
         predecessor_header;
+        predecessor_max_operations_ttl;
         predecessor_block_metadata_hash;
         predecessor_ops_metadata_hash;
         resulting_context_hash;
@@ -1623,15 +1047,18 @@ module Raw_exporter : EXPORTER = struct
     let file =
       Naming.(snapshot_block_data_file t.snapshot_tmp_dir |> file_path)
     in
-    let* fd =
+    let*! fd =
       Lwt_unix.openfile
         file
         Unix.[O_CREAT; O_TRUNC; O_WRONLY]
         snapshot_rw_file_perm
     in
-    Lwt.finalize
-      (fun () -> Lwt_utils_unix.write_bytes fd bytes)
-      (fun () -> Lwt_unix.close fd)
+    let*! () =
+      Lwt.finalize
+        (fun () -> Lwt_utils_unix.write_bytes fd bytes)
+        (fun () -> Lwt_unix.close fd)
+    in
+    return_unit
 
   let export_context t context_index context_hash =
     let open Lwt_result_syntax in
@@ -1639,7 +1066,10 @@ module Raw_exporter : EXPORTER = struct
       Naming.(snapshot_context_file t.snapshot_tmp_dir |> file_path)
     in
     let*! () =
-      Context.export_snapshot context_index context_hash ~path:tmp_context_path
+      Context_ops.export_snapshot
+        context_index
+        context_hash
+        ~path:tmp_context_path
     in
     return_unit
 
@@ -1649,7 +1079,11 @@ module Raw_exporter : EXPORTER = struct
         cemented_blocks_file t.snapshot_cemented_dir ~start_level ~end_level
         |> file_path)
     in
-    Lwt_utils_unix.copy_file ~src:file ~dst:filename
+    Lwt_utils_unix.copy_file_raw
+      ~buffer_size:cemented_buffer_size
+      ~src:file
+      ~dst:filename
+      ()
 
   let create_cemented_block_indexes t =
     let open Cemented_block_store in
@@ -1684,7 +1118,7 @@ module Raw_exporter : EXPORTER = struct
                       (cemented_blocks_dir t.snapshot_tmp_dir)))))
         (function
           | Unix.Unix_error (ENOENT, _, _) -> Lwt.return_unit
-          | exn -> Lwt.fail exn)
+          | exn -> Lwt.reraise exn)
     in
     Lwt.catch
       (fun () ->
@@ -1696,7 +1130,7 @@ module Raw_exporter : EXPORTER = struct
                     (cemented_blocks_dir t.snapshot_tmp_dir)))))
       (function
         | Unix.Unix_error (ENOENT, _, _) -> Lwt.return_unit
-        | exn -> Lwt.fail exn)
+        | exn -> Lwt.reraise exn)
 
   let filter_cemented_block_indexes t ~limit =
     let open Cemented_block_store in
@@ -1753,7 +1187,7 @@ module Raw_exporter : EXPORTER = struct
         protocol_file (protocol_store_dir t.snapshot_tmp_dir) dst_ph
         |> file_path)
     in
-    Lwt_utils_unix.copy_file ~src ~dst
+    Lwt_utils_unix.copy_file ~src ~dst ()
 
   let write_metadata t (metadata : Snapshot_metadata.t) =
     let metadata_file =
@@ -1764,9 +1198,6 @@ module Raw_exporter : EXPORTER = struct
       | Current metadata ->
           Data_encoding.Json.(
             construct Snapshot_metadata.metadata_encoding metadata)
-      | Legacy _ ->
-          (* The export of legacy snapshots is not allowed. *)
-          assert false
     in
     Lwt_utils_unix.Json.write_file metadata_file metadata_json
 
@@ -1808,7 +1239,7 @@ module Tar_exporter : EXPORTER = struct
     snapshot_tmp_cemented_dir : [`Cemented_blocks_dir] Naming.directory;
     snapshot_cemented_dir : [`Cemented_blocks_dir] Naming.directory;
     snapshot_protocol_dir : [`Protocol_dir] Naming.directory;
-    tar : Onthefly.o;
+    tar : Octez_tar_helpers.o;
   }
 
   let init snapshot_file =
@@ -1831,7 +1262,7 @@ module Tar_exporter : EXPORTER = struct
     let snapshot_protocol_dir = Naming.protocol_store_dir snapshot_tar in
     let snapshot_tar_file = Naming.snapshot_tmp_tar_file snapshot_tmp_dir in
     let*! tar =
-      Onthefly.open_out ~file:(snapshot_tar_file |> Naming.file_path)
+      Octez_tar_helpers.open_out ~file:(snapshot_tar_file |> Naming.file_path)
     in
     let version_file =
       Naming.snapshot_version_file snapshot_tmp_dir |> Naming.file_path
@@ -1841,10 +1272,11 @@ module Tar_exporter : EXPORTER = struct
     in
     let* () = Lwt_utils_unix.Json.write_file version_file version_json in
     let*! () =
-      Onthefly.add_file_and_finalize
+      Octez_tar_helpers.add_file_and_finalize
         tar
         ~file:version_file
         ~filename:(Filename.basename version_file)
+        ~buffer_size:cemented_buffer_size
     in
     return
       {
@@ -1858,13 +1290,16 @@ module Tar_exporter : EXPORTER = struct
         tar;
       }
 
-  let write_block_data t ~predecessor_header ~predecessor_block_metadata_hash
-      ~predecessor_ops_metadata_hash ~export_block ~resulting_context_hash =
+  let write_block_data t ~predecessor_header ~predecessor_max_operations_ttl
+      ~predecessor_block_metadata_hash ~predecessor_ops_metadata_hash
+      ~export_block ~resulting_context_hash =
+    let open Lwt_result_syntax in
     let block_data =
       {
         block_header = Store.Block.header export_block;
         operations = Store.Block.operations export_block;
         predecessor_header;
+        predecessor_max_operations_ttl;
         predecessor_block_metadata_hash;
         predecessor_ops_metadata_hash;
         resulting_context_hash;
@@ -1873,10 +1308,13 @@ module Tar_exporter : EXPORTER = struct
     let bytes =
       Data_encoding.Binary.to_bytes_exn block_data_encoding block_data
     in
-    Onthefly.add_raw_and_finalize
-      t.tar
-      ~f:(fun fd -> Lwt_utils_unix.write_bytes fd bytes)
-      ~filename:Naming.(snapshot_block_data_file t.snapshot_tar |> file_path)
+    let*! () =
+      Octez_tar_helpers.add_raw_and_finalize
+        t.tar
+        ~f:(fun fd -> Lwt_utils_unix.write_bytes fd bytes)
+        ~filename:Naming.(snapshot_block_data_file t.snapshot_tar |> file_path)
+    in
+    return_unit
 
   let export_context t context_index context_hash =
     let open Lwt_result_syntax in
@@ -1884,13 +1322,17 @@ module Tar_exporter : EXPORTER = struct
       Naming.(snapshot_context_file t.snapshot_tmp_dir |> file_path)
     in
     let*! () =
-      Context.export_snapshot context_index context_hash ~path:tmp_context_path
+      Context_ops.export_snapshot
+        context_index
+        context_hash
+        ~path:tmp_context_path
     in
     let*! () =
-      Onthefly.add_directory_and_finalize
+      Octez_tar_helpers.add_directory_and_finalize
         ~archive_prefix:"" (* /context/ was already added *)
         t.tar
         ~dir_path:tmp_context_path
+        ~buffer_size:cemented_buffer_size
     in
     let*! () = Lwt_utils_unix.remove_dir tmp_context_path in
     return_unit
@@ -1901,7 +1343,11 @@ module Tar_exporter : EXPORTER = struct
         cemented_blocks_file t.snapshot_cemented_dir ~start_level ~end_level
         |> file_path)
     in
-    Onthefly.add_file_and_finalize t.tar ~file ~filename:cemented_filename
+    Octez_tar_helpers.add_file_and_finalize
+      t.tar
+      ~file
+      ~filename:cemented_filename
+      ~buffer_size:cemented_buffer_size
 
   let create_cemented_block_indexes t =
     let open Cemented_block_store in
@@ -1936,7 +1382,7 @@ module Tar_exporter : EXPORTER = struct
                    (cemented_blocks_hash_index_dir t.snapshot_tmp_cemented_dir))))
         (function
           | Unix.Unix_error (ENOENT, _, _) -> Lwt.return_unit
-          | exn -> Lwt.fail exn)
+          | exn -> Lwt.reraise exn)
     in
     let* () =
       Lwt.catch
@@ -1948,24 +1394,26 @@ module Tar_exporter : EXPORTER = struct
                    (cemented_blocks_level_index_dir t.snapshot_tmp_cemented_dir))))
         (function
           | Unix.Unix_error (ENOENT, _, _) -> Lwt.return_unit
-          | exn -> Lwt.fail exn)
+          | exn -> Lwt.reraise exn)
     in
     let* () =
-      Onthefly.add_directory_and_finalize
+      Octez_tar_helpers.add_directory_and_finalize
         ~archive_prefix:(Naming.dir_path t.snapshot_cemented_dir)
         t.tar
         ~dir_path:
           Naming.(
             cemented_blocks_hash_index_dir t.snapshot_tmp_cemented_dir
             |> dir_path)
+        ~buffer_size:cemented_buffer_size
     in
-    Onthefly.add_directory_and_finalize
+    Octez_tar_helpers.add_directory_and_finalize
       ~archive_prefix:(Naming.dir_path t.snapshot_cemented_dir)
       t.tar
       ~dir_path:
         Naming.(
           cemented_blocks_level_index_dir t.snapshot_tmp_cemented_dir
           |> dir_path)
+      ~buffer_size:cemented_buffer_size
 
   let filter_cemented_block_indexes t ~limit =
     let open Cemented_block_store in
@@ -1994,14 +1442,14 @@ module Tar_exporter : EXPORTER = struct
     Cemented_block_hash_index.close fresh_hash_index
 
   let write_floating_blocks t ~f =
-    Onthefly.add_raw_and_finalize
+    Octez_tar_helpers.add_raw_and_finalize
       t.tar
       ~f
       ~filename:
         Naming.(snapshot_floating_blocks_file t.snapshot_tar |> file_path)
 
   let write_protocols_table t ~f =
-    Onthefly.add_raw_and_finalize
+    Octez_tar_helpers.add_raw_and_finalize
       t.tar
       ~f
       ~filename:
@@ -2015,7 +1463,11 @@ module Tar_exporter : EXPORTER = struct
           (Naming.dir_path t.snapshot_protocol_dir)
           (Protocol_hash.to_b58check dst_ph))
     in
-    Onthefly.add_file_and_finalize t.tar ~file:src ~filename:dst
+    Octez_tar_helpers.add_file_and_finalize
+      t.tar
+      ~file:src
+      ~filename:dst
+      ~buffer_size:cemented_buffer_size
 
   let write_metadata t metadata =
     let open Lwt_result_syntax in
@@ -2024,24 +1476,29 @@ module Tar_exporter : EXPORTER = struct
       | Snapshot_metadata.Current metadata ->
           Data_encoding.Json.(
             construct Snapshot_metadata.metadata_encoding metadata)
-      | Legacy metadata ->
-          Data_encoding.Json.(
-            construct Snapshot_metadata.legacy_metadata_encoding metadata)
     in
     let metadata_file =
       Naming.snapshot_metadata_file t.snapshot_tmp_dir |> Naming.file_path
     in
     let* () = Lwt_utils_unix.Json.write_file metadata_file metadata_json in
     let*! () =
-      Onthefly.add_file_and_finalize
+      Octez_tar_helpers.add_file_and_finalize
         t.tar
         ~file:metadata_file
         ~filename:(Filename.basename metadata_file)
+        ~buffer_size:cemented_buffer_size
     in
     return_unit
 
   let cleaner ?to_clean t =
     let open Lwt_syntax in
+    (* Best-effort: close the tar archive, ignoring errors since we are
+       already in a cleanup path. *)
+    let* () =
+      Lwt.catch
+        (fun () -> Octez_tar_helpers.close_out t.tar)
+        (fun _exn -> Lwt.return_unit)
+    in
     let* () = Event.(emit cleaning_after_failure ()) in
     let paths =
       match to_clean with
@@ -2058,7 +1515,7 @@ module Tar_exporter : EXPORTER = struct
       | None -> default_snapshot_filename metadata
     in
     let* () = write_metadata t metadata in
-    let*! () = Onthefly.close_out t.tar in
+    let*! () = Octez_tar_helpers.close_out t.tar in
     protect
       ~on_error:(fun errors ->
         let*! () = cleaner ~to_clean:[Naming.dir_path t.snapshot_tmp_dir] t in
@@ -2083,7 +1540,7 @@ module type Snapshot_exporter = sig
     ?rolling:bool ->
     block:Block_services.block ->
     store_dir:string ->
-    context_dir:string ->
+    data_dir:string ->
     chain_name:Distributed_db_version.Name.t ->
     progress_display_mode:Animation.progress_display_mode ->
     Genesis.t ->
@@ -2100,69 +1557,84 @@ module Make_snapshot_exporter (Exporter : EXPORTER) : Snapshot_exporter = struct
       (files : Cemented_block_store.cemented_blocks_file list) =
     let open Lwt_result_syntax in
     let open Cemented_block_store in
+    let*! () = Event.(emit exporting_cemented_cycles) () in
     let nb_cycles = List.length files in
     (* Rebuild fresh indexes: cannot cp because of concurrent accesses *)
     let fresh_level_index, fresh_hash_index =
       Exporter.create_cemented_block_indexes snapshot_exporter
     in
-    protect (fun () ->
-        let* () =
-          Animation.display_progress
-            ~pp_print_step:(fun fmt i ->
-              Format.fprintf
-                fmt
-                "Copying cemented blocks and populating indexes: %d/%d cycles"
-                i
-                nb_cycles)
-            ~progress_display_mode
-            (fun notify ->
-              (* Bound the number of copying threads *)
-              List.iter_es
-                (fun ({start_level; end_level; file} as cemented_file) ->
-                  let* () =
-                    Cemented_block_store.iter_cemented_file
-                      (fun block ->
-                        let hash = Block_repr.hash block in
-                        let level = Block_repr.level block in
-                        Cemented_block_level_index.replace
-                          fresh_level_index
-                          hash
-                          level ;
-                        Cemented_block_hash_index.replace
-                          fresh_hash_index
-                          level
-                          hash ;
-                        Lwt.return_unit)
-                      cemented_file
-                  in
-                  let file_path = Naming.file_path file in
-                  let*! () =
-                    Exporter.copy_cemented_block
-                      snapshot_exporter
-                      ~file:file_path
-                      ~start_level
-                      ~end_level
-                  in
-                  let*! () = notify () in
-                  return_unit)
-                files)
-        in
-        Cemented_block_level_index.close fresh_level_index ;
-        Cemented_block_hash_index.close fresh_hash_index ;
-        let*! () =
-          Exporter.clear_cemented_block_indexes_lockfiles snapshot_exporter
-        in
-        if should_filter_indexes && files <> [] then
-          Exporter.filter_cemented_block_indexes
-            snapshot_exporter
-            ~limit:
-              (List.last_opt files |> WithExceptions.Option.get ~loc:__LOC__)
-                .end_level ;
-        return_unit)
+    let* () =
+      protect (fun () ->
+          let* () =
+            Animation.display_progress
+              ~pp_print_step:(fun fmt i ->
+                Format.fprintf
+                  fmt
+                  "Copying cemented blocks and populating indexes: %d/%d cycles"
+                  i
+                  nb_cycles)
+              ~progress_display_mode
+              (fun notify ->
+                (* Bound the number of copying threads *)
+                List.iter_es
+                  (fun ({start_level; end_level; file} as cemented_file) ->
+                    let* () =
+                      Cemented_block_store.iter_cemented_file
+                        (fun block ->
+                          let hash = Block_repr.hash block in
+                          let level = Block_repr.level block in
+                          Cemented_block_level_index.replace
+                            fresh_level_index
+                            hash
+                            level ;
+                          Cemented_block_hash_index.replace
+                            fresh_hash_index
+                            level
+                            hash ;
+                          Lwt.return_unit)
+                        cemented_file
+                    in
+                    let file_path = Naming.file_path file in
+                    let*! () =
+                      Exporter.copy_cemented_block
+                        snapshot_exporter
+                        ~file:file_path
+                        ~start_level
+                        ~end_level
+                    in
+                    let*! () = notify () in
+                    return_unit)
+                  files)
+          in
+          Cemented_block_level_index.close fresh_level_index ;
+          Cemented_block_hash_index.close fresh_hash_index ;
+          let*! () =
+            Exporter.clear_cemented_block_indexes_lockfiles snapshot_exporter
+          in
+          if should_filter_indexes && files <> [] then
+            Exporter.filter_cemented_block_indexes
+              snapshot_exporter
+              ~limit:
+                (List.last_opt files |> WithExceptions.Option.get ~loc:__LOC__)
+                  .end_level ;
+          return_unit)
+    in
+    let*! () = Event.(emit cemented_cycles_exported) () in
+    return_unit
 
   let write_floating_block fd (block : Block_repr.t) =
-    let bytes = Data_encoding.Binary.to_bytes_exn Block_repr.encoding block in
-    Lwt_utils_unix.write_bytes ~pos:0 ~len:(Bytes.length bytes) fd bytes
+    let open Lwt_result_syntax in
+    let* bytes =
+      match Data_encoding.Binary.to_bytes Block_repr.encoding block with
+      | Ok bytes -> return bytes
+      | Error error ->
+          tzfail
+            (Cannot_encode_floating_block {hash = Block_repr.hash block; error})
+    in
+    let*! () =
+      Lwt_utils_unix.write_bytes ~pos:0 ~len:(Bytes.length bytes) fd bytes
+    in
+    return_unit
 
   let export_floating_blocks ~floating_ro_fd ~floating_rw_fd ~export_block =
     let open Lwt_result_syntax in
@@ -2189,15 +1661,23 @@ module Make_snapshot_exporter (Exporter : EXPORTER) : Snapshot_exporter = struct
         (Inconsistent_floating_store
            (export_block_descr, (Block_repr.hash first_block, first_block_level)))
     else
+      (* [Done] is raised by [f] when the limit level is reached to
+         stop iteration, caught by the outer [Lwt.catch]. *)
       let exception Done in
+      let export_pred_level = Int32.sub (Store.Block.level export_block) 1l in
       let f block =
-        (* FIXME: we also write potential branches, it will eventually
-           be GCed *)
+        (* Blocks from alternative branches at or above the export
+           block level are skipped. Blocks below that level are
+           included even if from alternative branches. *)
         if Compare.Int32.(Block_repr.level block >= limit_level) then
           if Block_hash.equal limit_hash (Block_repr.hash block) then raise Done
           else return_unit
         else
-          let block = (* Prune everything  *) {block with metadata = None} in
+          let block =
+            (* Prune everything but the predecessor's metadata *)
+            if Block_repr.level block = export_pred_level then block
+            else {block with metadata = None}
+          in
           let*! () = bpush#push block in
           return_unit
       in
@@ -2226,6 +1706,7 @@ module Make_snapshot_exporter (Exporter : EXPORTER) : Snapshot_exporter = struct
   let export_protocols snapshot_exporter export_block all_protocol_levels
       protocol_store_dir progress_display_mode =
     let open Lwt_syntax in
+    let* () = Event.(emit exporting_protocols) () in
     let export_proto_level = Store.Block.proto_level export_block in
     (* Export only the protocols with a protocol level below the
        protocol's level of the targeted export block. *)
@@ -2290,14 +1771,17 @@ module Make_snapshot_exporter (Exporter : EXPORTER) : Snapshot_exporter = struct
         in
         Lwt.finalize
           (fun () -> copy_protocols ())
-          (fun () -> Lwt_unix.closedir dir_handle))
+          (fun () ->
+            let* () = Lwt_unix.closedir dir_handle in
+            Event.(emit protocols_exported) ()))
 
   (* Ensures that the data needed to export the snapshot from the target
      block is available:
      - the target_block is not the genesis
      - the target_block and its predecessor are known
      - the context of the predecessor of the target_block must be known
-     - at least max_op_ttl(target_block) headers must be available
+     - at least max_op_ttl(target_block) headers must be available for the
+       predecessor of the target
   *)
   let check_export_block_validity chain_store block =
     let open Lwt_result_syntax in
@@ -2349,8 +1833,8 @@ module Make_snapshot_exporter (Exporter : EXPORTER) : Snapshot_exporter = struct
           savepoint_level > Int32.pred block_level && not pred_context_exists)
         (Invalid_export_block {block = Some block_hash; reason = `Pruned_pred})
     in
-    let* block_metadata =
-      let*! o = Store.Block.get_block_metadata_opt chain_store block in
+    let* pred_block_metadata =
+      let*! o = Store.Block.get_block_metadata_opt chain_store pred_block in
       match o with
       | None ->
           tzfail
@@ -2359,13 +1843,15 @@ module Make_snapshot_exporter (Exporter : EXPORTER) : Snapshot_exporter = struct
     in
     let*! _, caboose_level = Store.Chain.caboose chain_store in
     (* We will need the following blocks
-       [ (target_block - max_op_ttl(target_block)) ; ... ; target_block ] *)
-    let block_max_op_ttl = Store.Block.max_operations_ttl block_metadata in
+       [ (pred(target_block) - max_op_ttl(target_block)) ; ... ; pred(target_block) ] *)
+    let block_max_op_ttl = Store.Block.max_operations_ttl pred_block_metadata in
     let*! genesis_block = Store.Chain.genesis_block chain_store in
     let genesis_level = Store.Block.level genesis_block in
     let minimum_level_needed =
       Compare.Int32.(
-        max genesis_level Int32.(sub block_level (of_int block_max_op_ttl)))
+        max
+          genesis_level
+          Int32.(sub (sub block_level 1l) (of_int block_max_op_ttl)))
     in
     let* () =
       fail_when
@@ -2376,10 +1862,10 @@ module Make_snapshot_exporter (Exporter : EXPORTER) : Snapshot_exporter = struct
     return (pred_block, minimum_level_needed)
 
   (* Retrieves the block to export based on given block "as hint". As
-     the checkpoint is provided as a default value, we must ensure that
-     it is valid. It may be not the case when the checkpoint was set in
-     the future. In this particular case, the last allowed fork level of
-     the current head is chosen. *)
+     the checkpoint is provided as a default value, we must ensure
+     that it is valid. It may be not the case when the checkpoint was
+     set in the future. In this particular case, the last preserved
+     block level of the current head is chosen. *)
   let retrieve_export_block chain_store block =
     let open Lwt_result_syntax in
     let* export_block =
@@ -2406,6 +1892,23 @@ module Make_snapshot_exporter (Exporter : EXPORTER) : Snapshot_exporter = struct
     in
     return (export_block, pred_block, minimum_level_needed)
 
+  let retrieve_floating_block_list chain_store ~from_block ~to_block =
+    let open Lwt_result_syntax in
+    (* Invariant: the list of blocks returned by the
+       [Store.Chain_traversal.path] contains metadata for the block target and
+       its predecessor as the metadata were read during the early steps of the
+       snapshot export and are stored in the cache. Having metadata for theses
+       blocks is mandatory. *)
+    let*! o = Store.Chain_traversal.path chain_store ~from_block ~to_block in
+    match o with
+    | None -> tzfail Cannot_retrieve_block_interval
+    | Some floating_blocks ->
+        (* Don't forget to add the first block as
+           [Chain_traversal.path] does not include the lower-bound
+           block *)
+        let floating_blocks = from_block :: floating_blocks in
+        return_some floating_blocks
+
   (* Returns the list of cemented files to export and an optional list
      of remaining blocks. If the export block is cemented, we need to cut
      the cycle containing the export block accordingly and retrieve the
@@ -2416,7 +1919,7 @@ module Make_snapshot_exporter (Exporter : EXPORTER) : Snapshot_exporter = struct
     let* o = Cemented_block_store.load_table src_cemented_dir in
     match o with
     | None -> return ([], None)
-    | Some table_arr -> (
+    | Some table_arr ->
         let table_len = Array.length table_arr in
         let table = Array.to_list table_arr in
         (* Check whether the export_block is in the cemented blocks *)
@@ -2450,9 +1953,82 @@ module Make_snapshot_exporter (Exporter : EXPORTER) : Snapshot_exporter = struct
             let extra_cycle =
               List.hd extra_cycles |> WithExceptions.Option.get ~loc:__LOC__
             in
-            (* If the export block is the last block in cycle, append the cycle *)
+            (* If the export block is the last block of the extra_cycle, we need
+               to put the complete extra_cycle in the floating store to ensure
+               block metadata. *)
             if Compare.Int32.(export_block_level = extra_cycle.end_level) then
-              return (filtered_table @ [extra_cycle], Some [])
+              let block_store = Store.Unsafe.get_block_store chain_store in
+              let cemented_store =
+                Block_store.cemented_block_store block_store
+              in
+              let* from_block =
+                let* res =
+                  Cemented_block_store.get_cemented_block_by_level
+                    ~read_metadata:true
+                    cemented_store
+                    extra_cycle.start_level
+                in
+                match res with
+                | Some block -> Store.Unsafe.block_of_repr block |> return
+                | None -> tzfail Cannot_retrieve_block_interval
+              in
+              let* to_block =
+                let* res =
+                  Cemented_block_store.get_cemented_block_by_level
+                    ~read_metadata:true
+                    cemented_store
+                    extra_cycle.end_level
+                in
+                match res with
+                | Some block -> Store.Unsafe.block_of_repr block |> return
+                | None -> tzfail Cannot_retrieve_block_interval
+              in
+              let* floating_blocks =
+                retrieve_floating_block_list chain_store ~from_block ~to_block
+              in
+              return (filtered_table, floating_blocks)
+            else if Compare.Int32.(export_block_level = extra_cycle.start_level)
+            then
+              (* When the export level is set to the very first block of a
+                 cycle, it's preceding block (that needs to be exported with
+                 metadata) is stored in the preceding cycle -- without metadata.
+                 To handle that, the two last cycles are stored in the floating
+                 store of the exported snapshot. *)
+              let block_store = Store.Unsafe.get_block_store chain_store in
+              let cemented_store =
+                Block_store.cemented_block_store block_store
+              in
+              let last_filtered_cycle, remaining_filtered_cycles =
+                match List.rev filtered_table with
+                | hd :: tl -> (hd, tl)
+                | [] -> (* Invariant: the table is not empty here*) assert false
+              in
+              let* from_block =
+                let* res =
+                  Cemented_block_store.get_cemented_block_by_level
+                    ~read_metadata:true
+                    cemented_store
+                    last_filtered_cycle.start_level
+                in
+                match res with
+                | Some block -> Store.Unsafe.block_of_repr block |> return
+                | None -> tzfail Cannot_retrieve_block_interval
+              in
+              let* to_block =
+                let* res =
+                  Cemented_block_store.get_cemented_block_by_level
+                    ~read_metadata:true
+                    cemented_store
+                    export_block_level
+                in
+                match res with
+                | Some block -> Store.Unsafe.block_of_repr block |> return
+                | None -> tzfail Cannot_retrieve_block_interval
+              in
+              let* floating_blocks =
+                retrieve_floating_block_list chain_store ~from_block ~to_block
+              in
+              return (remaining_filtered_cycles, floating_blocks)
             else
               let* first_block =
                 let* first_block_in_cycle =
@@ -2460,31 +2036,26 @@ module Make_snapshot_exporter (Exporter : EXPORTER) : Snapshot_exporter = struct
                     chain_store
                     extra_cycle.start_level
                 in
-                (* TODO explain this... *)
+                (* When cycles are short (e.g. in sandboxed mode), the extra
+                   cycle's start level may exceed the export block level,
+                   meaning more blocks live in the floating store than in
+                   cemented. In that case, fall back to the caboose as the
+                   starting point for floating block retrieval. *)
                 if
                   Compare.Int32.(
                     Store.Block.level first_block_in_cycle > export_block_level)
                 then
-                  (* When the cycles are short, we may keep more blocks in the
-                     floating store than in cemented *)
                   let*! _, caboose_level = Store.Chain.caboose chain_store in
                   Store.Block.read_block_by_level chain_store caboose_level
                 else return first_block_in_cycle
               in
-              let*! o =
-                Store.Chain_traversal.path
+              let* floating_blocks =
+                retrieve_floating_block_list
                   chain_store
                   ~from_block:first_block
                   ~to_block:export_block
               in
-              match o with
-              | None -> tzfail Cannot_retrieve_block_interval
-              | Some floating_blocks ->
-                  (* Don't forget to add the first block as
-                     [Chain_traversal.path] does not include the lower-bound
-                     block *)
-                  let floating_blocks = first_block :: floating_blocks in
-                  return (filtered_table, Some floating_blocks))
+              return (filtered_table, floating_blocks)
 
   (* Ensures that the history mode requested to export is compatible
      with the current storage. *)
@@ -2498,40 +2069,57 @@ module Make_snapshot_exporter (Exporter : EXPORTER) : Snapshot_exporter = struct
 
   let export_floating_block_stream snapshot_exporter floating_block_stream
       progress_display_mode =
-    let open Lwt_syntax in
+    let open Lwt_result_syntax in
+    let*! () = Event.(emit exporting_floating_blocks) () in
     let f fd =
-      let* is_empty = Lwt_stream.is_empty floating_block_stream in
-      if is_empty then Lwt.return_unit
+      let*! is_empty = Lwt_stream.is_empty floating_block_stream in
+      if is_empty then return_unit
       else
         Animation.display_progress
           ~every:10
           ~pp_print_step:(fun fmt i ->
             Format.fprintf fmt "Copying floating blocks: %d blocks copied" i)
           (fun notify ->
-            Lwt_stream.iter_s
-              (fun b ->
-                let* () = write_floating_block fd b in
-                notify ())
-              floating_block_stream)
+            let rec loop () =
+              let*! next = Lwt_stream.get floating_block_stream in
+              match next with
+              | None -> return_unit
+              | Some b ->
+                  let* () = write_floating_block fd b in
+                  let*! () = notify () in
+                  loop ()
+            in
+            loop ())
           ~progress_display_mode
     in
     let* () = Exporter.write_floating_blocks snapshot_exporter ~f in
-    return_ok_unit
+    let*! () = Event.(emit floating_blocks_exported) () in
+    return_unit
 
-  let export_context snapshot_exporter ~context_dir context_hash =
+  let export_context snapshot_exporter ~data_dir context_hash =
     let open Lwt_result_syntax in
-    let*! context_index = Context.init ~readonly:true context_dir in
-    let is_gc_allowed = Context.is_gc_allowed context_index in
-    if not is_gc_allowed then tzfail Cannot_export_snapshot_format
-    else
-      Animation.three_dots ~progress_display_mode:Auto ~msg:"Exporting context"
-      @@ fun () ->
-      Lwt.finalize
-        (fun () ->
-          Exporter.export_context snapshot_exporter context_index context_hash)
-        (fun () -> Context.close context_index)
+    let*! () = Event.(emit exporting_context) () in
+    let* context_index =
+      Context_ops.init ~kind:`Disk ~readonly:true ~data_dir ()
+    in
+    (* Is it the right test? *)
+    let is_gc_allowed = Context_ops.is_gc_allowed context_index in
+    let* () =
+      if not is_gc_allowed then tzfail Cannot_export_snapshot_format
+      else
+        Animation.three_dots
+          ~progress_display_mode:Auto
+          ~msg:"Exporting context"
+        @@ fun () ->
+        Lwt.finalize
+          (fun () ->
+            Exporter.export_context snapshot_exporter context_index context_hash)
+          (fun () -> Context_ops.close context_index)
+    in
+    let*! () = Event.(emit context_exported) () in
+    return_unit
 
-  let export_rolling snapshot_exporter ~store_dir ~context_dir ~block ~rolling
+  let export_rolling snapshot_exporter ~store_dir ~data_dir ~block ~rolling
       genesis =
     let open Lwt_result_syntax in
     let export_rolling_f chain_store =
@@ -2572,10 +2160,17 @@ module Make_snapshot_exporter (Exporter : EXPORTER) : Snapshot_exporter = struct
       in
       (* Prune all blocks except for the export_block's predecessor *)
       let floating_block_stream =
+        let export_pred_level = Int32.sub (Store.Block.level export_block) 1l in
         Lwt_stream.of_list
           (List.filter_map
              (fun b ->
-               Some {(Store.Unsafe.repr_of_block b) with metadata = None})
+               if Store.Block.level b = export_pred_level then (
+                 let b = Store.Unsafe.repr_of_block b in
+                 (* Enforce metadata in predecessor's block. The invariant might
+                    be broken in case of Store cache issue. *)
+                 assert (Option.is_some (Block_repr.metadata b)) ;
+                 Some b)
+               else Some {(Store.Unsafe.repr_of_block b) with metadata = None})
              floating_blocks)
       in
       (* Protocols *)
@@ -2597,17 +2192,21 @@ module Make_snapshot_exporter (Exporter : EXPORTER) : Snapshot_exporter = struct
       let* resulting_context_hash =
         Store.Block.resulting_context_hash chain_store export_block
       in
+      let* pred_block_metadata =
+        Store.Block.get_block_metadata chain_store pred_block
+      in
+      let pred_max_operations_ttl =
+        Store.Block.max_operations_ttl pred_block_metadata
+      in
       let* () =
-        export_context
-          snapshot_exporter
-          ~context_dir
-          pred_resulting_context_hash
+        export_context snapshot_exporter ~data_dir pred_resulting_context_hash
       in
       return
         ( export_mode,
           export_block,
           resulting_context_hash,
           pred_block,
+          pred_max_operations_ttl,
           protocol_levels,
           (return_unit, floating_block_stream) )
     in
@@ -2615,11 +2214,12 @@ module Make_snapshot_exporter (Exporter : EXPORTER) : Snapshot_exporter = struct
            export_block,
            resulting_context_hash,
            pred_block,
+           pred_max_operations_ttl,
            protocol_levels,
            (return_unit, floating_block_stream) ) =
       Store.Unsafe.open_for_snapshot_export
         ~store_dir
-        ~context_dir
+        ~data_dir
         genesis
         ~locked_f:export_rolling_f
     in
@@ -2628,10 +2228,11 @@ module Make_snapshot_exporter (Exporter : EXPORTER) : Snapshot_exporter = struct
         export_block,
         resulting_context_hash,
         pred_block,
+        pred_max_operations_ttl,
         protocol_levels,
         (return_unit, floating_block_stream) )
 
-  let export_full snapshot_exporter ~store_dir ~context_dir ~block ~rolling
+  let export_full snapshot_exporter ~store_dir ~data_dir ~block ~rolling
       ~progress_display_mode genesis =
     let open Lwt_result_syntax in
     let export_full_f chain_store =
@@ -2700,10 +2301,16 @@ module Make_snapshot_exporter (Exporter : EXPORTER) : Snapshot_exporter = struct
           let* resulting_context_hash =
             Store.Block.resulting_context_hash chain_store export_block
           in
+          let* pred_block_metadata =
+            Store.Block.get_block_metadata chain_store pred_block
+          in
+          let pred_max_operations_ttl =
+            Store.Block.max_operations_ttl pred_block_metadata
+          in
           let* () =
             export_context
               snapshot_exporter
-              ~context_dir
+              ~data_dir
               pred_resulting_context_hash
           in
           return
@@ -2711,6 +2318,7 @@ module Make_snapshot_exporter (Exporter : EXPORTER) : Snapshot_exporter = struct
               export_block,
               resulting_context_hash,
               pred_block,
+              pred_max_operations_ttl,
               protocol_levels,
               cemented_table,
               (ro_fd, rw_fd),
@@ -2723,8 +2331,9 @@ module Make_snapshot_exporter (Exporter : EXPORTER) : Snapshot_exporter = struct
     in
     let* ( export_mode,
            export_block,
-           pred_block,
            pred_resulting_context,
+           pred_block,
+           pred_max_operations_ttl,
            protocol_levels,
            cemented_table,
            (floating_ro_fd, floating_rw_fd),
@@ -2732,7 +2341,7 @@ module Make_snapshot_exporter (Exporter : EXPORTER) : Snapshot_exporter = struct
            should_filter_indexes ) =
       Store.Unsafe.open_for_snapshot_export
         ~store_dir
-        ~context_dir
+        ~data_dir
         genesis
         ~locked_f:export_full_f
     in
@@ -2770,8 +2379,9 @@ module Make_snapshot_exporter (Exporter : EXPORTER) : Snapshot_exporter = struct
     return
       ( export_mode,
         export_block,
-        pred_block,
         pred_resulting_context,
+        pred_block,
+        pred_max_operations_ttl,
         protocol_levels,
         (reading_thread, floating_block_stream) )
 
@@ -2786,7 +2396,7 @@ module Make_snapshot_exporter (Exporter : EXPORTER) : Snapshot_exporter = struct
         tzfail
           (Invalid_chain_store_export (chain_id, Naming.dir_path store_dir))
 
-  let export ?snapshot_path ?(rolling = false) ~block ~store_dir ~context_dir
+  let export ?snapshot_path ?(rolling = false) ~block ~store_dir ~data_dir
       ~chain_name ~progress_display_mode genesis =
     let open Lwt_result_syntax in
     let chain_id = Chain_id.of_block_hash genesis.Genesis.block in
@@ -2805,13 +2415,14 @@ module Make_snapshot_exporter (Exporter : EXPORTER) : Snapshot_exporter = struct
                  export_block,
                  resulting_context_hash,
                  pred_block,
+                 predecessor_max_operations_ttl,
                  protocol_levels,
                  (reading_thread, floating_block_stream) ) =
             if rolling then
               export_rolling
                 snapshot_exporter
                 ~store_dir
-                ~context_dir
+                ~data_dir
                 ~block
                 ~rolling
                 genesis
@@ -2819,7 +2430,7 @@ module Make_snapshot_exporter (Exporter : EXPORTER) : Snapshot_exporter = struct
               export_full
                 snapshot_exporter
                 ~store_dir
-                ~context_dir
+                ~data_dir
                 ~block
                 ~rolling
                 ~progress_display_mode
@@ -2833,10 +2444,11 @@ module Make_snapshot_exporter (Exporter : EXPORTER) : Snapshot_exporter = struct
           let predecessor_ops_metadata_hash =
             Store.Block.all_operations_metadata_hash pred_block
           in
-          let*! () =
+          let* () =
             Exporter.write_block_data
               snapshot_exporter
               ~predecessor_header:(Store.Block.header pred_block)
+              ~predecessor_max_operations_ttl
               ~predecessor_block_metadata_hash
               ~predecessor_ops_metadata_hash
               ~export_block
@@ -2910,29 +2522,18 @@ module Raw_loader : LOADER = struct
     in
     Snapshot_metadata.read_metadata ~metadata_file
 
-  let load_snapshot_legacy_metadata t =
-    let metadata_file =
-      Naming.(snapshot_metadata_file t.snapshot_dir |> file_path)
-    in
-    Snapshot_metadata.read_legacy_metadata ~metadata_file
-
   let load_snapshot_header t =
     let open Lwt_result_syntax in
     let* version = load_snapshot_version t in
-    let* is_legacy = Version.is_legacy version in
-    if is_legacy then
-      let* legacy_metadata = load_snapshot_legacy_metadata t in
-      return (Snapshot_header.Legacy (version, legacy_metadata))
-    else
-      let* metadata = load_snapshot_metadata t in
-      return (Snapshot_header.Current (version, metadata))
+    let* metadata = load_snapshot_metadata t in
+    return (Snapshot_header.Current (version, metadata))
 
   let close _ = Lwt.return_unit
 end
 
 module Tar_loader : LOADER = struct
   type t = {
-    tar : Onthefly.i;
+    tar : Octez_tar_helpers.i;
     snapshot_file : [`Snapshot_file] Naming.file;
     snapshot_tar : [`Tar_archive] Naming.directory;
   }
@@ -2948,17 +2549,19 @@ module Tar_loader : LOADER = struct
         ~snapshot_filename:(Filename.basename snapshot_path)
         snapshot_dir
     in
-    let* tar = Onthefly.open_in ~file:(Naming.file_path snapshot_file) in
+    let* tar =
+      Octez_tar_helpers.open_in ~file:(Naming.file_path snapshot_file)
+    in
     Lwt.return {tar; snapshot_file; snapshot_tar}
 
   let load_snapshot_version t =
     let open Lwt_result_syntax in
     let filename = Naming.(snapshot_version_file t.snapshot_tar |> file_path) in
     let*! o =
-      let*! o = Onthefly.find_file t.tar ~filename in
+      let*! o = Octez_tar_helpers.find_file t.tar ~filename in
       match o with
       | Some file -> (
-          let*! str = Onthefly.load_file t.tar file in
+          let*! str = Octez_tar_helpers.load_file t.tar file in
           match Data_encoding.Json.from_string str with
           | Ok json ->
               Lwt.return_some
@@ -2976,10 +2579,10 @@ module Tar_loader : LOADER = struct
       Naming.(snapshot_metadata_file t.snapshot_tar |> file_path)
     in
     let*! o =
-      let*! o = Onthefly.find_file t.tar ~filename in
+      let*! o = Octez_tar_helpers.find_file t.tar ~filename in
       match o with
       | Some file -> (
-          let*! str = Onthefly.load_file t.tar file in
+          let*! str = Octez_tar_helpers.load_file t.tar file in
           match Data_encoding.Json.from_string str with
           | Ok json ->
               Lwt.return_some
@@ -2993,41 +2596,13 @@ module Tar_loader : LOADER = struct
     | Some metadata -> return metadata
     | None -> tzfail (Cannot_read {kind = `Metadata; path = filename})
 
-  let load_snapshot_legacy_metadata t =
-    let open Lwt_result_syntax in
-    let filename =
-      Naming.(snapshot_metadata_file t.snapshot_tar |> file_path)
-    in
-    let*! o =
-      let*! o = Onthefly.find_file t.tar ~filename in
-      match o with
-      | Some file -> (
-          let*! str = Onthefly.load_file t.tar file in
-          match Data_encoding.Json.from_string str with
-          | Ok json ->
-              Lwt.return_some
-                (Data_encoding.Json.destruct
-                   Snapshot_metadata.legacy_metadata_encoding
-                   json)
-          | Error _ -> Lwt.return_none)
-      | None -> Lwt.return_none
-    in
-    match o with
-    | Some metadata -> return metadata
-    | None -> tzfail (Cannot_read {kind = `Metadata; path = filename})
-
   let load_snapshot_header t =
     let open Lwt_result_syntax in
     let* version = load_snapshot_version t in
-    let* is_legacy = Version.is_legacy version in
-    if is_legacy then
-      let* legacy_metadata = load_snapshot_legacy_metadata t in
-      return (Snapshot_header.Legacy (version, legacy_metadata))
-    else
-      let* metadata = load_snapshot_metadata t in
-      return (Snapshot_header.Current (version, metadata))
+    let* metadata = load_snapshot_metadata t in
+    return (Snapshot_header.Current (version, metadata))
 
-  let close t = Onthefly.close_in t.tar
+  let close t = Octez_tar_helpers.close_in t.tar
 end
 
 module type Snapshot_loader = sig
@@ -3047,19 +2622,20 @@ module Make_snapshot_loader (Loader : LOADER) : Snapshot_loader = struct
   let load_snapshot_header ~snapshot_path =
     let open Lwt_syntax in
     let* loader = load snapshot_path in
-    trace (Wrong_snapshot_file {filename = snapshot_path})
-    @@ protect
-         (fun () ->
-           Lwt.finalize
-             (fun () -> Loader.load_snapshot_header loader)
-             (fun () -> close loader))
-         ~on_error:(fun err ->
-           let* () = close loader in
-           Lwt.return_error err)
+    protect
+      (fun () ->
+        Lwt.finalize
+          (fun () -> Loader.load_snapshot_header loader)
+          (fun () -> close loader))
+      ~on_error:(fun err ->
+        let* () = close loader in
+        Lwt.return_error err)
 end
 
 module type IMPORTER = sig
   type t
+
+  val format : snapshot_format
 
   val init :
     snapshot_path:string ->
@@ -3073,15 +2649,7 @@ module type IMPORTER = sig
 
   val load_block_data : t -> block_data tzresult Lwt.t
 
-  val restore_context : t -> dst_context_dir:string -> unit tzresult Lwt.t
-
-  val legacy_restore_context :
-    t ->
-    Context.index ->
-    expected_context_hash:Context_hash.t ->
-    nb_context_elements:int ->
-    progress_display_mode:Animation.progress_display_mode ->
-    unit tzresult Lwt.t
+  val restore_context : t -> dst_data_dir:string -> unit tzresult Lwt.t
 
   val load_protocol_table :
     t -> Protocol_levels.protocol_info Protocol_levels.t tzresult Lwt.t
@@ -3092,7 +2660,7 @@ module type IMPORTER = sig
   val copy_and_validate_protocol :
     t -> protocol_hash:Protocol_hash.t -> (unit, error trace) result Lwt.t
 
-  val restore_cemented_indexes : t -> unit Lwt.t
+  val restore_cemented_indexes : t -> unit tzresult Lwt.t
 
   val load_cemented_files : t -> string list tzresult Lwt.t
 
@@ -3118,6 +2686,8 @@ module Raw_importer : IMPORTER = struct
     dst_store_dir : [`Store_dir] Naming.directory;
     dst_chain_dir : [`Chain_dir] Naming.directory;
   }
+
+  let format = Raw
 
   let load_snapshot_header ~snapshot_path =
     let (module Loader) =
@@ -3160,89 +2730,24 @@ module Raw_importer : IMPORTER = struct
     match Data_encoding.Binary.of_string_opt block_data_encoding block_data with
     | Some block_data -> return block_data
     | None -> (
-        let* is_legacy = Version.is_legacy t.version in
-        let* res =
-          if is_legacy then
-            Data_encoding.Binary.of_string_opt
-              legacy_block_data_encoding
-              block_data
-            |> Option.map
-                 (fun
-                   {
-                     block_header;
-                     operations;
-                     predecessor_header;
-                     predecessor_block_metadata_hash;
-                     predecessor_ops_metadata_hash;
-                   }
-                 ->
-                   {
-                     block_header;
-                     operations;
-                     predecessor_header;
-                     predecessor_block_metadata_hash;
-                     predecessor_ops_metadata_hash;
-                     resulting_context_hash = Context_hash.zero;
-                   })
-            |> return
-          else
-            return
-            @@ Data_encoding.Binary.of_string_opt block_data_encoding block_data
+        let res =
+          Data_encoding.Binary.of_string_opt block_data_encoding block_data
         in
         match res with
         | Some v -> return v
         | None -> tzfail (Cannot_read {kind = `Block_data; path = file}))
 
-  let restore_context t ~dst_context_dir =
+  let restore_context t ~dst_data_dir =
     let open Lwt_result_syntax in
     let context_file_path =
       Naming.(snapshot_context_file t.snapshot_dir |> file_path)
     in
-    let*! () = Lwt_utils_unix.copy_dir context_file_path dst_context_dir in
+    let*! () =
+      Lwt_utils_unix.copy_dir
+        context_file_path
+        (Tezos_context_ops.Context_ops.context_dir dst_data_dir)
+    in
     return_unit
-
-  let legacy_restore_context t context_index ~expected_context_hash
-      ~nb_context_elements ~progress_display_mode =
-    let open Lwt_result_syntax in
-    let context_file_path =
-      Naming.(snapshot_context_file t.snapshot_dir |> file_path)
-    in
-    let* fd =
-      Lwt.catch
-        (fun () ->
-          let*! fd =
-            Lwt_unix.openfile
-              context_file_path
-              Lwt_unix.[O_RDONLY]
-              snapshot_ro_file_perm
-          in
-          return fd)
-        (function
-          | Unix.Unix_error (e, _, _) ->
-              tzfail (Context.Cannot_open_file (Unix.error_message e))
-          | exc ->
-              let msg =
-                Printf.sprintf "unknown error: %s" (Printexc.to_string exc)
-              in
-              tzfail (Context.Cannot_open_file msg))
-    in
-    Lwt.finalize
-      (fun () ->
-        let* () =
-          Context.restore_context
-            context_index
-            ~expected_context_hash
-            ~fd
-            ~nb_context_elements
-            ~in_memory:false
-            ~progress_display_mode
-        in
-        let*! current = Lwt_unix.lseek fd 0 Lwt_unix.SEEK_CUR in
-        let*! stats = Lwt_unix.fstat fd in
-        let total = stats.Lwt_unix.st_size in
-        if current = total then return_unit
-        else tzfail (Context.Suspicious_file (total - current)))
-      (fun () -> Lwt_unix.close fd)
 
   let load_protocol_table t =
     let open Lwt_result_syntax in
@@ -3251,37 +2756,8 @@ module Raw_importer : IMPORTER = struct
     in
     let*! table_bytes = Lwt_utils_unix.read_file protocol_tbl_filename in
     let* res =
-      let* is_legacy = Version.is_legacy t.version in
-      if is_legacy then
-        (* Use the legacy encoding *)
-        match
-          Data_encoding.Binary.of_string_opt
-            Protocol_levels.Legacy.encoding
-            table_bytes
-        with
-        | Some table ->
-            let* res =
-              Protocol_levels.Legacy.fold_es
-                (fun proto_level activation_block map ->
-                  let protocol_info =
-                    {
-                      Protocol_levels.protocol =
-                        activation_block.Protocol_levels.Legacy.protocol;
-                      activation_block = activation_block.block;
-                      (* Only snapshot with legacy semantics will have
-                         legacy encoding. *)
-                      expect_predecessor_context = false;
-                    }
-                  in
-                  return (Protocol_levels.add proto_level protocol_info map))
-                table
-                Protocol_levels.empty
-            in
-            return_some res
-        | None -> return_none
-      else
-        Data_encoding.Binary.of_string_opt Protocol_levels.encoding table_bytes
-        |> return
+      Data_encoding.Binary.of_string_opt Protocol_levels.encoding table_bytes
+      |> return
     in
     match res with
     | Some v -> return v
@@ -3332,7 +2808,7 @@ module Raw_importer : IMPORTER = struct
         (Naming.dir_path t.dst_protocol_dir)
         (Protocol_hash.to_b58check protocol_hash)
     in
-    let*! () = Lwt_utils_unix.copy_file ~src ~dst in
+    let*! () = Lwt_utils_unix.copy_file ~src ~dst () in
     let*! protocol_sources = Lwt_utils_unix.read_file dst in
     match Protocol.of_string protocol_sources with
     | None -> tzfail (Cannot_decode_protocol protocol_hash)
@@ -3343,7 +2819,7 @@ module Raw_importer : IMPORTER = struct
           (Inconsistent_protocol_hash {expected = protocol_hash; got = hash})
 
   let restore_cemented_indexes t =
-    let open Lwt_syntax in
+    let open Lwt_result_syntax in
     let src_level_dir =
       Naming.(
         cemented_blocks_level_index_dir t.snapshot_cemented_dir |> dir_path)
@@ -3352,7 +2828,7 @@ module Raw_importer : IMPORTER = struct
       Naming.(
         cemented_blocks_hash_index_dir t.snapshot_cemented_dir |> dir_path)
     in
-    let* () =
+    let*! () =
       if Sys.file_exists src_level_dir then
         Lwt_utils_unix.copy_dir
           src_level_dir
@@ -3360,11 +2836,14 @@ module Raw_importer : IMPORTER = struct
             cemented_blocks_level_index_dir t.dst_cemented_dir |> dir_path)
       else Lwt.return_unit
     in
-    if Sys.file_exists src_hash_dir then
-      Lwt_utils_unix.copy_dir
-        src_hash_dir
-        Naming.(cemented_blocks_hash_index_dir t.dst_cemented_dir |> dir_path)
-    else Lwt.return_unit
+    let*! () =
+      if Sys.file_exists src_hash_dir then
+        Lwt_utils_unix.copy_dir
+          src_hash_dir
+          Naming.(cemented_blocks_hash_index_dir t.dst_cemented_dir |> dir_path)
+      else Lwt.return_unit
+    in
+    return_unit
 
   let load_cemented_files t =
     let open Lwt_result_syntax in
@@ -3399,11 +2878,17 @@ module Raw_importer : IMPORTER = struct
       files
 
   let restore_cemented_cycle t ~file =
-    let open Lwt_syntax in
+    let open Lwt_result_syntax in
     let src = Filename.concat (Naming.dir_path t.snapshot_cemented_dir) file in
     let dst = Filename.concat (Naming.dir_path t.dst_cemented_dir) file in
-    let* () = Lwt_utils_unix.copy_file ~src ~dst in
-    return_ok_unit
+    let*! () =
+      Lwt_utils_unix.copy_file_raw
+        ~buffer_size:cemented_buffer_size
+        ~src
+        ~dst
+        ()
+    in
+    return_unit
 
   let restore_floating_blocks t genesis_hash =
     let open Lwt_result_syntax in
@@ -3458,10 +2943,12 @@ module Tar_importer : IMPORTER = struct
     dst_chain_dir : [`Chain_dir] Naming.directory;
     dst_cemented_dir : [`Cemented_blocks_dir] Naming.directory;
     dst_protocol_dir : [`Protocol_dir] Naming.directory;
-    tar : Onthefly.i;
+    tar : Octez_tar_helpers.i;
     (* Store the files of the archive to avoid re-reading them *)
-    files : Onthefly.file list;
+    files : Octez_tar_helpers.file list;
   }
+
+  let format = Tar
 
   let load_snapshot_header ~snapshot_path =
     let (module Loader) =
@@ -3493,8 +2980,10 @@ module Tar_importer : IMPORTER = struct
     let* snapshot_header =
       load_snapshot_header ~snapshot_path:(snapshot_file |> Naming.(file_path))
     in
-    let*! tar = Onthefly.open_in ~file:(Naming.file_path snapshot_file) in
-    let*! files = Onthefly.list_files tar in
+    let*! tar =
+      Octez_tar_helpers.open_in ~file:(Naming.file_path snapshot_file)
+    in
+    let*! files = Octez_tar_helpers.list_files tar in
     return
       {
         version = Snapshot_header.get_version snapshot_header;
@@ -3515,79 +3004,63 @@ module Tar_importer : IMPORTER = struct
     let filename =
       Naming.(snapshot_block_data_file t.snapshot_tar |> file_path)
     in
-    let*! o = Onthefly.load_from_filename t.tar ~filename in
+    let*! o = Octez_tar_helpers.load_from_filename t.tar ~filename in
     match o with
-    | Some str -> (
-        let* is_legacy = Version.is_legacy t.version in
-        let* res =
-          if is_legacy then
-            Data_encoding.Binary.of_string_opt legacy_block_data_encoding str
-            |> Option.map
-                 (fun
-                   {
-                     block_header;
-                     operations;
-                     predecessor_header;
-                     predecessor_block_metadata_hash;
-                     predecessor_ops_metadata_hash;
-                   }
-                 ->
-                   {
-                     block_header;
-                     operations;
-                     predecessor_header;
-                     predecessor_block_metadata_hash;
-                     predecessor_ops_metadata_hash;
-                     resulting_context_hash = Context_hash.zero;
-                   })
-            |> return
-          else
-            return @@ Data_encoding.Binary.of_string_opt block_data_encoding str
+    | Some block_data -> (
+        let res =
+          Data_encoding.Binary.of_string_opt block_data_encoding block_data
         in
         match res with
         | Some v -> return v
         | None -> tzfail (Cannot_read {kind = `Block_data; path = filename}))
     | None -> tzfail (Cannot_read {kind = `Block_data; path = filename})
 
-  let restore_context t ~dst_context_dir =
+  let restore_context t ~dst_data_dir =
     let open Lwt_result_syntax in
-    let*! () = Lwt_unix.mkdir dst_context_dir snapshot_dir_perm in
-    let index = Filename.concat dst_context_dir "index" in
+    let*! () =
+      Lwt_unix.mkdir
+        (Tezos_context_ops.Context_ops.context_dir dst_data_dir)
+        snapshot_dir_perm
+    in
+    let index =
+      Filename.concat
+        (Tezos_context_ops.Context_ops.context_dir dst_data_dir)
+        "index"
+    in
     let*! () = Lwt_unix.mkdir index snapshot_dir_perm in
     let*! context_files =
-      Onthefly.find_files_with_common_path t.tar ~pattern:"context"
+      Octez_tar_helpers.find_files_with_common_path t.tar ~pattern:"context"
     in
-    let dst_dir = Filename.chop_suffix dst_context_dir "context" in
-    let*! () =
-      List.iter_s
+    let dst_dir = Tezos_context_ops.Context_ops.context_dir dst_data_dir in
+    let* () =
+      List.iter_es
         (fun file ->
-          let filename = Onthefly.get_filename file in
-          Onthefly.copy_to_file
-            t.tar
-            file
-            ~dst:Filename.(concat dst_dir filename))
+          let filename = Octez_tar_helpers.get_filename file in
+          (* The member name comes from the snapshot archive. Reject any name
+             that could resolve outside [dst_dir] before building the
+             destination. *)
+          if not (Octez_tar_helpers.member_name_is_safe filename) then
+            tzfail (Invalid_snapshot_member filename)
+          else
+            (* Remove context from the filename since we can
+               restore a brassaia context and would want to
+               store it in brassaia_context *)
+            let dst =
+              dst_dir
+              ^ (String.remove_prefix ~prefix:"context" filename
+                |> Option.value ~default:"")
+            in
+            let*! () =
+              Octez_tar_helpers.copy_to_file
+                t.tar
+                file
+                ~dst
+                ~buffer_size:cemented_buffer_size
+            in
+            return_unit)
         context_files
     in
     return_unit
-
-  let legacy_restore_context t context_index ~expected_context_hash
-      ~nb_context_elements ~progress_display_mode =
-    let open Lwt_result_syntax in
-    let filename = Naming.(snapshot_context_file t.snapshot_tar |> file_path) in
-    let* header =
-      let*! o = Onthefly.get_file t.tar ~filename in
-      match o with
-      | Some header -> return header
-      | None -> tzfail (Cannot_read {kind = `Context; path = filename})
-    in
-    let*! fd = Onthefly.read_raw t.tar header in
-    Context.restore_context
-      context_index
-      ~expected_context_hash
-      ~nb_context_elements
-      ~fd
-      ~in_memory:false
-      ~progress_display_mode
 
   let load_protocol_table t =
     let open Lwt_result_syntax in
@@ -3595,42 +3068,13 @@ module Tar_importer : IMPORTER = struct
       Naming.(snapshot_protocol_levels_file t.snapshot_tar |> encoded_file_path)
     in
     let*! o =
-      Onthefly.load_from_filename t.tar ~filename:protocol_tbl_filename
+      Octez_tar_helpers.load_from_filename t.tar ~filename:protocol_tbl_filename
     in
     match o with
     | Some str -> (
         let* res =
-          let* is_legacy = Version.is_legacy t.version in
-          if is_legacy then
-            (* Use the legacy encoding *)
-            match
-              Data_encoding.Binary.of_string_opt
-                Protocol_levels.Legacy.encoding
-                str
-            with
-            | Some table ->
-                let* res =
-                  Protocol_levels.Legacy.fold_es
-                    (fun proto_level activation_block map ->
-                      let protocol_info =
-                        {
-                          Protocol_levels.protocol =
-                            activation_block.Protocol_levels.Legacy.protocol;
-                          activation_block = activation_block.block;
-                          (* Only snapshot with legacy semantics will have
-                             legacy encoding. *)
-                          expect_predecessor_context = false;
-                        }
-                      in
-                      return (Protocol_levels.add proto_level protocol_info map))
-                    table
-                    Protocol_levels.empty
-                in
-                return_some res
-            | None -> return_none
-          else
-            Data_encoding.Binary.of_string_opt Protocol_levels.encoding str
-            |> return
+          Data_encoding.Binary.of_string_opt Protocol_levels.encoding str
+          |> return
         in
         match res with
         | Some v -> return v
@@ -3648,14 +3092,16 @@ module Tar_importer : IMPORTER = struct
       Naming.(snapshot_protocol_levels_file t.snapshot_tar |> encoded_file_path)
     in
     let*! protocol_dir_files =
-      Onthefly.find_files_with_common_path
+      Octez_tar_helpers.find_files_with_common_path
         t.tar
         ~pattern:Naming.(protocol_store_dir t.snapshot_tar |> dir_path)
     in
     let protocol_files =
       List.fold_left
         (fun acc file ->
-          let filename = Filename.basename (Onthefly.get_filename file) in
+          let filename =
+            Filename.basename (Octez_tar_helpers.get_filename file)
+          in
           if filename <> protocol_tbl_filename then filename :: acc else acc)
         []
         protocol_dir_files
@@ -3676,7 +3122,7 @@ module Tar_importer : IMPORTER = struct
           (Protocol_hash.to_b58check protocol_hash))
     in
     let* file =
-      let*! o = Onthefly.get_file t.tar ~filename:src in
+      let*! o = Octez_tar_helpers.get_file t.tar ~filename:src in
       match o with
       | Some file -> return file
       | None -> tzfail (Cannot_read {kind = `Protocol; path = src})
@@ -3687,7 +3133,13 @@ module Tar_importer : IMPORTER = struct
           (Naming.dir_path t.dst_protocol_dir)
           (Protocol_hash.to_b58check protocol_hash))
     in
-    let*! () = Onthefly.copy_to_file t.tar file ~dst in
+    let*! () =
+      Octez_tar_helpers.copy_to_file
+        t.tar
+        file
+        ~dst
+        ~buffer_size:cemented_buffer_size
+    in
     let*! protocol_sources = Lwt_utils_unix.read_file dst in
     match Protocol.of_string protocol_sources with
     | None -> tzfail (Cannot_decode_protocol protocol_hash)
@@ -3698,17 +3150,17 @@ module Tar_importer : IMPORTER = struct
           (Inconsistent_protocol_hash {expected = protocol_hash; got = hash})
 
   let restore_cemented_indexes t =
-    let open Lwt_syntax in
-    let* cbl =
-      Onthefly.find_files_with_common_path
+    let open Lwt_result_syntax in
+    let*! cbl =
+      Octez_tar_helpers.find_files_with_common_path
         t.tar
         ~pattern:
           Naming.(
             cemented_blocks_level_index_dir t.snapshot_cemented_blocks_dir
             |> dir_path)
     in
-    let* cbh =
-      Onthefly.find_files_with_common_path
+    let*! cbh =
+      Octez_tar_helpers.find_files_with_common_path
         t.tar
         ~pattern:
           Naming.(
@@ -3716,45 +3168,56 @@ module Tar_importer : IMPORTER = struct
             |> dir_path)
     in
     let cemented_indexes_paths = cbl @ cbh in
-    if cemented_indexes_paths <> [] then
-      let level_index_dir =
-        Naming.(cemented_blocks_level_index_dir t.dst_cemented_dir |> dir_path)
-      in
-      let hash_index_dir =
-        Naming.(cemented_blocks_hash_index_dir t.dst_cemented_dir |> dir_path)
-      in
-      let* () = Lwt_unix.mkdir level_index_dir snapshot_dir_perm in
-      let* () = Lwt_unix.mkdir hash_index_dir snapshot_dir_perm in
-      let* () =
-        Lwt_unix.mkdir
-          Filename.(concat level_index_dir "index")
-          snapshot_dir_perm
-      in
-      let* () =
-        Lwt_unix.mkdir
-          Filename.(concat hash_index_dir "index")
-          snapshot_dir_perm
-      in
-      List.iter_s
-        (fun file ->
-          Onthefly.copy_to_file
-            t.tar
-            file
-            ~dst:
-              (Filename.concat
-                 (Naming.dir_path t.dst_chain_dir)
-                 (Onthefly.get_filename file)))
-        cemented_indexes_paths
-    else Lwt.return_unit
+    match cemented_indexes_paths with
+    | [] -> return_unit
+    | _ ->
+        let level_index_dir =
+          Naming.(
+            cemented_blocks_level_index_dir t.dst_cemented_dir |> dir_path)
+        in
+        let hash_index_dir =
+          Naming.(cemented_blocks_hash_index_dir t.dst_cemented_dir |> dir_path)
+        in
+        let*! () = Lwt_unix.mkdir level_index_dir snapshot_dir_perm in
+        let*! () = Lwt_unix.mkdir hash_index_dir snapshot_dir_perm in
+        let*! () =
+          Lwt_unix.mkdir
+            Filename.(concat level_index_dir "index")
+            snapshot_dir_perm
+        in
+        let*! () =
+          Lwt_unix.mkdir
+            Filename.(concat hash_index_dir "index")
+            snapshot_dir_perm
+        in
+        List.iter_es
+          (fun file ->
+            let filename = Octez_tar_helpers.get_filename file in
+            (* The member name comes from the snapshot archive. Reject any name
+               that could resolve outside [dst_chain_dir] before building the
+               destination. *)
+            if not (Octez_tar_helpers.member_name_is_safe filename) then
+              tzfail (Invalid_snapshot_member filename)
+            else
+              let*! () =
+                Octez_tar_helpers.copy_to_file
+                  t.tar
+                  file
+                  ~dst:
+                    (Filename.concat (Naming.dir_path t.dst_chain_dir) filename)
+                  ~buffer_size:cemented_buffer_size
+              in
+              return_unit)
+          cemented_indexes_paths
 
   let load_cemented_files t =
     let open Lwt_syntax in
     let* cemented_files =
-      Onthefly.find_files_with_common_path t.tar ~pattern:"\\d+_\\d+"
+      Octez_tar_helpers.find_files_with_common_path t.tar ~pattern:"\\d+_\\d+"
     in
     return_ok
       (List.map
-         (fun file -> Filename.basename (Onthefly.get_filename file))
+         (fun file -> Filename.basename (Octez_tar_helpers.get_filename file))
          cemented_files)
 
   let restore_cemented_cycle t ~file =
@@ -3764,34 +3227,37 @@ module Tar_importer : IMPORTER = struct
         concat Naming.(cemented_blocks_dir t.snapshot_tar |> dir_path) file)
     in
     let* tar_file =
-      let*! o = Onthefly.get_file t.tar ~filename in
+      let*! o = Octez_tar_helpers.get_file t.tar ~filename in
       match o with
       | Some file -> return file
       | None -> tzfail (Cannot_read {kind = `Cemented_cycle; path = filename})
     in
     let*! () =
-      Onthefly.copy_to_file
+      Octez_tar_helpers.copy_to_file
         t.tar
         tar_file
         ~dst:
           (Filename.concat
              (Naming.dir_path t.dst_cemented_dir)
              (Filename.basename file))
+        ~buffer_size:cemented_buffer_size
     in
     return_unit
 
   let restore_floating_blocks t genesis_hash =
     let open Lwt_result_syntax in
     let*! o =
-      Onthefly.get_file
+      Octez_tar_helpers.get_file
         t.tar
         ~filename:
           Naming.(snapshot_floating_blocks_file t.snapshot_tar |> file_path)
     in
     match o with
     | Some floating_blocks_file ->
-        let file_size = Onthefly.get_file_size floating_blocks_file in
-        let floating_blocks_file_fd = Onthefly.get_raw_input_fd t.tar in
+        let file_size = Octez_tar_helpers.get_file_size floating_blocks_file in
+        let floating_blocks_file_fd =
+          Octez_tar_helpers.get_raw_input_fd t.tar
+        in
         let stream, bounded_push = Lwt_stream.create_bounded 1000 in
         let rec loop ?pred_block nb_bytes_left =
           if nb_bytes_left < 0L then tzfail Corrupted_floating_store
@@ -3810,7 +3276,7 @@ module Tar_importer : IMPORTER = struct
           Lwt.finalize
             (fun () ->
               let raw_data_ofs =
-                Onthefly.get_raw_file_ofs floating_blocks_file
+                Octez_tar_helpers.get_raw_file_ofs floating_blocks_file
               in
               let*! _ =
                 Lwt_unix.LargeFile.lseek
@@ -3826,7 +3292,7 @@ module Tar_importer : IMPORTER = struct
         return (reading_thread, stream)
     | None -> return (return_unit, Lwt_stream.of_list [])
 
-  let close t = Onthefly.close_in t.tar
+  let close t = Octez_tar_helpers.close_in t.tar
 end
 
 module type Snapshot_importer = sig
@@ -3835,12 +3301,12 @@ module type Snapshot_importer = sig
   val import :
     snapshot_path:string ->
     ?patch_context:
-      (Tezos_protocol_environment.Context.t ->
-      Tezos_protocol_environment.Context.t tzresult Lwt.t) ->
+      (Tezos_context_ops.Context_ops.t ->
+      Tezos_context_ops.Context_ops.t tzresult Lwt.t) ->
     ?block:Block_hash.t ->
     ?check_consistency:bool ->
     dst_store_dir:[`Store_dir] Naming.directory ->
-    dst_context_dir:string ->
+    dst_data_dir:string ->
     chain_name:Distributed_db_version.Name.t ->
     configured_history_mode:History_mode.t option ->
     user_activated_upgrades:User_activated.upgrades ->
@@ -3861,8 +3327,10 @@ module Make_snapshot_importer (Importer : IMPORTER) : Snapshot_importer = struct
   let restore_cemented_blocks ?(check_consistency = true) ~dst_chain_dir
       ~genesis_hash ~progress_display_mode snapshot_importer =
     let open Lwt_result_syntax in
-    let*! () = Importer.restore_cemented_indexes snapshot_importer in
+    let*! () = Event.(emit restoring_cemented_indexes) () in
+    let* () = Importer.restore_cemented_indexes snapshot_importer in
     let* cemented_files = Importer.load_cemented_files snapshot_importer in
+    let*! () = Event.(emit restoring_cemented_cycles) () in
     let nb_cemented_files = List.length cemented_files in
     let* () =
       if nb_cemented_files > 0 then
@@ -3886,12 +3354,14 @@ module Make_snapshot_importer (Importer : IMPORTER) : Snapshot_importer = struct
               cemented_files)
       else return_unit
     in
+    let*! () = Event.(emit cemented_cycles_restored) () in
     let* cemented_store =
       Cemented_block_store.init
         ~log_size:cemented_import_log_size
         ~readonly:false
         dst_chain_dir
     in
+    let*! () = Event.(emit checking_cycles_consistency) () in
     let* () =
       if check_consistency && nb_cemented_files > 0 then
         match Cemented_block_store.cemented_blocks_files cemented_store with
@@ -3929,6 +3399,7 @@ module Make_snapshot_importer (Importer : IMPORTER) : Snapshot_importer = struct
       else return_unit
     in
     Cemented_block_store.close cemented_store ;
+    let*! () = Event.(emit cycles_consistency_checked) () in
     return_unit
 
   let read_floating_blocks snapshot_importer ~genesis_hash =
@@ -3936,6 +3407,7 @@ module Make_snapshot_importer (Importer : IMPORTER) : Snapshot_importer = struct
 
   let restore_protocols snapshot_importer progress_display_mode =
     let open Lwt_result_syntax in
+    let*! () = Event.(emit restoring_protocols) () in
     (* Import protocol table *)
     let* protocol_levels = Importer.load_protocol_table snapshot_importer in
     (* Retrieve protocol files *)
@@ -3963,6 +3435,7 @@ module Make_snapshot_importer (Importer : IMPORTER) : Snapshot_importer = struct
           in
           List.iter_es validate_and_copy protocols)
     in
+    let*! () = Event.(emit protocols_restored) () in
     return protocol_levels
 
   let import_log_notice ~snapshot_version ~snapshot_metadata filename block =
@@ -3987,7 +3460,8 @@ module Make_snapshot_importer (Importer : IMPORTER) : Snapshot_importer = struct
       (Context_hash.equal
          validation_store.Block_validation.resulting_context_hash
          expected_context_hash
-      || (* This is needed as the former snapshot's version does not
+      ||
+      (* This is needed as the former snapshot's version does not
             provide enough data to perform this check with the new
             context hash semantics (a block header contains the
             predecessor's context hash). In that particular case, we
@@ -4001,22 +3475,20 @@ module Make_snapshot_importer (Importer : IMPORTER) : Snapshot_importer = struct
 
   let apply_context context_index ~imported_context_hash chain_id ~block_header
       ~operations ~predecessor_header ~predecessor_block_metadata_hash
-      ~predecessor_ops_metadata_hash ~user_activated_upgrades
-      ~user_activated_protocol_overrides ~operation_metadata_size_limit =
+      ~predecessor_ops_metadata_hash ~predecessor_max_operations_ttl
+      ~user_activated_upgrades ~user_activated_protocol_overrides
+      ~operation_metadata_size_limit =
     let open Lwt_result_syntax in
     let* predecessor_context =
-      let*! o = Context.checkout context_index imported_context_hash in
+      let*! o = Context_ops.checkout context_index imported_context_hash in
       match o with
       | Some ch -> return ch
       | None -> tzfail (Inconsistent_context imported_context_hash)
     in
-    let predecessor_context =
-      Tezos_shell_context.Shell_context.wrap_disk_context predecessor_context
-    in
+    let max_operations_ttl = predecessor_max_operations_ttl in
     let apply_environment =
       {
-        Block_validation.max_operations_ttl =
-          Int32.to_int predecessor_header.Block_header.shell.level;
+        Block_validation.max_operations_ttl;
         chain_id;
         predecessor_block_header = predecessor_header;
         predecessor_context;
@@ -4027,6 +3499,9 @@ module Make_snapshot_importer (Importer : IMPORTER) : Snapshot_importer = struct
         user_activated_protocol_overrides;
         operation_metadata_size_limit;
       }
+    in
+    let operations =
+      List.map (List.map Block_validation.mk_operation) operations
     in
     let* {result = block_validation_result; _} =
       let*! r =
@@ -4051,16 +3526,16 @@ module Make_snapshot_importer (Importer : IMPORTER) : Snapshot_importer = struct
     return block_validation_result
 
   let restore_and_apply_context snapshot_importer protocol_levels
-      ?user_expected_block ~dst_context_dir ~user_activated_upgrades
+      ?user_expected_block ~dst_data_dir ~user_activated_upgrades
       ~user_activated_protocol_overrides ~operation_metadata_size_limit
-      ~progress_display_mode ~legacy ~patch_context ~check_consistency
-      snapshot_metadata genesis chain_id =
+      ~patch_context ~check_consistency snapshot_metadata genesis chain_id =
     let open Lwt_result_syntax in
     let* ({
             block_header;
             resulting_context_hash;
             operations;
             predecessor_header;
+            predecessor_max_operations_ttl;
             predecessor_block_metadata_hash;
             predecessor_ops_metadata_hash;
           } as block_data) =
@@ -4098,98 +3573,86 @@ module Make_snapshot_importer (Importer : IMPORTER) : Snapshot_importer = struct
           else predecessor_header.Block_header.shell.context
     in
     let* genesis_ctxt_hash, block_validation_result =
-      if legacy then
-        let*! context_index =
-          Context.init
-            ~readonly:false
-            ~index_log_size:default_index_log_size
-            ?patch_context
-            dst_context_dir
+      let* () =
+        Animation.three_dots
+          ~progress_display_mode:Auto
+          ~msg:"Importing context"
+        @@ fun () -> Importer.restore_context snapshot_importer ~dst_data_dir
+      in
+      let*! () =
+        if Context_ops.do_not_use__is_duo () then
+          (* The way the context is imported make it so that only one context is created
+             In duo mode this will always be the default one "context". We copy this directory
+             in "brassaia_context" *)
+          Lwt_utils_unix.copy_dir
+            (* Copy the context directory in the brassaia_context directory *)
+            (Tezos_context_ops.Context_ops.context_dir dst_data_dir)
+            (Tezos_context_ops.Context_ops.do_not_use__brassaia_dir
+               dst_data_dir)
+        else Lwt.return_unit
+      in
+      let* context_index =
+        Context_ops.init
+          ~kind:`Disk
+          ~readonly:false
+          ~index_log_size:default_index_log_size
+          ?patch_context
+          ~data_dir:dst_data_dir
+          ()
+      in
+      let* genesis_ctxt_hash =
+        Context_ops.commit_genesis
+          context_index
+          ~chain_id
+          ~time:genesis.Genesis.time
+          ~protocol:genesis.protocol
+      in
+      let* () =
+        (* As Irmin's integrity check is not actively checking that the
+           requested context hash is well stored, we do it manually. *)
+        let*! ctxt_opt =
+          Context_ops.checkout context_index imported_context_hash
         in
-        let* genesis_ctxt_hash =
-          Context.commit_genesis
-            context_index
-            ~chain_id
-            ~time:genesis.Genesis.time
-            ~protocol:genesis.protocol
-        in
-        let* context_elements =
-          match snapshot_metadata with
-          | Current _ ->
-              tzfail (Cannot_read {kind = `Metadata; path = "snapshot's file"})
-          | Legacy metadata -> return metadata.context_elements
-        in
-        let* () =
-          Importer.legacy_restore_context
-            snapshot_importer
-            context_index
-            ~expected_context_hash:imported_context_hash
-            ~nb_context_elements:context_elements
-            ~progress_display_mode
-        in
-        let* block_validation_result =
-          apply_context
-            context_index
-            ~imported_context_hash
-            chain_id
-            ~block_header
-            ~operations
-            ~predecessor_header
-            ~predecessor_block_metadata_hash
-            ~predecessor_ops_metadata_hash
-            ~user_activated_upgrades
-            ~user_activated_protocol_overrides
-            ~operation_metadata_size_limit
-        in
-        let*! () = Context.close context_index in
-        return (genesis_ctxt_hash, block_validation_result)
-      else
-        let* () =
+        match ctxt_opt with
+        | Some (_ : Context_ops.t) -> return_unit
+        | None ->
+            tzfail (Cannot_checkout_imported_context imported_context_hash)
+      in
+      let* () =
+        if check_consistency then
           Animation.three_dots
             ~progress_display_mode:Auto
-            ~msg:"Importing context"
+            ~msg:"Checking context integrity"
           @@ fun () ->
-          Importer.restore_context snapshot_importer ~dst_context_dir
-        in
-        let*! context_index =
-          Context.init
-            ~readonly:false
-            ~index_log_size:default_index_log_size
-            ?patch_context
-            dst_context_dir
-        in
-        let* genesis_ctxt_hash =
-          Context.commit_genesis
-            context_index
-            ~chain_id
-            ~time:genesis.Genesis.time
-            ~protocol:genesis.protocol
-        in
-        let*! () =
-          if check_consistency then
-            Context.Checks.Pack.Integrity_check.run
-              ~root:dst_context_dir
+          let*! () =
+            Context_ops.integrity_check
+              ~ppf:Format.std_formatter
+              ~root:dst_data_dir
               ~auto_repair:false
               ~always:false
               ~heads:(Some [Context_hash.to_b58check imported_context_hash])
-          else Lwt.return_unit
-        in
-        let* block_validation_result =
-          apply_context
-            context_index
-            ~imported_context_hash
-            chain_id
-            ~block_header
-            ~operations
-            ~predecessor_header
-            ~predecessor_block_metadata_hash
-            ~predecessor_ops_metadata_hash
-            ~user_activated_upgrades
-            ~user_activated_protocol_overrides
-            ~operation_metadata_size_limit
-        in
-        let*! () = Context.close context_index in
-        return (genesis_ctxt_hash, block_validation_result)
+              context_index
+          in
+          return_unit
+        else return_unit
+      in
+      let* block_validation_result =
+        apply_context
+          context_index
+          ~imported_context_hash
+          chain_id
+          ~block_header
+          ~operations
+          ~predecessor_header
+          ~predecessor_block_metadata_hash
+          ~predecessor_ops_metadata_hash
+          ~predecessor_max_operations_ttl
+          ~user_activated_upgrades
+          ~user_activated_protocol_overrides
+          ~operation_metadata_size_limit
+      in
+      let*! () = Context_ops.close context_index in
+      return (genesis_ctxt_hash, block_validation_result)
     in
     let* () =
       check_context_hash_consistency
@@ -4201,7 +3664,7 @@ module Make_snapshot_importer (Importer : IMPORTER) : Snapshot_importer = struct
   (* TODO parallelise in another process *)
   (* TODO? remove patch context *)
   let import ~snapshot_path ?patch_context ?block:user_expected_block
-      ?(check_consistency = true) ~dst_store_dir ~dst_context_dir ~chain_name
+      ?(check_consistency = true) ~dst_store_dir ~dst_data_dir ~chain_name
       ~configured_history_mode ~user_activated_upgrades
       ~user_activated_protocol_overrides ~operation_metadata_size_limit
       ~progress_display_mode (genesis : Genesis.t) =
@@ -4216,7 +3679,6 @@ module Make_snapshot_importer (Importer : IMPORTER) : Snapshot_importer = struct
     in
     let dst_store_dir = Naming.store_dir ~dir_path:dst_store_dir in
     let dst_protocol_dir = Naming.protocol_store_dir dst_store_dir in
-    let chain_id = Chain_id.of_block_hash genesis.block in
     let dst_chain_dir = Naming.chain_dir dst_store_dir chain_id in
     let dst_cemented_dir = Naming.cemented_blocks_dir dst_chain_dir in
     (* Create directories *)
@@ -4224,7 +3686,6 @@ module Make_snapshot_importer (Importer : IMPORTER) : Snapshot_importer = struct
       List.iter_s
         (Lwt_utils_unix.create_dir ~perm:snapshot_dir_perm)
         [
-          Naming.dir_path dst_store_dir;
           Naming.dir_path dst_protocol_dir;
           Naming.dir_path dst_chain_dir;
           Naming.dir_path dst_cemented_dir;
@@ -4236,6 +3697,12 @@ module Make_snapshot_importer (Importer : IMPORTER) : Snapshot_importer = struct
         (Snapshot_file_not_found snapshot_path)
     in
     let snapshot_version = Importer.snapshot_version snapshot_importer in
+    let* is_legacy_format = Version.is_legacy_format snapshot_version in
+    let*! () =
+      if is_legacy_format then
+        Store_events.(emit import_legacy_snapshot_version snapshot_version)
+      else Lwt.return_unit
+    in
     let snapshot_metadata = Importer.snapshot_metadata snapshot_importer in
     let* () =
       fail_unless
@@ -4245,6 +3712,11 @@ module Make_snapshot_importer (Importer : IMPORTER) : Snapshot_importer = struct
              expected = List.map fst Version.supported_versions;
              got = snapshot_version;
            })
+    in
+    let*! () =
+      if snapshot_version <= 6 && Importer.format = Tar then
+        Event.(emit warn_tar_corruption snapshot_version)
+      else Lwt.return_unit
     in
     let* () =
       let metadata_chain_name =
@@ -4276,32 +3748,21 @@ module Make_snapshot_importer (Importer : IMPORTER) : Snapshot_importer = struct
         snapshot_path
         user_expected_block
     in
-    let patch_context =
-      Option.map
-        (fun f ctxt ->
-          let open Tezos_shell_context in
-          let ctxt = Shell_context.wrap_disk_context ctxt in
-          let+ ctxt = f ctxt in
-          Shell_context.unwrap_disk_context ctxt)
-        patch_context
-    in
+    let patch_context = Option.map (fun f ctxt -> f ctxt) patch_context in
     (* Restore protocols *)
     let* protocol_levels =
       restore_protocols snapshot_importer progress_display_mode
     in
-    let* legacy = Version.is_legacy snapshot_version in
     (* Restore context *)
     let* block_data, genesis_context_hash, block_validation_result =
       restore_and_apply_context
         snapshot_importer
         protocol_levels
         ?user_expected_block
-        ~dst_context_dir
+        ~dst_data_dir
         ~user_activated_upgrades
         ~user_activated_protocol_overrides
         ~operation_metadata_size_limit
-        ~progress_display_mode
-        ~legacy
         ~patch_context
         ~check_consistency
         snapshot_metadata
@@ -4326,6 +3787,7 @@ module Make_snapshot_importer (Importer : IMPORTER) : Snapshot_importer = struct
       block_metadata;
       ops_metadata;
       shell_header_hash = _;
+      protocol_data = _;
     } =
       block_validation_result
     in
@@ -4346,7 +3808,8 @@ module Make_snapshot_importer (Importer : IMPORTER) : Snapshot_importer = struct
         ({
            message = validation_store.message;
            max_operations_ttl = validation_store.max_operations_ttl;
-           last_allowed_fork_level = validation_store.last_allowed_fork_level;
+           last_preserved_block_level =
+             validation_store.last_preserved_block_level;
            block_metadata = fst block_metadata;
            operations_metadata =
              (match ops_metadata with
@@ -4372,6 +3835,7 @@ module Make_snapshot_importer (Importer : IMPORTER) : Snapshot_importer = struct
       | Rolling _ -> return (Rolling None)
       | Full _ -> return (Full None)
     in
+    let*! () = Event.(emit restoring_floating_blocks) () in
     let* () =
       Animation.display_progress
         ~every:100
@@ -4393,14 +3857,14 @@ module Make_snapshot_importer (Importer : IMPORTER) : Snapshot_importer = struct
             ~history_mode)
     in
     let* () = reading_thread in
-    let*! () = Event.(emit import_success snapshot_path) in
+    let*! () = Event.(emit floating_blocks_restored) () in
     let*! () = close snapshot_importer in
+    let*! () = Event.(emit import_success snapshot_path) in
     return_unit
 end
 
-(* [snapshot_file_kind ~snapshot_path] returns the kind of a
-   snapshot. We assume that a snapshot is valid if the medata can be
-   read. *)
+(* [snapshot_file_kind ~snapshot_path] returns the kind of a snapshot. We assume
+   that a snapshot is valid if the metadata can be read. *)
 let snapshot_file_kind ~snapshot_path =
   let open Lwt_result_syntax in
   let is_valid_uncompressed_snapshot file =
@@ -4440,7 +3904,7 @@ let snapshot_file_kind ~snapshot_path =
         let* () = is_valid_uncompressed_snapshot snapshot_file in
         return Tar)
 
-let export ?snapshot_path export_format ?rolling ~block ~store_dir ~context_dir
+let export ?snapshot_path export_format ?rolling ~block ~store_dir ~data_dir
     ~chain_name ~progress_display_mode genesis =
   let (module Exporter) =
     match export_format with
@@ -4452,7 +3916,7 @@ let export ?snapshot_path export_format ?rolling ~block ~store_dir ~context_dir
     ?rolling
     ~block
     ~store_dir
-    ~context_dir
+    ~data_dir
     ~chain_name
     ~progress_display_mode
     genesis
@@ -4468,7 +3932,7 @@ let read_snapshot_header ~snapshot_path =
   Loader.load_snapshot_header ~snapshot_path
 
 let import ~snapshot_path ?patch_context ?block ?check_consistency
-    ~dst_store_dir ~dst_context_dir ~chain_name ~configured_history_mode
+    ~dst_store_dir ~dst_data_dir ~chain_name ~configured_history_mode
     ~user_activated_upgrades ~user_activated_protocol_overrides
     ~operation_metadata_size_limit ~progress_display_mode genesis =
   let open Lwt_result_syntax in
@@ -4485,7 +3949,7 @@ let import ~snapshot_path ?patch_context ?block ?check_consistency
     ?block
     ?check_consistency
     ~dst_store_dir
-    ~dst_context_dir
+    ~dst_data_dir
     ~chain_name
     ~configured_history_mode
     ~user_activated_upgrades

@@ -106,7 +106,8 @@ let wait_conns ?timeout ~pool n =
 let close_active_conns pool =
   P2p_pool.Connection.fold
     ~init:Lwt.return_unit
-    ~f:(fun _ conn _ -> P2p_conn.disconnect ~wait:true conn)
+    ~f:(fun _ conn _ ->
+      P2p_conn.disconnect ~reason:(User "closed by test") ~wait:true conn)
     pool
 
 let canceler = Lwt_canceler.create () (* unused *)
@@ -116,8 +117,6 @@ let proof_of_work_target = Tezos_crypto.Crypto_box.make_pow_target 1.
 let id1 = P2p_identity.generate proof_of_work_target
 
 let id2 = P2p_identity.generate proof_of_work_target
-
-let addr = ref Ipaddr.V6.localhost
 
 let version =
   {
@@ -137,23 +136,19 @@ let conn_meta_config : unit P2p_params.conn_meta_config =
 let glob_port = ref None
 
 let listen ?port addr =
-  let open Lwt_syntax in
-  let uaddr = Ipaddr_unix.V6.to_inet_addr addr in
-  let main_socket = Lwt_unix.(socket PF_INET6 SOCK_STREAM 0) in
-  Lwt_unix.(setsockopt main_socket SO_REUSEADDR true) ;
+  let open Lwt_result_syntax in
   (* If [port] is [0], a fresh port is used. *)
   let port_or_gen = Option.value port ~default:0 in
-  let* () = Lwt_unix.bind main_socket (ADDR_INET (uaddr, port_or_gen)) in
-  Lwt_unix.listen main_socket 1 ;
+  let* sock = P2p_fd.create_listening_socket ~backlog:1 ~addr port_or_gen in
   let port =
     match port with
     | Some port -> port
     | None -> (
         (* if [port] was [0], we get the port generated. *)
-        let addr = Lwt_unix.getsockname main_socket in
+        let addr = Lwt_unix.getsockname sock in
         match addr with ADDR_INET (_, port) -> port | _ -> assert false)
   in
-  Lwt.return (main_socket, port)
+  return (sock, port)
 
 let rec sync_nodes nodes =
   let open Lwt_result_syntax in
@@ -168,7 +163,9 @@ let sync_nodes nodes =
   | Ok () | Error (Exn End_of_file :: _) -> return_unit
   | Error _ as err -> Lwt.return err
 
-let run_nodes ?port client server =
+(* addr here is localhost as we run different nodes
+   on the same addr but different ports *)
+let run_nodes ~addr ?port client server =
   let open Lwt_result_syntax in
   let p =
     match port with
@@ -179,13 +176,22 @@ let run_nodes ?port client server =
         glob_port := Some (p + 1) ;
         Some p
   in
-  let*! main_socket, p = listen ?port:p !addr in
+  let* main_socket, p = listen ?port:p addr in
   let* server_node =
     Process.detach ~prefix:"server: " (fun channel ->
-        let sched = P2p_io_scheduler.create ~read_buffer_size:(1 lsl 12) () in
-        let* () = server channel sched main_socket in
-        let*! () = P2p_io_scheduler.shutdown sched in
-        return_unit)
+        let* sched = P2p_io_scheduler.create ~read_buffer_size:(1 lsl 12) () in
+        Lwt.finalize
+          (fun () ->
+            let* () = server channel sched main_socket in
+            let*! () = P2p_io_scheduler.shutdown sched in
+            return_unit)
+          (fun () ->
+            let*! r = Lwt_utils_unix.safe_close main_socket in
+            match r with
+            | Error trace ->
+                Format.eprintf "Uncaught error: %a\n%!" pp_print_trace trace ;
+                Lwt.return_unit
+            | Ok () -> Lwt.return_unit))
   in
   let* client_node =
     Process.detach ~prefix:"client: " (fun channel ->
@@ -197,21 +203,68 @@ let run_nodes ?port client server =
               Lwt.return_unit
           | Ok () -> Lwt.return_unit
         in
-        let sched = P2p_io_scheduler.create ~read_buffer_size:(1 lsl 12) () in
-        let* () = client channel sched !addr p in
+        let* sched = P2p_io_scheduler.create ~read_buffer_size:(1 lsl 12) () in
+        let* () = client channel sched addr p in
         let*! () = P2p_io_scheduler.shutdown sched in
         return_unit)
   in
   let nodes = [server_node; client_node] in
   Lwt.ignore_result (sync_nodes nodes) ;
-  Process.wait_all nodes
+  let* () = Process.wait_all nodes in
+  let*! _ = Lwt_utils_unix.safe_close main_socket in
+  return_unit
+
+(* for fd tests *)
+let run_nodes_fd ~addr ?port client server =
+  let open Lwt_result_syntax in
+  let p =
+    match port with
+    | None ->
+        glob_port := None ;
+        None
+    | Some p ->
+        glob_port := Some (p + 1) ;
+        Some p
+  in
+  let* main_socket, p = listen ?port:p addr in
+  let* server_node =
+    Process.detach ~prefix:"server: " (fun channel ->
+        Lwt.finalize
+          (fun () ->
+            let* () = server channel main_socket in
+            return_unit)
+          (fun () ->
+            let*! r = Lwt_utils_unix.safe_close main_socket in
+            match r with
+            | Error trace ->
+                Format.eprintf "Uncaught error: %a\n%!" pp_print_trace trace ;
+                Lwt.return_unit
+            | Ok () -> Lwt.return_unit))
+  in
+  let* client_node =
+    Process.detach ~prefix:"client: " (fun channel ->
+        let*! () =
+          let*! r = Lwt_utils_unix.safe_close main_socket in
+          match r with
+          | Error trace ->
+              Format.eprintf "Uncaught error: %a\n%!" pp_print_trace trace ;
+              Lwt.return_unit
+          | Ok () -> Lwt.return_unit
+        in
+        let* () = client channel addr p in
+        return_unit)
+  in
+  let nodes = [server_node; client_node] in
+  Lwt.ignore_result (sync_nodes nodes) ;
+  let* () = Process.wait_all nodes in
+  let*! _ = Lwt_utils_unix.safe_close main_socket in
+  return_unit
 
 let raw_accept sched main_socket =
   let open Lwt_syntax in
   let* r = P2p_fd.accept main_socket in
   match r with
-  | Error (`Socket_error ex | `System_error ex | `Unexpected_error ex) ->
-      Lwt.fail ex
+  | Error e -> Lwt_result_syntax.tzfail (P2p_fd.accept_error_to_tzerror e)
   | Ok (fd, sockaddr) ->
       let fd = P2p_io_scheduler.register sched fd in
       let point =
@@ -231,8 +284,7 @@ let accept ?(id = id1) ?(proof_of_work_target = proof_of_work_target) sched
   let* r = raw_accept sched main_socket in
   let* id1 = id in
   match r with
-  | Error (`Socket_error ex | `System_error ex | `Unexpected_error ex) ->
-      Lwt.fail ex
+  | Error e -> Lwt_result.fail e
   | Ok (fd, point) ->
       P2p_socket.authenticate
         ~canceler
@@ -246,11 +298,11 @@ let accept ?(id = id1) ?(proof_of_work_target = proof_of_work_target) sched
 
 let raw_connect sched addr port =
   let open Lwt_result_syntax in
-  let*! fd = P2p_fd.socket PF_INET6 SOCK_STREAM 0 in
+  let* fd = Lwt_result.map_error Either.right (P2p_fd.socket ()) in
   let uaddr = Lwt_unix.ADDR_INET (Ipaddr_unix.V6.to_inet_addr addr, port) in
-  let* () = P2p_fd.connect fd uaddr in
+  let* () = Lwt_result.map_error Either.left (P2p_fd.connect fd uaddr) in
   let fd = P2p_io_scheduler.register sched fd in
-  Lwt.return_ok fd
+  return fd
 
 exception Cant_connect
 
@@ -261,7 +313,12 @@ let connect ?(proof_of_work_target = proof_of_work_target) sched addr port id =
   let open Lwt_result_syntax in
   let*! r = raw_connect sched addr port in
   match r with
-  | Error (`Connection_refused | `Unexpected_error _) -> Lwt.fail Cant_connect
+  | Error
+      (Left
+         ( `Network_unreachable | `Connection_unreachable | `Connection_refused
+         | `Connection_canceled | `Unexpected_error _ )) ->
+      Lwt.fail Cant_connect
+  | Error (Right e) -> Lwt_result.fail e
   | Ok fd ->
       P2p_socket.authenticate
         ~canceler

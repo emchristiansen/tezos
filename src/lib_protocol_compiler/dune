@@ -6,12 +6,12 @@
  (public_name octez-protocol-compiler)
  (instrumentation (backend bisect_ppx))
  (libraries
-  tezos-base
-  tezos-base.unix
-  tezos-version
-  tezos-protocol-environment.sigs
-  tezos-stdlib-unix
-  compiler-libs.common
+  octez-libs.base
+  octez-libs.base.unix
+  octez-proto-libs.protocol-environment.sigs
+  octez-libs.stdlib-unix
+  octez-protocol-compiler-compat
+  octez-protocol-compiler.alternative-hashes
   lwt.unix
   ocplib-ocamlres
   unix)
@@ -19,22 +19,24 @@
   (:standard)
   -open Tezos_base.TzPervasives
   -open Tezos_base_unix
-  -open Tezos_stdlib_unix)
+  -open Tezos_stdlib_unix
+  -open Octez_protocol_compiler_compat
+  -open Octez_protocol_alternative_hashes)
  (modules Embedded_cmis_env Embedded_cmis_register Packer Compiler Defaults))
 
 (rule
  (targets embedded-interfaces-env)
- (deps (package tezos-protocol-environment))
+ (deps (package octez-proto-libs))
  (action
   (with-stdout-to
    %{targets}
    (run
     bin/cmis_of_cma.exe
-    %{lib:tezos-protocol-environment.sigs:tezos_protocol_environment_sigs.cmxa}))))
+    %{lib:octez-proto-libs.protocol-environment.sigs:tezos_protocol_environment_sigs.cmxa}))))
 
 (rule
  (targets embedded_cmis_env.ml)
- (deps (package tezos-protocol-environment))
+ (deps (package octez-proto-libs))
  (action
   (run
    %{bin:ocp-ocamlres} -format variants -o %{targets}
@@ -59,13 +61,15 @@
  (public_name octez-protocol-compiler.native)
  (instrumentation (backend bisect_ppx))
  (libraries
-  tezos-base
+  octez-libs.base
   octez-protocol-compiler
+  octez-protocol-compiler-compat
   compiler-libs.optcomp)
  (flags
   (:standard)
   -open Tezos_base.TzPervasives
-  -open Octez_protocol_compiler)
+  -open Octez_protocol_compiler
+  -open Octez_protocol_compiler_compat)
  (modules Native))
 
 (install

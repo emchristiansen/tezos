@@ -38,9 +38,13 @@ module Cost_of = struct
 
   let int_size_in_bytes (z : 'a Script_int.num) = z_bytes (Script_int.to_zint z)
 
-  let manager_operation_int = 1_000
+  let manager_operation_int = 100
 
   let manager_operation = step_cost @@ S.safe_int manager_operation_int
+
+  let transfer_operation_int = 2000
+
+  let transfer_operation = step_cost @@ S.safe_int transfer_operation_int
 
   module Interpreter = struct
     open Michelson_v1_gas_costs
@@ -109,6 +113,11 @@ module Cost_of = struct
 
     let big_map_elt_size = Script_expr_hash.size
 
+    (* The uses of [cost_N_IMap_*] below are intentional.  They are for
+       the cost of the big_map overlay. The other costs such as the storage
+       access and the deserialization are separately charged in the protocol.
+       We don't use [cost_N_IBig_map_*] here, since they include these partial
+       carbonations. *)
     let big_map_mem ({size; _} : _ Script_typed_ir.big_map_overlay) =
       atomic_step_cost (cost_N_IMap_mem big_map_elt_size size)
 
@@ -295,15 +304,35 @@ module Cost_of = struct
 
     let view = atomic_step_cost cost_N_IView
 
-    let check_signature (pkey : Signature.public_key) b =
-      let cost =
-        match pkey with
-        | Ed25519 _ -> cost_N_ICheck_signature_ed25519 (Bytes.length b)
-        | Secp256k1 _ -> cost_N_ICheck_signature_secp256k1 (Bytes.length b)
-        | P256 _ -> cost_N_ICheck_signature_p256 (Bytes.length b)
-        | Bls _ -> cost_N_ICheck_signature_bls (Bytes.length b)
-      in
-      atomic_step_cost cost
+    type algo = Ed25519 | Secp256k1 | P256 | Bls | Mldsa44
+
+    let algo_of_public_key (pkey : Signature.public_key) =
+      match pkey with
+      | Ed25519 _ -> Ed25519
+      | Secp256k1 _ -> Secp256k1
+      | P256 _ -> P256
+      | Bls _ -> Bls
+      | Mldsa44 _ -> Mldsa44
+
+    let algo_of_public_key_hash (pkh : Implicit_account_repr.t) =
+      (* FIXME-PA: probably irrelevant for tzx, would need a new cost function *)
+      match Implicit_account_repr.Forbidden.to_pkh pkh with
+      | Ed25519 _ -> Ed25519
+      | Secp256k1 _ -> Secp256k1
+      | P256 _ -> P256
+      | Bls _ -> Bls
+      | Mldsa44 _ -> Mldsa44
+
+    let check_signature_on_algo algo length =
+      match algo with
+      | Ed25519 -> cost_N_ICheck_signature_ed25519 length
+      | Secp256k1 -> cost_N_ICheck_signature_secp256k1 length
+      | P256 -> cost_N_ICheck_signature_p256 length
+      | Bls -> cost_N_ICheck_signature_bls length
+      | Mldsa44 -> cost_N_ICheck_signature_mldsa44 length
+
+    let check_signature pkey b =
+      check_signature_on_algo (algo_of_public_key pkey) (Bytes.length b)
 
     let blake2b b = atomic_step_cost (cost_N_IBlake2b (Bytes.length b))
 
@@ -369,16 +398,20 @@ module Cost_of = struct
     let dupn n = atomic_step_cost (cost_N_IDupN n)
 
     let sapling_verify_update ~inputs ~outputs ~bound_data =
-      atomic_step_cost (cost_N_ISapling_verify_update inputs outputs bound_data)
+      atomic_step_cost
+        (cost_N_ISapling_verify_update_with_blake2b inputs outputs bound_data)
 
     let sapling_verify_update_deprecated ~inputs ~outputs =
-      atomic_step_cost (cost_N_ISapling_verify_update inputs outputs 0)
+      atomic_step_cost
+        (cost_N_ISapling_verify_update_with_blake2b inputs outputs 0)
 
     let sapling_empty_state = atomic_step_cost cost_N_ISapling_empty_state
 
     let halt = atomic_step_cost cost_N_IHalt
 
-    let const = atomic_step_cost cost_N_IConst
+    let push = atomic_step_cost cost_N_IPush
+
+    let unit = atomic_step_cost cost_N_IUnit
 
     let empty_big_map = atomic_step_cost cost_N_IEmpty_big_map
 
@@ -403,6 +436,15 @@ module Cost_of = struct
     let transfer_tokens = atomic_step_cost cost_N_ITransfer_tokens
 
     let implicit_account = atomic_step_cost cost_N_IImplicit_account
+
+    let is_implicit_account = atomic_step_cost cost_N_IIs_implicit_account
+
+    let index_address = atomic_step_cost cost_N_IIndex_address
+
+    (* TODO: https://gitlab.com/tezos/tezos/-/issues/8039
+       This gas cost is temporary and uses Big map's get, as their
+       semantics and implementation is highly similar. *)
+    let get_address_index = atomic_step_cost cost_N_IGet_address_index
 
     let create_contract = atomic_step_cost cost_N_ICreate_contract
 
@@ -498,10 +540,6 @@ module Cost_of = struct
       let sz = Signature.Public_key_hash.size + entrypoint_size in
       atomic_step_cost (cost_N_ICompare sz sz)
 
-    (** TODO: https://gitlab.com/tezos/tezos/-/issues/2340
-        Refine the gas model *)
-    let compare_tx_rollup_l2_address = atomic_step_cost (cost_N_ICompare 48 48)
-
     let compare_chain_id = atomic_step_cost (S.safe_int 30)
 
     (* Defunctionalized CPS *)
@@ -511,8 +549,7 @@ module Cost_of = struct
 
     let compare : type a. a Script_typed_ir.comparable_ty -> a -> a -> cost =
      fun ty x y ->
-      let rec compare :
-          type a.
+      let rec compare : type a.
           a Script_typed_ir.comparable_ty -> a -> a -> cost -> cont -> cost =
        fun ty x y acc k ->
         match ty with
@@ -530,8 +567,6 @@ module Cost_of = struct
         | Timestamp_t ->
             (apply [@tailcall]) Gas.(acc +@ compare_timestamp x y) k
         | Address_t -> (apply [@tailcall]) Gas.(acc +@ compare_address) k
-        | Tx_rollup_l2_address_t ->
-            (apply [@tailcall]) Gas.(acc +@ compare_tx_rollup_l2_address) k
         | Chain_id_t -> (apply [@tailcall]) Gas.(acc +@ compare_chain_id) k
         | Pair_t (tl, tr, _, YesYes) ->
             (* Reasonable over-approximation of the cost of lexicographic comparison. *)
@@ -569,58 +604,45 @@ module Cost_of = struct
       compare ty x y Gas.free Return
 
     let set_mem (type a) (elt : a) (set : a Script_typed_ir.set) =
-      let open S.Syntax in
       let (module Box) = Script_set.get set in
-      let per_elt_cost = Box.OPS.elt_size elt |> Size.to_int |> S.safe_int in
-      let size = S.safe_int Box.size in
-      let intercept = atomic_step_cost (S.safe_int 115) in
-      Gas.(intercept +@ (log2 size *@ per_elt_cost))
+      let per_elt_cost = Box.OPS.elt_size elt |> Size.to_int in
+      Michelson_v1_gas_costs.cost_N_ISet_mem per_elt_cost Box.size
 
     let set_update (type a) (elt : a) (set : a Script_typed_ir.set) =
-      let open S.Syntax in
       let (module Box) = Script_set.get set in
-      let per_elt_cost = Box.OPS.elt_size elt |> Size.to_int |> S.safe_int in
-      let size = S.safe_int Box.size in
-      let intercept = atomic_step_cost (S.safe_int 130) in
-      (* The 2 factor reflects the update vs mem overhead as benchmarked
-         on non-structured data *)
-      Gas.(intercept +@ (S.safe_int 2 * log2 size *@ per_elt_cost))
+      let per_elt_cost = Box.OPS.elt_size elt |> Size.to_int in
+      Michelson_v1_gas_costs.cost_N_ISet_update per_elt_cost Box.size
 
     let map_mem (type k v) (elt : k) (map : (k, v) Script_typed_ir.map) =
-      let open S.Syntax in
       let (module Box) = Script_map.get_module map in
-      let per_elt_cost = Box.OPS.key_size elt |> Size.to_int |> S.safe_int in
-      let size = S.safe_int Box.size in
-      let intercept = atomic_step_cost (S.safe_int 80) in
-      Gas.(intercept +@ (log2 size *@ per_elt_cost))
+      let per_elt_cost = Box.OPS.key_size elt in
+      Michelson_v1_gas_costs.cost_N_IMap_mem per_elt_cost Box.size
 
     let map_get = map_mem
 
     let map_update (type k v) (elt : k) (map : (k, v) Script_typed_ir.map) =
-      let open S.Syntax in
       let (module Box) = Script_map.get_module map in
-      let per_elt_cost = Box.OPS.key_size elt |> Size.to_int |> S.safe_int in
-      let size = S.safe_int Box.size in
-      let intercept = atomic_step_cost (S.safe_int 80) in
-      (* The 2 factor reflects the update vs mem overhead as benchmarked
-         on non-structured data *)
-      Gas.(intercept +@ (S.safe_int 2 * log2 size *@ per_elt_cost))
+      let per_elt_cost = Box.OPS.key_size elt in
+      Michelson_v1_gas_costs.cost_N_IMap_update per_elt_cost Box.size
 
     let map_get_and_update (type k v) (elt : k)
         (map : (k, v) Script_typed_ir.map) =
-      let open S.Syntax in
       let (module Box) = Script_map.get_module map in
-      let per_elt_cost = Box.OPS.key_size elt |> Size.to_int |> S.safe_int in
-      let size = S.safe_int Box.size in
-      let intercept = atomic_step_cost (S.safe_int 80) in
-      (* The 3 factor reflects the update vs mem overhead as benchmarked
-         on non-structured data *)
-      Gas.(intercept +@ (S.safe_int 3 * log2 size *@ per_elt_cost))
+      let per_elt_cost = Box.OPS.key_size elt in
+      Michelson_v1_gas_costs.cost_N_IMap_get_and_update per_elt_cost Box.size
 
     let view_get (elt : Script_string.t) (m : Script_typed_ir.view_map) =
       map_get elt m
 
+    let native_view_get (elt : Script_string.t)
+        (m : 'storage Script_native_types.view_map) =
+      map_get elt m
+
     let view_update (elt : Script_string.t) (m : Script_typed_ir.view_map) =
+      map_update elt m
+
+    let native_view_update (elt : Script_string.t)
+        (m : 'storage Script_native_types.view_map) =
       map_update elt m
 
     let join_tickets :
@@ -665,42 +687,27 @@ module Cost_of = struct
 
       let list_exit_body = atomic_step_cost cost_N_KList_exit_body
 
-      let map_enter_body = atomic_step_cost cost_N_KMap_enter_body
+      let map_enter_body (type k v) (map : (k, v) Script_typed_ir.map) =
+        let (module Box) = Script_map.get_module map in
+        atomic_step_cost (cost_N_KMap_enter_body Box.size)
 
       let map_exit_body (type k v) (key : k) (map : (k, v) Script_typed_ir.map)
           =
         map_update key map
     end
 
-    (* --------------------------------------------------------------------- *)
-    (* Hand-crafted models *)
-
-    (* The cost functions below where not benchmarked, a cost model was derived
-       from looking at similar instructions. *)
-
-    (* Cost for Concat_string is paid in two steps: when entering the interpreter,
-       the user pays for the cost of computing the information necessary to compute
-       the actual gas (so it's meta-gas): indeed, one needs to run through the
-       list of strings to compute the total allocated cost.
-       [concat_string_precheck] corresponds to the meta-gas cost of this computation.
-    *)
     let concat_string_precheck (l : 'a Script_list.t) =
-      (* we set the precheck to be slightly more expensive than cost_N_IList_iter *)
-      atomic_step_cost (S.mul (S.safe_int l.length) (S.safe_int 10))
+      atomic_step_cost (cost_N_IConcat_string_precheck l.length)
 
-    (* This is the cost of allocating a string and blitting existing ones into it. *)
     let concat_string total_bytes =
-      atomic_step_cost S.(add (S.safe_int 100) (S.shift_right total_bytes 1))
+      atomic_step_cost (cost_N_IConcat_string total_bytes)
 
-    (* Same story as Concat_string. *)
     let concat_bytes total_bytes =
-      atomic_step_cost S.(add (S.safe_int 100) (S.shift_right total_bytes 1))
+      atomic_step_cost (cost_N_IConcat_bytes total_bytes)
 
-    (* Cost of Unpack pays two integer comparisons, and a Bytes slice *)
     let unpack bytes =
       let blen = Bytes.length bytes in
-      let open S.Syntax in
-      atomic_step_cost (S.safe_int 260 + (S.safe_int blen lsr 1))
+      atomic_step_cost (cost_N_IUnpack blen)
 
     (* TODO benchmark *)
     (* FIXME: imported from 006, needs proper benchmarks *)
@@ -725,7 +732,11 @@ module Cost_of = struct
              cost_DECODING_PUBLIC_KEY_ed25519
              (max
                 cost_DECODING_PUBLIC_KEY_secp256k1
-                (max cost_DECODING_PUBLIC_KEY_p256 cost_DECODING_PUBLIC_KEY_bls)))
+                (max
+                   cost_DECODING_PUBLIC_KEY_p256
+                   (max
+                      cost_DECODING_PUBLIC_KEY_bls
+                      cost_DECODING_PUBLIC_KEY_HASH_mldsa44))))
 
     let public_key_readable =
       atomic_step_cost
@@ -736,7 +747,9 @@ module Cost_of = struct
                 cost_B58CHECK_DECODING_PUBLIC_KEY_secp256k1
                 (max
                    cost_B58CHECK_DECODING_PUBLIC_KEY_p256
-                   cost_B58CHECK_DECODING_PUBLIC_KEY_bls)))
+                   (max
+                      cost_B58CHECK_DECODING_PUBLIC_KEY_bls
+                      cost_B58CHECK_DECODING_PUBLIC_KEY_mldsa44))))
 
     let key_hash_optimized =
       atomic_step_cost
@@ -747,7 +760,9 @@ module Cost_of = struct
                 cost_DECODING_PUBLIC_KEY_HASH_secp256k1
                 (max
                    cost_DECODING_PUBLIC_KEY_HASH_p256
-                   cost_DECODING_PUBLIC_KEY_HASH_bls)))
+                   (max
+                      cost_DECODING_PUBLIC_KEY_HASH_bls
+                      cost_DECODING_PUBLIC_KEY_HASH_mldsa44))))
 
     let key_hash_readable =
       atomic_step_cost
@@ -758,7 +773,9 @@ module Cost_of = struct
                 cost_B58CHECK_DECODING_PUBLIC_KEY_HASH_secp256k1
                 (max
                    cost_B58CHECK_DECODING_PUBLIC_KEY_HASH_p256
-                   cost_B58CHECK_DECODING_PUBLIC_KEY_HASH_bls)))
+                   (max
+                      cost_B58CHECK_DECODING_PUBLIC_KEY_HASH_bls
+                      cost_B58CHECK_DECODING_PUBLIC_KEY_HASH_mldsa44))))
 
     let signature_optimized =
       atomic_step_cost
@@ -767,7 +784,11 @@ module Cost_of = struct
              cost_DECODING_SIGNATURE_ed25519
              (max
                 cost_DECODING_SIGNATURE_secp256k1
-                (max cost_DECODING_SIGNATURE_p256 cost_DECODING_SIGNATURE_bls)))
+                (max
+                   cost_DECODING_SIGNATURE_p256
+                   (max
+                      cost_DECODING_SIGNATURE_bls
+                      cost_DECODING_SIGNATURE_mldsa44))))
 
     let signature_readable =
       atomic_step_cost
@@ -778,7 +799,9 @@ module Cost_of = struct
                 cost_B58CHECK_DECODING_SIGNATURE_secp256k1
                 (max
                    cost_B58CHECK_DECODING_SIGNATURE_p256
-                   cost_B58CHECK_DECODING_SIGNATURE_bls)))
+                   (max
+                      cost_B58CHECK_DECODING_SIGNATURE_bls
+                      cost_B58CHECK_DECODING_SIGNATURE_mldsa44))))
 
     let chain_id_optimized = atomic_step_cost cost_DECODING_CHAIN_ID
 
@@ -802,9 +825,16 @@ module Cost_of = struct
     let check_printable s =
       atomic_step_cost (cost_CHECK_PRINTABLE (String.length s))
 
-    let merge_cycle = atomic_step_cost cost_TY_EQ
+    let ty_eq ty1 ty2 =
+      (* Assumes O(1) access to the size of a type *)
+      let size1 = Script_typed_ir.(ty_size ty1 |> Type_size.to_int) in
+      let size2 = Script_typed_ir.(ty_size ty2 |> Type_size.to_int) in
+      atomic_step_cost (cost_TY_EQ (Saturation_repr.min size1 size2))
 
-    let parse_type_cycle = atomic_step_cost cost_PARSE_TYPE
+    (* The gas cost for comparing a type with a type of size 1 *)
+    let ty_eq_prim = atomic_step_cost (cost_TY_EQ (Saturation_repr.safe_int 1))
+
+    let parse_type_cycle = atomic_step_cost cost_PARSE_TYPE1
 
     let parse_instr_cycle = atomic_step_cost cost_TYPECHECKING_CODE
 
@@ -822,10 +852,6 @@ module Cost_of = struct
 
     let timestamp_readable s =
       atomic_step_cost (cost_TIMESTAMP_READABLE_DECODING (String.length s))
-
-    (** TODO: https://gitlab.com/tezos/tezos/-/issues/2340
-        Refine the gas model *)
-    let tx_rollup_l2_address = bls12_381_g1
 
     (* Balance stored at /contracts/index/hash/balance, on 64 bits *)
     let contract_exists =
@@ -851,7 +877,11 @@ module Cost_of = struct
              cost_ENCODING_PUBLIC_KEY_ed25519
              (max
                 cost_ENCODING_PUBLIC_KEY_secp256k1
-                (max cost_ENCODING_PUBLIC_KEY_p256 cost_ENCODING_PUBLIC_KEY_bls)))
+                (max
+                   cost_ENCODING_PUBLIC_KEY_p256
+                   (max
+                      cost_ENCODING_PUBLIC_KEY_bls
+                      cost_ENCODING_PUBLIC_KEY_mldsa44))))
 
     let public_key_readable =
       atomic_step_cost
@@ -862,7 +892,9 @@ module Cost_of = struct
                 cost_B58CHECK_ENCODING_PUBLIC_KEY_secp256k1
                 (max
                    cost_B58CHECK_ENCODING_PUBLIC_KEY_p256
-                   cost_B58CHECK_ENCODING_PUBLIC_KEY_bls)))
+                   (max
+                      cost_B58CHECK_ENCODING_PUBLIC_KEY_bls
+                      cost_B58CHECK_ENCODING_PUBLIC_KEY_mldsa44))))
 
     let key_hash_optimized =
       atomic_step_cost
@@ -873,7 +905,9 @@ module Cost_of = struct
                 cost_ENCODING_PUBLIC_KEY_HASH_secp256k1
                 (max
                    cost_ENCODING_PUBLIC_KEY_HASH_p256
-                   cost_ENCODING_PUBLIC_KEY_HASH_bls)))
+                   (max
+                      cost_ENCODING_PUBLIC_KEY_HASH_bls
+                      cost_ENCODING_PUBLIC_KEY_HASH_mldsa44))))
 
     let key_hash_readable =
       atomic_step_cost
@@ -884,7 +918,9 @@ module Cost_of = struct
                 cost_B58CHECK_ENCODING_PUBLIC_KEY_HASH_secp256k1
                 (max
                    cost_B58CHECK_ENCODING_PUBLIC_KEY_HASH_p256
-                   cost_B58CHECK_ENCODING_PUBLIC_KEY_HASH_bls)))
+                   (max
+                      cost_B58CHECK_ENCODING_PUBLIC_KEY_HASH_bls
+                      cost_B58CHECK_ENCODING_PUBLIC_KEY_HASH_mldsa44))))
 
     let signature_optimized =
       atomic_step_cost
@@ -893,7 +929,11 @@ module Cost_of = struct
              cost_ENCODING_SIGNATURE_ed25519
              (max
                 cost_ENCODING_SIGNATURE_secp256k1
-                (max cost_ENCODING_SIGNATURE_p256 cost_ENCODING_SIGNATURE_bls)))
+                (max
+                   cost_ENCODING_SIGNATURE_p256
+                   (max
+                      cost_ENCODING_SIGNATURE_bls
+                      cost_ENCODING_SIGNATURE_mldsa44))))
 
     let signature_readable =
       atomic_step_cost
@@ -904,7 +944,9 @@ module Cost_of = struct
                 cost_B58CHECK_ENCODING_SIGNATURE_secp256k1
                 (max
                    cost_B58CHECK_ENCODING_SIGNATURE_p256
-                   cost_B58CHECK_ENCODING_SIGNATURE_bls)))
+                   (max
+                      cost_B58CHECK_ENCODING_SIGNATURE_bls
+                      cost_B58CHECK_ENCODING_SIGNATURE_mldsa44))))
 
     let chain_id_optimized = atomic_step_cost cost_ENCODING_CHAIN_ID
 
@@ -928,18 +970,14 @@ module Cost_of = struct
     let bls12_381_fr = atomic_step_cost cost_ENCODING_BLS_FR
 
     let unparse_type ty =
-      atomic_step_cost
-      @@ cost_UNPARSE_TYPE Script_typed_ir.(ty_size ty |> Type_size.to_int)
+      atomic_step_cost @@ cost_UNPARSE_TYPE
+      @@ Script_typed_ir.(Type_size.to_int @@ ty_size ty)
 
     let unparse_instr_cycle = atomic_step_cost cost_UNPARSING_CODE
 
     let unparse_data_cycle = atomic_step_cost cost_UNPARSING_DATA
 
     let unit = Gas.free
-
-    (** TODO: https://gitlab.com/tezos/tezos/-/issues/2340
-        Refine the gas model *)
-    let tx_rollup_l2_address = bls12_381_g1
 
     (* Reuse 006 costs. *)
     let operation bytes = Script.bytes_node_cost bytes

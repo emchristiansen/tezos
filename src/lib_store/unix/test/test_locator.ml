@@ -25,12 +25,11 @@
 
 (** Testing
     -------
-    Component:    Shell
-    Invocation:   dune exec src/lib_shell/test/test_locator.exe
+    Component: Store
+    Invocation:   dune exec src/lib_shell/test/main.exe \
+                  -- --file test_locator.ml
     Subject:      Checks operations on locators.
 *)
-
-(** Basic blocks *)
 
 module Assert = Assert
 
@@ -71,11 +70,11 @@ let init_chain ?(history_mode = History_mode.Archive) base_dir =
   let open Filename.Infix in
   let open Lwt_syntax in
   let store_dir = base_dir // "store" in
-  let context_dir = base_dir // "context" in
+  let data_dir = base_dir in
   let* r =
     Store.init
       ~store_dir
-      ~context_dir
+      ~data_dir
       ~history_mode
       ~allow_testchains:true
       ~patch_context
@@ -122,11 +121,13 @@ let make_empty_chain chain_store n : Block_hash.t Lwt.t =
               timestamp = header.shell.timestamp;
               message;
               max_operations_ttl;
-              last_allowed_fork_level = 0l;
+              last_finalized_block_level = 0l;
+              last_preserved_block_level = 0l;
             };
           block_metadata = (zero, None);
           ops_metadata = Block_validation.No_metadata_hash [];
           shell_header_hash = Block_validation.Shell_header_hash.zero;
+          protocol_data = Bytes.empty;
         }
       in
       let* _ =
@@ -164,7 +165,8 @@ let make_multiple_protocol_chain (chain_store : Store.Chain.t)
       timestamp = Time.Protocol.epoch;
       message = None;
       max_operations_ttl = 0;
-      last_allowed_fork_level = 0l;
+      last_finalized_block_level = 0l;
+      last_preserved_block_level = 0l;
     }
   in
   let rec loop remaining_fork_points lvl (pred_header : Block_header.t) =
@@ -183,8 +185,7 @@ let make_multiple_protocol_chain (chain_store : Store.Chain.t)
             {
               pred_header.shell with
               predecessor =
-                (if lvl = 1 then genesis_hash
-                else Block_header.hash pred_header);
+                (if lvl = 1 then genesis_hash else Block_header.hash pred_header);
               level = Int32.of_int lvl;
               proto_level;
             };
@@ -195,16 +196,17 @@ let make_multiple_protocol_chain (chain_store : Store.Chain.t)
         Option.some @@ Block_metadata_hash.hash_bytes [block_metadata]
       in
       (* make some cycles *)
-      let last_allowed_fork_level =
+      let last_preserved_block_level =
         Int32.of_int (max 0 (20 * ((lvl - 10) / 20)))
       in
       let validation_result =
         {
           Block_validation.validation_store =
-            {empty_result with last_allowed_fork_level};
+            {empty_result with last_preserved_block_level};
           block_metadata = (zero, block_metadata_hash);
           ops_metadata = Block_validation.No_metadata_hash [];
           shell_header_hash = Block_validation.Shell_header_hash.zero;
+          protocol_data = Bytes.empty;
         }
       in
       let* o =
@@ -374,66 +376,6 @@ let compute_size_chain size_locator =
    chain 2 months 86k    covered by locator 120
 *)
 
-(** Test if the linear and exponential locator are the same and outputs
-    their timing.
-    Run the test with:
-    $ dune build @runtest_locator
-    Copy the output to a file timing.dat and plot it with:
-    $ generate_locator_plot.sh timing.dat
-*)
-let bench_locator base_dir =
-  let open Lwt_result_syntax in
-  let size_chain = 80000 in
-  (* timing locators with average over [runs] times *)
-  let runs = 10 in
-  let _ = Printf.printf "#runs %i\n" runs in
-  (* limit after which exp should go linear *)
-  let exp_limit = compute_size_chain 120 in
-  let _ = Printf.printf "#exp_limit %i\n" exp_limit in
-  (* size after which locator always reaches genesis *)
-  let locator_limit = compute_size_locator size_chain in
-  let _ = Printf.printf "#locator_limit %i\n" locator_limit in
-  let*! store = init_chain base_dir in
-  let chain_store = Store.main_chain_store store in
-  time1 (fun () -> make_empty_chain chain_store size_chain)
-  |> fun (res, t_chain) ->
-  let _ =
-    Printf.printf
-      "#size_chain %i built in %f sec\n#      size      exp       lins\n"
-      size_chain
-      t_chain
-  in
-  let*! head = res in
-  let check_locator max_size : unit tzresult Lwt.t =
-    let*! caboose, _ = Store.Chain.caboose chain_store in
-    let* block = Store.Block.read_block chain_store head in
-    time ~runs (fun () ->
-        Store.Chain.compute_locator chain_store ~max_size block seed)
-    |> fun (l_exp, t_exp) ->
-    time ~runs (fun () ->
-        compute_linear_locator chain_store ~caboose ~max_size block)
-    |> fun (l_lin, t_lin) ->
-    let*! {Block_locator.history = l_exp; _} = l_exp in
-    let*! {Block_locator.history = l_lin; _} = l_lin in
-    let _ = Printf.printf "%10i %f %f\n" max_size t_exp t_lin in
-    Lwt.return
-    @@ List.iter2
-         ~when_different_lengths:(TzTrace.make @@ Exn (Failure __LOC__))
-         (fun hn ho ->
-           if not (Block_hash.equal hn ho) then
-             Assert.fail_msg "Invalid locator %i" max_size)
-         l_exp
-         l_lin
-  in
-  let stop = locator_limit + 20 in
-  let rec loop size =
-    if size < stop then
-      let* _ = check_locator size in
-      loop (size + 5)
-    else return_unit
-  in
-  loop 1
-
 let test_protocol_locator base_dir =
   let open Lwt_result_syntax in
   let*! store = init_chain base_dir in
@@ -538,7 +480,7 @@ let test_protocol_locator base_dir =
   let* () =
     Store.may_switch_history_mode
       ~store_dir:(base_dir // "store")
-      ~context_dir:(base_dir // "context")
+      ~data_dir:base_dir
       genesis
       ~new_history_mode:(Rolling (Some {offset = 0}))
   in
@@ -619,22 +561,5 @@ let tests =
     wrap "test protocol locator" test_protocol_locator;
   ]
 
-let bench = [wrap "bench locator" bench_locator]
-
-let tests =
-  tests
-  @
-  if Array.length Sys.argv > 1 then
-    match Sys.argv.(1) with "--bench" -> bench | _ -> []
-  else []
-
-let tests =
-  tests
-  @
-  if Array.length Sys.argv > 1 then
-    match Sys.argv.(1) with "--bench" -> bench | _ -> []
-  else []
-
 let () =
-  Alcotest_lwt.run ~argv:[|""|] "tezos-store" [("locator", tests)]
-  |> Lwt_main.run
+  Alcotest_lwt.run ~__FILE__ "tezos-store" [("locator", tests)] |> Lwt_main.run

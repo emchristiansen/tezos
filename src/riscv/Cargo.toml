@@ -1,0 +1,68 @@
+[workspace]
+resolver = "3"
+members = ["api", "common", "durable-common", "durable-in-memory", "durable-on-disk"]
+
+[workspace.lints.clippy]
+allow_attributes = "deny"
+allow_attributes_without_reason = "deny"
+
+[workspace.lints.rustdoc]
+broken_intra_doc_links = "deny"
+private_intra_doc_links = "allow"
+
+[workspace.dependencies]
+arbitrary-int = "1.2.7"
+bytes = "1.11.1"
+num_enum = "0.7.2"
+ocaml-build = "1.0.0"
+sha2 = "0.10.9"
+parking_lot = "0.12.5"
+thiserror = "2.0.18"
+trait-set = "0.3.0"
+
+[workspace.dependencies.derive_more]
+version = "2.1.1"
+features = ["deref", "deref_mut"]
+
+[workspace.dependencies.strum]
+version = "0.28"
+features = ["derive"]
+
+[workspace.dependencies.octez-riscv]
+# The rev and regression assets can be updated via `make update-riscv-pvm`
+git = "https://github.com/tezos/riscv-pvm.git"
+rev = "653f1318ecc606836b92332198a5a16372e6f598"
+
+[workspace.dependencies.octez-riscv-data]
+# The rev and regression assets can be updated via `make update-riscv-pvm`
+git = "https://github.com/tezos/riscv-pvm.git"
+rev = "653f1318ecc606836b92332198a5a16372e6f598"
+
+[workspace.dependencies.octez-riscv-durable-storage]
+# The rev and regression assets can be updated via `make update-riscv-pvm`
+git = "https://github.com/tezos/riscv-pvm.git"
+rev = "653f1318ecc606836b92332198a5a16372e6f598"
+default-features = false
+
+[workspace.dependencies.octez-riscv-api-common]
+path = "./common"
+
+[workspace.dependencies.octez-riscv-durable-storage-common]
+path = "./durable-common"
+
+[workspace.dependencies.octez-riscv-durable-storage-on-disk]
+path = "./durable-on-disk"
+
+[workspace.dependencies.ocaml]
+version = "1.2.1"
+default-features = false
+
+[workspace.dependencies.ocaml-sys]
+# We don't care about the version. Ideally this gets pinned to what `ocaml` needs.
+version = "*"
+default-features = false
+
+[workspace.dependencies.ocaml-boxroot-sys]
+# We don't care about the version. Ideally this gets pinned to what `ocaml` needs.
+version = "*"
+default-features = false

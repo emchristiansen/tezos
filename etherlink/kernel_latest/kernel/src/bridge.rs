@@ -1,0 +1,1136 @@
+// SPDX-FileCopyrightText: 2022-2023 TriliTech <contact@trili.tech>
+// SPDX-FileCopyrightText: 2025-2026 Functori <contact@functori.com>
+//
+// SPDX-License-Identifier: MIT
+
+//! Native token (TEZ) bridge primitives and helpers.
+
+use std::fmt::Display;
+
+use alloy_sol_types::SolEvent;
+use evm_inspectors::TracerInput;
+use primitive_types::{H160, H256, U256};
+use revm::primitives::{Address, Log, LogData, B256};
+use revm_etherlink::helpers::legacy::{alloy_to_h160, h160_to_alloy, u256_to_alloy};
+use revm_etherlink::precompiles::constants::FEED_DEPOSIT_ADDR;
+use rlp::{Decodable, DecoderError, Encodable, Rlp, RlpEncodable};
+use sha3::{Digest, Keccak256};
+use tezos_crypto_rs::hash::{BlockHash, HashTrait};
+use tezos_data_encoding::enc::BinWriter;
+use tezos_data_encoding::nom::NomReader;
+use tezos_data_encoding::types::Narith;
+use tezos_ethereum::block::BlockConstants;
+use tezos_ethereum::rlp_helpers::{
+    decode_field, decode_field_u256_le, decode_option_explicit, next,
+};
+use tezos_ethereum::transaction::TRANSACTION_HASH_SIZE;
+use tezos_evm_logging::{log, Level::Error, Level::Info};
+use tezos_evm_runtime::runtime_keyspaces::RuntimeKeyspaces;
+use tezos_execution::account_storage::TezosAccount;
+use tezos_protocol::contract::Contract;
+use tezos_smart_rollup::michelson::{ticket::FA2_1Ticket, MichelsonBytes};
+use tezos_smart_rollup_host::storage::StorageV1;
+use tezos_smart_rollup_keyspace::{KeySpace, KeySpaceLoader};
+use tezos_tezlink::block::AppliedOperation;
+use tezos_tezlink::operation::{
+    ManagerOperation, ManagerOperationContent, Parameters, TransferContent,
+};
+use tezos_tezlink::operation_result::{
+    ApplyOperationErrors, BalanceUpdate, ContentResult, EventContent, EventSuccess,
+    InternalContentWithMetadata, InternalOperationSum, OperationBatchWithMetadata,
+    OperationDataAndMetadata, OperationResult, OperationResultSum, OperationWithMetadata,
+    TransferError, TransferSuccess, TransferTarget,
+};
+use tezos_tracing::trace_kernel;
+use tezosx_interfaces::{Registry, RuntimeId};
+use tezosx_tezos_runtime::TezosRuntime;
+use tezosx_types::{Mutez, Wei};
+
+use crate::apply::{
+    pure_xtz_deposit, EthereumTransactionResult, ExecutionResult,
+    RuntimeTransactionResult,
+};
+use crate::chains::EvmLimits;
+
+/// Keccak256 of Deposit(uint256,address,uint256,uint256)
+/// This is main topic (non-anonymous event): https://docs.soliditylang.org/en/latest/abi-spec.html#events
+pub const DEPOSIT_EVENT_TOPIC: [u8; 32] = [
+    211, 106, 47, 103, 208, 109, 40, 87, 134, 246, 26, 50, 176, 82, 185, 172, 230, 176,
+    183, 171, 239, 81, 119, 181, 67, 88, 171, 220, 131, 160, 182, 155,
+];
+
+/// Native token bridge error
+#[derive(Debug, thiserror::Error)]
+pub enum BridgeError {
+    #[error("Invalid deposit receiver address: {0:?}")]
+    InvalidDepositReceiver(Vec<u8>),
+    #[error("Invalid RLP bytes: {0}")]
+    RlpError(DecoderError),
+    #[error("Invalid amount for a deposit: {0:?}")]
+    InvalidAmount(U256),
+}
+
+alloy_sol_types::sol! {
+    event SolBridgeDepositEvent (
+        uint256 amount,
+        address receiver,
+        uint256 inbox_level,
+        uint256 inbox_msg_id,
+    );
+}
+
+const TEZLINK_ADDRESS: u8 = 1;
+
+#[derive(Debug, PartialEq, Clone)]
+pub enum DepositReceiver {
+    Ethereum(H160),
+    Tezos(Contract),
+}
+
+impl DepositReceiver {
+    pub fn to_h160(&self) -> Result<H160, BridgeError> {
+        match self {
+            Self::Ethereum(receiver) => Ok(*receiver),
+            Self::Tezos(contract) => {
+                // TODO https://linear.app/tezos/issue/L2-641
+                // This function converts a Tezos like address to a H160
+                // to represent its wallet in the Etherlink runtime. This should
+                // be done outside of 'bridge.rs' and the conversion function
+                // may be different (for example determine the H160 from the keccak)
+                // of the Tezos contract bytes.
+                let bytes = contract
+                    .to_bytes()
+                    .map_err(|_| BridgeError::InvalidDepositReceiver(vec![]))?;
+                // Tezos addresses are 22-byte long, to canonically represent
+                // a Tezos address as a H160, we drop the first and last bytes.
+                if bytes.len() == 22 {
+                    Ok(H160::from_slice(&bytes[1..21]))
+                } else {
+                    Err(BridgeError::InvalidDepositReceiver(bytes))
+                }
+            }
+        }
+    }
+
+    pub fn to_contract(&self) -> Result<Contract, BridgeError> {
+        match self {
+            DepositReceiver::Ethereum(address) => {
+                // A Tezos contract's length is 22 bytes
+                // The first two bytes here represent:
+                //     - 0u8: means that it's an implicit account
+                //     - 0u8: means that it's a tz1
+                // This code is temporary and should be replaced for the same
+                // reason as in https://linear.app/tezos/issue/L2-641
+                let mut contract = vec![0u8, 0u8];
+                contract.extend_from_slice(address.as_bytes());
+                match Contract::nom_read_exact(&contract) {
+                    Ok(contract) => Ok(contract),
+                    Err(_) => Err(BridgeError::InvalidDepositReceiver(contract)),
+                }
+            }
+            DepositReceiver::Tezos(contract) => Ok(contract.clone()),
+        }
+    }
+}
+
+impl rlp::Encodable for DepositReceiver {
+    fn rlp_append(&self, s: &mut rlp::RlpStream) {
+        match self {
+            DepositReceiver::Ethereum(addr) => addr.rlp_append(s),
+            DepositReceiver::Tezos(contract) => {
+                s.begin_list(2);
+                s.append(&TEZLINK_ADDRESS);
+                let mut out = vec![];
+                // BinWriter returns a Result<()> but can't properly
+                // propagate it outside of rlp_append
+                let _ = contract.bin_write(&mut out);
+                s.append(&out);
+            }
+        }
+    }
+}
+
+impl rlp::Decodable for DepositReceiver {
+    fn decode(decoder: &Rlp) -> Result<Self, DecoderError> {
+        if decoder.is_list() {
+            if decoder.item_count()? != 2 {
+                return Err(DecoderError::RlpIncorrectListLen);
+            }
+            let tag: u8 = decoder.at(0)?.as_val()?;
+            let receiver = decoder.at(1)?;
+            match tag {
+                TEZLINK_ADDRESS => {
+                    let receiver = receiver.data()?;
+                    let contract = Contract::nom_read_exact(receiver).map_err(|_| {
+                        DecoderError::Custom(
+                            "Can't decode Tezos receiver using NomReader",
+                        )
+                    })?;
+
+                    if contract.is_implicit() {
+                        Ok(Self::Tezos(contract))
+                    } else {
+                        Err(DecoderError::Custom(
+                            "Deposit to smart contracts are disabled",
+                        ))
+                    }
+                }
+                _ => Err(DecoderError::Custom("Unknown receiver tag.")),
+            }
+        } else {
+            let receiver: H160 = decode_field(decoder, "receiver")?;
+            Ok(Self::Ethereum(receiver))
+        }
+    }
+}
+
+impl Display for DepositReceiver {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Ethereum(address) => write!(f, "{address}"),
+            Self::Tezos(contract) => write!(f, "{}", contract.to_b58check()),
+        }
+    }
+}
+
+#[derive(Debug, PartialEq)]
+pub struct DepositInfo {
+    pub receiver: DepositReceiver,
+    pub chain_id: Option<U256>,
+}
+
+impl DepositInfo {
+    const RECEIVER_LENGTH: usize = std::mem::size_of::<Address>();
+
+    const RECEIVER_AND_CHAIN_ID_LENGTH: usize =
+        Self::RECEIVER_LENGTH + std::mem::size_of::<U256>();
+
+    /// Decodes the Michelson `bytes` receiver payload of an XTZ deposit into
+    /// its receiver and optional chain id.
+    ///
+    /// Byte-length is authoritative: the two legacy formats occupy exactly
+    /// [`Self::RECEIVER_LENGTH`] and [`Self::RECEIVER_AND_CHAIN_ID_LENGTH`]
+    /// bytes, and every other length is read as a versioned RLP payload.
+    /// Dispatching on length in a single function is what guarantees a
+    /// routing byte-string resolves to exactly one receiver: the versioned
+    /// scheme can never be read out of a legacy length, nor the reverse.
+    fn decode(bytes: &[u8]) -> Result<Self, DecoderError> {
+        if bytes.is_empty() {
+            return Err(DecoderError::Custom("Unexpected empty deposit info"));
+        }
+
+        let input_length = bytes.len();
+        if input_length == Self::RECEIVER_LENGTH {
+            // Legacy format: the input is exactly the receiver EVM address.
+            let receiver = H160::from_slice(bytes);
+            Ok(Self {
+                receiver: DepositReceiver::Ethereum(receiver),
+                chain_id: None,
+            })
+        } else if input_length == Self::RECEIVER_AND_CHAIN_ID_LENGTH {
+            // Legacy format: the receiver EVM address followed by the chain id.
+            let receiver = H160::from_slice(&bytes[..Self::RECEIVER_LENGTH]);
+            let chain_id = U256::from_little_endian(&bytes[Self::RECEIVER_LENGTH..]);
+            Ok(Self {
+                receiver: DepositReceiver::Ethereum(receiver),
+                chain_id: Some(chain_id),
+            })
+        } else {
+            // Every other length is a versioned RLP payload: a leading
+            // version byte followed by an RLP list.
+            let version = bytes[0];
+            let decoder = Rlp::new(&bytes[1..]);
+            if version == 1u8 {
+                if !decoder.is_list() {
+                    return Err(DecoderError::RlpExpectedToBeList);
+                }
+                if decoder.item_count()? != 2 {
+                    return Err(DecoderError::RlpIncorrectListLen);
+                }
+                let mut it: rlp::RlpIterator<'_, '_> = decoder.iter();
+                let receiver: DepositReceiver =
+                    decode_field(&next(&mut it)?, "receiver")?;
+                let chain_id: Option<U256> = decode_option_explicit(
+                    &next(&mut it)?,
+                    "chain_id",
+                    decode_field_u256_le,
+                )?;
+                Ok(Self { receiver, chain_id })
+            } else {
+                Err(DecoderError::Custom(
+                    "Unexpected version for Deposit informations",
+                ))
+            }
+        }
+    }
+}
+/// Native token deposit
+#[derive(Debug, PartialEq, Clone, RlpEncodable)]
+pub struct Deposit {
+    /// Deposit amount in wei
+    pub amount: U256,
+    /// Deposit receiver on L2
+    pub receiver: DepositReceiver,
+    /// Inbox level containing the original deposit message
+    pub inbox_level: u32,
+    /// Inbox message id
+    pub inbox_msg_id: u32,
+}
+
+impl Deposit {
+    /// Parses a deposit from a ticket transfer (internal inbox message).
+    /// The "entrypoint" type is pair of ticket (FA2.1) and bytes (receiver address).
+    #[cfg_attr(feature = "benchmark", inline(never))]
+    pub fn try_parse(
+        ticket: FA2_1Ticket,
+        receiver: MichelsonBytes,
+        inbox_level: u32,
+        inbox_msg_id: u32,
+    ) -> Result<(Self, Option<U256>), BridgeError> {
+        // Amount
+        let (_sign, amount_bytes) = ticket.amount().to_bytes_le();
+        // `U256::from_little_endian` takes arbitrary-length bytes, so a
+        // ticket amount past `u64` (let alone the mutez domain) is parsed
+        // without panicking; `Mutez::try_from` then narrows it to the
+        // domain, rejecting rather than truncating anything that doesn't
+        // fit.
+        let amount_u256 = U256::from_little_endian(&amount_bytes);
+        let amount_mutez = u64::try_from(amount_u256)
+            .ok()
+            .and_then(|raw| Mutez::try_from(raw).ok())
+            .ok_or(BridgeError::InvalidAmount(amount_u256))?;
+        let amount: U256 = amount_mutez.to_wei().as_u256();
+
+        // EVM address of the receiver and chain id both come from the
+        // Michelson byte parameter.
+        let info = DepositInfo::decode(&receiver.0).map_err(BridgeError::RlpError)?;
+
+        Ok((
+            Self {
+                amount,
+                receiver: info.receiver,
+                inbox_level,
+                inbox_msg_id,
+            },
+            info.chain_id,
+        ))
+    }
+
+    /// Returns log structure for an implicit deposit event.
+    ///
+    /// This event is added to the outer transaction receipt,
+    /// so that we can index successful deposits and update status.
+    ///
+    /// Signature: Deposit(uint256,address,uint256,uint256)
+    pub fn event_log(&self) -> Result<Log, BridgeError> {
+        let event_data = SolBridgeDepositEvent {
+            receiver: h160_to_alloy(&self.receiver.to_h160()?),
+            amount: u256_to_alloy(&self.amount),
+            inbox_level: u256_to_alloy(&U256::from(self.inbox_level)),
+            inbox_msg_id: u256_to_alloy(&U256::from(self.inbox_msg_id)),
+        };
+
+        let data = SolBridgeDepositEvent::encode_data(&event_data);
+
+        Ok(Log {
+            // Emitted by the "system" contract
+            address: Address::ZERO,
+            // (Event ID (non-anonymous) and indexed fields, Non-indexed fields)
+            data: LogData::new_unchecked(
+                vec![B256::from_slice(&DEPOSIT_EVENT_TOPIC)],
+                data.into(),
+            ),
+        })
+    }
+
+    /// Returns unique deposit digest that can be used as hash for the
+    /// pseudo transaction.
+    pub fn hash(&self, seed: &[u8]) -> H256 {
+        let mut hasher = Keccak256::new();
+        hasher.update(self.rlp_bytes());
+        hasher.update(seed);
+        H256(hasher.finalize().into())
+    }
+
+    pub fn display(&self) -> String {
+        format!("Deposit {} to {}", self.amount, self.receiver)
+    }
+}
+
+impl Decodable for Deposit {
+    /// Decode deposit from RLP bytes in a retro-compatible manner.
+    /// If it is a legacy deposit it will have zero inbox level and message ID.
+    ///
+    /// NOTE that [Deposit::hash] would give the same results for "legacy" deposits,
+    /// but since decoding is used only for items that are already in delayed inbox this is OK:
+    /// the hash is calculated for items that are to be submitted to delayed inbox.
+    fn decode(decoder: &Rlp) -> Result<Self, DecoderError> {
+        if !decoder.is_list() {
+            return Err(DecoderError::RlpExpectedToBeList);
+        }
+        match decoder.item_count()? {
+            2 => {
+                let mut it = decoder.iter();
+                let amount: U256 = decode_field(&next(&mut it)?, "amount")?;
+                let receiver: H160 = decode_field(&next(&mut it)?, "receiver")?;
+                Ok(Self {
+                    amount,
+                    receiver: DepositReceiver::Ethereum(receiver),
+                    inbox_level: 0,
+                    inbox_msg_id: 0,
+                })
+            }
+            4 => {
+                let mut it = decoder.iter();
+                let amount: U256 = decode_field(&next(&mut it)?, "amount")?;
+                let receiver_decoder = next(&mut it)?;
+                let receiver: DepositReceiver =
+                    decode_field(&receiver_decoder, "receiver")?;
+                let inbox_level: u32 = decode_field(&next(&mut it)?, "inbox_level")?;
+                let inbox_msg_id: u32 = decode_field(&next(&mut it)?, "inbox_msg_id")?;
+                Ok(Self {
+                    amount,
+                    receiver,
+                    inbox_level,
+                    inbox_msg_id,
+                })
+            }
+            _ => Err(DecoderError::RlpIncorrectListLen),
+        }
+    }
+}
+
+pub struct DepositResult<Outcome> {
+    pub outcome: Outcome,
+    #[allow(dead_code)]
+    pub runtime: RuntimeId,
+}
+
+/// Builds a Michelson `deposit` event carrying the inbox level and message
+/// id of the originating shared-inbox message, so indexers can correlate a
+/// Tezos-address deposit with the L1 inbox slot that produced it.
+///
+/// Type:    `pair (nat %inbox_level) (nat %inbox_msg_id)`
+/// Payload: `Pair <inbox_level> <inbox_msg_id>`
+fn build_deposit_event(
+    sender: Contract,
+    inbox_level: u32,
+    inbox_msg_id: u32,
+) -> Result<InternalOperationSum, crate::Error> {
+    use mir::ast::annotations::{Annotation, Annotations, NO_ANNS};
+    use mir::ast::micheline::Micheline;
+    use mir::ast::Entrypoint;
+    use mir::gas::{Gas, OutOfGas};
+    use mir::lexer::Prim;
+    use std::borrow::Cow;
+    use typed_arena::Arena;
+
+    let arena = Arena::new();
+
+    // L1→L2 deposits are inbox-triggered: no Tezos op-gas to thread,
+    // and the event itself reports `consumed_milligas: 0` in the
+    // receipt. `Gas::default()` acts as an OOG safety cap on the two
+    // small bounded encodes below (pair of two nats).
+    // Fixed-size array; see Note: alloc_extend.
+    #[allow(clippy::disallowed_methods)]
+    let payload = Micheline::App(
+        Prim::Pair,
+        arena.alloc_extend([
+            Micheline::from(i128::from(inbox_level)),
+            Micheline::from(i128::from(inbox_msg_id)),
+        ]),
+        NO_ANNS,
+    )
+    .encode(&mut Gas::default())
+    .map_err(|OutOfGas| {
+        crate::Error::BridgeError("Out of gas encoding deposit event payload".into())
+    })?
+    .map_err(|e| {
+        crate::Error::BridgeError(format!("Failed to encode deposit event payload: {e}"))
+    })?;
+
+    let level_annots: Annotations =
+        Annotations::from([Annotation::Field(Cow::Borrowed("inbox_level"))]);
+    let msg_id_annots: Annotations =
+        Annotations::from([Annotation::Field(Cow::Borrowed("inbox_msg_id"))]);
+
+    // Fixed-size array; see Note: alloc_extend.
+    #[allow(clippy::disallowed_methods)]
+    let ty = Micheline::App(
+        Prim::pair,
+        arena.alloc_extend([
+            Micheline::App(Prim::nat, &[], level_annots),
+            Micheline::App(Prim::nat, &[], msg_id_annots),
+        ]),
+        NO_ANNS,
+    )
+    .encode(&mut Gas::default())
+    .map_err(|OutOfGas| {
+        crate::Error::BridgeError("Out of gas encoding deposit event type".into())
+    })?
+    .map_err(|e| {
+        crate::Error::BridgeError(format!("Failed to encode deposit event type: {e}"))
+    })?;
+
+    Ok(InternalOperationSum::Event(InternalContentWithMetadata {
+        content: EventContent {
+            tag: Some(Entrypoint::from_string_unchecked("deposit".into())),
+            payload: Some(payload.into()),
+            ty: ty.into(),
+        },
+        sender,
+        nonce: 0,
+        result: ContentResult::Applied(EventSuccess {
+            consumed_milligas: Narith(0u64.into()),
+        }),
+    }))
+}
+
+#[allow(clippy::too_many_arguments)]
+#[trace_kernel]
+pub fn apply_tezosx_xtz_deposit<Host>(
+    rk: &mut RuntimeKeyspaces<'_, Host, Host::KeySpace>,
+    registry: &impl Registry<Journal = tezosx_journal::TezosXJournal>,
+    deposit: &Deposit,
+    block_constants: &BlockConstants,
+    transaction_hash: [u8; TRANSACTION_HASH_SIZE],
+    tracer_input: Option<TracerInput>,
+    limits: &EvmLimits,
+) -> Result<ExecutionResult<RuntimeTransactionResult>, crate::Error>
+where
+    Host: StorageV1 + KeySpaceLoader,
+{
+    match &deposit.receiver {
+        DepositReceiver::Ethereum(_) => {
+            let execution_outcome = pure_xtz_deposit(
+                rk,
+                registry,
+                deposit,
+                block_constants,
+                transaction_hash,
+                limits.maximum_gas_limit,
+                tracer_input,
+            )?;
+
+            // A specific address is allocated for queue call
+            // System address can only be used as caller for simulations
+            let transaction_result =
+                RuntimeTransactionResult::Ethereum(EthereumTransactionResult {
+                    caller: alloy_to_h160(&FEED_DEPOSIT_ADDR),
+                    execution_outcome,
+                    crac_receipts: vec![],
+                });
+
+            Ok(ExecutionResult::Valid(transaction_result))
+        }
+        DepositReceiver::Tezos(Contract::Implicit(pkh)) => {
+            let amount = Wei::from_u256(deposit.amount)
+                .to_mutez_exact()
+                .map_err(|_| crate::Error::InvalidConversion)?;
+
+            let receiver = Contract::Implicit(pkh.clone());
+            let content = TransferContent {
+                amount: amount.to_narith(),
+                destination: receiver.clone(),
+                parameters: Parameters::default(),
+            };
+
+            let source = tezos_crypto_rs::public_key_hash::PublicKeyHash::nom_read_exact(
+                &TEZLINK_DEPOSITOR[1..],
+            )
+            .map_err(|_| crate::Error::InvalidConversion)?;
+            let dummy_signature =
+                tezos_crypto_rs::hash::UnknownSignature::nom_read_exact(&[0u8; 64])
+                    .map_err(|_| crate::Error::InvalidConversion)?;
+
+            let depositor = Contract::Implicit(source.clone());
+
+            let (result, internal_operation_results) = match TezosRuntime::add_balance(
+                rk.tez_accounts_mut(),
+                pkh,
+                U256::from(amount.as_u64()),
+            ) {
+                Ok(()) => {
+                    let event = build_deposit_event(
+                        depositor.clone(),
+                        deposit.inbox_level,
+                        deposit.inbox_msg_id,
+                    )?;
+                    let success = TransferSuccess {
+                        balance_updates: BalanceUpdate::transfer(
+                            depositor,
+                            receiver,
+                            amount.as_u64(),
+                        ),
+                        ..TransferSuccess::default()
+                    };
+                    (
+                        ContentResult::Applied(TransferTarget::ToContract(success)),
+                        vec![event],
+                    )
+                }
+                Err(err) => {
+                    log!(Info, "Deposit failed because of {err}");
+                    (
+                        ContentResult::Failed(ApplyOperationErrors { errors: vec![] }),
+                        vec![],
+                    )
+                }
+            };
+
+            let applied_operation = AppliedOperation {
+                hash: transaction_hash.into(),
+                branch: BlockHash::from([0u8; BlockHash::SIZE]),
+                op_and_receipt: OperationDataAndMetadata::OperationWithMetadata(
+                    OperationBatchWithMetadata {
+                        operations: vec![OperationWithMetadata {
+                            content: ManagerOperationContent::Transaction(
+                                ManagerOperation {
+                                    source,
+                                    fee: 0.into(),
+                                    counter: 0.into(),
+                                    gas_limit: 0.into(),
+                                    storage_limit: 0.into(),
+                                    operation: content,
+                                },
+                            ),
+                            receipt: OperationResultSum::Transfer(OperationResult {
+                                balance_updates: vec![],
+                                result,
+                                internal_operation_results,
+                            }),
+                        }],
+                        signature: dummy_signature,
+                    },
+                ),
+            };
+
+            Ok(ExecutionResult::Valid(RuntimeTransactionResult::Tezos {
+                op: applied_operation,
+                etherlink_withdrawals: vec![],
+                cross_runtime_effects: vec![],
+                // Deposits bypass the Michelson interpreter — no gas consumed.
+                consumed_milligas: 0,
+            }))
+        }
+        DepositReceiver::Tezos(Contract::Originated(kt1)) => Err(
+            crate::Error::BridgeError(format!("Invalid deposit receiver: {kt1}")),
+        ),
+    }
+}
+
+pub const TEZLINK_DEPOSITOR: [u8; 22] = [0u8; 22];
+
+fn tezlink_deposit<Host: StorageV1, KS: KeySpace>(
+    rk: &mut RuntimeKeyspaces<'_, Host, KS>,
+    amount: u64,
+    receiver: Contract,
+) -> Result<TransferSuccess, TransferError> {
+    let to_account = tezos_execution::context::implicit_from_contract(&receiver)
+        .map_err(|_| TransferError::FailedToFetchDestinationAccount)?;
+
+    let _was_allocated = to_account
+        .allocate(rk.tez_accounts_mut())
+        .map_err(|_| TransferError::FailedToAllocateDestination)?;
+
+    match to_account.add_balance(rk.host_mut(), amount) {
+        Ok(()) => {
+            let mut success = TransferSuccess::default();
+            let depositor = Contract::nom_read_exact(&TEZLINK_DEPOSITOR).unwrap();
+            let balance_updates = BalanceUpdate::transfer(depositor, receiver, amount);
+            success.balance_updates = balance_updates;
+            Ok(success)
+        }
+        Err(e) => {
+            log!(Error, "Deposit failed because of {e}");
+            Err(TransferError::DepositError(e.to_string()))
+        }
+    }
+}
+
+type TezlinkOutcome = (ContentResult<TransferContent>, TransferContent);
+
+pub fn execute_tezlink_deposit<Host: StorageV1, KS: KeySpace>(
+    rk: &mut RuntimeKeyspaces<'_, Host, KS>,
+    deposit: &Deposit,
+) -> Result<DepositResult<TezlinkOutcome>, BridgeError> {
+    // We should be able to obtain an account for arbitrary H160 address
+    // otherwise it is a fatal error.
+    let receiver = deposit.receiver.to_contract()?;
+
+    let amount = Wei::from_u256(deposit.amount)
+        .to_mutez_exact()
+        .map_err(|_| BridgeError::InvalidAmount(deposit.amount))?;
+
+    let content = TransferContent {
+        amount: amount.to_narith(),
+        destination: receiver.clone(),
+        parameters: Parameters::default(),
+    };
+
+    let result = match tezlink_deposit(rk, amount.as_u64(), receiver) {
+        Ok(success) => ContentResult::Applied(TransferTarget::ToContract(success)),
+        Err(err) => ContentResult::Failed(ApplyOperationErrors {
+            errors: vec![err.into()],
+        }),
+    };
+
+    let result = DepositResult {
+        outcome: (result, content),
+        runtime: RuntimeId::Tezos,
+    };
+
+    Ok(result)
+}
+
+#[cfg(test)]
+mod tests {
+    use crate::registry_impl::RegistryImpl;
+    use alloy_sol_types::SolEvent;
+    use num_bigint::BigInt;
+    use primitive_types::{H160, U256};
+    use revm::primitives::hardfork::SpecId;
+    use revm_etherlink::precompiles::initializer::init_precompile_bytecodes;
+    use rlp::{Decodable, RlpStream};
+    use tezos_crypto_rs::hash::ContractKt1Hash;
+    use tezos_ethereum::{
+        block::{BlockConstants, BlockFees},
+        rlp_helpers::{append_option_explicit, append_u256_le},
+        transaction::TRANSACTION_HASH_SIZE,
+    };
+    use tezos_evm_runtime::runtime::MockKernelHost;
+    use tezos_protocol::contract::Contract;
+    use tezos_smart_rollup::michelson::{
+        ticket::FA2_1Ticket, MichelsonNat, MichelsonOption, MichelsonPair,
+    };
+    use tezos_smart_rollup_encoding::michelson::MichelsonBytes;
+
+    use crate::{
+        apply::{EthereumTransactionResult, ExecutionResult, RuntimeTransactionResult},
+        bridge::{DepositInfo, DepositReceiver, DEPOSIT_EVENT_TOPIC},
+        chains::EvmLimits,
+    };
+    use revm_etherlink::precompiles::constants::FEED_DEPOSIT_ADDR;
+    use revm_etherlink::storage::world_state_handler::StorageAccount;
+
+    use super::{apply_tezosx_xtz_deposit, BridgeError, Deposit, Mutez};
+    use tezos_evm_runtime::runtime_keyspaces::RuntimeKeyspaces;
+
+    mod xtz_events {
+        alloy_sol_types::sol! {
+            event Deposit (
+                uint256 amount,
+                address receiver,
+                uint256 inboxLevel,
+                uint256 inboxMsgId
+            );
+        }
+    }
+
+    fn dummy_deposit() -> Deposit {
+        Deposit {
+            amount: U256::from(1u64),
+            receiver: DepositReceiver::Ethereum(H160::from([2u8; 20])),
+            inbox_level: 3,
+            inbox_msg_id: 4,
+        }
+    }
+
+    pub fn create_fa_ticket(
+        ticketer: &str,
+        token_id: u64,
+        metadata: &[u8],
+        amount: BigInt,
+    ) -> FA2_1Ticket {
+        let creator =
+            Contract::Originated(ContractKt1Hash::from_base58_check(ticketer).unwrap());
+        let contents = MichelsonPair(
+            MichelsonNat::new(BigInt::from(token_id).into()).unwrap(),
+            MichelsonOption(Some(MichelsonBytes(metadata.to_vec()))),
+        );
+        FA2_1Ticket::new(creator, contents, amount).unwrap()
+    }
+
+    #[test]
+    fn deposit_event_topic() {
+        assert_eq!(xtz_events::Deposit::SIGNATURE_HASH.0, DEPOSIT_EVENT_TOPIC);
+    }
+
+    #[test]
+    fn deposit_parsing_rejects_amount_above_u64_max() {
+        // Pre-fix, this panicked inside `U256::as_u64()` instead of
+        // failing gracefully.
+        let huge_amount = BigInt::from(u64::MAX) * BigInt::from(4);
+        let ticket = create_fa_ticket(
+            "KT18amZmM5W7qDWVt2pH6uj7sCEd3kbzLrHT",
+            0,
+            &[0u8],
+            huge_amount,
+        );
+        let receiver = MichelsonBytes(vec![1u8; 20]);
+        let result = Deposit::try_parse(ticket, receiver, 0, 0);
+        assert!(
+            matches!(result, Err(BridgeError::InvalidAmount(_))),
+            "amount past the mutez domain must be a parse error, not a panic; got {result:?}"
+        );
+    }
+
+    #[test]
+    fn deposit_parsing_rejects_amount_above_i64_max() {
+        // Within u64 but past the mutez domain (i64::MAX): pre-fix, this
+        // was accepted via `U256::as_u64()` without complaint.
+        let amount = BigInt::from(i64::MAX as u64) + BigInt::from(1);
+        let ticket =
+            create_fa_ticket("KT18amZmM5W7qDWVt2pH6uj7sCEd3kbzLrHT", 0, &[0u8], amount);
+        let receiver = MichelsonBytes(vec![1u8; 20]);
+        let result = Deposit::try_parse(ticket, receiver, 0, 0);
+        assert!(
+            matches!(result, Err(BridgeError::InvalidAmount(_))),
+            "amount past the mutez domain must be a parse error, not a panic; got {result:?}"
+        );
+    }
+
+    #[test]
+    fn deposit_parsing_no_chain_id() {
+        let ticket =
+            create_fa_ticket("KT18amZmM5W7qDWVt2pH6uj7sCEd3kbzLrHT", 0, &[0u8], 2.into());
+        let receiver = MichelsonBytes(vec![1u8; 20]);
+        let (deposit, chain_id) =
+            Deposit::try_parse(ticket, receiver, 0, 0).expect("Failed to parse");
+        pretty_assertions::assert_eq!(
+            deposit,
+            Deposit {
+                amount: Mutez::try_from(2u64).unwrap().to_wei().as_u256(),
+                receiver: DepositReceiver::Ethereum(H160([1u8; 20])),
+                inbox_level: 0,
+                inbox_msg_id: 0,
+            }
+        );
+        pretty_assertions::assert_eq!(chain_id, None)
+    }
+
+    #[test]
+    fn deposit_parsing_chain_id() {
+        let ticket =
+            create_fa_ticket("KT18amZmM5W7qDWVt2pH6uj7sCEd3kbzLrHT", 0, &[0u8], 2.into());
+        let mut receiver_and_chain_id = vec![];
+        receiver_and_chain_id.extend(vec![1u8; 20]);
+        receiver_and_chain_id.extend(vec![1u8]);
+        receiver_and_chain_id.extend(vec![0u8; 31]);
+        let receiver_and_chain_id = MichelsonBytes(receiver_and_chain_id);
+        let (deposit, chain_id) = Deposit::try_parse(ticket, receiver_and_chain_id, 0, 0)
+            .expect("Failed to parse");
+        pretty_assertions::assert_eq!(
+            deposit,
+            Deposit {
+                amount: Mutez::try_from(2u64).unwrap().to_wei().as_u256(),
+                receiver: DepositReceiver::Ethereum(H160::from([1u8; 20])),
+                inbox_level: 0,
+                inbox_msg_id: 0,
+            }
+        );
+        pretty_assertions::assert_eq!(chain_id, Some(U256::one()))
+    }
+
+    #[test]
+    fn ensure_deposit_legacy_and_deposit_have_no_collision() {
+        let receiver = H160::from_slice(&[1u8; 20]);
+        let chain_id: U256 = 15544u64.into();
+        let mut chain_id_encoded = [0u8; 32];
+        chain_id.to_little_endian(&mut chain_id_encoded);
+
+        // Receiver representation should be 20 bytes long
+        let legacy_receiver = MichelsonBytes(receiver.as_bytes().to_vec());
+
+        assert_eq!(legacy_receiver.0.len(), DepositInfo::RECEIVER_LENGTH);
+
+        // Receiver and chain_id old representation should be 52 bytes long
+        let mut legacy_receiver_and_chain_id = MichelsonBytes(vec![]);
+        legacy_receiver_and_chain_id
+            .0
+            .extend_from_slice(receiver.as_bytes());
+        legacy_receiver_and_chain_id
+            .0
+            .extend_from_slice(&chain_id_encoded);
+
+        assert_eq!(
+            legacy_receiver_and_chain_id.0.len(),
+            DepositInfo::RECEIVER_AND_CHAIN_ID_LENGTH
+        );
+
+        // DepositInfo with no chain_id representation should be 24 bytes long
+        const RLP_DEPOSIT_NO_CHAIN_ID: usize = 24;
+        let deposit_info = DepositInfo {
+            receiver: DepositReceiver::Ethereum(receiver),
+            chain_id: None,
+        };
+        let mut stream = RlpStream::new();
+        stream.append(&1u8);
+        stream.begin_list(2);
+        stream.append(&deposit_info.receiver);
+        stream.append(&deposit_info.chain_id);
+        let deposit_info_no_chain_id = MichelsonBytes(stream.as_raw().to_vec());
+
+        assert_eq!(deposit_info_no_chain_id.0.len(), RLP_DEPOSIT_NO_CHAIN_ID);
+
+        // DepositInfo with no chain_id representation should be 56 bytes long
+        const RLP_DEPOSIT_CHAIN_ID: usize = 56;
+        let deposit_info = DepositInfo {
+            receiver: DepositReceiver::Ethereum(receiver),
+            chain_id: Some(chain_id),
+        };
+        let mut stream = RlpStream::new();
+        stream.append(&1u8);
+        stream.begin_list(2);
+        stream.append(&deposit_info.receiver);
+        append_option_explicit(&mut stream, &deposit_info.chain_id, append_u256_le);
+
+        let deposit_info_chain_id = MichelsonBytes(stream.as_raw().to_vec());
+
+        assert_eq!(deposit_info_chain_id.0.len(), RLP_DEPOSIT_CHAIN_ID);
+
+        let ticket =
+            create_fa_ticket("KT18amZmM5W7qDWVt2pH6uj7sCEd3kbzLrHT", 0, &[0u8], 2.into());
+        let result_legacy_receiver =
+            Deposit::try_parse(ticket, legacy_receiver, 0, 0).expect("Failed to parse");
+
+        let ticket =
+            create_fa_ticket("KT18amZmM5W7qDWVt2pH6uj7sCEd3kbzLrHT", 0, &[0u8], 2.into());
+        let result_legacy_receiver_chain_id =
+            Deposit::try_parse(ticket, legacy_receiver_and_chain_id, 0, 0)
+                .expect("Failed to parse");
+
+        let ticket =
+            create_fa_ticket("KT18amZmM5W7qDWVt2pH6uj7sCEd3kbzLrHT", 0, &[0u8], 2.into());
+        let result_deposit_info_no_chain_id =
+            Deposit::try_parse(ticket, deposit_info_no_chain_id, 0, 0)
+                .expect("Failed to parse");
+
+        let ticket =
+            create_fa_ticket("KT18amZmM5W7qDWVt2pH6uj7sCEd3kbzLrHT", 0, &[0u8], 2.into());
+        let result_deposit_info_chain_id =
+            Deposit::try_parse(ticket, deposit_info_chain_id, 0, 0)
+                .expect("Failed to parse");
+
+        pretty_assertions::assert_eq!(
+            result_legacy_receiver,
+            result_deposit_info_no_chain_id,
+        );
+
+        pretty_assertions::assert_eq!(
+            result_legacy_receiver_chain_id,
+            result_deposit_info_chain_id,
+        );
+    }
+
+    #[test]
+    fn deposit_info_decode_is_length_authoritative() {
+        // Build a byte-string that is *both* a structurally valid versioned
+        // encoding [version, [receiver_b, chain_id]] and exactly the legacy
+        // receiver-and-chain-id length. If the versioned scheme were tried
+        // first it would decode to receiver_b; length authority instead
+        // reads it as the legacy receiver+chain_id, so the payload maps to a
+        // single receiver.
+        let receiver_b = H160::from_slice(&[0xbbu8; 20]);
+        // The payload length is only chosen to land the whole encoding on
+        // the 52-byte legacy length; its contents are otherwise arbitrary.
+        let chain_id_payload = vec![0xccu8; 28];
+
+        let mut stream = RlpStream::new();
+        stream.append(&1u8);
+        stream.begin_list(2);
+        stream.append(&DepositReceiver::Ethereum(receiver_b));
+        stream.append(&chain_id_payload);
+        let bytes = stream.as_raw().to_vec();
+
+        assert_eq!(bytes.len(), DepositInfo::RECEIVER_AND_CHAIN_ID_LENGTH);
+
+        let info = DepositInfo::decode(&bytes).expect("decode");
+
+        // Read under the legacy scheme: first 20 bytes are the receiver, the
+        // trailing 32 bytes the little-endian chain id.
+        pretty_assertions::assert_eq!(
+            info,
+            DepositInfo {
+                receiver: DepositReceiver::Ethereum(H160::from_slice(&bytes[..20])),
+                chain_id: Some(U256::from_little_endian(&bytes[20..])),
+            }
+        );
+
+        // In particular it is not the receiver the versioned scheme carries.
+        assert_ne!(info.receiver, DepositReceiver::Ethereum(receiver_b));
+    }
+
+    #[test]
+    fn deposit_decode_legacy() {
+        let mut stream = rlp::RlpStream::new_list(2);
+        stream
+            .append(&primitive_types::U256::one())
+            .append(&primitive_types::H160([1u8; 20]));
+        let bytes = stream.out().to_vec();
+        let decoder = rlp::Rlp::new(&bytes);
+        let res = Deposit::decode(&decoder).unwrap();
+        assert_eq!(
+            res,
+            Deposit {
+                amount: U256::one(),
+                receiver: DepositReceiver::Ethereum(H160::from([1u8; 20])),
+                inbox_level: 0,
+                inbox_msg_id: 0,
+            }
+        );
+    }
+
+    #[test]
+    fn deposit_execution_outcome_contains_event() {
+        let mut host = MockKernelHost::default();
+        let mut rk = RuntimeKeyspaces::init(&mut host).unwrap();
+        let registry = &RegistryImpl::default();
+        init_precompile_bytecodes(rk.eth_accounts_mut(), true).unwrap();
+
+        let deposit = dummy_deposit();
+
+        let limits = EvmLimits::default();
+        let execution_result = apply_tezosx_xtz_deposit(
+            &mut rk,
+            registry,
+            &deposit,
+            &BlockConstants::first_block(
+                U256::zero(),
+                U256::zero(),
+                BlockFees::new(
+                    limits.minimum_base_fee_per_gas,
+                    U256::zero(),
+                    U256::zero(),
+                ),
+                limits.maximum_gas_limit,
+                H160::zero(),
+                &SpecId::default(),
+            ),
+            [0; TRANSACTION_HASH_SIZE],
+            None,
+            &limits,
+        )
+        .unwrap();
+        let outcome = if let ExecutionResult::Valid(RuntimeTransactionResult::Ethereum(
+            EthereumTransactionResult {
+                execution_outcome, ..
+            },
+        )) = execution_result
+        {
+            execution_outcome
+        } else {
+            panic!("Deposit is invalid")
+        };
+        let logs = outcome.result.logs();
+        assert!(outcome.result.is_success());
+        assert_eq!(logs.len(), 1);
+
+        let event = xtz_events::Deposit::decode_log_data(&logs[0].data).unwrap();
+        assert_eq!(event.amount, alloy_primitives::U256::from(1));
+        assert_eq!(
+            event.receiver,
+            alloy_primitives::Address::from_slice(&[2u8; 20])
+        );
+        assert_eq!(event.inboxLevel, alloy_primitives::U256::from(3));
+        assert_eq!(event.inboxMsgId, alloy_primitives::U256::from(4));
+    }
+
+    #[test]
+    fn deposit_execution_fails_due_to_balance_overflow() {
+        let mut host = MockKernelHost::default();
+        let mut rk = RuntimeKeyspaces::init(&mut host).unwrap();
+        let registry = &RegistryImpl::default();
+        init_precompile_bytecodes(rk.eth_accounts_mut(), true).unwrap();
+
+        let mut deposit = dummy_deposit();
+        deposit.amount = U256::MAX;
+
+        let limits = EvmLimits::default();
+        let execution_result = apply_tezosx_xtz_deposit(
+            &mut rk,
+            registry,
+            &deposit,
+            &BlockConstants::first_block(
+                U256::zero(),
+                U256::zero(),
+                BlockFees::new(
+                    limits.minimum_base_fee_per_gas,
+                    U256::zero(),
+                    U256::zero(),
+                ),
+                limits.maximum_gas_limit,
+                H160::zero(),
+                &SpecId::default(),
+            ),
+            [0; TRANSACTION_HASH_SIZE],
+            None,
+            &limits,
+        )
+        .unwrap();
+        let outcome = if let ExecutionResult::Valid(RuntimeTransactionResult::Ethereum(
+            EthereumTransactionResult {
+                execution_outcome, ..
+            },
+        )) = execution_result
+        {
+            execution_outcome
+        } else {
+            panic!("Deposit is invalid")
+        };
+        assert!(outcome.result.is_success());
+
+        let execution_result = apply_tezosx_xtz_deposit(
+            &mut rk,
+            registry,
+            &deposit,
+            &BlockConstants::first_block(
+                U256::zero(),
+                U256::zero(),
+                BlockFees::new(
+                    limits.minimum_base_fee_per_gas,
+                    U256::zero(),
+                    U256::zero(),
+                ),
+                limits.maximum_gas_limit,
+                H160::zero(),
+                &SpecId::default(),
+            ),
+            [0; TRANSACTION_HASH_SIZE],
+            None,
+            &limits,
+        )
+        .unwrap();
+        let outcome = if let ExecutionResult::Valid(RuntimeTransactionResult::Ethereum(
+            EthereumTransactionResult {
+                execution_outcome, ..
+            },
+        )) = execution_result
+        {
+            execution_outcome
+        } else {
+            panic!("Deposit is invalid")
+        };
+        assert!(!outcome.result.is_success());
+        assert!(outcome.result.logs().is_empty());
+
+        // Even though the EVM call returned Ok with a non-success result
+        // (balance overflow on the receiver), the prefund must be refunded
+        // on the `Ok`-with-revert arm too, so no value is stranded on
+        // FEED_DEPOSIT_ADDR.
+        let feed_account = StorageAccount::from_address(&FEED_DEPOSIT_ADDR).unwrap();
+        let feed_info = feed_account.info(rk.eth_accounts_mut()).unwrap();
+        assert_eq!(feed_info.balance, alloy_primitives::U256::ZERO);
+    }
+
+    #[test]
+    fn bridge_deposit_event_log_consistent() {
+        let deposit = dummy_deposit();
+        let log = deposit.event_log();
+        let expected_log = hex::decode("0000000000000000000000000000000000000000000000000000000000000001\
+                                        0000000000000000000000000202020202020202020202020202020202020202\
+                                        0000000000000000000000000000000000000000000000000000000000000003\
+                                        0000000000000000000000000000000000000000000000000000000000000004").unwrap();
+        assert_eq!(expected_log, log.unwrap().data.data)
+    }
+}

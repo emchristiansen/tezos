@@ -57,6 +57,8 @@ val is_bootstrapped : t -> bool
 
 val force_bootstrapped : t -> bool -> unit Lwt.t
 
+val active_peers_heads : t -> Chain_services.active_peers_info list Lwt.t
+
 val prevalidator : t -> Prevalidator.t option
 
 val chain_db : t -> Distributed_db.chain_db
@@ -76,9 +78,11 @@ val validate_block :
 
 val shutdown : t -> unit Lwt.t
 
-val valid_block_watcher : t -> Store.Block.t Lwt_stream.t * Lwt_watcher.stopper
+val received_block_watcher :
+  t -> Block_hash.t Lwt_stream.t * Lwt_watcher.stopper
 
-val new_head_watcher : t -> Store.Block.t Lwt_stream.t * Lwt_watcher.stopper
+val new_head_watcher :
+  t -> (Block_hash.t * Block_header.t) Lwt_stream.t * Lwt_watcher.stopper
 
 val running_workers : unit -> (Chain_id.t * t) list
 

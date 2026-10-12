@@ -122,9 +122,9 @@ module MakeEncoder (H : sig
   val raw_encoding : t Data_encoding.t
 end) =
 struct
-  let pp ppf t = Format.pp_print_string ppf (H.to_b58check t)
+  let pp ppf t = Format.fprintf ppf "@{<bold>%s@}" (H.to_b58check t)
 
-  let pp_short ppf t = Format.pp_print_string ppf (H.to_short_b58check t)
+  let pp_short ppf t = Format.fprintf ppf "@{<bold>%s@}" (H.to_short_b58check t)
 
   let encoding =
     let open Data_encoding in
@@ -307,3 +307,54 @@ struct
     let encoding = encoding
   end)
 end
+
+(** This variable is used to enable yes-cryptography at runtime.
+
+  With yes-cryptography activated, signatures are faked and always considered
+  valid.
+
+  This can put your software at risk of being
+  - considered faulty/malicious if it fake signs,
+  - exploited by attackers if it fake-checks signatures.
+
+  This should be used for testing purposes only and/or with extreme care.
+
+  Yes-cryptography comes in two flavors:
+    - Yes: uses the normal [sign] and [check] functions to simulate
+      cryptographic costs, but [check] always returns [true].
+    - Fast: return hardcoded signatures and skip any actual cryptographic checks.
+
+  In both modes, verification always succeeds. *)
+
+let yes_crypto_environment_variable =
+  "TEZOS_USE_YES_CRYPTO_I_KNOW_WHAT_I_AM_DOING"
+
+type yes_crypto_kind = Fast | Yes | No
+
+let yes_crypto_kind =
+  match Sys.getenv_opt yes_crypto_environment_variable with
+  | None -> No
+  | Some x -> (
+      match String.lowercase_ascii x with
+      | "yes" | "y" -> Yes
+      | "fast" -> Fast
+      | _ -> No)
+
+let is_yes_crypto_enabled =
+  match yes_crypto_kind with Yes | Fast -> true | No -> false
+
+module Events = struct
+  include Tezos_event_logging.Internal_event.Simple
+
+  let yes_crypto_is_enabled =
+    declare_0
+      ~level:Warning
+      ~section:["crypto"]
+      ~name:"yes_crypto_is_enabled"
+      ~msg:"yes-cryptography is enabled"
+      ()
+end
+
+let () =
+  if is_yes_crypto_enabled then
+    Events.(emit_at_top_level yes_crypto_is_enabled ())

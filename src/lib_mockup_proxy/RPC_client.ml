@@ -29,23 +29,23 @@ module Service = Tezos_rpc.Service
 let media_types = [Tezos_rpc_http.Media_type.json]
 
 module NullLogger = struct
-  let debug fmt = Format.kasprintf ignore fmt
+  let log_debug fmt = Format.kasprintf ignore fmt
 
   let log_info fmt = Format.kasprintf ignore fmt
 
   let log_notice fmt = Format.kasprintf ignore fmt
 
-  let warn fmt = Format.kasprintf ignore fmt
+  let log_warn fmt = Format.kasprintf ignore fmt
 
   let log_error fmt = Format.kasprintf ignore fmt
 
-  let lwt_debug fmt = Format.kasprintf (fun _ -> Lwt.return_unit) fmt
+  let lwt_log_debug fmt = Format.kasprintf (fun _ -> Lwt.return_unit) fmt
 
   let lwt_log_info fmt = Format.kasprintf (fun _ -> Lwt.return_unit) fmt
 
   let lwt_log_notice fmt = Format.kasprintf (fun _ -> Lwt.return_unit) fmt
 
-  let lwt_warn fmt = Format.kasprintf (fun _ -> Lwt.return_unit) fmt
+  let lwt_log_warn fmt = Format.kasprintf (fun _ -> Lwt.return_unit) fmt
 
   let lwt_log_error fmt = Format.kasprintf (fun _ -> Lwt.return_unit) fmt
 end
@@ -68,25 +68,25 @@ let local_ctxt (directory : unit Tezos_rpc.Directory.t) :
     method generic_media_type_call meth ?body uri =
       C.generic_media_type_call ~accept:media_types meth ?body uri
 
-    method call_service
-        : 'm 'p 'q 'i 'o.
-          (([< Resto.meth] as 'm), unit, 'p, 'q, 'i, 'o) Tezos_rpc.Service.t ->
-          'p ->
-          'q ->
-          'i ->
-          'o tzresult Lwt.t =
+    method call_service :
+        'm 'p 'q 'i 'o.
+        (([< Resto.meth] as 'm), unit, 'p, 'q, 'i, 'o) Tezos_rpc.Service.t ->
+        'p ->
+        'q ->
+        'i ->
+        'o tzresult Lwt.t =
       fun service params query body ->
         C.call_service media_types ~base service params query body
 
-    method call_streamed_service
-        : 'm 'p 'q 'i 'o.
-          (([< Resto.meth] as 'm), unit, 'p, 'q, 'i, 'o) Tezos_rpc.Service.t ->
-          on_chunk:('o -> unit) ->
-          on_close:(unit -> unit) ->
-          'p ->
-          'q ->
-          'i ->
-          (unit -> unit) tzresult Lwt.t =
+    method call_streamed_service :
+        'm 'p 'q 'i 'o.
+        (([< Resto.meth] as 'm), unit, 'p, 'q, 'i, 'o) Tezos_rpc.Service.t ->
+        on_chunk:('o -> unit) ->
+        on_close:(unit -> unit) ->
+        'p ->
+        'q ->
+        'i ->
+        (unit -> unit) tzresult Lwt.t =
       fun service ~on_chunk ~on_close params query body ->
         C.call_streamed_service
           media_types

@@ -26,8 +26,8 @@
 (** Testing
     -------
     Component:    Script_comparison
-    Invocation:   dune exec \
-                  src/proto_alpha/lib_protocol/test/pbt/test_script_comparison.exe
+    Invocation:   dune exec src/proto_alpha/lib_protocol/test/pbt/main.exe \
+                  -- --file test_script_comparison.ml
     Subject:      PBT of the Script_comparable.compare_comparable function.
 *)
 
@@ -64,8 +64,6 @@ let rec reference_compare_comparable : type a. a comparable_ty -> a -> a -> int
   | Timestamp_t, x, y -> normalize_compare @@ Script_timestamp.compare x y
   | Address_t, x, y ->
       normalize_compare @@ Script_comparable.compare_address x y
-  | Tx_rollup_l2_address_t, x, y ->
-      normalize_compare @@ Script_comparable.compare_tx_rollup_l2_address x y
   | Bytes_t, x, y -> normalize_compare @@ Compare.Bytes.compare x y
   | Chain_id_t, x, y -> normalize_compare @@ Script_chain_id.compare x y
   | Pair_t (tl, tr, _, YesYes), (lx, rx), (ly, ry) ->
@@ -115,8 +113,7 @@ module Parameters = struct
     }
 end
 
-module Crypto_samplers =
-Tezos_benchmark.Crypto_samplers.Make_finite_key_pool (struct
+module Crypto_samplers = Crypto_samplers.Make_finite_key_pool (struct
   let size = 1000
 
   let algo = `Default
@@ -195,9 +192,9 @@ let assert_return x = assert_ok (Lwt_main.run x)
 let ctxt =
   assert_return
     (let open Lwt_result_syntax in
-    let* b, _cs = Context.init3 () in
-    let* v = Incremental.begin_construction b in
-    return (Incremental.alpha_ctxt v))
+     let* b, _cs = Context.init3 () in
+     let* v = Incremental.begin_construction b in
+     return (Incremental.alpha_ctxt v))
 
 let unparse_comparable_ty ty =
   Micheline.strip_locations
@@ -343,14 +340,13 @@ let test_pack_unpack =
 
 let () =
   Alcotest.run
-    "protocol > pbt > script_comparison"
+    ~__FILE__
+    Protocol.name
     [
-      ( Protocol.name ^ ": compatible_with_reference",
-        qcheck_wrap [test_compatible_with_reference] );
-      ( Protocol.name ^ ": compatible_with_packing",
-        qcheck_wrap [test_compatible_with_packing] );
-      (Protocol.name ^ ": reflexivity", qcheck_wrap [test_reflexivity]);
-      (Protocol.name ^ ": symmetry", qcheck_wrap [test_symmetry]);
-      (Protocol.name ^ ": transitivity", qcheck_wrap [test_transitivity]);
-      (Protocol.name ^ ": pack_unpack", qcheck_wrap [test_pack_unpack]);
+      ("compatible_with_reference", qcheck_wrap [test_compatible_with_reference]);
+      ("compatible_with_packing", qcheck_wrap [test_compatible_with_packing]);
+      ("reflexivity", qcheck_wrap [test_reflexivity]);
+      ("symmetry", qcheck_wrap [test_symmetry]);
+      ("transitivity", qcheck_wrap [test_transitivity]);
+      ("pack_unpack", qcheck_wrap [test_pack_unpack]);
     ]

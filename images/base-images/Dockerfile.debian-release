@@ -1,0 +1,35 @@
+ARG IMAGE=invalid
+# the image with proper version is set as ARG
+#hadolint ignore=DL3006
+FROM ${IMAGE}
+
+SHELL ["/bin/sh", "-eu", "-c"]
+ENV LANG=C.UTF-8 LC_ALL=C.UTF-8
+
+# This image is built on top of the internal "debian" base image, which already
+# provides ca-certificates, curl, jq, gpg, gcloud, datadog, kiss-fetch and the
+# KISSCACHE environment. Only the release-specific tooling is added here.
+COPY images/scripts/install-release-cli.sh /tmp
+
+# hadolint ignore=DL3008
+RUN apt-get install -y --update --no-install-recommends \
+    bash \
+    bzip2 \
+    git \
+    gnupg \
+    make \
+    openssh-client \
+    unzip \
+    wget \
+    xz-utils \
+    zip \
+    python3 \
+    awscli \
+    gawk \
+    tar \
+    pandoc && \
+    /tmp/install-release-cli.sh && \
+    rm -f /tmp/install-*
+
+RUN release-cli --version && \
+    pandoc --version

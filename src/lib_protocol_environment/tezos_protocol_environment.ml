@@ -26,6 +26,7 @@
 
 module Context = Environment_context.Context
 module Register = Environment_context.Register
+module Environment_profiler = Environment_profiler
 
 let err_implementation_mismatch =
   Environment_context.err_implementation_mismatch
@@ -35,7 +36,8 @@ type validation_result = Environment_context.validation_result = {
   fitness : Fitness.t;
   message : string option;
   max_operations_ttl : int;
-  last_allowed_fork_level : Int32.t;
+  last_finalized_block_level : Int32.t;
+  last_preserved_block_level : Int32.t;
 }
 
 type quota = Environment_context.quota = {max_size : int; max_op : int option}
@@ -58,7 +60,16 @@ module V6 = Environment_V6
 module V7 = Environment_V7
 module V8 = Environment_V8
 module V9 = Environment_V9
+module V10 = Environment_V10
+module V11 = Environment_V11
+module V12 = Environment_V12
+module V13 = Environment_V13
+module V14 = Environment_V14
+module V15 = Environment_V15
+module V16 = Environment_V16
+module V17 = Environment_V17
 module Memory_context = Memory_context
+module Brassaia_memory_context = Brassaia_memory_context
 module Proxy_context = Proxy_context
 module Proxy_delegate = Proxy_delegate
 

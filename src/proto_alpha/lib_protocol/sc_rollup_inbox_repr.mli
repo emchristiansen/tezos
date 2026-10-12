@@ -121,9 +121,9 @@ type error += Inbox_level_reached_messages_limit
 
 *)
 
-module Hash : S.HASH
+module Hash : S.HASH with type t = Smart_rollup.Inbox_hash.t
 
-module Skip_list : Skip_list_repr.S
+module Skip_list : Skip_list.S
 
 module V1 : sig
   type level_proof = {
@@ -241,6 +241,8 @@ val serialized_proof_encoding : serialized_proof Data_encoding.t
 val add_all_messages :
   protocol_migration_message:
     Sc_rollup_inbox_message_repr.internal_inbox_message option ->
+  dal_attested_slots_messages:
+    Sc_rollup_inbox_message_repr.internal_inbox_message list ->
   predecessor_timestamp:Time.t ->
   predecessor:Block_hash.t ->
   History.t ->
@@ -330,13 +332,13 @@ val add_info_per_level_no_history :
   predecessor_timestamp:Time.t ->
   predecessor:Block_hash.t ->
   Sc_rollup_inbox_merkelized_payload_hashes_repr.t ->
-  Sc_rollup_inbox_merkelized_payload_hashes_repr.t tzresult
+  Sc_rollup_inbox_merkelized_payload_hashes_repr.t
 
 (** [finalize_inbox_level payloads_history history inbox level_witness] updates
     the current inbox's level witness by adding [EOL], and archives the current
     level. *)
 val finalize_inbox_level_no_history :
-  t -> Sc_rollup_inbox_merkelized_payload_hashes_repr.t -> t tzresult
+  t -> Sc_rollup_inbox_merkelized_payload_hashes_repr.t -> t
 
 (** [genesis ~protocol_migration_message ~timestamp ~predecessor
     level] initializes the inbox at some given [level] with: [SOL],
@@ -346,11 +348,11 @@ val finalize_inbox_level_no_history :
     The expected value of [protocol_migration_message] is
     [Raw_context.protocol_migration_internal_message]. *)
 val genesis :
-  protocol_migration_message:Sc_rollup_inbox_message_repr.internal_inbox_message ->
+  protocol_migration_message:Sc_rollup_inbox_message_repr.serialized ->
   predecessor_timestamp:Time.t ->
   predecessor:Block_hash.t ->
   Raw_level_repr.t ->
-  t tzresult
+  t
 
 module Internal_for_tests : sig
   (** Given a inbox [A] at some level [L] and another inbox [B] at some level

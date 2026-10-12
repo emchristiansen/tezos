@@ -1,34 +1,15 @@
 (*****************************************************************************)
 (*                                                                           *)
-(* Open Source License                                                       *)
-(* Copyright (c) 2022 Nomadic-Labs. <contact@nomadic-labs.com>               *)
-(*                                                                           *)
-(* Permission  is hereby granted, free of charge, to any person obtaining a  *)
-(* copy of this software and associated documentation files (the "Software"),*)
-(* to deal in the Software without restriction, including without limitation *)
-(* the rights to use, copy, modify, merge, publish, distribute, sublicense,  *)
-(* and/or sell copies of the Software, and to permit persons to whom the     *)
-(* Software is furnished to do so, subject to the following conditions:      *)
-(*                                                                           *)
-(* The above copyright notice and this permission notice shall be included   *)
-(* in all copies or substantial portions of the Software.                    *)
-(*                                                                           *)
-(* THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR*)
-(* IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,  *)
-(* FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL   *)
-(* THE AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER*)
-(* LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING   *)
-(* FROM, OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER       *)
-(* DEALINGS IN THE SOFTWARE.                                                 *)
+(* SPDX-License-Identifier: MIT                                              *)
+(* Copyright (c) 2022 Nomadic Labs, <contact@nomadic-labs.com>               *)
 (*                                                                           *)
 (*****************************************************************************)
 
 (** Testing
     -------
     Component:  Protocol (validate manager)
-    Invocation: dune exec \
-                src/proto_alpha/lib_protocol/test/integration/validate/main.exe \
-                -- test "^covalidity"
+    Invocation: dune exec src/proto_alpha/lib_protocol/test/integration/validate/main.exe \
+                  -- --file test_covalidity.ml
     Subject:    Validation of operation.
 *)
 open Validate_helpers
@@ -37,6 +18,9 @@ open Generator_descriptors
 open Valid_operations_generators
 open Protocol
 open Alpha_context
+
+let register_test =
+  Tezt_helpers.register_test ~__FILE__ ~file_tags:["validation"; "operation"]
 
 (** Values of number of bootstraps to create.*)
 
@@ -60,10 +44,10 @@ let pp_seed fmt = function
 
 let op_of_seed_gen = function Nonce -> KNonce | Vdf -> KVdf
 
-let is_not_preendorsement op =
+let is_not_preattestation op =
   let open Protocol.Alpha_context in
   let (Operation_data {contents; _}) = op.protocol_data in
-  match contents with Single (Preendorsement _) -> false | _ -> true
+  match contents with Single (Preattestation _) -> false | _ -> true
 
 module OpkindMap = Map.Make (struct
   type t = op_kind
@@ -107,7 +91,7 @@ let covalid_permutation_and_bake ks nb_bootstrap =
           QCheck2.Gen.shuffle_l candidates
           |> QCheck2.Gen.generate1
           |> List.sort Protocol.Alpha_context.Operation.compare_by_passes
-          |> List.rev_filter is_not_preendorsement
+          |> List.rev_filter is_not_preattestation
         in
         (* Ensure that we can validate and apply this permutation *)
         let* (_ : Block.t) =
@@ -155,3 +139,5 @@ let tests =
     []
     voting_periods
   |> Qcheck2_helpers.qcheck_wrap_lwt
+
+let () = List.iter (fun (s, _, f) -> register_test ~title:s f) tests

@@ -1,16 +1,17 @@
 ; This file was automatically generated, do not edit.
 ; Edit file manifest/main.ml instead.
 
-(executable
- (name benchmark_scoru_wasm)
+(library
+ (name octez_smart_rollup_wasm_benchmark_lib)
+ (public_name octez-l2-libs.smart_rollup_wasm_benchmark_lib)
  (instrumentation (backend bisect_ppx))
  (libraries
-  tezos-base
+  bls12-381.archive
+  octez-libs.base
   tezt
-  tezos-webassembly-interpreter
-  tezos-context.memory
-  tezos-scoru-wasm
-  tezos-scoru-wasm-helpers
+  octez-libs.webassembly-interpreter
+  octez-libs.scoru-wasm
+  octez-l2-libs.scoru-wasm-helpers
   lwt.unix)
  (preprocess (pps ppx_deriving.show))
  (flags

@@ -33,12 +33,17 @@ let group =
     title = "Commands for managing FA1.2-compatible smart contracts";
   }
 
-let alias_param = Client_proto_contracts.ContractAlias.destination_param
+let alias_param = Client_proto_contracts.Contract_alias.destination_param
+
+let implicit_alias_param = Client_keys.Public_key_hash.source_param
 
 let token_contract_param () =
-  Client_proto_contracts.OriginatedContractAlias.destination_param
+  Client_proto_contracts.Originated_contract_alias.destination_param
     ~name:"contract"
     ~desc:"name or address of the FA1.2-compatible contract"
+
+let from_implicit_param () =
+  implicit_alias_param ~name:"from" ~desc:"name or address of the sender"
 
 let from_param () =
   alias_param ~name:"from" ~desc:"name or address of the sender"
@@ -60,9 +65,9 @@ let amount_param () =
 let tez_amount_arg =
   tez_arg ~default:"0" ~parameter:"tez-amount" ~doc:"amount in \xEA\x9C\xA9"
 
-let as_arg =
-  Client_proto_contracts.ContractAlias.destination_arg
-    ~name:"as"
+let implicit_as_arg =
+  Client_keys.Public_key_hash.source_arg
+    ~long:"as"
     ~doc:"name or address of the caller of the contract"
     ()
 
@@ -80,25 +85,27 @@ let callback_entrypoint_arg =
     string_parameter
 
 let contract_call_options =
-  Tezos_clic.args9
+  Tezos_clic.args10
     tez_amount_arg
     fee_arg
     Client_proto_context_commands.dry_run_switch
     Client_proto_context_commands.verbose_signing_switch
     gas_limit_arg
+    safety_guard_arg
     storage_limit_arg
     counter_arg
     no_print_source_flag
     fee_parameter_args
 
 let contract_view_options =
-  Tezos_clic.args10
+  Tezos_clic.args11
     callback_entrypoint_arg
     tez_amount_arg
     fee_arg
     Client_proto_context_commands.dry_run_switch
     Client_proto_context_commands.verbose_signing_switch
     gas_limit_arg
+    safety_guard_arg
     storage_limit_arg
     counter_arg
     no_print_source_flag
@@ -110,17 +117,13 @@ let view_options =
     payer_arg
     (unparsing_mode_arg ~default:"Readable")
 
-let dummy_callback = Contract.Implicit Signature.Public_key_hash.zero
+let dummy_callback = Contract.Implicit Implicit_account_repr.zero
 
-let get_contract_caller_keys (cctxt : #Client_context.full)
-    (caller : Contract.t) =
+let get_contract_caller_keys (cctxt : #Client_context.full) source =
   let open Lwt_result_syntax in
-  match caller with
-  | Originated _ ->
-      cctxt#error "only implicit accounts can be the source of a contract call"
-  | Implicit source ->
-      let* _, caller_pk, caller_sk = Client_keys.get_key cctxt source in
-      return (source, caller_pk, caller_sk)
+  let* _, caller_pk, caller_sk = Client_keys.get_key cctxt source in
+  (* FIXME-PA *)
+  return (Implicit_account_repr.Forbidden.of_pkh source, caller_pk, caller_sk)
 
 let commands_ro () : #Protocol_client_context.full Tezos_clic.command list =
   Tezos_clic.
@@ -164,7 +167,8 @@ let commands_ro () : #Protocol_client_context.full Tezos_clic.command list =
         (fun (gas, payer, unparsing_mode)
              contract
              addr
-             (cctxt : #Protocol_client_context.full) ->
+             (cctxt : #Protocol_client_context.full)
+           ->
           let open Lwt_syntax in
           let action =
             Client_proto_fa12.Get_balance (addr, (dummy_callback, None))
@@ -176,9 +180,11 @@ let commands_ro () : #Protocol_client_context.full Tezos_clic.command list =
               ~block:cctxt#block
               ~contract
               ~action
-              ~source:addr
-              ?gas
-              ?payer
+              ~sender:(Some addr)
+              ~gas
+              ~payer:
+                (* FIXME-PA *)
+                (Option.map Implicit_account_repr.Forbidden.of_pkh payer)
               ~unparsing_mode
               ()
           in
@@ -200,13 +206,14 @@ let commands_ro () : #Protocol_client_context.full Tezos_clic.command list =
         @@ stop)
         (fun (gas, payer, unparsing_mode)
              contract
-             source
+             sender
              destination
-             (cctxt : #Protocol_client_context.full) ->
+             (cctxt : #Protocol_client_context.full)
+           ->
           let open Lwt_syntax in
           let action =
             Client_proto_fa12.Get_allowance
-              (source, destination, (dummy_callback, None))
+              (sender, destination, (dummy_callback, None))
           in
           let* res =
             Client_proto_fa12.run_view_action
@@ -215,9 +222,11 @@ let commands_ro () : #Protocol_client_context.full Tezos_clic.command list =
               ~block:cctxt#block
               ~contract
               ~action
-              ~source
-              ?gas
-              ?payer
+              ~sender:(Some sender)
+              ~gas
+              ~payer:
+                (* FIXME-PA *)
+                (Option.map Implicit_account_repr.Forbidden.of_pkh payer)
               ~unparsing_mode
               ()
           in
@@ -232,7 +241,8 @@ let commands_ro () : #Protocol_client_context.full Tezos_clic.command list =
         @@ stop)
         (fun (gas, payer, unparsing_mode)
              contract
-             (cctxt : #Protocol_client_context.full) ->
+             (cctxt : #Protocol_client_context.full)
+           ->
           let open Lwt_syntax in
           let action =
             Client_proto_fa12.Get_total_supply (dummy_callback, None)
@@ -242,10 +252,13 @@ let commands_ro () : #Protocol_client_context.full Tezos_clic.command list =
               cctxt
               ~chain:cctxt#chain
               ~block:cctxt#block
+              ~sender:None
               ~contract
               ~action
-              ?gas
-              ?payer
+              ~gas
+              ~payer:
+                (* FIXME-PA *)
+                (Option.map Implicit_account_repr.Forbidden.of_pkh payer)
               ~unparsing_mode
               ()
           in
@@ -257,7 +270,7 @@ let commands_ro () : #Protocol_client_context.full Tezos_clic.command list =
         (prefixes ["from"; "fa1.2"; "contract"]
         @@ token_contract_param ()
         @@ prefixes ["get"; "balance"; "for"]
-        @@ alias_param
+        @@ implicit_alias_param
              ~name:"from"
              ~desc:
                "name or address of the account to lookup (also the source \
@@ -273,6 +286,7 @@ let commands_ro () : #Protocol_client_context.full Tezos_clic.command list =
                dry_run,
                verbose_signing,
                gas_limit,
+               safety_guard,
                storage_limit,
                counter,
                no_print_source,
@@ -280,11 +294,15 @@ let commands_ro () : #Protocol_client_context.full Tezos_clic.command list =
              contract
              addr
              callback
-             (cctxt : #Protocol_client_context.full) ->
+             (cctxt : #Protocol_client_context.full)
+           ->
           let open Lwt_result_syntax in
           let* source, src_pk, src_sk = get_contract_caller_keys cctxt addr in
           let action =
-            Client_proto_fa12.Get_balance (addr, (callback, callback_entrypoint))
+            Client_proto_fa12.Get_balance
+              (* FIXME-PA *)
+              ( Implicit (Implicit_account_repr.Forbidden.of_pkh addr),
+                (callback, callback_entrypoint) )
           in
           let*! errors =
             Client_proto_fa12.call_contract
@@ -302,6 +320,7 @@ let commands_ro () : #Protocol_client_context.full Tezos_clic.command list =
               ~src_sk
               ~tez_amount
               ?gas_limit
+              ?safety_guard
               ?storage_limit
               ?counter
               ~fee_parameter
@@ -322,7 +341,7 @@ let commands_ro () : #Protocol_client_context.full Tezos_clic.command list =
         (prefixes ["from"; "fa1.2"; "contract"]
         @@ token_contract_param ()
         @@ prefixes ["get"; "allowance"; "on"]
-        @@ alias_param
+        @@ implicit_alias_param
              ~name:"from"
              ~desc:"name or address of the account giving the allowance"
         @@ prefix "as"
@@ -340,6 +359,7 @@ let commands_ro () : #Protocol_client_context.full Tezos_clic.command list =
                dry_run,
                verbose_signing,
                gas_limit,
+               safety_guard,
                storage_limit,
                counter,
                no_print_source,
@@ -348,12 +368,16 @@ let commands_ro () : #Protocol_client_context.full Tezos_clic.command list =
              src
              dst
              callback
-             (cctxt : #Protocol_client_context.full) ->
+             (cctxt : #Protocol_client_context.full)
+           ->
           let open Lwt_result_syntax in
           let* source, src_pk, src_sk = get_contract_caller_keys cctxt src in
           let action =
             Client_proto_fa12.Get_allowance
-              (src, dst, (callback, callback_entrypoint))
+              (* FIXME-PA *)
+              ( Implicit (Implicit_account_repr.Forbidden.of_pkh src),
+                dst,
+                (callback, callback_entrypoint) )
           in
           let*! errors =
             Client_proto_fa12.call_contract
@@ -371,6 +395,7 @@ let commands_ro () : #Protocol_client_context.full Tezos_clic.command list =
               ~src_sk
               ~tez_amount
               ?gas_limit
+              ?safety_guard
               ?storage_limit
               ?counter
               ~fee_parameter
@@ -392,7 +417,7 @@ let commands_ro () : #Protocol_client_context.full Tezos_clic.command list =
         (prefixes ["from"; "fa1.2"; "contract"]
         @@ token_contract_param ()
         @@ prefixes ["get"; "total"; "supply"; "as"]
-        @@ alias_param
+        @@ implicit_alias_param
              ~name:"from"
              ~desc:"name or address of the source account"
         @@ prefixes ["callback"; "on"]
@@ -406,6 +431,7 @@ let commands_ro () : #Protocol_client_context.full Tezos_clic.command list =
                dry_run,
                verbose_signing,
                gas_limit,
+               safety_guard,
                storage_limit,
                counter,
                no_print_source,
@@ -413,7 +439,8 @@ let commands_ro () : #Protocol_client_context.full Tezos_clic.command list =
              contract
              addr
              callback
-             (cctxt : #Protocol_client_context.full) ->
+             (cctxt : #Protocol_client_context.full)
+           ->
           let open Lwt_result_syntax in
           let* source, src_pk, src_sk = get_contract_caller_keys cctxt addr in
           let action =
@@ -435,6 +462,7 @@ let commands_ro () : #Protocol_client_context.full Tezos_clic.command list =
               ~src_sk
               ~tez_amount
               ?gas_limit
+              ?safety_guard
               ?storage_limit
               ?counter
               ~fee_parameter
@@ -457,27 +485,29 @@ let commands_rw () : #Protocol_client_context.full Tezos_clic.command list =
       command
         ~group
         ~desc:"Transfer tokens between two given accounts"
-        (Tezos_clic.args10
-           as_arg
+        (Tezos_clic.args11
+           implicit_as_arg
            tez_amount_arg
            fee_arg
            Client_proto_context_commands.dry_run_switch
            Client_proto_context_commands.verbose_signing_switch
            gas_limit_arg
+           safety_guard_arg
            storage_limit_arg
            counter_arg
            no_print_source_flag
            fee_parameter_args)
         (prefixes ["from"; "fa1.2"; "contract"]
         @@ token_contract_param () @@ prefix "transfer" @@ amount_param ()
-        @@ prefix "from" @@ from_param () @@ prefix "to" @@ to_param () @@ stop
-        )
+        @@ prefix "from" @@ from_implicit_param () @@ prefix "to" @@ to_param ()
+        @@ stop)
         (fun ( as_address,
                tez_amount,
                fee,
                dry_run,
                verbose_signing,
                gas_limit,
+               safety_guard,
                storage_limit,
                counter,
                no_print_source,
@@ -486,13 +516,20 @@ let commands_rw () : #Protocol_client_context.full Tezos_clic.command list =
              amount
              src
              dst
-             (cctxt : #Protocol_client_context.full) ->
+             (cctxt : #Protocol_client_context.full)
+           ->
           let open Lwt_result_syntax in
           let caller = Option.value ~default:src as_address in
           let* source, caller_pk, caller_sk =
             get_contract_caller_keys cctxt caller
           in
-          let action = Client_proto_fa12.Transfer (src, dst, amount) in
+          (* FIXME-PA *)
+          let action =
+            Client_proto_fa12.Transfer
+              ( Implicit (Implicit_account_repr.Forbidden.of_pkh src),
+                dst,
+                amount )
+          in
           let*! errors =
             Client_proto_fa12.call_contract
               cctxt
@@ -509,6 +546,7 @@ let commands_rw () : #Protocol_client_context.full Tezos_clic.command list =
               ~src_sk:caller_sk
               ~tez_amount
               ?gas_limit
+              ?safety_guard
               ?storage_limit
               ?counter
               ~fee_parameter
@@ -528,7 +566,7 @@ let commands_rw () : #Protocol_client_context.full Tezos_clic.command list =
         contract_call_options
         (prefixes ["from"; "fa1.2"; "contract"]
         @@ token_contract_param () @@ prefix "as"
-        @@ alias_param ~name:"as" ~desc:"name or address of the sender"
+        @@ implicit_alias_param ~name:"as" ~desc:"name or address of the sender"
         @@ prefix "approve" @@ amount_param () @@ prefix "from"
         @@ alias_param
              ~name:"from"
@@ -539,6 +577,7 @@ let commands_rw () : #Protocol_client_context.full Tezos_clic.command list =
                dry_run,
                verbose_signing,
                gas_limit,
+               safety_guard,
                storage_limit,
                counter,
                no_print_source,
@@ -547,7 +586,8 @@ let commands_rw () : #Protocol_client_context.full Tezos_clic.command list =
              source
              amount
              dst
-             (cctxt : #Protocol_client_context.full) ->
+             (cctxt : #Protocol_client_context.full)
+           ->
           let open Lwt_result_syntax in
           let* source, src_pk, src_sk = get_contract_caller_keys cctxt source in
           let action = Client_proto_fa12.Approve (dst, amount) in
@@ -567,6 +607,7 @@ let commands_rw () : #Protocol_client_context.full Tezos_clic.command list =
               ~src_sk
               ~tez_amount
               ?gas_limit
+              ?safety_guard
               ?storage_limit
               ?counter
               ~fee_parameter
@@ -585,18 +626,19 @@ let commands_rw () : #Protocol_client_context.full Tezos_clic.command list =
         ~desc:
           "Execute multiple token transfers from a single source account. If \
            one of the token transfers fails, none of them are executed."
-        (args9
+        (args10
            default_fee_arg
-           as_arg
+           implicit_as_arg
            Client_proto_context_commands.dry_run_switch
            Client_proto_context_commands.verbose_signing_switch
            default_gas_limit_arg
+           safety_guard_arg
            default_storage_limit_arg
            counter_arg
            no_print_source_flag
            fee_parameter_args)
         (prefixes ["multiple"; "fa1.2"; "transfers"; "from"]
-        @@ alias_param
+        @@ implicit_alias_param
              ~name:"src"
              ~desc:"name or address of the source of the transfers"
         @@ prefix "using"
@@ -643,13 +685,15 @@ let commands_rw () : #Protocol_client_context.full Tezos_clic.command list =
                dry_run,
                verbose_signing,
                gas_limit,
+               safety_guard,
                storage_limit,
                counter,
                no_print_source,
                fee_parameter )
              src
              operations
-             cctxt ->
+             cctxt
+           ->
           let open Lwt_result_syntax in
           let caller = Option.value ~default:src as_address in
           match operations with
@@ -666,7 +710,9 @@ let commands_rw () : #Protocol_client_context.full Tezos_clic.command list =
                   ?confirmations:cctxt#confirmations
                   ~dry_run
                   ~verbose_signing
-                  ~sender:src
+                  ~sender:
+                    (* FIXME-PA *)
+                    (Implicit (Implicit_account_repr.Forbidden.of_pkh src))
                   ~source
                   ~src_pk
                   ~src_sk
@@ -676,6 +722,7 @@ let commands_rw () : #Protocol_client_context.full Tezos_clic.command list =
                   ?default_fee:fee
                   ?default_gas_limit:gas_limit
                   ?default_storage_limit:storage_limit
+                  ?safety_guard
                   ()
               in
               let*! _ =

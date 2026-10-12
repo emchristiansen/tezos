@@ -26,9 +26,8 @@
 (** Testing
     -------
     Component: Protocol (Ticket_balance_key)
-    Invocation: dune exec \
-                src/proto_alpha/lib_protocol/test/integration/michelson/main.exe \
-                -- test "^ticket balance"
+    Invocation: dune exec src/proto_alpha/lib_protocol/test/integration/michelson/main.exe \
+                  -- --file test_ticket_balance.ml
     Subject: Ticket balance key hashing
 *)
 
@@ -37,7 +36,7 @@ open Alpha_context
 
 type init_env = {
   block : Block.t;
-  baker : Signature.public_key_hash;
+  baker : Implicit_account_repr.t;
   contract : Contract.t;
 }
 
@@ -158,7 +157,7 @@ let assert_token_balance ~loc block token owner expected =
   | Some b, None ->
       failwith "%s: Expected no balance but got some %d" loc (Z.to_int b)
   | None, Some b -> failwith "%s: Expected balance %d but got none" loc b
-  | None, None -> return ()
+  | None, None -> return_unit
 
 let string_token ~ticketer content =
   let contents =
@@ -174,10 +173,10 @@ let unit_ticket ~ticketer =
 let new_contracts ~before ~after =
   let open Lwt_result_wrap_syntax in
   let all_contracts current_block =
-    let* ctxt =
-      Incremental.begin_construction current_block >|=? Incremental.alpha_ctxt
-    in
-    Lwt.map Result.ok (Contract.list ctxt)
+    let* result = Incremental.begin_construction current_block in
+    let ctxt = Incremental.alpha_ctxt result in
+    let*! cs = Contract.For_RPC.list ctxt in
+    return cs
   in
   let* cs1 = all_contracts before in
   let* cs2 = all_contracts after in
@@ -1607,7 +1606,7 @@ let test_ticket_storage () =
   in
   let* () = assert_used_ticket_storage ~loc:__LOC__ block 66 in
   let* () = assert_paid_ticket_storage ~loc:__LOC__ block 132 in
-  return ()
+  return_unit
 
 (* Test used ticket storage and paid storage. *)
 let test_storage_for_create_and_remove_tickets () =
@@ -1758,31 +1757,35 @@ let test_storage_for_create_and_remove_tickets () =
 
 let tests =
   [
-    Tztest.tztest "Test add strict" `Quick test_add_strict;
-    Tztest.tztest "Test add and remove" `Quick test_add_remove;
-    Tztest.tztest "Test add to big-map" `Quick test_add_to_big_map;
-    Tztest.tztest "Test swap big-map" `Quick test_swap_big_map;
-    Tztest.tztest "Test send ticket" `Quick test_send_tickets;
+    Tztest.tztest "add strict" `Quick test_add_strict;
+    Tztest.tztest "add and remove" `Quick test_add_remove;
+    Tztest.tztest "add to big-map" `Quick test_add_to_big_map;
+    Tztest.tztest "swap big-map" `Quick test_swap_big_map;
+    Tztest.tztest "send ticket" `Quick test_send_tickets;
     Tztest.tztest
-      "Test send ticket to implicit"
+      "send ticket to implicit"
       `Quick
       test_send_tickets_to_implicit_account;
     Tztest.tztest
-      "Test send and store tickets with amount 0"
+      "send and store tickets with amount 0"
       `Quick
       test_send_and_store_zero_amount_tickets;
+    Tztest.tztest "send tickets in big-map" `Quick test_send_tickets_in_big_map;
+    Tztest.tztest "modify big-map" `Quick test_modify_big_map;
+    Tztest.tztest "send drop" `Quick test_send_tickets_in_big_map_and_drop;
     Tztest.tztest
-      "Test send tickets in big-map"
+      "create contract with ticket"
       `Quick
-      test_send_tickets_in_big_map;
-    Tztest.tztest "Test modify big-map" `Quick test_modify_big_map;
-    Tztest.tztest "Test send drop" `Quick test_send_tickets_in_big_map_and_drop;
-    Tztest.tztest "Test send drop" `Quick test_create_contract_with_ticket;
-    Tztest.tztest "Test join" `Quick test_join_tickets;
-    Tztest.tztest "Test wallet" `Quick test_ticket_wallet;
-    Tztest.tztest "Test ticket storage" `Quick test_ticket_storage;
+      test_create_contract_with_ticket;
+    Tztest.tztest "join" `Quick test_join_tickets;
+    Tztest.tztest "wallet" `Quick test_ticket_wallet;
+    Tztest.tztest "ticket storage" `Quick test_ticket_storage;
     Tztest.tztest
-      "Test storage for create and remove tickets"
+      "storage for create and remove tickets"
       `Quick
       test_storage_for_create_and_remove_tickets;
   ]
+
+let () =
+  Alcotest_lwt.run ~__FILE__ Protocol.name [("ticket balance", tests)]
+  |> Lwt_main.run

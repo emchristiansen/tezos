@@ -65,6 +65,17 @@ let unparsable_operation =
     ~pp1:Operation_hash.pp
     ("oph", Operation_hash.encoding)
 
+let unknown_operation_branch =
+  declare_2
+    ~section
+    ~name:"unknown_operation_branch"
+    ~msg:"unknown operation branch {branch} for {oph}"
+    ~level:Debug
+    ~pp1:Block_hash.pp
+    ("branch", Block_hash.encoding)
+    ~pp2:Operation_hash.pp
+    ("oph", Operation_hash.encoding)
+
 let processing_operations =
   declare_0
     ~section
@@ -95,16 +106,16 @@ let operations_to_reclassify =
   declare_1
     ~section
     ~name:"operations_to_reclassify"
-    ~msg:"{count} operations set to be reeclassified after the flush"
+    ~msg:"{count} operations set to be reclassified after the flush"
     ~level:Debug
     ~pp1:Format.pp_print_int
     ("count", Data_encoding.int31)
 
-let operation_reclassified =
+let operation_classified =
   declare_1
     ~section
-    ~name:"operation_reclassified"
-    ~msg:"operation {oph} reclassified"
+    ~name:"operation_classified"
+    ~msg:"operation {oph} classified"
     ~level:Debug
     ~pp1:Operation_hash.pp
     ("oph", Operation_hash.encoding)
@@ -214,3 +225,14 @@ let operation_not_fetched =
     ~level:Debug
     ~pp1:Operation_hash.pp
     ("oph", Operation_hash.encoding)
+
+let pending_operation_context_error =
+  declare_1
+    ~section
+    ~name:"pending_operations_context_error"
+    ~msg:
+      "The sources from the RPC results will not be filtered. Unable to \
+       retrieve the context; got: {errors}"
+    ~level:Warning
+    ~pp1:Error_monad.pp_print_trace
+    ("errors", Error_monad.trace_encoding)

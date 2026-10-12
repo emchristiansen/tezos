@@ -23,6 +23,14 @@
 (*                                                                           *)
 (*****************************************************************************)
 
+(* Testing
+   -------
+   Component:    Stdlib
+   Invocation:   dune exec src/lib_lwt_result_stdlib/test/main.exe \
+                  -- --file test_fuzzing_map_against_stdlib.ml
+   Subject:      Test fuzzing map against stdlib
+*)
+
 open Test_fuzzing_lib
 
 (* The test framework [Test_fuzzing_lib] uses [char] as the type of values
@@ -136,4 +144,4 @@ let fold =
 
 let all_map : unit Alcotest.test_case list = [iter; fold]
 
-let () = Alcotest.run "FuzzRef" [("Map", all_map)]
+let () = Alcotest.run ~__FILE__ "FuzzRef" [("Map", all_map)]

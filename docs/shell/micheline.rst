@@ -22,12 +22,13 @@ one of the five following constructs:
 Primitives
 ~~~~~~~~~~
 
-Micheline primitives are character strings containing only
-alphanumeric or underscore (``_``) characters. Additional restrictions
-on primitives can also be put to achieve the equivalent of JSON and
-XML schemas; for example each protocol specifies a fixed list of
-Michelson primitives. This restriction impacts the way Micheline nodes
-are serialized to binary format (see `Binary serialization`_).
+Micheline primitives are character strings starting by an alphabetic
+or underscore (``_``) characters and containing only alphanumeric or
+underscore (``_``) characters. Additional restrictions on primitives
+can also be put to achieve the equivalent of JSON and XML schemas; for
+example each protocol specifies a fixed list of Michelson
+primitives. This restriction impacts the way Micheline nodes are
+serialized to binary format (see `Binary serialization`_).
 
 Annotations
 ~~~~~~~~~~~
@@ -139,7 +140,7 @@ Formally, Micheline nodes have the following BNF grammar::
   <natural> ::= [0-9]+
   <char> ::= \" | \r | \n | \t | \b | \\ | [^"\]
   <hexadecimal> ::= [0-9a-fA-F][0-9a-fA-F]
-  <primitive> ::= [a-zA-Z_0-9]+
+  <primitive> ::= [a-zA-Z_][a-zA-Z_0-9]*
   <annotation> ::= [@:$&%!?][_0-9a-zA-Z\.%@]*
 
   <node> ::= <integer> | <string> | <bytes> | <primitive application> | <sequence>
@@ -269,7 +270,7 @@ we want to keep the locations canonical and use the ``root`` function
 to obtain a plain node.
 
 
-The `Micheline_printer` module exports two pretty-printing functions
+The ``Micheline_printer`` module exports two pretty-printing functions
 based on the ``Format`` standard OCaml module: ``print_expr`` and
 ``print_expr_unwrapped``. The difference is that ``print_expr`` wraps
 its output in parentheses if it is a primitive application with at
@@ -277,7 +278,7 @@ least one argument. The input of these printing functions can be
 produced from a ``'p canonical`` by the ``printable`` function.
 
 
-The `Micheline_parser` module can be used to produce Micheline nodes
+The ``Micheline_parser`` module can be used to produce Micheline nodes
 from strings and files. It is done in two stages: tokenization (also
 known as lexing) and parsing. Tokenization is done by the ``tokenize``
 function that uses the ``uutf`` OCaml library to decode UTF-8
@@ -287,10 +288,18 @@ Micheline node while the second parses a list of expressions separated
 by semicolons. They both take an optional boolean parameter named
 ``check``; setting it to ``false`` disables indentation checking.
 
-Other tools and resources
--------------------------
+Tools and resources
+-------------------
 
-The following links are not part of the Octez OCaml code base but are
+Besides the direct use of the OCaml libraries described above, the following tools from the Octez suite can be used to convert Micheline and Michelson values to and from other representations:
+
+* ``octez-client convert data`` and ``octez-client convert script`` can convert Micheline expressions, and respectively Michelson scripts, from Micheline, JSON or binary to Micheline, JSON, binary or OCaml representations.
+
+* ``octez-client hash data`` and ``octez-client unpack michelson data`` can do serialization and deserialization of Michelson values to/from binary representation, in a way compatible with the Michelson `PACK <https://tezos.gitlab.io/michelson-reference/#instr-PACK>`__ and `UNPACK <https://tezos.gitlab.io/michelson-reference/#instr-UNPACK>`__ instructions.
+
+* :ref:`octez-codec <octez-codec>` can convert Micheline expressions between JSON and binary form.
+
+The following tools and links are not part of the Octez code base but are
 reimplementations of parts of ``lib_micheline`` in other tools and
 languages:
 
@@ -302,8 +311,3 @@ languages:
   available as part of the Mi-Cho-Coq framework:
   https://gitlab.com/nomadic-labs/mi-cho-coq/-/blob/master/src/michocoq/micheline_parser.vy
   it is incomplete as it does not support annotations.
-
-- An online converter between Micheline files and their JSON encoding
-  (improperly called "Michelson")
-  developed as part of Cryptonomic hackathon and documented here:
-  https://scalac.io/blog/we-hakked-tezos-and-created-a-micheline-michelson-translator/

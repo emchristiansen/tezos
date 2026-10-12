@@ -1,0 +1,617 @@
+(*****************************************************************************)
+(*                                                                           *)
+(* SPDX-License-Identifier: MIT                                              *)
+(* Copyright (c) 2025 Nomadic Labs. <contact@nomadic-labs.com>               *)
+(*                                                                           *)
+(*****************************************************************************)
+
+open Gitlab_ci.Types
+open Tezos_ci
+module CI = Cacio.Shared
+
+(* Helper function to standardise the path of a base image built in the same
+   pipeline. Used to build more complex base images and avoid code duplications *)
+let base_dep_img_name image =
+  let prefix = "${GCP_REGISTRY}/$CI_PROJECT_NAMESPACE/tezos" in
+  let tag = "${RELEASE}-${CI_COMMIT_REF_SLUG}-${CI_COMMIT_SHORT_SHA}" in
+  Format.sprintf "%s/%s:%s" prefix image tag
+
+type compilation =
+  | Amd64_only (* Built on amd64 runner *)
+  | Arm64_only
+    (* Built on arm64 runner. The image will be suffixed with -arm64 *)
+  | Emulated
+    (* Built on amd64 runners. Arm64 image is built using qumu.
+       Use 1 runner / 1 job to create one multi-arch image *)
+  | Native
+(* Both amd64 and arm64 images are built on their respective native architectures
+   Use 3 runners. 2 jobs for building the images, one job for merging the manifest
+   must be added to create one multi-arch image. Both images are suffixed,
+   repesctively, with -amd64 or -arm64 *)
+
+type upstream_image = Pipeline_dep of string | Upstream of string
+(* Datatype to differenciate between variable passed with IMAGE_PATH to the
+   dockerfile via --build-arg IMAGE=IMAGE_PATH.
+   Upstream is the full upstream image ref ( eg. debian:$RELEASE or
+   debian:$RELEASE-slim ).
+   Pipeline_dep is the name of an image generate in this pipeline ( eg.
+   ${GCP_REGISTRY}/$CI_PROJECT_NAMESPACE/tezos/debian:trixie-$CI_COMMIT_REF_SLUG-$CI_COMMIT_SHORT_SHA )
+*)
+
+module Files = struct
+  let build_script = ["scripts/ci/build-base-images.sh"]
+
+  (* Used in jobs merging manifests of natively build Docker images. *)
+  let merge_script = ["scripts/ci/docker-merge-base-images.sh"]
+
+  (* Direct changesets of jobs, i.e. files directly used by the corresponding jobs.
+
+     The full changeset of a job should also contain the files indirectly used.
+     - Example: [image A] is built on top of [image B], then the
+     changeset of the image A build ([job A])job should contain the
+     files needed to build B.
+
+
+     Also, the full changeset of a job should contain the changeset of the jobs that depend on it.
+     - Example: [image A] is built on top of [image B] so [job A] depends on
+     [job B]. If [job A] is in the pipeline then [job B] should be too. So, the
+     full changeset of [job B] needs to include the changeset of [job A].
+     NB: This is enforced by Cacio, so this part will be simplified if the jobs are migrated.
+
+   *)
+
+  let debian_base =
+    [
+      "images/base-images/Dockerfile.debian";
+      (* scripts in Dockerfile *)
+      "scripts/kiss-fetch.sh";
+      "images/scripts/install_datadog_static.sh";
+      "images/scripts/install-gcloud.sh";
+    ]
+    @ build_script
+
+  let debian_homebrew =
+    [
+      "images/base-images/Dockerfile.debian-homebrew";
+      (* script used in Dockerfile *)
+      "scripts/packaging/homebrew_install.sh";
+    ]
+    @ build_script
+
+  let debian_build =
+    [
+      "images/base-images/Dockerfile.debian-build";
+      (* files copied in Dockerfile except Makefile as many changes to
+         it should be irrelevant to debian packages *)
+      "images/scripts/install_sccache_static.sh";
+      "images/scripts/install_opam_static.sh";
+      "scripts/kiss-fetch.sh";
+      "scripts/kiss-logs.sh";
+      "scripts/version.sh";
+      "scripts/install_build_deps.sh";
+      "scripts/install_build_deps.rust.sh";
+      "opam/virtual/octez-deps.opam.locked";
+      "opam/virtual/release-tools-deps.opam.locked";
+      "opam/virtual/dream-httpaf.opam.locked";
+      "opam/virtual/dream.opam.locked";
+    ]
+    @ build_script
+
+  let debian_systemd =
+    [
+      "images/base-images/Dockerfile.debian-systemd";
+      (* scripts in Dockerfile *)
+      "scripts/ci/systemd-entrypoint.service";
+      "scripts/ci/systemd-entrypoint.sh";
+      "scripts/ci/octez-packages-version.sh";
+      "scripts/packaging/tests/tests-common.inc.sh";
+      "script-inputs/active_protocol_versions_without_number";
+    ]
+    @ build_script
+
+  let debian_jsonnet =
+    ["images/base-images/Dockerfile.debian-jsonnet"] @ build_script
+
+  let debian_rust_build =
+    [
+      "images/base-images/Dockerfile.rust";
+      (* script used in Dockerfile *)
+      "images/scripts/install_sccache_static.sh";
+    ]
+    @ build_script
+
+  let rust_sdk_bindings =
+    [
+      "images/base-images/Dockerfile.rust-sdk-bindings";
+      (* script used in Dockerfile *)
+      "images/scripts/install_sccache_static.sh";
+    ]
+    @ build_script
+
+  let alpine_docker_ci =
+    [
+      "images/base-images/Dockerfile.alpine-docker-ci";
+      "images/scripts/install-gcloud-apk.sh";
+      "scripts/ci/docker_initialize.sh";
+      "images/scripts/install_datadog_static.sh";
+    ]
+    @ build_script
+
+  let ci_releases =
+    [
+      "scripts/kiss-fetch.sh";
+      "images/scripts/install-release-cli.sh";
+      "images/scripts/install_datadog_static.sh";
+      "images/scripts/install-gcloud.sh";
+      "images/base-images/Dockerfile.debian-release";
+    ]
+
+  (* Inputs of the static "alpine-*" CI images built by [docker buildx bake]
+     (images/ci/ci-images.hcl): the bake file, the per-image Dockerfiles and
+     everything they COPY from the build context (repository root). *)
+  let ci_images =
+    [
+      "images/ci/**";
+      "opam/virtual/*.opam.locked";
+      "pyproject.toml";
+      "poetry.lock";
+      "scripts/version.sh";
+      "scripts/kiss-fetch.sh";
+      "scripts/kiss-logs.sh";
+      "scripts/install_dal_trusted_setup.sh";
+      "images/scripts/install_opam_static.sh";
+      "images/scripts/install_sccache_static.sh";
+      "images/scripts/install_datadog_static.sh";
+      "images/common/install-nvm.sh";
+    ]
+end
+
+let release_matrix distro = [("RELEASE", Distro.supported_releases distro)]
+
+let dockerfile = function
+  | Distro.Debian | Ubuntu -> "images/base-images/Dockerfile.debian"
+
+(* ── Cacio helpers ───────────────────────────────────────────────────────── *)
+
+(* Partial application of [CI.job] that fixes the docker-auth settings:
+   alpine_docker_ci image, dind service, DOCKER_VERSION variable, and
+   docker_initialize.sh prepended to the script (Cacio has no before_script).
+   All other [CI.job] arguments are left for the caller. *)
+let docker_job ?(extra_variables = []) ?(retry = Tezos_ci.dind_retry) ~script =
+  CI.job
+    ~stage:Build
+    ~image:Images.Base_images.alpine_docker_ci
+    ~services:[{name = Images.Base_images.dind_service}]
+    ~retry
+    ~variables:
+      (("DOCKER_VERSION", Images.Base_images.docker_version) :: extra_variables)
+    ~script:("./scripts/ci/docker_initialize.sh" :: script)
+
+(* Partial application of [docker_job] that fixes the image-build variables
+   (DISTRIBUTION, IMAGE_PATH, PLATFORM) and the compilation strategy
+   (tag and matrix). All other arguments are left for the caller. *)
+let base_image_job ~image_name
+    ?(base_name = Upstream (image_name ^ ":$RELEASE")) ~matrix ~compilation
+    ?(extra_variables = []) dockerfile =
+  let platform, extra_tags =
+    match compilation with
+    | Amd64_only -> ("linux/amd64", [])
+    | Arm64_only -> ("", [("TAGS", [Runner.Tag.show Gcp_arm64])])
+    | Emulated -> ("linux/amd64,linux/arm64", [])
+    | Native ->
+        ( "",
+          [
+            ( "TAGS",
+              [Runner.Tag.show Gcp_very_high_cpu; Runner.Tag.show Gcp_arm64] );
+          ] )
+  in
+  let emulated = extra_tags = [] in
+  docker_job
+    ~extra_variables:
+      ([
+         ("DISTRIBUTION", image_name);
+         ( "IMAGE_PATH",
+           match base_name with
+           | Upstream image_ref -> image_ref
+           | Pipeline_dep name -> base_dep_img_name name );
+         ("PLATFORM", platform);
+       ]
+      @ extra_variables)
+    ~script:[Printf.sprintf "scripts/ci/build-base-images.sh %s" dockerfile]
+    ~retry:Tezos_ci.dind_retry
+    ~tag:(if emulated then Gcp_very_high_cpu else Dynamic)
+    ~parallel:(Matrix [matrix @ extra_tags])
+
+(* ── Base distribution jobs ─────────────────────────────────────────────── *)
+
+(* ── Cacio: debian ───────────────────────────────────────────────────────── *)
+
+(* Root job. Cacio propagates the changeset to dependent jobs automatically
+   via [~needs], so only the files this job directly depends on are listed. *)
+let job_debian_based_images =
+  (* Build from the slim upstream variant. The slim suffix is on the upstream
+     [FROM] only: [RELEASE], and hence the tag we produce, is unchanged, so
+     consumers and pinned versions keep referring to e.g. [debian:trixie-...]. *)
+  base_image_job
+    ~image_name:"debian"
+    ~base_name:(Upstream "debian:$RELEASE-slim")
+    ~matrix:(release_matrix Debian)
+    ~compilation:Emulated
+    (dockerfile Debian)
+    ~__POS__
+    ~description:"Build debian base images"
+    ~only_if_changed:Files.debian_base
+    "images.debian"
+
+(* ── Cacio: ubuntu ───────────────────────────────────────────────────────── *)
+
+let job_ubuntu_based_images =
+  base_image_job
+    ~image_name:"ubuntu"
+    ~matrix:(release_matrix Ubuntu)
+    ~compilation:Emulated
+    (dockerfile Ubuntu)
+    ~__POS__
+    ~description:"Build ubuntu base images"
+    ~only_if_changed:Files.debian_base
+    "images.ubuntu"
+
+(* ── Standalone jobs (no job dependencies within this file) ─────────────── *)
+
+(* ── Cacio: ci-release ───────────────────────────────────────────────────── *)
+
+let job_ci_release_based_images =
+  base_image_job
+    ~image_name:"ci-release"
+    ~base_name:(Pipeline_dep "debian")
+    ~matrix:[("RELEASE", ["trixie"])]
+    ~compilation:Amd64_only
+    "images/base-images/Dockerfile.debian-release"
+    ~__POS__
+    ~description:"Build ci-release base images"
+    ~only_if_changed:Files.(ci_releases @ debian_base)
+    ~needs:[(Job, job_debian_based_images)]
+    "images.ci-release"
+
+(* ── Cacio: alpine-docker-ci ─────────────────────────────────────────────── *)
+
+(* This job is special: it bootstraps from the upstream docker:<version> image
+   (not alpine-docker-ci itself) and has a custom build procedure. *)
+let job_docker_ci_based_images =
+  let docker_version = Images.Base_images.docker_version in
+  CI.job
+    "images.alpine-docker-ci"
+    ~__POS__
+    ~description:
+      "Build alpine-docker-ci base images (bootstrapped from upstream docker)"
+    ~stage:Build
+    ~image:Images.upstream_docker
+    ~services:[{name = Images.Base_images.dind_service}]
+    ~retry:Tezos_ci.dind_retry
+    ~tag:Gcp_very_high_cpu
+    ~only_if_changed:Files.alpine_docker_ci
+    ~variables:
+      [
+        ("RELEASE", docker_version);
+        ("DISTRIBUTION", "alpine-docker-ci");
+        ("IMAGE_PATH", "");
+        ("GCLOUD_VERSION", "543.0.0");
+        ("HADOLINT_VERSION", "2.10.0");
+        ("DOCKER_VERSION", docker_version);
+        ("DOCKER_DIGEST", Images.Base_images.docker_digest);
+        ("REGCTL_VERSION", "v0.4.3");
+        ("PLATFORM", "linux/amd64,linux/arm64");
+        ("CI_DOCKER_HUB", "false");
+      ]
+    ~script:
+      [
+        "images/scripts/install-gcloud-apk.sh";
+        "export PATH=$PATH:/google-cloud-sdk/bin";
+        "scripts/ci/docker_initialize.sh";
+        "scripts/ci/build-base-images.sh \
+         images/base-images/Dockerfile.alpine-docker-ci";
+      ]
+
+(* ── Rust family ────────────────────────────────────────────────────────── *)
+
+(* ── Cacio: debian-rust ──────────────────────────────────────────────────── *)
+
+let job_rust_based_images =
+  base_image_job
+    ~image_name:"debian-rust"
+    ~base_name:(Pipeline_dep "debian")
+    ~matrix:[("RELEASE", ["trixie"])]
+    ~compilation:Native
+    "images/base-images/Dockerfile.rust"
+    ~__POS__
+    ~description:"Build debian-rust base images"
+    ~only_if_changed:Files.(debian_rust_build @ debian_base)
+    ~needs:[(Job, job_debian_based_images)]
+    "images.debian-rust"
+
+(* ── Cacio: debian-rust.merge ────────────────────────────────────────────── *)
+
+(* Note: dedicated merge job exist because QEMU compilation takes too much time.
+   Without them the build job reaches a timeout. *)
+
+let job_rust_based_images_merge =
+  docker_job
+    ~extra_variables:
+      [
+        ("RELEASE", "trixie");
+        ("IMAGE_NAME", "${GCP_REGISTRY}/tezos/tezos/debian-rust");
+      ]
+    ~script:["scripts/ci/docker-merge-base-images.sh"]
+    ~__POS__
+    ~description:"Merge debian-rust base image manifests"
+    ~only_if_changed:Files.(merge_script @ debian_rust_build @ debian_base)
+    ~needs:[(Job, job_rust_based_images)]
+    "images.debian-rust.merge"
+
+(* ── debian-homebrew ────────────────────────────────────────────────────── *)
+
+(* ── Cacio: debian-homebrew ──────────────────────────────────────────────── *)
+
+(* debian_base is included so that a change to debian files triggers a
+   rebuild of this derived image even when the debian job itself is not
+   explicitly in scope. *)
+let job_debian_homebrew_based_images =
+  base_image_job
+    ~image_name:"debian-homebrew"
+    ~base_name:(Pipeline_dep "debian")
+    ~matrix:[("RELEASE", ["trixie"])]
+    ~compilation:Amd64_only
+    "images/base-images/Dockerfile.debian-homebrew"
+    ~__POS__
+    ~description:"Build debian-homebrew base images"
+    ~only_if_changed:Files.(debian_homebrew @ debian_base)
+    ~needs:[(Job, job_debian_based_images)]
+    "images.debian-homebrew"
+
+(* ── debian-build and ubuntu-build families ─────────────────────────────── *)
+
+(* ── Cacio: debian-build ─────────────────────────────────────────────────── *)
+
+let job_debian_build_based_images =
+  base_image_job
+    ~image_name:"debian-build"
+    ~base_name:(Pipeline_dep "debian")
+    ~matrix:(release_matrix Debian)
+    ~compilation:Native
+    "images/base-images/Dockerfile.debian-build"
+    ~__POS__
+    ~description:"Build debian-build base images"
+    ~only_if_changed:Files.(debian_build @ debian_base)
+    ~needs:[(Job, job_debian_based_images)]
+    "images.debian-build"
+
+(* ── Cacio: debian-build.merge ───────────────────────────────────────────── *)
+
+let job_debian_build_based_images_merge =
+  docker_job
+    ~extra_variables:
+      [("IMAGE_NAME", "${GCP_REGISTRY}/tezos/tezos/debian-build")]
+    ~script:["scripts/ci/docker-merge-base-images.sh"]
+    ~__POS__
+    ~description:"Merge debian-build base image manifests"
+    ~parallel:(Matrix [release_matrix Debian])
+    ~only_if_changed:Files.(merge_script @ debian_build @ debian_base)
+    ~needs:[(Job, job_debian_build_based_images)]
+    "images.debian-build.merge"
+
+(* ── Cacio: ubuntu-build ─────────────────────────────────────────────────── *)
+
+let job_ubuntu_build_based_images =
+  base_image_job
+    ~image_name:"ubuntu-build"
+    ~base_name:(Pipeline_dep "ubuntu")
+    ~matrix:(release_matrix Ubuntu)
+    ~compilation:Native
+    "images/base-images/Dockerfile.debian-build"
+    ~__POS__
+    ~description:"Build ubuntu-build base images"
+    ~only_if_changed:Files.(debian_build @ debian_base)
+    ~needs:[(Job, job_ubuntu_based_images)]
+    "images.ubuntu-build"
+
+(* ── Cacio: ubuntu-build.merge ───────────────────────────────────────────── *)
+
+let job_ubuntu_build_based_images_merge =
+  docker_job
+    ~extra_variables:
+      [("IMAGE_NAME", "${GCP_REGISTRY}/tezos/tezos/ubuntu-build")]
+    ~script:["scripts/ci/docker-merge-base-images.sh"]
+    ~__POS__
+    ~description:"Merge ubuntu-build base image manifests"
+    ~parallel:(Matrix [release_matrix Ubuntu])
+    ~only_if_changed:Files.(merge_script @ debian_build @ debian_base)
+    ~needs:[(Job, job_ubuntu_build_based_images)]
+    "images.ubuntu-build.merge"
+
+(* ── Systemd images ──────────────────────────────────────────────────────── *)
+
+(* ── Cacio: debian-systemd ───────────────────────────────────────────────── *)
+
+let job_debian_systemd_based_images =
+  base_image_job
+    ~image_name:"debian-systemd"
+    ~base_name:(Pipeline_dep "debian")
+    ~matrix:(release_matrix Debian)
+    ~compilation:Amd64_only
+    "images/base-images/Dockerfile.debian-systemd"
+    ~__POS__
+    ~description:"Build debian-systemd base images"
+    ~only_if_changed:Files.(debian_systemd @ debian_base)
+    ~needs:[(Job, job_debian_based_images)]
+    "images.debian-systemd"
+
+(* ── Cacio: ubuntu-systemd ───────────────────────────────────────────────── *)
+
+let job_ubuntu_systemd_based_images =
+  base_image_job
+    ~image_name:"ubuntu-systemd"
+    ~base_name:(Pipeline_dep "ubuntu")
+    ~matrix:(release_matrix Ubuntu)
+    ~compilation:Amd64_only
+    "images/base-images/Dockerfile.debian-systemd"
+    ~__POS__
+    ~description:"Build ubuntu-systemd base images"
+    ~only_if_changed:Files.(debian_systemd @ debian_base)
+    ~needs:[(Job, job_ubuntu_based_images)]
+    "images.ubuntu-systemd"
+
+(* ── debian-jsonnet ──────────────────────────────────────────────────────── *)
+
+(* ── Cacio: debian-jsonnet ───────────────────────────────────────────────── *)
+
+let job_jsonnet_based_images =
+  base_image_job
+    ~image_name:"debian-jsonnet"
+    ~base_name:(Pipeline_dep "debian")
+    ~matrix:[("RELEASE", ["trixie"])]
+    ~compilation:Amd64_only
+    "images/base-images/Dockerfile.debian-jsonnet"
+    ~__POS__
+    ~description:"Build debian-jsonnet base images"
+    ~only_if_changed:Files.(debian_jsonnet @ debian_base)
+    ~needs:[(Job, job_debian_based_images)]
+    "images.debian-jsonnet"
+
+(* ── rust-sdk-bindings ───────────────────────────────────────────────────── *)
+
+(* ── Cacio: rust-sdk-bindings ────────────────────────────────────────────── *)
+
+let job_rust_sdk_bindings_based_images =
+  base_image_job
+    ~image_name:"debian-rust-sdk-bindings"
+    ~base_name:(Pipeline_dep "debian")
+    ~matrix:[("RELEASE", ["trixie"])]
+    ~compilation:Amd64_only
+    "images/base-images/Dockerfile.rust-sdk-bindings"
+    ~__POS__
+    ~description:"Build debian-rust-sdk-bindings base images"
+    ~only_if_changed:Files.(rust_sdk_bindings @ debian_base)
+    ~needs:[(Job, job_debian_based_images)]
+    "images.debian-rust-sdk-bindings"
+
+(* ── Cacio: static "alpine-*" CI images (docker buildx bake) ─────────────── *)
+
+(* Build the static "alpine-*" CI images (runtime, monitoring, prebuild,
+   build, test, e2etest, release-page) with [docker buildx bake]
+   (images/ci/ci-images.hcl). Each architecture is built natively; the
+   per-arch images are then merged into multi-arch manifests by
+   [job_alpine_ci_merge].
+
+   [--allow=fs.read=/tmp/npm_token.txt] grants the filesystem entitlement that
+   recent buildx requires to read the npm_token secret declared on the e2etest
+   target (its src is outside the build context).
+
+   When the operator sets [DOCKER_FORCE_BUILD=true] (e.g. in the scheduled
+   [base_images.daily] pipeline), pass [--no-cache] to bake so the images are
+   rebuilt from scratch with fresh packages, as
+   [scripts/ci/build-base-images.sh] does for the other base images. *)
+let job_alpine_ci =
+  Cacio.parameterize @@ fun arch ->
+  let arch_str = Runner.Arch.show_uniform arch in
+  docker_job
+    ~extra_variables:
+      [
+        ("REGISTRY", "${GCP_REGISTRY}/${CI_PROJECT_NAMESPACE}/tezos");
+        ( "TAG",
+          Format.sprintf
+            "${CI_COMMIT_REF_SLUG}-${CI_COMMIT_SHORT_SHA}-%s"
+            arch_str );
+      ]
+    ~script:
+      [
+        "docker buildx create --driver docker-container --use --name tezos";
+        Format.sprintf
+          "docker buildx bake --allow=fs.read=/tmp/npm_token.txt --push --set \
+           \"*.platform=linux/%s\" $(if [ \"${DOCKER_FORCE_BUILD:-false}\" = \
+           \"true\" ]; then echo \"--no-cache\"; fi) -f \
+           images/ci/ci-images.hcl"
+          arch_str;
+      ]
+    ~__POS__
+    ~description:("Build the static alpine-* CI images for " ^ arch_str)
+    ~timeout:(Minutes 90)
+    ~arch
+      (* amd64 builds on a very-high-CPU runner to shorten the build; arm64
+         builds on a ramfs (memory-backed) work volume for build I/O. *)
+    ?cpu:(match arch with Amd64 -> Some Runner.CPU.Very_high | _ -> None)
+    ?storage:(match arch with Arm64 -> Some Runner.Storage.Ramfs | _ -> None)
+      (* Inherits [dind_retry] from [docker_job], which retries on both
+         [Script_failure] and [Runner_system_failure] to recover preemptions. *)
+    ~only_if_changed:Files.ci_images
+    ("images.alpine-ci-all:" ^ arch_str)
+
+let job_alpine_ci_merge =
+  (* Branch-only tag, as for the other base images: it lets a test branch
+     pin [base_images_tag] to its slug once instead of at every commit. *)
+  let tag_generic = "${CI_COMMIT_REF_SLUG}" in
+  let tag = tag_generic ^ "-${CI_COMMIT_SHORT_SHA}" in
+  let registry = "${GCP_REGISTRY}/${CI_PROJECT_NAMESPACE}/tezos" in
+  docker_job
+    ~script:
+      ("docker buildx create --driver docker-container --use --name tezos"
+      :: List.map
+           (fun image_short_name ->
+             let image_name = registry ^ "/alpine-" ^ image_short_name in
+             String.concat
+               " "
+               [
+                 "docker buildx imagetools create";
+                 (* Output tags *)
+                 "--tag " ^ image_name ^ ":" ^ tag;
+                 "--tag " ^ image_name ^ ":" ^ tag_generic;
+                 (* Input tags *)
+                 image_name ^ ":" ^ tag ^ "-amd64";
+                 image_name ^ ":" ^ tag ^ "-arm64";
+               ])
+           [
+             "runtime";
+             "monitoring";
+             "prebuild";
+             "build";
+             "release-page";
+             "test";
+             "e2etest";
+           ])
+    ~__POS__
+    ~description:
+      "Merge the per-arch static alpine-* CI images into multi-arch manifests, \
+       tagged both <ref-slug>-<short-sha> and <ref-slug>"
+    ~only_if_changed:Files.ci_images
+    ~needs:[(Job, job_alpine_ci Amd64); (Job, job_alpine_ci Arm64)]
+    "images.alpine-ci-all.merge"
+
+(* ── Cacio pipeline registrations ───────────────────────────────────────── *)
+
+let () =
+  let jobs : (Cacio.trigger * Cacio.job) list =
+    [
+      (Auto, job_ci_release_based_images);
+      (Auto, job_docker_ci_based_images);
+      (Auto, job_debian_homebrew_based_images);
+      (Auto, job_jsonnet_based_images);
+      (Auto, job_rust_sdk_bindings_based_images);
+      (Auto, job_debian_systemd_based_images);
+      (Auto, job_ubuntu_systemd_based_images);
+      (Auto, job_debian_build_based_images);
+      (Auto, job_debian_build_based_images_merge);
+      (Auto, job_ubuntu_build_based_images);
+      (Auto, job_ubuntu_build_based_images_merge);
+      (Auto, job_rust_based_images);
+      (Auto, job_rust_based_images_merge);
+      (Auto, job_debian_based_images);
+      (Auto, job_ubuntu_based_images);
+      (Auto, job_alpine_ci Amd64);
+      (Auto, job_alpine_ci Arm64);
+      (Auto, job_alpine_ci_merge);
+    ]
+  in
+  Tezos_ci_pipelines.register_merge_request_jobs jobs ;
+  Cacio.register_jobs Tezos_ci_pipelines.base_images_daily jobs ;
+  (* Same jobs as the daily pipeline; the [base_images.refresh] pipeline only
+     runs on the [master-ci-images] branch (see [Rules.base_images_refresh]). *)
+  Cacio.register_jobs Tezos_ci_pipelines.base_images_refresh jobs

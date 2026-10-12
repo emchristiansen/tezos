@@ -91,24 +91,63 @@ val constant : 'a -> ('a, 'ctx) arg
 (** [arg ~doc ~long ?short converter] creates an argument to a command.
     The [~long] argument is the long format, without the double dashes.
     The [?short] argument is the optional one letter shortcut.
+    The [?env] argument is the optional environment variable name that can be
+    used to provide a default value. If the environment variable is set and
+    the CLI argument is passed, the CLI argument is used.
     If the argument is not provided, [None] is returned. *)
 val arg :
   doc:string ->
   ?short:char ->
   long:string ->
   placeholder:string ->
+  ?env:string ->
   ('a, 'ctx) parameter ->
   ('a option, 'ctx) arg
 
-(** Create an argument that will contain the [~default] value if it is not provided. *)
+(** [multiple_arg ~doc ~long ?short converter] creates an argument to
+    a command.  The [~long] argument is the long format, without the
+    double dashes. The [?short] argument is the optional one letter
+    shortcut. If the argument is not provided, [None] is
+    returned. Multiple occurrence of the argument is allowed in the
+    command. [?env] is the optional environment variable name that can
+    be used to override the default values, and [env_separator] can be
+    used to specify the character used to variable into a list. *)
+val multiple_arg :
+  doc:string ->
+  ?short:char ->
+  long:string ->
+  placeholder:string ->
+  ?env:string ->
+  ?env_separator:char ->
+  ('a, 'ctx) parameter ->
+  ('a list option, 'ctx) arg
+
+(** Create an argument that will contain the [~default] value if it is not provided.
+    [?env] is the optional environment variable name that can be
+    used to override the default value. *)
 val default_arg :
   doc:string ->
   ?short:char ->
   long:string ->
   placeholder:string ->
   default:string ->
+  ?pp_default:(Format.formatter -> unit) ->
+  ?env:string ->
   ('a, 'ctx) parameter ->
   ('a, 'ctx) arg
+
+(** Create an argument that will contain the [~default] value if it
+    contains no value (i.e. if it's a switch). To use such argument,
+    it must be enabled in [dispatch]. *)
+val arg_or_switch :
+  doc:string ->
+  ?short:char ->
+  long:string ->
+  placeholder:string ->
+  default:string ->
+  ?pp_default:(Format.formatter -> unit) ->
+  ('a, 'ctx) parameter ->
+  ('a option, 'ctx) arg
 
 (** Create a boolean switch.
     The value will be set to [true] if the switch is provided and [false] if it is not. *)
@@ -135,6 +174,10 @@ val args1 : ('a, 'ctx) arg -> ('a, 'ctx) options
 
 (** Include 2 optional parameters *)
 val args2 : ('a, 'ctx) arg -> ('b, 'ctx) arg -> ('a * 'b, 'ctx) options
+
+(** Merge optional parameters  *)
+val merge_options :
+  ('a, 'ctx) options -> ('b, 'ctx) options -> ('a * 'b, 'ctx) options
 
 (** Include 3 optional parameters *)
 val args3 :
@@ -454,6 +497,422 @@ val args19 :
     'ctx )
   options
 
+(** Include 20 optional parameters *)
+val args20 :
+  ('a, 'ctx) arg ->
+  ('b, 'ctx) arg ->
+  ('c, 'ctx) arg ->
+  ('d, 'ctx) arg ->
+  ('e, 'ctx) arg ->
+  ('f, 'ctx) arg ->
+  ('g, 'ctx) arg ->
+  ('h, 'ctx) arg ->
+  ('i, 'ctx) arg ->
+  ('j, 'ctx) arg ->
+  ('k, 'ctx) arg ->
+  ('l, 'ctx) arg ->
+  ('m, 'ctx) arg ->
+  ('n, 'ctx) arg ->
+  ('o, 'ctx) arg ->
+  ('p, 'ctx) arg ->
+  ('q, 'ctx) arg ->
+  ('r, 'ctx) arg ->
+  ('s, 'ctx) arg ->
+  ('t, 'ctx) arg ->
+  ( 'a
+    * 'b
+    * 'c
+    * 'd
+    * 'e
+    * 'f
+    * 'g
+    * 'h
+    * 'i
+    * 'j
+    * 'k
+    * 'l
+    * 'm
+    * 'n
+    * 'o
+    * 'p
+    * 'q
+    * 'r
+    * 's
+    * 't,
+    'ctx )
+  options
+
+(** Include 21 optional parameters *)
+val args21 :
+  ('a, 'ctx) arg ->
+  ('b, 'ctx) arg ->
+  ('c, 'ctx) arg ->
+  ('d, 'ctx) arg ->
+  ('e, 'ctx) arg ->
+  ('f, 'ctx) arg ->
+  ('g, 'ctx) arg ->
+  ('h, 'ctx) arg ->
+  ('i, 'ctx) arg ->
+  ('j, 'ctx) arg ->
+  ('k, 'ctx) arg ->
+  ('l, 'ctx) arg ->
+  ('m, 'ctx) arg ->
+  ('n, 'ctx) arg ->
+  ('o, 'ctx) arg ->
+  ('p, 'ctx) arg ->
+  ('q, 'ctx) arg ->
+  ('r, 'ctx) arg ->
+  ('s, 'ctx) arg ->
+  ('t, 'ctx) arg ->
+  ('u, 'ctx) arg ->
+  ( 'a
+    * 'b
+    * 'c
+    * 'd
+    * 'e
+    * 'f
+    * 'g
+    * 'h
+    * 'i
+    * 'j
+    * 'k
+    * 'l
+    * 'm
+    * 'n
+    * 'o
+    * 'p
+    * 'q
+    * 'r
+    * 's
+    * 't
+    * 'u,
+    'ctx )
+  options
+
+(** Include 22 optional parameters *)
+val args22 :
+  ('a, 'ctx) arg ->
+  ('b, 'ctx) arg ->
+  ('c, 'ctx) arg ->
+  ('d, 'ctx) arg ->
+  ('e, 'ctx) arg ->
+  ('f, 'ctx) arg ->
+  ('g, 'ctx) arg ->
+  ('h, 'ctx) arg ->
+  ('i, 'ctx) arg ->
+  ('j, 'ctx) arg ->
+  ('k, 'ctx) arg ->
+  ('l, 'ctx) arg ->
+  ('m, 'ctx) arg ->
+  ('n, 'ctx) arg ->
+  ('o, 'ctx) arg ->
+  ('p, 'ctx) arg ->
+  ('q, 'ctx) arg ->
+  ('r, 'ctx) arg ->
+  ('s, 'ctx) arg ->
+  ('t, 'ctx) arg ->
+  ('u, 'ctx) arg ->
+  ('v, 'ctx) arg ->
+  ( 'a
+    * 'b
+    * 'c
+    * 'd
+    * 'e
+    * 'f
+    * 'g
+    * 'h
+    * 'i
+    * 'j
+    * 'k
+    * 'l
+    * 'm
+    * 'n
+    * 'o
+    * 'p
+    * 'q
+    * 'r
+    * 's
+    * 't
+    * 'u
+    * 'v,
+    'ctx )
+  options
+
+(** Include 23 optional parameters *)
+val args23 :
+  ('a, 'ctx) arg ->
+  ('b, 'ctx) arg ->
+  ('c, 'ctx) arg ->
+  ('d, 'ctx) arg ->
+  ('e, 'ctx) arg ->
+  ('f, 'ctx) arg ->
+  ('g, 'ctx) arg ->
+  ('h, 'ctx) arg ->
+  ('i, 'ctx) arg ->
+  ('j, 'ctx) arg ->
+  ('k, 'ctx) arg ->
+  ('l, 'ctx) arg ->
+  ('m, 'ctx) arg ->
+  ('n, 'ctx) arg ->
+  ('o, 'ctx) arg ->
+  ('p, 'ctx) arg ->
+  ('q, 'ctx) arg ->
+  ('r, 'ctx) arg ->
+  ('s, 'ctx) arg ->
+  ('t, 'ctx) arg ->
+  ('u, 'ctx) arg ->
+  ('v, 'ctx) arg ->
+  ('w, 'ctx) arg ->
+  ( 'a
+    * 'b
+    * 'c
+    * 'd
+    * 'e
+    * 'f
+    * 'g
+    * 'h
+    * 'i
+    * 'j
+    * 'k
+    * 'l
+    * 'm
+    * 'n
+    * 'o
+    * 'p
+    * 'q
+    * 'r
+    * 's
+    * 't
+    * 'u
+    * 'v
+    * 'w,
+    'ctx )
+  options
+
+(** Include 24 optional parameters *)
+val args24 :
+  ('a, 'ctx) arg ->
+  ('b, 'ctx) arg ->
+  ('c, 'ctx) arg ->
+  ('d, 'ctx) arg ->
+  ('e, 'ctx) arg ->
+  ('f, 'ctx) arg ->
+  ('g, 'ctx) arg ->
+  ('h, 'ctx) arg ->
+  ('i, 'ctx) arg ->
+  ('j, 'ctx) arg ->
+  ('k, 'ctx) arg ->
+  ('l, 'ctx) arg ->
+  ('m, 'ctx) arg ->
+  ('n, 'ctx) arg ->
+  ('o, 'ctx) arg ->
+  ('p, 'ctx) arg ->
+  ('q, 'ctx) arg ->
+  ('r, 'ctx) arg ->
+  ('s, 'ctx) arg ->
+  ('t, 'ctx) arg ->
+  ('u, 'ctx) arg ->
+  ('v, 'ctx) arg ->
+  ('w, 'ctx) arg ->
+  ('x, 'ctx) arg ->
+  ( 'a
+    * 'b
+    * 'c
+    * 'd
+    * 'e
+    * 'f
+    * 'g
+    * 'h
+    * 'i
+    * 'j
+    * 'k
+    * 'l
+    * 'm
+    * 'n
+    * 'o
+    * 'p
+    * 'q
+    * 'r
+    * 's
+    * 't
+    * 'u
+    * 'v
+    * 'w
+    * 'x,
+    'ctx )
+  options
+
+(** Include 25 optional parameters *)
+val args25 :
+  ('a, 'ctx) arg ->
+  ('b, 'ctx) arg ->
+  ('c, 'ctx) arg ->
+  ('d, 'ctx) arg ->
+  ('e, 'ctx) arg ->
+  ('f, 'ctx) arg ->
+  ('g, 'ctx) arg ->
+  ('h, 'ctx) arg ->
+  ('i, 'ctx) arg ->
+  ('j, 'ctx) arg ->
+  ('k, 'ctx) arg ->
+  ('l, 'ctx) arg ->
+  ('m, 'ctx) arg ->
+  ('n, 'ctx) arg ->
+  ('o, 'ctx) arg ->
+  ('p, 'ctx) arg ->
+  ('q, 'ctx) arg ->
+  ('r, 'ctx) arg ->
+  ('s, 'ctx) arg ->
+  ('t, 'ctx) arg ->
+  ('u, 'ctx) arg ->
+  ('v, 'ctx) arg ->
+  ('w, 'ctx) arg ->
+  ('x, 'ctx) arg ->
+  ('y, 'ctx) arg ->
+  ( 'a
+    * 'b
+    * 'c
+    * 'd
+    * 'e
+    * 'f
+    * 'g
+    * 'h
+    * 'i
+    * 'j
+    * 'k
+    * 'l
+    * 'm
+    * 'n
+    * 'o
+    * 'p
+    * 'q
+    * 'r
+    * 's
+    * 't
+    * 'u
+    * 'v
+    * 'w
+    * 'x
+    * 'y,
+    'ctx )
+  options
+
+(** Include 26 optional parameters *)
+val args26 :
+  ('a, 'ctx) arg ->
+  ('b, 'ctx) arg ->
+  ('c, 'ctx) arg ->
+  ('d, 'ctx) arg ->
+  ('e, 'ctx) arg ->
+  ('f, 'ctx) arg ->
+  ('g, 'ctx) arg ->
+  ('h, 'ctx) arg ->
+  ('i, 'ctx) arg ->
+  ('j, 'ctx) arg ->
+  ('k, 'ctx) arg ->
+  ('l, 'ctx) arg ->
+  ('m, 'ctx) arg ->
+  ('n, 'ctx) arg ->
+  ('o, 'ctx) arg ->
+  ('p, 'ctx) arg ->
+  ('q, 'ctx) arg ->
+  ('r, 'ctx) arg ->
+  ('s, 'ctx) arg ->
+  ('t, 'ctx) arg ->
+  ('u, 'ctx) arg ->
+  ('v, 'ctx) arg ->
+  ('w, 'ctx) arg ->
+  ('x, 'ctx) arg ->
+  ('y, 'ctx) arg ->
+  ('z, 'ctx) arg ->
+  ( 'a
+    * 'b
+    * 'c
+    * 'd
+    * 'e
+    * 'f
+    * 'g
+    * 'h
+    * 'i
+    * 'j
+    * 'k
+    * 'l
+    * 'm
+    * 'n
+    * 'o
+    * 'p
+    * 'q
+    * 'r
+    * 's
+    * 't
+    * 'u
+    * 'v
+    * 'w
+    * 'x
+    * 'y
+    * 'z,
+    'ctx )
+  options
+
+(** Include 27 optional parameters *)
+val args27 :
+  ('a, 'ctx) arg ->
+  ('b, 'ctx) arg ->
+  ('c, 'ctx) arg ->
+  ('d, 'ctx) arg ->
+  ('e, 'ctx) arg ->
+  ('f, 'ctx) arg ->
+  ('g, 'ctx) arg ->
+  ('h, 'ctx) arg ->
+  ('i, 'ctx) arg ->
+  ('j, 'ctx) arg ->
+  ('k, 'ctx) arg ->
+  ('l, 'ctx) arg ->
+  ('m, 'ctx) arg ->
+  ('n, 'ctx) arg ->
+  ('o, 'ctx) arg ->
+  ('p, 'ctx) arg ->
+  ('q, 'ctx) arg ->
+  ('r, 'ctx) arg ->
+  ('s, 'ctx) arg ->
+  ('t, 'ctx) arg ->
+  ('u, 'ctx) arg ->
+  ('v, 'ctx) arg ->
+  ('w, 'ctx) arg ->
+  ('x, 'ctx) arg ->
+  ('y, 'ctx) arg ->
+  ('z, 'ctx) arg ->
+  ('aa, 'ctx) arg ->
+  ( 'a
+    * 'b
+    * 'c
+    * 'd
+    * 'e
+    * 'f
+    * 'g
+    * 'h
+    * 'i
+    * 'j
+    * 'k
+    * 'l
+    * 'm
+    * 'n
+    * 'o
+    * 'p
+    * 'q
+    * 'r
+    * 's
+    * 't
+    * 'u
+    * 'v
+    * 'w
+    * 'x
+    * 'y
+    * 'z
+    * 'aa,
+    'ctx )
+  options
+
 (** Aggregate a set of options into a single value. *)
 val aggregate : ('a, 'ctx) options -> ('a, 'ctx) arg
 
@@ -576,8 +1035,12 @@ type verbosity = Terse | Short | Details | Full
     Wrapping a piece of text with a debug level means that the
     contents are only printed if the verbosity is equal to or
     above that level. Use prefix [=] for an exact match, or [-]
-    for the inverse interpretation. *)
-val setup_formatter : Format.formatter -> format -> verbosity -> formatter_state
+    for the inverse interpretation.
+
+    If [isatty] is [true], a maximum number of columns based on the terminal size
+    is enforced for [Format] boxes. *)
+val setup_formatter :
+  isatty:bool -> Format.formatter -> verbosity -> formatter_state
 
 (** Restore the formatter state after [setup_formatter]. *)
 val restore_formatter : Format.formatter -> formatter_state -> unit
@@ -595,8 +1058,17 @@ type error += Help : _ command option -> error
 type error += Version : error
 
 (** Find and call the applicable command on the series of arguments.
-    @raise Failure if the command list would be ambiguous. *)
-val dispatch : 'ctx command list -> 'ctx -> string list -> unit tzresult Lwt.t
+    Option [enable_argDefSwitch] is [false] by default.
+    @raise Failure if the command list would be ambiguous.
+    @raise Failure if [enable_argDefSwitch = false] and such option
+      exists in any command.
+*)
+val dispatch :
+  ?enable_argDefSwitch:bool ->
+  'ctx command list ->
+  'ctx ->
+  string list ->
+  unit tzresult Lwt.t
 
 (** Parse the global options, and return their value, with the rest of
     the command to be parsed. *)

@@ -123,9 +123,15 @@ let is_directory file_name =
   let+ s = Lwt_unix.stat file_name in
   s.st_kind = S_DIR
 
+let dir_exists path =
+  Lwt.try_bind
+    (fun () -> Lwt_unix.stat path)
+    (fun {st_kind; _} -> Lwt.return (st_kind = S_DIR))
+    (function Unix.Unix_error _ -> Lwt.return_false | e -> Lwt.reraise e)
+
 let remove_dir dir =
+  let open Lwt_syntax in
   let rec remove dir =
-    let open Lwt_syntax in
     let files = Lwt_unix.files_of_directory dir in
     let* () =
       Lwt_stream.iter_s
@@ -138,8 +144,8 @@ let remove_dir dir =
     in
     Lwt_unix.rmdir dir
   in
-  if Sys.file_exists dir && Sys.is_directory dir then remove dir
-  else Lwt.return_unit
+  let* dir_exists = dir_exists dir in
+  if dir_exists then remove dir else Lwt.return_unit
 
 let rec create_dir ?(perm = 0o755) dir =
   let open Lwt_syntax in
@@ -153,7 +159,7 @@ let rec create_dir ?(perm = 0o755) dir =
             (* This is the case where the directory has been created
                by another Lwt.t, after the call to Lwt_unix.file_exists. *)
             Lwt.return_unit
-        | e -> Lwt.fail e)
+        | e -> Lwt.reraise e)
   else
     let* {st_kind; _} = Lwt_unix.stat dir in
     match st_kind with
@@ -199,20 +205,42 @@ let create_file ?(close_on_exec = true) ?(perm = 0o644) name content =
 
 let read_file fn = Lwt_io.with_file fn ~mode:Input (fun ch -> Lwt_io.read ch)
 
-let copy_file ~src ~dst =
+let copy_file ?(buffer_size = 4096) ~src ~dst () =
   let open Lwt_syntax in
   Lwt_io.with_file ~mode:Output dst (fun dst_ch ->
       Lwt_io.with_file src ~mode:Input (fun src_ch ->
-          let buff = Bytes.create 4096 in
+          let buffer = Bytes.create buffer_size in
           let rec loop () =
-            let* n = Lwt_io.read_into src_ch buff 0 4096 in
+            let* n = Lwt_io.read_into src_ch buffer 0 buffer_size in
             match n with
             | 0 -> Lwt.return_unit
             | n ->
-                let* () = Lwt_io.write_from_exactly dst_ch buff 0 n in
+                let* () = Lwt_io.write_from_exactly dst_ch buffer 0 n in
                 loop ()
           in
           loop ()))
+
+let copy_file_raw ?(buffer_size = 4096 * 1024) ?(dst_perm = 0o666) ~src ~dst ()
+    =
+  let open Lwt_syntax in
+  let buffer = Bytes.create buffer_size in
+  let* src_fd = Lwt_unix.openfile src [Unix.O_RDONLY; O_CLOEXEC] 0o444 in
+  let* dst_fd =
+    Lwt_unix.openfile dst [Unix.O_WRONLY; O_CREAT; O_TRUNC; O_CLOEXEC] dst_perm
+  in
+  let raw_copy src_fd dst_fd =
+    let rec loop () =
+      let* read = Lwt_unix.read src_fd buffer 0 buffer_size in
+      if read = 0 then Lwt.return_unit
+      else
+        let* (_ : int) = Lwt_unix.write dst_fd buffer 0 read in
+        loop ()
+    in
+    loop ()
+  in
+  let* () = raw_copy src_fd dst_fd in
+  let* () = Lwt_unix.close src_fd in
+  Lwt_unix.close dst_fd
 
 let copy_dir ?(perm = 0o755) src dst =
   let open Lwt_syntax in
@@ -230,11 +258,35 @@ let copy_dir ?(perm = 0o755) src dst =
             let new_dir = Filename.concat dst_dir basename in
             let* () = create_dir ~perm new_dir in
             copy_dir file new_dir
-          else copy_file ~src:file ~dst:(Filename.concat dst_dir basename))
+          else copy_file ~src:file ~dst:(Filename.concat dst_dir basename) ())
       files
   in
-  if Sys.file_exists src && Sys.is_directory src then copy_dir src dst
+  let* src_dir_exists = dir_exists src in
+  if src_dir_exists then copy_dir src dst
   else Lwt.fail (Unix.Unix_error (Unix.ENOTDIR, "", "copy_dir"))
+
+let hardlink_dir ?(perm = 0o755) src dst =
+  let open Lwt_syntax in
+  let rec link_dir dir dst_dir =
+    let* () = create_dir ~perm dst in
+    let files = Lwt_unix.files_of_directory dir in
+    Lwt_stream.iter_p
+      (fun file ->
+        if file = Filename.current_dir_name || file = Filename.parent_dir_name
+        then Lwt.return_unit
+        else
+          let basename = file in
+          let file = Filename.concat dir file in
+          if Sys.is_directory file then
+            let new_dir = Filename.concat dst_dir basename in
+            let* () = create_dir ~perm new_dir in
+            link_dir file new_dir
+          else Lwt_unix.link file (Filename.concat dst_dir basename))
+      files
+  in
+  let* src_dir_exists = dir_exists src in
+  if src_dir_exists then link_dir src dst
+  else Lwt.fail (Unix.Unix_error (Unix.ENOTDIR, "", "hardlink_dir"))
 
 let of_sockaddr = function
   | Unix.ADDR_UNIX _ -> None
@@ -273,6 +325,19 @@ let getpass () =
   passwd
 
 module Json = struct
+  type error += Json_decoding_error of {input : string; error : string}
+
+  let () =
+    register_error_kind
+      `Temporary
+      ~id:"json_decoding_error"
+      ~title:"Json decoding error"
+      ~description:"The input string is not a valid JSON value"
+      Data_encoding.(obj2 (req "input" string) (req "error" string))
+      (function
+        | Json_decoding_error {input; error} -> Some (input, error) | _ -> None)
+      (fun (input, error) -> Json_decoding_error {input; error})
+
   let to_root = function
     | `O ctns -> `O ctns
     | `A ctns -> `A ctns
@@ -293,14 +358,55 @@ module Json = struct
         Lwt_io.with_file ~mode:Input file (fun chan ->
             let open Lwt_result_syntax in
             let*! str = Lwt_io.read chan in
-            return (Ezjsonm.from_string str :> Data_encoding.json)))
+            match Data_encoding.Json.from_string str with
+            | Ok json -> return json
+            | Error error -> tzfail (Json_decoding_error {input = str; error})))
 end
 
-let with_tempdir name f =
+(* This module is used by [safe_cancel_on_exit] to register and unregister
+   callbacks. Following the recommendation of [Lwt_exit] library, we prefer
+   this approach over unregistering a [Lwt_exit] callback.
+
+   See https://ocaml.org/p/lwt-exit/1.0/doc/Lwt_exit/index.html#registering,-unregistering,-and-loops. *)
+module Callbacks : sig
+  val next : unit -> (unit Lwt.t -> unit) * (unit -> unit)
+end = struct
+  include Map.Make (Int)
+
+  let callbacks = ref empty
+
+  let _ =
+    Lwt_exit.register_clean_up_callback ~loc:__LOC__ (fun _ ->
+        iter_p (fun _ callback -> callback) !callbacks)
+
+  let register id was_finalized = callbacks := add id was_finalized !callbacks
+
+  let unregister id () = callbacks := remove id !callbacks
+
+  let counter = ref 0
+
+  let next () =
+    let res = !counter in
+    incr counter ;
+    (register res, unregister res)
+end
+
+let safe_cancel_on_exit f =
   let open Lwt_syntax in
-  let base_dir = Filename.temp_file name "" in
+  let register, unregister = Callbacks.next () in
+  let was_finalized, wf_waker = Lwt.task () in
+  register was_finalized ;
+  Lwt.finalize f (fun () ->
+      Lwt.wakeup wf_waker () ;
+      unregister () ;
+      return_unit)
+
+let with_tempdir ?temp_dir name f =
+  let open Lwt_syntax in
+  let base_dir = Filename.temp_file ?temp_dir name "" in
   let* () = Lwt_unix.unlink base_dir in
   let* () = Lwt_unix.mkdir base_dir 0o700 in
+  safe_cancel_on_exit @@ fun () ->
   Lwt.finalize (fun () -> f base_dir) (fun () -> remove_dir base_dir)
 
 let rec retry ?(log = fun _ -> Lwt.return_unit) ?(n = 5) ?(sleep = 1.) f =
@@ -322,9 +428,11 @@ type 'action io_error = {
   arg : string;
 }
 
-type error += Io_error of [`Close | `Open | `Rename] io_error
+type error += Io_error of [`Close | `Open | `Rename | `Unlink | `Lock] io_error
 
-let tzfail_of_io_error e = Error [Io_error e]
+let tzfail_of_io_error
+    (e : [< `Close | `Open | `Rename | `Unlink | `Lock] io_error) =
+  Error [Io_error e]
 
 let () =
   register_error_kind
@@ -344,7 +452,13 @@ let () =
         (req
            "action"
            (string_enum
-              [("close", `Close); ("open", `Open); ("Rename", `Rename)]))
+              [
+                ("close", `Close);
+                ("open", `Open);
+                ("Rename", `Rename);
+                ("Unlink", `Unlink);
+                ("lock", `Lock);
+              ]))
         (req "unix_code" Unix_error.encoding)
         (req "caller" string)
         (req "arg" string))
@@ -365,20 +479,36 @@ let with_open_file ~flags ?(perm = 0o640) filename task =
       (function
         | Unix.Unix_error (unix_code, caller, arg) ->
             Lwt.return (Error {action = `Open; unix_code; caller; arg})
-        | exn -> raise exn)
+        | exn -> Lwt.reraise exn)
   in
   match rfd with
   | Error _ as r -> Lwt.return r
   | Ok fd ->
-      let* res = task fd in
-      Lwt.catch
-        (fun () ->
-          let* () = Lwt_unix.close fd in
-          Lwt.return (Ok res))
-        (function
-          | Unix.Unix_error (unix_code, caller, arg) ->
-              Lwt.return (Error {action = `Close; unix_code; caller; arg})
-          | exn -> raise exn)
+      let close () =
+        Lwt.catch
+          (fun () ->
+            let* () = Lwt_unix.close fd in
+            Lwt.return_none)
+          (function
+            | Unix.Unix_error (unix_code, caller, arg) ->
+                Lwt.return_some {action = `Close; unix_code; caller; arg}
+            | exn -> Lwt.reraise exn)
+      in
+      Lwt.try_bind
+        (fun () -> task fd)
+        (fun res ->
+          let* close_failure = close () in
+          match close_failure with
+          | None -> Lwt.return (Ok res)
+          | Some error -> Lwt.return (Error error))
+        (fun exn ->
+          (* [task] raised or was cancelled. The descriptor is closed here
+             because the close above is only reached when [task] returns a
+             value, and it would otherwise be leaked. The original exception is
+             what the caller is told about; a failure to close on top of it
+             says nothing useful. *)
+          let* (_ : _ option) = close () in
+          Lwt.reraise exn)
 
 let with_open_out ?(overwrite = true) file task =
   let flags =
@@ -398,12 +528,32 @@ let with_atomic_open_out ?(overwrite = true) filename
   let temp_file =
     Filename.temp_file ~temp_dir (Filename.basename filename) ".tmp"
   in
-  let* res = with_open_out ~overwrite temp_file f in
-  Lwt.catch
-    (fun () ->
-      let*! () = Lwt_unix.rename temp_file filename in
-      return res)
+  (* [Filename.temp_file] has created the file. Every path that does not rename
+     it onto [filename] has to remove it, or it stays in [temp_dir] for good. *)
+  let remove_temp_file () =
+    Lwt.catch (fun () -> Lwt_unix.unlink temp_file) (fun _ -> Lwt.return_unit)
+  in
+  let rename_or_remove res =
+    Lwt.catch
+      (fun () ->
+        let*! () = Lwt_unix.rename temp_file filename in
+        return res)
+      (function
+        | Unix.Unix_error (unix_code, caller, arg) ->
+            let*! () = remove_temp_file () in
+            Lwt.return (Error {action = `Rename; unix_code; caller; arg})
+        | exn ->
+            let*! () = remove_temp_file () in
+            Lwt.reraise exn)
+  in
+  Lwt.try_bind
+    (fun () -> with_open_out ~overwrite temp_file f)
     (function
-      | Unix.Unix_error (unix_code, caller, arg) ->
-          Lwt.return (Error {action = `Rename; unix_code; caller; arg})
-      | exn -> raise exn)
+      | Ok res -> rename_or_remove res
+      | Error _ as error ->
+          let*! () = remove_temp_file () in
+          Lwt.return error)
+    (fun exn ->
+      (* [f] raised or was cancelled. *)
+      let*! () = remove_temp_file () in
+      Lwt.reraise exn)

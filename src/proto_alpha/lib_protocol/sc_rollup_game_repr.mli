@@ -316,8 +316,8 @@ val initial :
   start_level:Raw_level_repr.t ->
   parent_commitment:Sc_rollup_commitment_repr.t ->
   defender_commitment:Sc_rollup_commitment_repr.t ->
-  refuter:Signature.public_key_hash ->
-  defender:Signature.public_key_hash ->
+  refuter:Implicit_account_repr.t ->
+  defender:Implicit_account_repr.t ->
   default_number_of_sections:int ->
   t
 
@@ -383,19 +383,24 @@ val status_encoding : status Data_encoding.t
     player and returns a [Ongoing] status. Otherwise, it returns a
     [Ended <game_result>] status.
 
-    The provided DAL parameters and [dal_attestation_lag] are used in case the
-    game needs to check that a page's content is part of a slot (using the
-    slot's commitment).
+    The provided DAL related parameters are used in case the game needs to:
+    - Check that a page's content is part of a slot (using the slot's commitment)
+      when refuting a DAL page reveal.
+    - Check that the parameters are correct when refuting a DAL parameter reveal.
 *)
 val play :
   Sc_rollups.Kind.t ->
-  Dal_slot_repr.parameters ->
-  dal_attestation_lag:int ->
+  config:Wasm_2_0_0.config ->
+  dal_activation_level:Raw_level_repr.t option ->
+  find_dal_parameters:
+    (Raw_level_repr.t -> Constants_parametric_repr.dal tzresult Lwt.t) ->
   stakers:Index.t ->
   Sc_rollup_metadata_repr.t ->
   t ->
   step:step ->
   choice:Sc_rollup_tick_repr.t ->
+  is_reveal_enabled:Sc_rollup_PVM_sig.is_reveal_enabled ->
+  dal_attested_slots_validity_lag:int ->
   (game_result, t) Either.t tzresult Lwt.t
 
 (** [cost_play ~step ~choice] returns the gas cost of [play] applied with[step],

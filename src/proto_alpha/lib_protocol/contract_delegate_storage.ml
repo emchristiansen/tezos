@@ -23,54 +23,62 @@
 (*                                                                           *)
 (*****************************************************************************)
 
-type error += (* `Permanent *) Forbidden_tz4_delegate of Bls.Public_key_hash.t
-
-let () =
-  register_error_kind
-    `Branch
-    ~id:"delegate.forbidden_tz4"
-    ~title:"Forbidden delegate"
-    ~description:"Delegates are forbidden to be tz4 (BLS) accounts."
-    ~pp:(fun ppf implicit ->
-      Format.fprintf
-        ppf
-        "The delegate %a is forbidden as it is a BLS public key hash."
-        Bls.Public_key_hash.pp
-        implicit)
-    Data_encoding.(obj1 (req "delegate" Bls.Public_key_hash.encoding))
-    (function Forbidden_tz4_delegate d -> Some d | _ -> None)
-    (fun d -> Forbidden_tz4_delegate d)
-
-let check_not_tz4 : Signature.Public_key_hash.t -> unit tzresult = function
-  | Bls tz4 -> error (Forbidden_tz4_delegate tz4)
-  | Ed25519 _ | Secp256k1 _ | P256 _ -> Ok ()
-
 let find = Storage.Contract.Delegate.find
 
+type delegate_status =
+  | Delegate
+  | Delegated of Implicit_account_repr.t
+  | Undelegated
+
+let get_delegate_status ctxt pkh =
+  let open Lwt_result_syntax in
+  let+ delegate = find ctxt (Contract_repr.Implicit pkh) in
+  match delegate with
+  | None -> Undelegated
+  | Some delegate when Implicit_account_repr.(equal delegate pkh) -> Delegate
+  | Some delegate -> Delegated delegate
+
+let is_delegate ctxt pkh =
+  let open Lwt_result_syntax in
+  let+ find_res = get_delegate_status ctxt pkh in
+  match find_res with Delegate -> true | Delegated _ | Undelegated -> false
+
 let init ctxt contract delegate =
-  check_not_tz4 delegate >>?= fun () ->
-  Storage.Contract.Delegate.init ctxt contract delegate >>=? fun ctxt ->
+  let open Lwt_result_syntax in
+  let* ctxt = Storage.Contract.Delegate.init ctxt contract delegate in
   let delegate_contract = Contract_repr.Implicit delegate in
-  Storage.Contract.Delegated.add (ctxt, delegate_contract) contract >|= ok
+  let*! ctxt =
+    Storage.Contract.Delegated.add (ctxt, delegate_contract) contract
+  in
+  return ctxt
 
 let unlink ctxt contract =
-  Storage.Contract.Delegate.find ctxt contract >>=? function
+  let open Lwt_result_syntax in
+  let* delegate_opt = Storage.Contract.Delegate.find ctxt contract in
+  match delegate_opt with
   | None -> return ctxt
   | Some delegate ->
       let delegate_contract = Contract_repr.Implicit delegate in
-      Storage.Contract.Delegated.remove (ctxt, delegate_contract) contract
-      >|= ok
+      let*! ctxt =
+        Storage.Contract.Delegated.remove (ctxt, delegate_contract) contract
+      in
+      return ctxt
 
 let delete ctxt contract =
-  unlink ctxt contract >>=? fun ctxt ->
-  Storage.Contract.Delegate.remove ctxt contract >|= ok
+  let open Lwt_result_syntax in
+  let* ctxt = unlink ctxt contract in
+  let*! ctxt = Storage.Contract.Delegate.remove ctxt contract in
+  return ctxt
 
 let set ctxt contract delegate =
-  check_not_tz4 delegate >>?= fun () ->
-  unlink ctxt contract >>=? fun ctxt ->
-  Storage.Contract.Delegate.add ctxt contract delegate >>= fun ctxt ->
+  let open Lwt_result_syntax in
+  let* ctxt = unlink ctxt contract in
+  let*! ctxt = Storage.Contract.Delegate.add ctxt contract delegate in
   let delegate_contract = Contract_repr.Implicit delegate in
-  Storage.Contract.Delegated.add (ctxt, delegate_contract) contract >|= ok
+  let*! ctxt =
+    Storage.Contract.Delegated.add (ctxt, delegate_contract) contract
+  in
+  return ctxt
 
 let delegated_contracts ctxt delegate =
   let contract = Contract_repr.Implicit delegate in

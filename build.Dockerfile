@@ -1,6 +1,16 @@
-ARG BASE_IMAGE=registry.gitlab.com/tezos/opam-repository
-ARG BASE_IMAGE_VERSION
-FROM ${BASE_IMAGE}:${BASE_IMAGE_VERSION}
+# check=skip=InvalidDefaultArgInFrom,SecretsUsedInArgOrEnv
+# Note: `check=skip` is file-global (BuildKit cannot scope it per line). It
+# suppresses InvalidDefaultArgInFrom (the `FROM ${BUILD_DEPS_IMAGE}` ARG is
+# always supplied at build time) and the
+# SecretsUsedInArgOrEnv false positive on
+# `ARG SCCACHE_GCS_KEY_PREFIX` (a path prefix, not a secret). A genuinely bad
+# FROM or a real secret in ARG/ENV added later will therefore not be flagged.
+# Full image reference (name:tag) for the build-dependencies image (build
+# environment), passed by docker-bake.hcl.
+ARG BUILD_DEPS_IMAGE
+
+# hadolint ignore=DL3006
+FROM ${BUILD_DEPS_IMAGE}
 # use alpine /bin/ash and set pipefail.
 # see https://docs.docker.com/develop/develop-images/dockerfile_best-practices/#run
 SHELL ["/bin/ash", "-o", "pipefail", "-c"]
@@ -11,25 +21,111 @@ ARG GIT_SHORTREF
 ARG GIT_DATETIME
 ARG GIT_VERSION
 WORKDIR /home/tezos
-RUN mkdir -p /home/tezos/tezos/scripts /home/tezos/tezos/script-inputs /home/tezos/tezos/parameters
+RUN mkdir -p /home/tezos/tezos/scripts/ci /home/tezos/tezos/script-inputs /home/tezos/tezos/parameters
+# Cargo registry: route crates.io through the CI mirror proxy when CARGO_MIRROR
+# is non-empty (requires --network=host). The proxy is an in-cluster service, so
+# the default is empty and a build outside the CI goes to crates.io directly --
+# the same gating as SCCACHE_GCS_BUCKET below.
+ARG CARGO_MIRROR=""
+COPY --chown=tezos:nogroup images/ci/.cargo/config.toml /tmp/cargo-mirror.toml
+RUN if [ -n "${CARGO_MIRROR}" ]; then \
+      install -o tezos -g nogroup -D -m 644 \
+        /tmp/cargo-mirror.toml /home/tezos/.cargo/config.toml; \
+      echo "### cargo crates-io mirror enabled"; \
+    else \
+      echo "### cargo crates-io mirror disabled (direct crates.io)"; \
+    fi; \
+    rm -f /tmp/cargo-mirror.toml
+# COPY layers are ordered by change frequency (rarely -> frequently) so that a
+# change in a later group does not invalidate the cached COPY layers of the
+# earlier groups, maximizing Docker layer cache reuse across commits.
+
+# Group 1: build-system files (change rarely)
 COPY --chown=tezos:nogroup Makefile tezos
+COPY --chown=tezos:nogroup dune tezos/dune
+COPY --chown=tezos:nogroup dune-workspace tezos/dune-workspace
+COPY --chown=tezos:nogroup dune-project tezos/dune-project
+COPY --chown=tezos:nogroup rust-toolchain tezos/rust-toolchain
+COPY --chown=tezos:nogroup scripts/version.sh tezos/scripts/
+COPY --chown=tezos:nogroup scripts/custom-flags.sh tezos/scripts/
+COPY --chown=tezos:nogroup scripts/ci/dune.sh tezos/scripts/ci/dune.sh
+# Used by [make build-deps] below (install_build_deps.sh calls its .rust.sh).
+COPY --chown=tezos:nogroup scripts/install_build_deps.sh scripts/install_build_deps.rust.sh tezos/scripts/
+
+# Group 2: script inputs (change rarely)
 COPY --chown=tezos:nogroup script-inputs/active_protocol_versions tezos/script-inputs/
 COPY --chown=tezos:nogroup script-inputs/active_protocol_versions_without_number tezos/script-inputs/
 COPY --chown=tezos:nogroup script-inputs/released-executables tezos/script-inputs/
 COPY --chown=tezos:nogroup script-inputs/experimental-executables tezos/script-inputs/
-COPY --chown=tezos:nogroup dune tezos
-COPY --chown=tezos:nogroup scripts/version.sh tezos/scripts/
-COPY --chown=tezos:nogroup src tezos/src
-COPY --chown=tezos:nogroup tezt tezos/tezt
-COPY --chown=tezos:nogroup opam tezos/opam
-COPY --chown=tezos:nogroup dune tezos/dune
-COPY --chown=tezos:nogroup dune-workspace tezos/dune-workspace
-COPY --chown=tezos:nogroup dune-project tezos/dune-project
+COPY --chown=tezos:nogroup script-inputs/dev-executables tezos/script-inputs/
+
+# Group 3: vendored/forked libraries (change infrequently)
 COPY --chown=tezos:nogroup vendors tezos/vendors
+COPY --chown=tezos:nogroup irmin tezos/irmin
+COPY --chown=tezos:nogroup brassaia tezos/brassaia
+COPY --chown=tezos:nogroup data-encoding tezos/data-encoding
+COPY --chown=tezos:nogroup resto tezos/resto
+COPY --chown=tezos:nogroup prometheus tezos/prometheus
+COPY --chown=tezos:nogroup websocket tezos/websocket
+COPY --chown=tezos:nogroup lwt_domain tezos/lwt_domain
+COPY --chown=tezos:nogroup efunc-core tezos/efunc-core
+
+# Group 4: ancillary source (change occasionally)
+COPY --chown=tezos:nogroup opam tezos/opam
+COPY --chown=tezos:nogroup sdk/rust tezos/sdk/rust
+COPY --chown=tezos:nogroup tezt tezos/tezt
+COPY --chown=tezos:nogroup teztale tezos/teztale
+COPY --chown=tezos:nogroup contrib tezos/contrib
+
+# Group 5: main source (changes frequently)
+COPY --chown=tezos:nogroup src tezos/src
+COPY --chown=tezos:nogroup etherlink tezos/etherlink
+# sccache configuration for Rust compilation caching (via GCS backend).
+# When SCCACHE_GCS_BUCKET is non-empty, RUSTC_WRAPPER=sccache is activated.
+# Authentication uses GCP Application Default Credentials (ADC) via the
+# instance metadata service, which requires --network=host on the RUN step.
+# All other ARGs have sensible defaults and are effectively constants.
+# Note: Docker ARGs are automatically available as environment variables
+# during RUN instructions, so sccache picks them up without explicit ENV.
+
+# Note 2: For simplicity, --network=host is unconditional even though
+# it is needed only when sccache is running. Another solution would
+# have been to put the [RUN --network=host] command in a specific
+# stage used only when sccache is used. But that seems overkill since
+# there would be no obvious security gains.
+
+ARG SCCACHE_GCS_BUCKET=""
+ARG SCCACHE_GCS_RW_MODE="READ_WRITE"
+ARG SCCACHE_GCS_KEY_PREFIX="sccache"
+ARG SCCACHE_IDLE_TIMEOUT="0"
+ARG SCCACHE_IGNORE_SERVER_IO_ERROR="1"
+ARG CARGO_INCREMENTAL="0"
 ENV GIT_SHORTREF=${GIT_SHORTREF}
 ENV GIT_DATETIME=${GIT_DATETIME}
 ENV GIT_VERSION=${GIT_VERSION}
-RUN opam exec -- make -C tezos release OCTEZ_EXECUTABLES="${OCTEZ_EXECUTABLES}" OCTEZ_BIN_DIR=bin
+# The [build-deps] target reconciles the opam dependencies with this commit's
+# lockfiles on top of the deps baked into the alpine-build base image, so the
+# build never links stale dependencies. It is a near no-op on a fresh base
+# and installs only the delta when the base has drifted. Kept in the [release]
+# RUN rather than a separate one: with no layer cache a separate layer would
+# buy nothing.
+# hadolint ignore=DL3059
+RUN --network=host \
+    if [ -n "${SCCACHE_GCS_BUCKET}" ]; then \
+      if sccache --start-server 2>&1; then \
+        export RUSTC_WRAPPER=sccache; \
+        echo "### sccache enabled (bucket: ${SCCACHE_GCS_BUCKET})"; \
+      else \
+        echo "### sccache server failed to start, compiling without cache"; \
+      fi; \
+    else \
+      echo "### sccache disabled (no bucket configured)"; \
+    fi && \
+    opam exec -- make -C tezos build-deps release OCTEZ_EXECUTABLES="${OCTEZ_EXECUTABLES}" OCTEZ_BIN_DIR=bin && \
+    if [ -n "${SCCACHE_GCS_BUCKET}" ]; then \
+      echo "### sccache stats:"; \
+      sccache --show-stats || true; \
+    fi
 # Gather the parameters of all active protocols in 1 place
 RUN while read -r protocol; do \
     mkdir -p tezos/parameters/"$protocol"-parameters && \

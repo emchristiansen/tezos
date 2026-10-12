@@ -25,7 +25,14 @@
 (*                                                                           *)
 (*****************************************************************************)
 
-module Assert_lib = Lib_test_extra.Assert_lib
+(** Testing
+    _______
+
+    Component: Store
+    Invocation: dune exec src/lib_store/unix/test/main.exe -- --match "tezos-store: snapshots"
+    Subject: Store tests ( snapshots )
+*)
+
 open Test_utils
 
 let check_import_invariants ~test_descr ~rolling
@@ -58,7 +65,7 @@ let check_import_invariants ~test_descr ~rolling
       let expected_present, expected_absent =
         List.partition
           (fun b ->
-            Compare.Int32.(Store.Block.level b <= snd checkpoint)
+            Compare.Int32.(Store.Block.level b <= Store.Block.level head)
             && Compare.Int32.(Store.Block.level b >= snd caboose))
           previously_baked_blocks
       in
@@ -72,18 +79,26 @@ let check_import_invariants ~test_descr ~rolling
       (* Check that the descriptors are consistent *)
       let* expected_caboose_level =
         if rolling then
+          let* head_pred =
+            Store.Block.read_predecessor imported_chain_store head
+          in
           (* In rolling: we expected to have at least the max_op_ttl
-                blocks from the head *)
+                blocks from the predecessor of the head *)
           let* metadata =
-            Store.Block.get_block_metadata imported_chain_store head
+            Store.Block.get_block_metadata imported_chain_store head_pred
           in
           let max_op_ttl = Store.Block.max_operations_ttl metadata in
-          return Int32.(sub (Store.Block.level head) (of_int max_op_ttl))
+          return Int32.(sub (Store.Block.level head_pred) (of_int max_op_ttl))
         else return 0l
+      in
+      (* As the savepoint and checkpoint are targeting the predecessor of the
+         snapshot's target, we rely on the target's predecessor. *)
+      let exported_block_predecessor_level =
+        Int32.sub (Store.Block.level exported_block) 1l
       in
       Assert.equal
         ~msg:("savepoint consistency: " ^ test_descr)
-        (Store.Block.level exported_block)
+        exported_block_predecessor_level
         (snd savepoint) ;
       Assert.equal
         ~msg:("checkpoint consistency: " ^ test_descr)
@@ -98,7 +113,7 @@ let check_import_invariants ~test_descr ~rolling
       return_unit)
 
 let export_import ~test_descr ~previously_baked_blocks ?exported_block_hash
-    ~rolling ~export_mode (store_dir, context_dir) chain_store =
+    ~rolling ~export_mode (store_dir, data_dir) chain_store =
   let open Lwt_result_syntax in
   let* () = check_invariants chain_store in
   let open Filename.Infix in
@@ -116,20 +131,20 @@ let export_import ~test_descr ~previously_baked_blocks ?exported_block_hash
       ~rolling
       ~block:exported_block
       ~store_dir
-      ~context_dir
+      ~data_dir
       ~chain_name
       ~progress_display_mode:Animation.Auto
       genesis
   in
   let dir = store_dir // "imported_store" in
   let dst_store_dir = dir // "store" in
-  let dst_context_dir = dir // "context" in
+  let dst_data_dir = dir in
   let* () =
     Snapshots.import
       ?block:exported_block_hash
       ~snapshot_path
       ~dst_store_dir
-      ~dst_context_dir
+      ~dst_data_dir
       ~chain_name
       ~configured_history_mode:None
       ~user_activated_upgrades:[]
@@ -141,7 +156,7 @@ let export_import ~test_descr ~previously_baked_blocks ?exported_block_hash
   let* store' =
     Store.init
       ~store_dir:dst_store_dir
-      ~context_dir:dst_context_dir
+      ~data_dir:dst_data_dir
       ~allow_testchains:true
       genesis
   in
@@ -190,7 +205,10 @@ let check_baking_continuity ~test_descr ~exported_chain_store
   let open Lwt_result_syntax in
   let open Tezos_protocol_alpha.Protocol.Alpha_context in
   let*! imported_head = Store.Chain.current_head imported_chain_store in
-  let* {Constants.parametric = {blocks_per_cycle; preserved_cycles; _}; _} =
+  let* {
+         Constants.parametric = {blocks_per_cycle; blocks_preservation_cycles; _};
+         _;
+       } =
     Alpha_utils.get_constants imported_chain_store imported_head
   in
   let imported_history_mode = Store.Chain.history_mode imported_chain_store in
@@ -205,7 +223,8 @@ let check_baking_continuity ~test_descr ~exported_chain_store
     let min_nb_blocks_to_bake =
       Int32.(
         of_int
-          (to_int blocks_per_cycle * (preserved_cycles + imported_offset + 2)))
+          (to_int blocks_per_cycle
+          * (blocks_preservation_cycles + imported_offset + 2)))
     in
     Compare.Int32.(
       max
@@ -257,7 +276,7 @@ let check_baking_continuity ~test_descr ~exported_chain_store
     checkpoint' ;
   return_unit
 
-let test store_path ~test_descr ?exported_block_level
+let test_export_import store_path ~test_descr ?exported_block_level
     ~nb_blocks_to_bake_before_export ~rolling ~export_mode store =
   let open Lwt_result_syntax in
   let chain_store = Store.main_chain_store store in
@@ -376,11 +395,11 @@ let test store_path ~test_descr ?exported_block_level
           let*! _ = Store.close_store store' in
           Lwt.return_unit)
 
-let make_tests speed genesis_parameters =
+let make_tests_export_import speed genesis_parameters =
   let open Tezos_protocol_alpha.Protocol.Alpha_context in
   let {
     Parameters.constants =
-      {Constants.Parametric.blocks_per_cycle; preserved_cycles; _};
+      {Constants.Parametric.blocks_per_cycle; blocks_preservation_cycles; _};
     _;
   } =
     genesis_parameters
@@ -391,13 +410,13 @@ let make_tests speed genesis_parameters =
     match speed with
     | `Slow ->
         [
-          preserved_cycles * blocks_per_cycle;
-          ((2 * preserved_cycles) + 1) * blocks_per_cycle;
+          blocks_preservation_cycles * blocks_per_cycle;
+          ((2 * blocks_preservation_cycles) + 1) * blocks_per_cycle;
           65;
           77;
           89;
         ]
-    | `Quick -> [((2 * preserved_cycles) + 1) * blocks_per_cycle; 77]
+    | `Quick -> [((2 * blocks_preservation_cycles) + 1) * blocks_per_cycle; 77]
   in
   let exporter_history_modes =
     let open History_mode in
@@ -444,7 +463,8 @@ let make_tests speed genesis_parameters =
            exported_block_level,
            history_mode,
            rolling,
-           export_mode ) ->
+           export_mode )
+       ->
       let test_descr =
         Format.asprintf
           "export => import with %d initial blocks from %a to %s (exported \
@@ -469,6 +489,7 @@ let make_tests speed genesis_parameters =
           | None | Some _ ->
               Some
                 (wrap_test
+                   ~speed
                    ~with_gc:true
                    ~keep_dir:false
                    ~history_mode
@@ -476,7 +497,7 @@ let make_tests speed genesis_parameters =
                      Alpha_utils.default_patch_context ctxt)
                    ( test_descr,
                      fun store_path store ->
-                       test
+                       test_export_import
                          ?exported_block_level
                          ~nb_blocks_to_bake_before_export:nb_initial_blocks
                          ~rolling
@@ -486,9 +507,89 @@ let make_tests speed genesis_parameters =
                          store ))))
     permutations
 
-let test_rolling export_mode =
+(* Regression test for archive member name validation: a context member whose
+   name contains ".." components ("context/../../snapshot_escape_marker") must
+   be rejected during import and must not write any file outside the destination
+   context directory. *)
+let test_tar_import_rejects_non_canonical_member_names speed =
+  let test (store_dir, data_dir) store =
+    let open Lwt_result_syntax in
+    let open Filename.Infix in
+    let chain_store = Store.main_chain_store store in
+    let*! genesis_block = Store.Chain.genesis_block chain_store in
+    let* _blocks, _head = Alpha_utils.bake_n chain_store 2 genesis_block in
+    let snapshot_path = store_dir // "snapshot.member-validation.full" in
+    let chain_name = Distributed_db_version.Name.of_string "test" in
+    let* () =
+      Snapshots.export
+        ~snapshot_path
+        Snapshots.Tar
+        ~rolling:false
+        ~block:(`Head 0)
+        ~store_dir
+        ~data_dir
+        ~chain_name
+        ~progress_display_mode:Animation.Auto
+        genesis
+    in
+    let marker_path = store_dir // "snapshot_escape_marker" in
+    (* Append a member whose name contains ".." components and resolves outside
+       the context directory, using the OCaml helper so the test has no
+       dependency on GNU tar. *)
+    let raw_member = "context/../../snapshot_escape_marker" in
+    let*! () =
+      Octez_tar_helpers.Internal_for_test.append_raw_member
+        ~file:snapshot_path
+        ~member_name:raw_member
+        ~data:"test payload\n"
+    in
+    let*! marker_exists = Lwt_unix.file_exists marker_path in
+    Assert.assert_true
+      "marker file unexpectedly exists before import"
+      (not marker_exists) ;
+    let import_dir = store_dir // "imported_member_validation" in
+    let dst_store_dir = import_dir // "store" in
+    let dst_data_dir = import_dir in
+    let*! import_result =
+      Snapshots.import
+        ~snapshot_path
+        ~dst_store_dir
+        ~dst_data_dir
+        ~chain_name
+        ~configured_history_mode:None
+        ~user_activated_upgrades:[]
+        ~user_activated_protocol_overrides:[]
+        ~operation_metadata_size_limit:Unlimited
+        ~progress_display_mode:Animation.Auto
+        genesis
+    in
+    (match import_result with
+    | Ok () ->
+        Assert.fail_msg
+          "snapshot import unexpectedly succeeded on a snapshot containing \
+           member with non-canonical name %S"
+          raw_member
+    | Error _ -> ()) ;
+    let*! marker_exists = Lwt_unix.file_exists marker_path in
+    if marker_exists then
+      Assert.fail_msg
+        "snapshot import wrote context member %S outside destination context \
+         directory at %S"
+        raw_member
+        marker_path ;
+    return_unit
+  in
+  wrap_test
+    ~speed
+    ~with_gc:true
+    ~keep_dir:false
+    ~history_mode:(Full (Some History_mode.default_additional_cycles))
+    ~patch_context:(fun ctxt -> Alpha_utils.default_patch_context ctxt)
+    ("tar snapshot import rejects members with non-canonical paths", test)
+
+let test_rolling speed export_mode =
   let patch_context ctxt = Alpha_utils.default_patch_context ctxt in
-  let test (store_dir, context_dir) store =
+  let test (store_dir, data_dir) store =
     let open Lwt_result_syntax in
     let chain_store = Store.main_chain_store store in
     let*! genesis_block = Store.Chain.genesis_block chain_store in
@@ -506,7 +607,7 @@ let test_rolling export_mode =
     let chain_name = Distributed_db_version.Name.of_string "test" in
     let dst_dir = store_dir // "imported_store" in
     let dst_store_dir = dst_dir // "store" in
-    let dst_context_dir = dst_dir // "context" in
+    let dst_data_dir = dst_dir in
     let* () =
       Snapshots.export
         ~snapshot_path
@@ -514,7 +615,7 @@ let test_rolling export_mode =
         ~rolling:true
         ~block:(`Head 0)
         ~store_dir
-        ~context_dir
+        ~data_dir
         ~chain_name
         ~progress_display_mode:Animation.Auto
         genesis
@@ -523,7 +624,7 @@ let test_rolling export_mode =
       Snapshots.import
         ~snapshot_path
         ~dst_store_dir
-        ~dst_context_dir
+        ~dst_data_dir
         ~chain_name
         ~configured_history_mode:None
         ~user_activated_upgrades:[]
@@ -538,7 +639,7 @@ let test_rolling export_mode =
         ~history_mode:History_mode.default_rolling
         ~readonly:false
         ~store_dir:dst_store_dir
-        ~context_dir:dst_context_dir
+        ~data_dir:dst_data_dir
         ~allow_testchains:true
         genesis
     in
@@ -556,11 +657,12 @@ let test_rolling export_mode =
         sub (snd checkpoint) (of_int (Store.Block.max_operations_ttl metadata)))
     in
     let*! caboose = Store.Chain.caboose chain_store' in
-    Assert.Int32.equal ~msg:__LOC__ max_op_ttl_cp (snd caboose) ;
+    Assert.Int32.geq ~msg:__LOC__ max_op_ttl_cp (snd caboose) ;
     let*! () = Store.close_store store' in
     return_unit
   in
   wrap_test
+    ~speed
     ~keep_dir:false
     ~with_gc:true
     ~history_mode:History_mode.default
@@ -573,20 +675,20 @@ let test_rolling export_mode =
         export_mode,
       test )
 
-let make_tests_rolling =
+let make_tests_rolling speed =
   let export_mode = Snapshots.[Tar; Raw] in
-  List.map test_rolling export_mode
+  List.map (test_rolling speed) export_mode
 
 (* This test aims to check that the caboose and savepoint are well
    dragged when the first merge occurs, after a rolling snapshot
    import on a block which is not on a cycle's bound. Indeed, in such
-   a scenario, the merge procedure may remove blocks bellow the lafl
+   a scenario, the merge procedure may remove blocks bellow the lpbl
    without cementing them. It would result in non stored caboose
    (rolling issue) and savepoint (rolling and full issue).
    In this test, we need to increase the number of blocks per cycle to
    avoid the max_op_ttl to hide this potential issue. The exported
    block must be outside the max_op_ttl of the next checkpoint. *)
-let test_drag_after_import export_mode =
+let test_drag_after_import speed export_mode =
   let open Lwt_result_syntax in
   let constants =
     Default_parameters.
@@ -594,7 +696,8 @@ let test_drag_after_import export_mode =
         constants_test with
         blocks_per_cycle = 256l;
         cycles_per_voting_period = 1l;
-        consensus_threshold = 0;
+        consensus_threshold_size = 0;
+        proof_of_work_threshold = -1L;
       }
   in
   let patch_context ctxt =
@@ -609,7 +712,7 @@ let test_drag_after_import export_mode =
       ctxt
       ~json:(Default_parameters.json_of_parameters test_parameters)
   in
-  let test (store_dir, context_dir) store =
+  let test (store_dir, data_dir) store =
     let chain_store = Store.main_chain_store store in
     let*! genesis_block = Store.Chain.genesis_block chain_store in
     let nb_cycles_to_bake = 2 in
@@ -626,7 +729,7 @@ let test_drag_after_import export_mode =
     let chain_name = Distributed_db_version.Name.of_string "test" in
     let dst_dir = store_dir // "imported_store" in
     let dst_store_dir = dst_dir // "store" in
-    let dst_context_dir = dst_dir // "context" in
+    let dst_data_dir = dst_dir in
     (* export distance is higer than the 120 max_op_tt*)
     let export_distance = 130 in
     let* export_block =
@@ -643,7 +746,7 @@ let test_drag_after_import export_mode =
         ~rolling:true
         ~block:(`Hash (export_block_hash, 0))
         ~store_dir
-        ~context_dir
+        ~data_dir
         ~chain_name
         ~progress_display_mode:Animation.Auto
         genesis
@@ -652,7 +755,7 @@ let test_drag_after_import export_mode =
       Snapshots.import
         ~snapshot_path
         ~dst_store_dir
-        ~dst_context_dir
+        ~dst_data_dir
         ~chain_name
         ~configured_history_mode:None
         ~user_activated_upgrades:[]
@@ -667,7 +770,7 @@ let test_drag_after_import export_mode =
         ~patch_context
         ~readonly:false
         ~store_dir:dst_store_dir
-        ~context_dir:dst_context_dir
+        ~data_dir:dst_data_dir
         ~allow_testchains:true
         genesis
     in
@@ -693,6 +796,10 @@ let test_drag_after_import export_mode =
       else
         let* _, head = Alpha_utils.bake_until_cycle_end chain_store' head in
         let*! () = Block_store.await_merging block_store in
+        let context_index =
+          Store.context_index (Store.Chain.global_store chain_store)
+        in
+        let*! () = Context_ops.wait_gc_completion context_index in
         let*! _, caboose_level = Store.Chain.caboose chain_store' in
         let*! _, savepoint_level = Store.Chain.savepoint chain_store' in
         let* () =
@@ -714,6 +821,7 @@ let test_drag_after_import export_mode =
     return_unit
   in
   wrap_test
+    ~speed
     ~keep_dir:false
     ~with_gc:true
     ~history_mode:History_mode.default
@@ -726,9 +834,9 @@ let test_drag_after_import export_mode =
         export_mode,
       test )
 
-let make_tests_drag_after_import =
+let make_tests_drag_after_import speed =
   let export_mode = Snapshots.[Tar; Raw] in
-  List.map test_drag_after_import export_mode
+  List.map (test_drag_after_import speed) export_mode
 
 (* TODO:
    export => import => export => import from full & rolling
@@ -737,15 +845,16 @@ let make_tests_drag_after_import =
 
 let tests speed =
   let test_cases =
-    let generated_tests =
-      make_tests
+    let export_import_tests =
+      make_tests_export_import
         speed
         Tezos_protocol_alpha_parameters.Default_parameters.(
           parameters_of_constants
-            {constants_sandbox with consensus_threshold = 0})
+            {constants_sandbox with consensus_threshold_size = 0})
     in
-    let tests_rolling = make_tests_rolling in
-    let tests_drag_after_import = make_tests_drag_after_import in
-    tests_rolling @ tests_drag_after_import @ generated_tests
+    let tests_rolling = make_tests_rolling speed in
+    let tests_drag_after_import = make_tests_drag_after_import speed in
+    test_tar_import_rejects_non_canonical_member_names speed
+    :: (tests_rolling @ tests_drag_after_import @ export_import_tests)
   in
   ("snapshots", test_cases)

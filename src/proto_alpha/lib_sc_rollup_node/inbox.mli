@@ -36,28 +36,14 @@
 open Protocol.Alpha_context
 open Sc_rollup
 
-(** [process_head node_ctxt head operations] changes the state of the inbox to
-    react to [head]. In particular, this process filters the provided
-    [operations] of the [head] block. *)
-val process_head :
-  Node_context.rw ->
-  Layer1.head ->
-  (Sc_rollup.Inbox.Hash.t
-  * Sc_rollup.Inbox.t
-  * Sc_rollup.Inbox_merkelized_payload_hashes.Hash.t
-  * Sc_rollup.Inbox_message.t list
-  * Context.rw)
-  tzresult
-  Lwt.t
+include Protocol_plugin_sig.INBOX
 
-(** [start ()] initializes the inbox to track the messages being published. *)
-val start : unit -> unit Lwt.t
-
-(** [add_messages ~is_migration_block ~predecessor_timestamp
-    ~predecessor inbox messages] adds [messages] to the [inbox] using
-    {!Inbox.add_all_messages}. *)
+(** [add_messages ~is_first_block ~dal_attested_slots_messages
+    ~predecessor_timestamp ~predecessor inbox messages] adds [messages] to the
+    [inbox] using {!Sc_rollup.Inbox.add_all_messages}. *)
 val add_messages :
-  is_migration_block:bool ->
+  is_first_block:bool ->
+  dal_attested_slots_messages:Inbox_message.internal_inbox_message list ->
   predecessor_timestamp:Timestamp.time ->
   predecessor:Block_hash.t ->
   Inbox.t ->
@@ -69,14 +55,21 @@ val add_messages :
   tzresult
   Lwt.t
 
-(** [payloads_history_of_messages ~is_migration_block ~predecessor
-    ~predecessor_timestamp messages] builds the payloads history for
-    the list of [messages]. This allows to not store payloads
-    histories (which contain merkelized skip lists) but simply
+(** [payloads_history_of_messages ~is_first_block ~predecessor
+    ~predecessor_timestamp ~dal_attested_slots_messages messages] builds the
+    payloads history for the list of [messages]. This allows to not store
+    payloads histories (which contain merkelized skip lists) but simply
     messages. *)
 val payloads_history_of_messages :
-  is_migration_block:bool ->
+  is_first_block:bool ->
   predecessor:Block_hash.t ->
   predecessor_timestamp:Timestamp.time ->
-  Sc_rollup.Inbox_message.t list ->
+  dal_attested_slots_messages:
+    Sc_rollup.Inbox_message.internal_inbox_message list ->
+  string list ->
   Sc_rollup.Inbox_merkelized_payload_hashes.History.t tzresult
+
+(** [payloads_history_of_all_messages messages] builds the merkelized payloads
+    history for the list of serialzied messages [messages]. *)
+val payloads_history_of_all_messages :
+  string trace -> Sc_rollup.Inbox_merkelized_payload_hashes.History.t tzresult

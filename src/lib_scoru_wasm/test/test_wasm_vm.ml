@@ -1,4 +1,43 @@
+(*****************************************************************************)
+(*                                                                           *)
+(* Open Source License                                                       *)
+(* Copyright (c) 2022 Trili Tech  <contact@trili.tech>                       *)
+(*                                                                           *)
+(* Permission is hereby granted, free of charge, to any person obtaining a   *)
+(* copy of this software and associated documentation files (the "Software"),*)
+(* to deal in the Software without restriction, including without limitation *)
+(* the rights to use, copy, modify, merge, publish, distribute, sublicense,  *)
+(* and/or sell copies of the Software, and to permit persons to whom the     *)
+(* Software is furnished to do so, subject to the following conditions:      *)
+(*                                                                           *)
+(* The above copyright notice and this permission notice shall be included   *)
+(* in all copies or substantial portions of the Software.                    *)
+(*                                                                           *)
+(* THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR*)
+(* IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,  *)
+(* FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL   *)
+(* THE AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER*)
+(* LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING   *)
+(* FROM, OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER       *)
+(* DEALINGS IN THE SOFTWARE.                                                 *)
+(*                                                                           *)
+(*****************************************************************************)
+
+(** Testing
+    -------
+    Component:    Lib_scoru_wasm
+    Invocation:   dune exec src/lib_scoru_wasm/test/main.exe -- --file test_wasm_vm.ml
+    Subject:      Tests for the tezos-scoru-wasm library
+*)
+
 open Tezos_scoru_wasm
+
+module Wasm_vm = Wasm_vm.Make_vm (struct
+  let config = Wasm_pvm_config.empty
+
+  let make_empty_nds = None
+end)
+
 open Wasm_utils
 open Tztest_helper
 
@@ -15,7 +54,7 @@ let init_tree_with_empty_input ~version =
       )
     |}
   in
-  let*! tree = initial_tree ~version ~from_binary:false module_ in
+  let*! tree = initial_state ~version ~from_binary:false module_ in
   let*! tree = eval_until_input_requested tree in
   let*! tree = set_empty_inbox_step 0l tree in
   return tree
@@ -24,18 +63,15 @@ let test_padding_state ~version () =
   let open Lwt_result_syntax in
   let open Wasm_pvm_state.Internal_state in
   let* tree = init_tree_with_empty_input ~version in
-  let*! pvm_state =
-    Encodings_util.Tree_encoding_runner.decode
-      Tezos_scoru_wasm.Wasm_pvm.pvm_state_encoding
-      tree
-  in
+  let*! pvm_state = State.Encoding_runner.decode tree in
   let should_continue state =
     match state.tick_state with
-    | Padding -> Lwt_syntax.return false
-    | _ -> Lwt_syntax.return true
+    | Padding -> Lwt_syntax.return_false
+    | _ -> Lwt_syntax.return_true
   in
   let*! pvm_state, _ =
     Wasm_vm.compute_step_many_until
+      ~wasm_entrypoint:Constants.wasm_entrypoint
       ~write_debug:Noop
       ~max_steps:Int64.max_int
       should_continue
@@ -57,7 +93,12 @@ let test_set_input_step_in_padding ~version () =
   let open Lwt_result_syntax in
   let* tree = init_tree_with_empty_input ~version in
   (* Advance execution for relatively many steps in order to reach Padding tick_state *)
-  let*! tree, _ = Wasm.compute_step_many ~max_steps:(Int64.of_int 10000) tree in
+  let*! tree, _ =
+    Wasm.compute_step_many
+      ~wasm_entrypoint:Constants.wasm_entrypoint
+      ~max_steps:(Int64.of_int 10000)
+      tree
+  in
 
   (* Ensure we are in Padding state *)
   let*! tick_state = Wasm.Internal_for_tests.get_tick_state tree in
@@ -74,7 +115,7 @@ let test_set_input_step_in_padding ~version () =
     match tick_state with
     | Stuck
         (Wasm_pvm_errors.Invalid_state
-          (Wasm_pvm_errors.Truncated "No input required during padding")) ->
+           (Wasm_pvm_errors.Truncated "No input required during padding")) ->
         return_unit
     | _ ->
         failwith
@@ -129,8 +170,7 @@ let test_last_input_info_updated_in_set_input_step ~version () =
   return_unit
 
 let tests =
-  tztests_with_pvm
-    ~versions:[V0; V1]
+  tztests_with_all_pvms
     [
       ("Test eval_has_finished: padding", `Quick, test_padding_state);
       ("Test set_input_state: padding", `Quick, test_set_input_step_in_padding);
@@ -138,3 +178,7 @@ let tests =
         `Quick,
         test_last_input_info_updated_in_set_input_step );
     ]
+
+let () =
+  Alcotest_lwt.run ~__FILE__ "test lib scoru wasm" [("WASM VM", tests)]
+  |> Lwt_main.run

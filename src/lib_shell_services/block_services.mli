@@ -26,6 +26,8 @@
 
 module Proof = Tezos_context_sigs.Context.Proof_types
 
+type version = Version_1 | Version_2
+
 type chain = [`Main | `Test | `Hash of Chain_id.t]
 
 type chain_prefix = unit * chain
@@ -130,8 +132,12 @@ val protocols :
   unit ->
   protocols tzresult Lwt.t
 
-module Make (Proto : PROTO) (Next_proto : PROTO) : sig
+module type S = sig
   val path : (unit, chain_prefix * block) Tezos_rpc.Path.t
+
+  module Proto : PROTO
+
+  module Next_proto : PROTO
 
   type raw_block_header = {
     shell : Block_header.shell_header;
@@ -175,12 +181,13 @@ module Make (Proto : PROTO) (Next_proto : PROTO) : sig
     operations : operation list list;
   }
 
-  val block_info_encoding : block_info Data_encoding.t
+  val block_info_encoding : (version * block_info) Data_encoding.t
 
   open Tezos_rpc.Context
 
   val info :
     #simple ->
+    ?version:version ->
     ?force_metadata:bool ->
     ?metadata:[`Always | `Never] ->
     ?chain:chain ->
@@ -207,6 +214,7 @@ module Make (Proto : PROTO) (Next_proto : PROTO) : sig
 
   val metadata :
     #simple ->
+    ?version:version ->
     ?chain:chain ->
     ?block:block ->
     unit ->
@@ -248,6 +256,7 @@ module Make (Proto : PROTO) (Next_proto : PROTO) : sig
   module Operations : sig
     val operations :
       #simple ->
+      ?version:version ->
       ?force_metadata:bool ->
       ?metadata:[`Always | `Never] ->
       ?chain:chain ->
@@ -257,6 +266,7 @@ module Make (Proto : PROTO) (Next_proto : PROTO) : sig
 
     val operations_in_pass :
       #simple ->
+      ?version:version ->
       ?force_metadata:bool ->
       ?metadata:[`Always | `Never] ->
       ?chain:chain ->
@@ -266,6 +276,7 @@ module Make (Proto : PROTO) (Next_proto : PROTO) : sig
 
     val operation :
       #simple ->
+      ?version:version ->
       ?force_metadata:bool ->
       ?metadata:[`Always | `Never] ->
       ?chain:chain ->
@@ -374,6 +385,7 @@ module Make (Proto : PROTO) (Next_proto : PROTO) : sig
         #simple ->
         ?chain:chain ->
         ?block:block ->
+        ?version:version ->
         Next_proto.operation list ->
         (Next_proto.operation_data * Next_proto.operation_receipt) list tzresult
         Lwt.t
@@ -389,7 +401,7 @@ module Make (Proto : PROTO) (Next_proto : PROTO) : sig
 
   module Mempool : sig
     type t = {
-      applied : (Operation_hash.t * Next_proto.operation) list;
+      validated : (Operation_hash.t * Next_proto.operation) list;
       refused : (Next_proto.operation * error list) Operation_hash.Map.t;
       outdated : (Next_proto.operation * error list) Operation_hash.Map.t;
       branch_refused : (Next_proto.operation * error list) Operation_hash.Map.t;
@@ -397,30 +409,29 @@ module Make (Proto : PROTO) (Next_proto : PROTO) : sig
       unprocessed : Next_proto.operation Operation_hash.Map.t;
     }
 
-    type t_with_version
-
-    val pending_operations_version_dispatcher :
-      version:int -> t -> t_with_version Tezos_rpc.Answer.t Lwt.t
-
     (** Call RPC GET /chains/[chain]/mempool/pending_operations
 
     - Default [version] is [0].
-    - Default [applied] is [true].
+    - Default [validated] is [true].
     - Default [branch_delayed] is [true].
     - Default [branch_refused] is [true].
     - Default [refused] is [true].
     - Default [outdated] is [true].
-    - Default [validation_passes] is [[]] *)
+    - Default [validation_passes] is [[]]
+    - Default [sources] is [[]]
+    - Default [operation_hash] is [[]]*)
     val pending_operations :
       #simple ->
       ?chain:chain ->
-      ?version:int ->
-      ?applied:bool ->
+      ?version:version ->
+      ?validated:bool ->
       ?branch_delayed:bool ->
       ?branch_refused:bool ->
       ?refused:bool ->
       ?outdated:bool ->
       ?validation_passes:int list ->
+      ?sources:string list ->
+      ?operation_hash:string list ->
       unit ->
       t tzresult Lwt.t
 
@@ -449,18 +460,28 @@ module Make (Proto : PROTO) (Next_proto : PROTO) : sig
     val monitor_operations :
       #streamed ->
       ?chain:chain ->
-      ?applied:bool ->
+      ?version:version ->
+      ?validated:bool ->
       ?branch_delayed:bool ->
       ?branch_refused:bool ->
       ?refused:bool ->
       ?outdated:bool ->
       ?validation_passes:int list ->
+      ?sources:string list ->
       unit ->
       (((Operation_hash.t * Next_proto.operation) * error trace option) list
        Lwt_stream.t
       * stopper)
       tzresult
       Lwt.t
+
+    (** Call RPC GET /chains/[chain]/mempool/filter *)
+    val get_filter :
+      #simple ->
+      ?chain:chain ->
+      ?include_default:bool ->
+      unit ->
+      Data_encoding.json tzresult Lwt.t
 
     (** Call RPC POST /chains/[chain]/mempool/request_operations *)
     val request_operations :
@@ -486,9 +507,11 @@ module Make (Proto : PROTO) (Next_proto : PROTO) : sig
       ( [`GET],
         prefix,
         prefix,
-        < force_metadata : bool ; metadata : [`Always | `Never] option >,
+        < version : version
+        ; force_metadata : bool
+        ; metadata : [`Always | `Never] option >,
         unit,
-        block_info )
+        version * block_info )
       Tezos_rpc.Service.t
 
     val header :
@@ -498,7 +521,13 @@ module Make (Proto : PROTO) (Next_proto : PROTO) : sig
       ([`GET], prefix, prefix, unit, unit, Bytes.t) Tezos_rpc.Service.t
 
     val metadata :
-      ([`GET], prefix, prefix, unit, unit, block_metadata) Tezos_rpc.Service.t
+      ( [`GET],
+        prefix,
+        prefix,
+        < version : version >,
+        unit,
+        version * block_metadata )
+      Tezos_rpc.Service.t
 
     val metadata_hash :
       ( [`GET],
@@ -543,27 +572,33 @@ module Make (Proto : PROTO) (Next_proto : PROTO) : sig
         ( [`GET],
           prefix,
           prefix,
-          < force_metadata : bool ; metadata : [`Always | `Never] option >,
+          < version : version
+          ; force_metadata : bool
+          ; metadata : [`Always | `Never] option >,
           unit,
-          operation list list )
+          version * operation list list )
         Tezos_rpc.Service.t
 
       val operations_in_pass :
         ( [`GET],
           prefix,
           prefix * int,
-          < force_metadata : bool ; metadata : [`Always | `Never] option >,
+          < version : version
+          ; force_metadata : bool
+          ; metadata : [`Always | `Never] option >,
           unit,
-          operation list )
+          version * operation list )
         Tezos_rpc.Service.t
 
       val operation :
         ( [`GET],
           prefix,
           (prefix * int) * int,
-          < force_metadata : bool ; metadata : [`Always | `Never] option >,
+          < version : version
+          ; force_metadata : bool
+          ; metadata : [`Always | `Never] option >,
           unit,
-          operation )
+          version * operation )
         Tezos_rpc.Service.t
     end
 
@@ -694,9 +729,11 @@ module Make (Proto : PROTO) (Next_proto : PROTO) : sig
           ( [`POST],
             prefix,
             prefix,
-            unit,
+            < version : version >,
             Next_proto.operation list,
-            (Next_proto.operation_data * Next_proto.operation_receipt) list )
+            version
+            * (Next_proto.operation_data * Next_proto.operation_receipt) list
+          )
           Tezos_rpc.Service.t
       end
 
@@ -711,23 +748,23 @@ module Make (Proto : PROTO) (Next_proto : PROTO) : sig
     end
 
     module Mempool : sig
-      val encoding : Mempool.t Data_encoding.t
-
       (** Define RPC GET /chains/[chain]/mempool/pending_operations *)
       val pending_operations :
         ('a, 'b) Tezos_rpc.Path.t ->
         ( [`GET],
           'a,
           'b,
-          < version : int
-          ; applied : bool
+          < version : version
+          ; validated : bool
           ; branch_delayed : bool
           ; branch_refused : bool
           ; refused : bool
           ; outdated : bool
-          ; validation_passes : int list >,
+          ; validation_passes : int list
+          ; sources : string list
+          ; operation_hash : string list >,
           unit,
-          Mempool.t_with_version )
+          version * Mempool.t )
         Tezos_rpc.Service.t
 
       (** Define RPC POST /chains/[chain]/mempool/ban_operation *)
@@ -751,15 +788,18 @@ module Make (Proto : PROTO) (Next_proto : PROTO) : sig
         ( [`GET],
           'a,
           'b,
-          < applied : bool
+          < version : version
+          ; validated : bool
           ; branch_delayed : bool
           ; branch_refused : bool
           ; refused : bool
           ; outdated : bool
-          ; validation_passes : int list >,
+          ; validation_passes : int list
+          ; sources : string list >,
           unit,
-          ((Operation_hash.t * Next_proto.operation) * error trace option) list
-        )
+          version
+          * ((Operation_hash.t * Next_proto.operation) * error trace option)
+            list )
         Tezos_rpc.Service.t
 
       (** Define RPC GET /chains/[chain]/mempool/filter *)
@@ -800,6 +840,9 @@ module Make (Proto : PROTO) (Next_proto : PROTO) : sig
       ([`GET], prefix, prefix, unit, unit, Block_hash.Set.t) Tezos_rpc.Service.t
   end
 end
+
+module Make (Proto : PROTO) (Next_proto : PROTO) :
+  S with module Proto = Proto and module Next_proto = Next_proto
 
 module Fake_protocol : PROTO
 

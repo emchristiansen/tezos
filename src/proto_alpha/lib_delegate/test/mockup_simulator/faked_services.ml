@@ -1,3 +1,10 @@
+(*****************************************************************************)
+(*                                                                           *)
+(* SPDX-License-Identifier: MIT                                              *)
+(* Copyright (c) 2024 Nomadic Labs, <contact@nomadic-labs.com>               *)
+(*                                                                           *)
+(*****************************************************************************)
+
 open Tezos_shell_services
 module Directory = Tezos_rpc.Directory
 module Chain_services = Tezos_shell_services.Chain_services
@@ -7,14 +14,14 @@ module Block_services_alpha = Protocol_client_context.Alpha_block_services
 module type Mocked_services_hooks = sig
   type mempool = Mockup.M.Block_services.Mempool.t
 
-  (** The baker and endorser rely on this stream to be notified of new
+  (** The baker relies on this stream to be notified of new
      valid blocks. *)
   val monitor_validated_blocks :
     unit ->
     (Chain_id.t * Block_hash.t * Block_header.t * Operation.t list list)
     Tezos_rpc.Answer.stream
 
-  (** The baker and endorser rely on this stream to be notified of new
+  (** The baker relies on this stream to be notified of new
      heads. *)
   val monitor_heads :
     unit -> (Block_hash.t * Block_header.t) Tezos_rpc.Answer.stream
@@ -50,26 +57,29 @@ module type Mocked_services_hooks = sig
     Operation.t trace trace ->
     unit tzresult Lwt.t
 
-  (** [inject_operation] is used by the endorser (or the client) to inject
-      operations, including endorsements. *)
+  (** [inject_operation] is used by the baker (or the client) to inject
+      operations, including attestations. *)
   val inject_operation : Operation.t -> Operation_hash.t tzresult Lwt.t
 
   (** [pending_operations] returns the current contents of the mempool. It
      is used by the baker to fetch operations to potentially include in the
-     block being baked. These operations might include endorsements. If
-     there aren't enough endorsements, the baker waits on
+     block being baked. These operations might include attestations. If
+     there aren't enough attestations, the baker waits on
      [monitor_operations]. *)
   val pending_operations : unit -> mempool Lwt.t
 
   (** Return a stream of list of operations. Used by the baker to wait on
-     endorsements. Invariant: the stream becomes empty when the node changes
+     attestations. Invariant: the stream becomes empty when the node changes
      head. *)
   val monitor_operations :
-    applied:bool ->
+    version:Block_services.version ->
+    validated:bool ->
     branch_delayed:bool ->
     branch_refused:bool ->
     refused:bool ->
-    ((Operation_hash.t * Mockup.M.Protocol.operation) * error trace option) list
+    (Block_services.version
+    * ((Operation_hash.t * Mockup.M.Protocol.operation) * error trace option)
+      list)
     Tezos_rpc.Answer.stream
 
   (** Lists block hashes from the chain, up to the last checkpoint, sorted
@@ -185,27 +195,35 @@ module Make (Hooks : Mocked_services_hooks) = struct
     @@ Directory.register
          Directory.empty
          Mockup.M.Block_services.S.Operations.operations
-         (fun (((), _chain), block) _ () -> Hooks.operations block)
+         (fun (((), _chain), block) q () ->
+           let open Lwt_result_syntax in
+           let* ops = Hooks.operations block in
+           return (q#version, ops))
 
   let hash =
+    let open Lwt_result_syntax in
     Directory.prefix
       (Tezos_rpc.Path.prefix Chain_services.path Block_services.path)
     @@ Directory.register
          Directory.empty
          Block_services.Empty.S.hash
          (fun (((), _chain), block) () () ->
-           Hooks.header block >>=? fun x -> return x.hash)
+           let* x = Hooks.header block in
+           return x.hash)
 
   let shell_header =
+    let open Lwt_result_syntax in
     Directory.prefix
       (Tezos_rpc.Path.prefix Chain_services.path Block_services.path)
     @@ Directory.register
          Directory.empty
          Mockup.M.Block_services.S.Header.shell_header
          (fun (((), _chain), block) _ _ ->
-           Hooks.header block >>=? fun x -> return x.shell)
+           let* x = Hooks.header block in
+           return x.shell)
 
   let chain chain_id =
+    let open Lwt_result_syntax in
     Directory.prefix
       Chain_services.path
       (Directory.register
@@ -214,6 +232,7 @@ module Make (Hooks : Mocked_services_hooks) = struct
          (fun _chain () () -> return chain_id))
 
   let inject_block =
+    let open Lwt_result_syntax in
     Directory.register
       Directory.empty
       Injection_services.S.block
@@ -222,7 +241,7 @@ module Make (Hooks : Mocked_services_hooks) = struct
         | None -> failwith "faked_services.inject_block: can't deserialize"
         | Some block_header ->
             let block_hash = Block_hash.hash_bytes [bytes] in
-            Hooks.inject_block block_hash block_header operations >>=? fun () ->
+            let* () = Hooks.inject_block block_hash block_header operations in
             return block_hash)
 
   let inject_operation =
@@ -232,17 +251,6 @@ module Make (Hooks : Mocked_services_hooks) = struct
       (fun () _chain bytes ->
         match Data_encoding.Binary.of_bytes_opt Operation.encoding bytes with
         | None -> failwith "faked_services.inject_operation: can't deserialize"
-        | Some operation -> Hooks.inject_operation operation)
-
-  let inject_private_operation =
-    Directory.register
-      Directory.empty
-      Injection_services.S.private_operation
-      (fun () _chain bytes ->
-        match Data_encoding.Binary.of_bytes_opt Operation.encoding bytes with
-        | None ->
-            failwith
-              "faked_services.inject_private_operation: can't deserialize"
         | Some operation -> Hooks.inject_operation operation)
 
   let broadcast_block =
@@ -264,15 +272,14 @@ module Make (Hooks : Mocked_services_hooks) = struct
         Hooks.broadcast_operation ?dests operation)
 
   let pending_operations =
+    let open Lwt_syntax in
     Directory.gen_register
       Directory.empty
       (Mockup.M.Block_services.S.Mempool.pending_operations
       @@ Block_services.mempool_path Block_services.chain_path)
-      (fun ((), _chain) _params () ->
-        Hooks.pending_operations () >>= fun mempool ->
-        Mockup.M.Block_services.Mempool.pending_operations_version_dispatcher
-          ~version:1
-          mempool)
+      (fun ((), _chain) params () ->
+        let* mempool = Hooks.pending_operations () in
+        Tezos_rpc.Answer.return (params#version, mempool))
 
   let monitor_operations =
     Directory.gen_register
@@ -282,7 +289,8 @@ module Make (Hooks : Mocked_services_hooks) = struct
       (fun ((), _chain) flags () ->
         let stream =
           Hooks.monitor_operations
-            ~applied:flags#applied
+            ~version:flags#version
+            ~validated:flags#validated
             ~branch_delayed:flags#branch_delayed
             ~branch_refused:flags#branch_refused
             ~refused:flags#refused
@@ -334,7 +342,6 @@ module Make (Hooks : Mocked_services_hooks) = struct
         chain chain_id;
         inject_block;
         inject_operation;
-        inject_private_operation;
         monitor_operations;
         list_blocks;
         live_blocks;
@@ -345,6 +352,7 @@ module Make (Hooks : Mocked_services_hooks) = struct
       ]
 
   let directory chain_id =
+    let open Lwt_syntax in
     let proto_directory =
       Directory.prefix
         Chain_services.path
@@ -352,7 +360,8 @@ module Make (Hooks : Mocked_services_hooks) = struct
            Block_services.path
            (Directory.map
               (fun (((), _chain), block) ->
-                Hooks.rpc_context_callback block >>= function
+                let* result = Hooks.rpc_context_callback block in
+                match result with
                 | Error _ -> assert false
                 | Ok rpc_context -> Lwt.return rpc_context)
               Mockup.M.directory))

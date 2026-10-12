@@ -24,18 +24,6 @@
 (*****************************************************************************)
 
 module ProtoRpc : Tezos_proxy.Proxy_proto.PROTO_RPC = struct
-  (** Split done only when the mode is [Tezos_proxy.Proxy.server]. Getting
-      an entire big map at once is useful for dapp developers that
-      iterate a lot on big maps and that use proxy servers in their
-      internal infra. *)
-  let split_server key =
-    match key with
-    (* matches paths like:
-       big_maps/index/i/contents/tail *)
-    | "big_maps" :: "index" :: i :: "contents" :: tail ->
-        Some (["big_maps"; "index"; i; "contents"], tail)
-    | _ -> None
-
   (** Split that is always done, no matter the mode *)
   let split_always key =
     match key with
@@ -51,20 +39,11 @@ module ProtoRpc : Tezos_proxy.Proxy_proto.PROTO_RPC = struct
     | "v1" :: tail -> Some (["v1"], tail)
     | _ -> None
 
-  let split_key (mode : Tezos_proxy.Proxy.mode)
-      (key : Tezos_protocol_environment.Proxy_context.M.key) :
+  let split_key (key : Tezos_protocol_environment.Proxy_context.M.key) :
       (Tezos_protocol_environment.Proxy_context.M.key
       * Tezos_protocol_environment.Proxy_context.M.key)
       option =
-    match split_always key with
-    | Some _ as res ->
-        res (* No need to inspect the mode, this split is always done *)
-    | None -> (
-        match mode with
-        | Client ->
-            (* There are strictly less splits in Client mode: return immediately *)
-            None
-        | Server -> split_server key)
+    split_always key
 
   let failure_is_permanent = function
     | ["pending_migration_balance_updates"]
@@ -74,24 +53,28 @@ module ProtoRpc : Tezos_proxy.Proxy_proto.PROTO_RPC = struct
 
   let do_rpc (pgi : Tezos_proxy.Proxy.proxy_getter_input)
       (key : Tezos_protocol_environment.Proxy_context.M.key) =
+    let open Lwt_result_syntax in
     let chain = pgi.chain in
     let block = pgi.block in
-    Tezos_proxy.Logger.emit
-      Tezos_proxy.Logger.proxy_block_rpc
-      ( Tezos_shell_services.Block_services.chain_to_string chain,
-        Tezos_shell_services.Block_services.to_string block,
-        key )
-    >>= fun () ->
-    Protocol_client_context.Alpha_block_services.Context.read
-      pgi.rpc_context
-      ~chain
-      ~block
-      key
-    >>=? fun (raw_context : Tezos_context_sigs.Context.Proof_types.raw_context)
-      ->
-    Tezos_proxy.Logger.emit Tezos_proxy.Logger.tree_received
-    @@ Int64.of_int (Tezos_proxy.Proxy_getter.raw_context_size raw_context)
-    >>= fun () -> return raw_context
+    let*! () =
+      Tezos_proxy.Logger.emit
+        Tezos_proxy.Logger.proxy_block_rpc
+        ( Tezos_shell_services.Block_services.chain_to_string chain,
+          Tezos_shell_services.Block_services.to_string block,
+          key )
+    in
+    let* (raw_context : Tezos_context_sigs.Context.Proof_types.raw_context) =
+      Protocol_client_context.Alpha_block_services.Context.read
+        pgi.rpc_context
+        ~chain
+        ~block
+        key
+    in
+    let*! () =
+      Tezos_proxy.Logger.emit Tezos_proxy.Logger.tree_received
+      @@ Int64.of_int (Tezos_proxy.Proxy_getter.raw_context_size raw_context)
+    in
+    return raw_context
 end
 
 let initial_context (ctx : Tezos_proxy.Proxy_getter.rpc_context_args)
@@ -139,6 +122,8 @@ let initial_context (ctx : Tezos_proxy.Proxy_getter.rpc_context_args)
         constants_mainnet.cache_script_size;
         constants_mainnet.cache_stake_distribution_cycles;
         constants_mainnet.cache_sampler_state_cycles;
+        constants_mainnet.cache_stake_info_cycles;
+        constants_mainnet.cache_swrr_selected_distribution_cycles;
       ]
   in
   Lwt_result.ok
@@ -150,16 +135,19 @@ let round_durations (rpc_context : Tezos_rpc.Context.generic)
     (chain : Tezos_shell_services.Block_services.chain)
     (block : Tezos_shell_services.Block_services.block) =
   let open Protocol in
+  let open Lwt_result_syntax in
   let rpc_context = new Protocol_client_context.wrap_rpc_context rpc_context in
-  Constants_services.all rpc_context (chain, block) >>=? fun constants ->
+  let* constants = Constants_services.all rpc_context (chain, block) in
   (* Return the duration of block 0 *)
-  return_some
-    (Alpha_context.Period.to_seconds constants.parametric.minimal_block_delay)
+  return
+  @@ Some
+       (Alpha_context.Period.to_seconds
+          constants.parametric.minimal_block_delay)
 
 let () =
   let open Tezos_proxy.Registration in
   let module M : Proxy_sig = struct
-    module Protocol = Protocol_client_context.Lifted_protocol
+    module Protocol = Lifted_protocol
 
     let protocol_hash = Protocol.hash
 

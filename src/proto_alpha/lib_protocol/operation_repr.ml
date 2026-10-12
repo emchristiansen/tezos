@@ -3,6 +3,7 @@
 (* Open Source License                                                       *)
 (* Copyright (c) 2018 Dynamic Ledger Solutions, Inc. <contact@tezos.com>     *)
 (* Copyright (c) 2022 Nomadic Labs <contact@nomadic-labs.com>                *)
+(* Copyright (c) 2023 Marigold, <contact@marigold.dev>                       *)
 (*                                                                           *)
 (* Permission is hereby granted, free of charge, to any person obtaining a   *)
 (* copy of this software and associated documentation files (the "Software"),*)
@@ -27,34 +28,43 @@
 (* Tezos Protocol Implementation - Low level Repr. of Operations *)
 
 module Kind = struct
-  type preendorsement_consensus_kind = Preendorsement_consensus_kind
+  type preattestation_consensus_kind = Preattestation_consensus_kind
 
-  type endorsement_consensus_kind = Endorsement_consensus_kind
+  type attestation_consensus_kind = Attestation_consensus_kind
+
+  type preattestations_aggregate_consensus_kind =
+    | Preattestations_aggregate_consensus_kind
+
+  type attestations_aggregate_consensus_kind =
+    | Attestations_aggregate_consensus_kind
 
   type 'a consensus =
-    | Preendorsement_kind : preendorsement_consensus_kind consensus
-    | Endorsement_kind : endorsement_consensus_kind consensus
+    | Preattestation_kind : preattestation_consensus_kind consensus
+    | Attestation_kind : attestation_consensus_kind consensus
+    | Preattestations_aggregate_kind :
+        preattestations_aggregate_consensus_kind consensus
+    | Attestations_aggregate_kind :
+        attestations_aggregate_consensus_kind consensus
 
-  type preendorsement = preendorsement_consensus_kind consensus
+  type preattestation = preattestation_consensus_kind consensus
 
-  type endorsement = endorsement_consensus_kind consensus
+  type attestation = attestation_consensus_kind consensus
 
-  type dal_attestation = Dal_attestation_kind
+  type preattestations_aggregate =
+    preattestations_aggregate_consensus_kind consensus
+
+  type attestations_aggregate = attestations_aggregate_consensus_kind consensus
 
   type seed_nonce_revelation = Seed_nonce_revelation_kind
 
   type vdf_revelation = Vdf_revelation_kind
 
-  type 'a double_consensus_operation_evidence =
+  type double_consensus_operation_evidence =
     | Double_consensus_operation_evidence
 
-  type double_endorsement_evidence =
-    endorsement_consensus_kind double_consensus_operation_evidence
-
-  type double_preendorsement_evidence =
-    preendorsement_consensus_kind double_consensus_operation_evidence
-
   type double_baking_evidence = Double_baking_evidence_kind
+
+  type dal_entrapment_evidence = Dal_entrapment_evidence_kind
 
   type activate_account = Activate_account_kind
 
@@ -84,25 +94,9 @@ module Kind = struct
 
   type register_global_constant = Register_global_constant_kind
 
-  type tx_rollup_origination = Tx_rollup_origination_kind
-
-  type tx_rollup_submit_batch = Tx_rollup_submit_batch_kind
-
-  type tx_rollup_commit = Tx_rollup_commit_kind
-
-  type tx_rollup_return_bond = Tx_rollup_return_bond_kind
-
-  type tx_rollup_finalize_commitment = Tx_rollup_finalize_commitment_kind
-
-  type tx_rollup_remove_commitment = Tx_rollup_remove_commitment_kind
-
-  type tx_rollup_rejection = Tx_rollup_rejection_kind
-
-  type tx_rollup_dispatch_tickets = Tx_rollup_dispatch_tickets_kind
-
   type transfer_ticket = Transfer_ticket_kind
 
-  type dal_publish_slot_header = Dal_publish_slot_header_kind
+  type dal_publish_commitment = Dal_publish_commitment_kind
 
   type sc_rollup_originate = Sc_rollup_originate_kind
 
@@ -137,27 +131,16 @@ module Kind = struct
     | Set_deposits_limit_manager_kind : set_deposits_limit manager
     | Increase_paid_storage_manager_kind : increase_paid_storage manager
     | Update_consensus_key_manager_kind : update_consensus_key manager
-    | Tx_rollup_origination_manager_kind : tx_rollup_origination manager
-    | Tx_rollup_submit_batch_manager_kind : tx_rollup_submit_batch manager
-    | Tx_rollup_commit_manager_kind : tx_rollup_commit manager
-    | Tx_rollup_return_bond_manager_kind : tx_rollup_return_bond manager
-    | Tx_rollup_finalize_commitment_manager_kind
-        : tx_rollup_finalize_commitment manager
-    | Tx_rollup_remove_commitment_manager_kind
-        : tx_rollup_remove_commitment manager
-    | Tx_rollup_rejection_manager_kind : tx_rollup_rejection manager
-    | Tx_rollup_dispatch_tickets_manager_kind
-        : tx_rollup_dispatch_tickets manager
     | Transfer_ticket_manager_kind : transfer_ticket manager
-    | Dal_publish_slot_header_manager_kind : dal_publish_slot_header manager
+    | Dal_publish_commitment_manager_kind : dal_publish_commitment manager
     | Sc_rollup_originate_manager_kind : sc_rollup_originate manager
     | Sc_rollup_add_messages_manager_kind : sc_rollup_add_messages manager
     | Sc_rollup_cement_manager_kind : sc_rollup_cement manager
     | Sc_rollup_publish_manager_kind : sc_rollup_publish manager
     | Sc_rollup_refute_manager_kind : sc_rollup_refute manager
     | Sc_rollup_timeout_manager_kind : sc_rollup_timeout manager
-    | Sc_rollup_execute_outbox_message_manager_kind
-        : sc_rollup_execute_outbox_message manager
+    | Sc_rollup_execute_outbox_message_manager_kind :
+        sc_rollup_execute_outbox_message manager
     | Sc_rollup_recover_bond_manager_kind : sc_rollup_recover_bond manager
     | Zk_rollup_origination_manager_kind : zk_rollup_origination manager
     | Zk_rollup_publish_manager_kind : zk_rollup_publish manager
@@ -165,20 +148,24 @@ module Kind = struct
 end
 
 type 'a consensus_operation_type =
-  | Endorsement : Kind.endorsement consensus_operation_type
-  | Preendorsement : Kind.preendorsement consensus_operation_type
+  | Attestation : Kind.attestation consensus_operation_type
+  | Preattestation : Kind.preattestation consensus_operation_type
+  | Preattestations_aggregate :
+      Kind.preattestations_aggregate consensus_operation_type
+  | Attestations_aggregate :
+      Kind.attestations_aggregate consensus_operation_type
 
-let pp_operation_kind (type kind) ppf
-    (operation_kind : kind consensus_operation_type) =
-  match operation_kind with
-  | Endorsement -> Format.fprintf ppf "Endorsement"
-  | Preendorsement -> Format.fprintf ppf "Preendorsement"
+type consensus_aggregate_content = {
+  level : Raw_level_repr.t;
+  round : Round_repr.t;
+  block_payload_hash : Block_payload_hash.t;
+}
 
 type consensus_content = {
   slot : Slot_repr.t;
   level : Raw_level_repr.t;
-  (* The level is not required to validate an endorsement when it corresponds
-     to the current payload, but if we want to filter endorsements, we need
+  (* The level is not required to validate an attestation when it corresponds
+     to the current payload, but if we want to filter attestations, we need
      the level. *)
   round : Round_repr.t;
   block_payload_hash : Block_payload_hash.t;
@@ -188,18 +175,30 @@ type consensus_content = {
          important but could make things easier for debugging *)
 }
 
+type dal_content = {attestations : Dal_attestations_repr.t}
+
+let consensus_aggregate_content_encoding =
+  let open Data_encoding in
+  conv
+    (fun ({level; round; block_payload_hash} : consensus_aggregate_content) ->
+      (level, round, block_payload_hash))
+    (fun (level, round, block_payload_hash) : consensus_aggregate_content ->
+      {level; round; block_payload_hash})
+    (obj3
+       (req "level" Raw_level_repr.encoding)
+       (req "round" Round_repr.encoding)
+       (req "block_payload_hash" Block_payload_hash.encoding))
+
 let consensus_content_encoding =
   let open Data_encoding in
   conv
     (fun {slot; level; round; block_payload_hash} ->
-      (slot, level, round, block_payload_hash))
-    (fun (slot, level, round, block_payload_hash) ->
+      (slot, {level; round; block_payload_hash}))
+    (fun (slot, {level; round; block_payload_hash}) ->
       {slot; level; round; block_payload_hash})
-    (obj4
-       (req "slot" Slot_repr.encoding)
-       (req "level" Raw_level_repr.encoding)
-       (req "round" Round_repr.encoding)
-       (req "block_payload_hash" Block_payload_hash.encoding))
+    (merge_objs
+       (obj1 (req "slot" Slot_repr.encoding))
+       consensus_aggregate_content_encoding)
 
 let pp_consensus_content ppf content =
   Format.fprintf
@@ -214,22 +213,14 @@ let pp_consensus_content ppf content =
     content.block_payload_hash
 
 type consensus_watermark =
-  | Endorsement of Chain_id.t
-  | Preendorsement of Chain_id.t
-  | Dal_attestation of Chain_id.t
+  | Attestation of Chain_id.t
+  | Preattestation of Chain_id.t
 
 let to_watermark = function
-  | Preendorsement chain_id ->
+  | Preattestation chain_id ->
       Signature.Custom
         (Bytes.cat (Bytes.of_string "\x12") (Chain_id.to_bytes chain_id))
-  | Dal_attestation chain_id
-  (* FIXME: https://gitlab.com/tezos/tezos/-/issues/4479
-
-     We reuse the watermark of an endorsement. This is because this
-     operation is temporary and aims to be merged with an endorsement
-     later on. Moreover, there is a leak of abstraction with the shell
-     which makes adding a new watermark a bit awkward. *)
-  | Endorsement chain_id ->
+  | Attestation chain_id ->
       Signature.Custom
         (Bytes.cat (Bytes.of_string "\x13") (Chain_id.to_bytes chain_id))
 
@@ -239,15 +230,55 @@ let of_watermark = function
         match Bytes.get b 0 with
         | '\x12' ->
             Option.map
-              (fun chain_id -> Preendorsement chain_id)
+              (fun chain_id -> Preattestation chain_id)
               (Chain_id.of_bytes_opt (Bytes.sub b 1 (Bytes.length b - 1)))
         | '\x13' ->
             Option.map
-              (fun chain_id -> Endorsement chain_id)
+              (fun chain_id -> Attestation chain_id)
               (Chain_id.of_bytes_opt (Bytes.sub b 1 (Bytes.length b - 1)))
         | _ -> None
       else None
   | _ -> None
+
+type consensus_key_kind = Consensus | Companion
+
+let consensus_key_kind_encoding =
+  let open Data_encoding in
+  conv
+    (function Consensus -> true | Companion -> false)
+    (fun x -> if x then Consensus else Companion)
+    bool
+
+let consensus_key_kind_to_string = function
+  | Consensus -> "consensus"
+  | Companion -> "companion"
+
+let pp_consensus_key_kind ppf kind =
+  Format.fprintf ppf "%s" (consensus_key_kind_to_string kind)
+
+type public_key_kind = Manager_pk | Consensus_pk | Companion_pk
+
+let public_key_kind_encoding =
+  let open Data_encoding in
+  string_enum
+    [
+      ("manager_pk", Manager_pk);
+      ("consensus_pk", Consensus_pk);
+      ("companion_pk", Companion_pk);
+    ]
+
+let pp_public_key_kind fmt kind =
+  Format.pp_print_string
+    fmt
+    (match kind with
+    | Manager_pk -> "manager"
+    | Consensus_pk -> "consensus"
+    | Companion_pk -> "companion")
+
+let consensus_to_public_key_kind kind : public_key_kind =
+  match (kind : consensus_key_kind) with
+  | Consensus -> Consensus_pk
+  | Companion -> Companion_pk
 
 type raw = Operation.t = {shell : Operation.shell_header; proto : bytes}
 
@@ -270,11 +301,22 @@ and _ contents_list =
       -> ('kind * 'rest) Kind.manager contents_list
 
 and _ contents =
-  | Preendorsement : consensus_content -> Kind.preendorsement contents
-  | Endorsement : consensus_content -> Kind.endorsement contents
-  | Dal_attestation :
-      Dal_attestation_repr.operation
-      -> Kind.dal_attestation contents
+  | Preattestation : consensus_content -> Kind.preattestation contents
+  | Attestation : {
+      consensus_content : consensus_content;
+      dal_content : dal_content option;
+    }
+      -> Kind.attestation contents
+  | Preattestations_aggregate : {
+      consensus_content : consensus_aggregate_content;
+      committee : Slot_repr.t list;
+    }
+      -> Kind.preattestations_aggregate contents
+  | Attestations_aggregate : {
+      consensus_content : consensus_aggregate_content;
+      committee : (Slot_repr.t * dal_content option) list;
+    }
+      -> Kind.attestations_aggregate contents
   | Seed_nonce_revelation : {
       level : Raw_level_repr.t;
       nonce : Seed_repr.nonce;
@@ -284,34 +326,40 @@ and _ contents =
       solution : Seed_repr.vdf_solution;
     }
       -> Kind.vdf_revelation contents
-  | Double_preendorsement_evidence : {
-      op1 : Kind.preendorsement operation;
-      op2 : Kind.preendorsement operation;
+  | Double_consensus_operation_evidence : {
+      slot : Slot_repr.t;
+      op1 : 'a Kind.consensus operation;
+      op2 : 'b Kind.consensus operation;
     }
-      -> Kind.double_preendorsement_evidence contents
-  | Double_endorsement_evidence : {
-      op1 : Kind.endorsement operation;
-      op2 : Kind.endorsement operation;
-    }
-      -> Kind.double_endorsement_evidence contents
+      -> Kind.double_consensus_operation_evidence contents
   | Double_baking_evidence : {
       bh1 : Block_header_repr.t;
       bh2 : Block_header_repr.t;
     }
       -> Kind.double_baking_evidence contents
+  | Dal_entrapment_evidence : {
+      attestation : 'a Kind.consensus operation;
+      consensus_slot : Slot_repr.t;
+      slot_index : Dal_slot_index_repr.t;
+      lag_index_opt : int option;
+          (* TODO: https://gitlab.com/tezos/tezos/-/issues/8238
+             Introduce [Dal_lag_index_repr] module *)
+      shard_with_proof : Dal_slot_repr.Shard_with_proof.t;
+    }
+      -> Kind.dal_entrapment_evidence contents
   | Activate_account : {
       id : Ed25519.Public_key_hash.t;
       activation_code : Blinded_public_key_hash.activation_code;
     }
       -> Kind.activate_account contents
   | Proposals : {
-      source : Signature.Public_key_hash.t;
+      source : Implicit_account_repr.t;
       period : int32;
       proposals : Protocol_hash.t list;
     }
       -> Kind.proposals contents
   | Ballot : {
-      source : Signature.Public_key_hash.t;
+      source : Implicit_account_repr.t;
       period : int32;
       proposal : Protocol_hash.t;
       ballot : Vote_repr.ballot;
@@ -319,14 +367,14 @@ and _ contents =
       -> Kind.ballot contents
   | Drain_delegate : {
       consensus_key : Signature.Public_key_hash.t;
-      delegate : Signature.Public_key_hash.t;
-      destination : Signature.Public_key_hash.t;
+      delegate : Implicit_account_repr.t;
+      destination : Implicit_account_repr.t;
     }
       -> Kind.drain_delegate contents
   | Failing_noop : string -> Kind.failing_noop contents
   | Manager_operation : {
-      source : Signature.public_key_hash;
-      fee : Tez_repr.tez;
+      source : Implicit_account_repr.t;
+      fee : Tez_repr.t;
       counter : Manager_counter_repr.t;
       operation : 'kind manager_operation;
       gas_limit : Gas_limit_repr.Arith.integral;
@@ -335,22 +383,26 @@ and _ contents =
       -> 'kind Kind.manager contents
 
 and _ manager_operation =
-  | Reveal : Signature.Public_key.t -> Kind.reveal manager_operation
+  | Reveal : {
+      public_key : Signature.Public_key.t;
+      proof : Bls.t option;
+    }
+      -> Kind.reveal manager_operation
   | Transaction : {
-      amount : Tez_repr.tez;
+      amount : Tez_repr.t;
       parameters : Script_repr.lazy_expr;
       entrypoint : Entrypoint_repr.t;
       destination : Contract_repr.t;
     }
       -> Kind.transaction manager_operation
   | Origination : {
-      delegate : Signature.Public_key_hash.t option;
+      delegate : Implicit_account_repr.t option;
       script : Script_repr.t;
-      credit : Tez_repr.tez;
+      credit : Tez_repr.t;
     }
       -> Kind.origination manager_operation
   | Delegation :
-      Signature.Public_key_hash.t option
+      Implicit_account_repr.t option
       -> Kind.delegation manager_operation
   | Register_global_constant : {
       value : Script_repr.lazy_expr;
@@ -364,55 +416,12 @@ and _ manager_operation =
       destination : Contract_hash.t;
     }
       -> Kind.increase_paid_storage manager_operation
-  | Update_consensus_key :
-      Signature.Public_key.t
+  | Update_consensus_key : {
+      public_key : Signature.Public_key.t;
+      proof : Bls.t option;
+      kind : consensus_key_kind;
+    }
       -> Kind.update_consensus_key manager_operation
-  | Tx_rollup_origination : Kind.tx_rollup_origination manager_operation
-  | Tx_rollup_submit_batch : {
-      tx_rollup : Tx_rollup_repr.t;
-      content : string;
-      burn_limit : Tez_repr.t option;
-    }
-      -> Kind.tx_rollup_submit_batch manager_operation
-  | Tx_rollup_commit : {
-      tx_rollup : Tx_rollup_repr.t;
-      commitment : Tx_rollup_commitment_repr.Full.t;
-    }
-      -> Kind.tx_rollup_commit manager_operation
-  | Tx_rollup_return_bond : {
-      tx_rollup : Tx_rollup_repr.t;
-    }
-      -> Kind.tx_rollup_return_bond manager_operation
-  | Tx_rollup_finalize_commitment : {
-      tx_rollup : Tx_rollup_repr.t;
-    }
-      -> Kind.tx_rollup_finalize_commitment manager_operation
-  | Tx_rollup_remove_commitment : {
-      tx_rollup : Tx_rollup_repr.t;
-    }
-      -> Kind.tx_rollup_remove_commitment manager_operation
-  | Tx_rollup_rejection : {
-      tx_rollup : Tx_rollup_repr.t;
-      level : Tx_rollup_level_repr.t;
-      message : Tx_rollup_message_repr.t;
-      message_position : int;
-      message_path : Tx_rollup_inbox_repr.Merkle.path;
-      message_result_hash : Tx_rollup_message_result_hash_repr.t;
-      message_result_path : Tx_rollup_commitment_repr.Merkle.path;
-      previous_message_result : Tx_rollup_message_result_repr.t;
-      previous_message_result_path : Tx_rollup_commitment_repr.Merkle.path;
-      proof : Tx_rollup_l2_proof.serialized;
-    }
-      -> Kind.tx_rollup_rejection manager_operation
-  | Tx_rollup_dispatch_tickets : {
-      tx_rollup : Tx_rollup_repr.t;
-      level : Tx_rollup_level_repr.t;
-      context_hash : Context_hash.t;
-      message_index : int;
-      message_result_path : Tx_rollup_commitment_repr.Merkle.path;
-      tickets_info : Tx_rollup_reveal_repr.t list;
-    }
-      -> Kind.tx_rollup_dispatch_tickets manager_operation
   | Transfer_ticket : {
       contents : Script_repr.lazy_expr;
       ty : Script_repr.lazy_expr;
@@ -422,14 +431,14 @@ and _ manager_operation =
       entrypoint : Entrypoint_repr.t;
     }
       -> Kind.transfer_ticket manager_operation
-  | Dal_publish_slot_header :
-      Dal_operations_repr.Publish_slot_header.t
-      -> Kind.dal_publish_slot_header manager_operation
+  | Dal_publish_commitment :
+      Dal_operations_repr.Publish_commitment.t
+      -> Kind.dal_publish_commitment manager_operation
   | Sc_rollup_originate : {
       kind : Sc_rollups.Kind.t;
       boot_sector : string;
-      origination_proof : Sc_rollup_proof_repr.serialized;
       parameters_ty : Script_repr.lazy_expr;
+      whitelist : Sc_rollup_whitelist_repr.t option;
     }
       -> Kind.sc_rollup_originate manager_operation
   | Sc_rollup_add_messages : {
@@ -438,7 +447,6 @@ and _ manager_operation =
       -> Kind.sc_rollup_add_messages manager_operation
   | Sc_rollup_cement : {
       rollup : Sc_rollup_repr.t;
-      commitment : Sc_rollup_commitment_repr.Hash.t;
     }
       -> Kind.sc_rollup_cement manager_operation
   | Sc_rollup_publish : {
@@ -465,7 +473,7 @@ and _ manager_operation =
       -> Kind.sc_rollup_execute_outbox_message manager_operation
   | Sc_rollup_recover_bond : {
       sc_rollup : Sc_rollup_repr.t;
-      staker : Signature.public_key_hash;
+      staker : Implicit_account_repr.t;
     }
       -> Kind.sc_rollup_recover_bond manager_operation
   | Zk_rollup_origination : {
@@ -496,18 +504,8 @@ let manager_kind : type kind. kind manager_operation -> kind Kind.manager =
   | Set_deposits_limit _ -> Kind.Set_deposits_limit_manager_kind
   | Increase_paid_storage _ -> Kind.Increase_paid_storage_manager_kind
   | Update_consensus_key _ -> Kind.Update_consensus_key_manager_kind
-  | Tx_rollup_origination -> Kind.Tx_rollup_origination_manager_kind
-  | Tx_rollup_submit_batch _ -> Kind.Tx_rollup_submit_batch_manager_kind
-  | Tx_rollup_commit _ -> Kind.Tx_rollup_commit_manager_kind
-  | Tx_rollup_return_bond _ -> Kind.Tx_rollup_return_bond_manager_kind
-  | Tx_rollup_finalize_commitment _ ->
-      Kind.Tx_rollup_finalize_commitment_manager_kind
-  | Tx_rollup_remove_commitment _ ->
-      Kind.Tx_rollup_remove_commitment_manager_kind
-  | Tx_rollup_rejection _ -> Kind.Tx_rollup_rejection_manager_kind
-  | Tx_rollup_dispatch_tickets _ -> Kind.Tx_rollup_dispatch_tickets_manager_kind
   | Transfer_ticket _ -> Kind.Transfer_ticket_manager_kind
-  | Dal_publish_slot_header _ -> Kind.Dal_publish_slot_header_manager_kind
+  | Dal_publish_commitment _ -> Kind.Dal_publish_commitment_manager_kind
   | Sc_rollup_originate _ -> Kind.Sc_rollup_originate_manager_kind
   | Sc_rollup_add_messages _ -> Kind.Sc_rollup_add_messages_manager_kind
   | Sc_rollup_cement _ -> Kind.Sc_rollup_cement_manager_kind
@@ -573,7 +571,9 @@ type error += Contents_list_error of string (* `Permanent *)
 let of_list l =
   match of_list_internal l with
   | Ok contents -> Ok contents
-  | Error s -> error @@ Contents_list_error s
+  | Error s -> Result_syntax.tzfail @@ Contents_list_error s
+
+let committee_slots committee = List.map fst committee
 
 let tx_rollup_operation_tag_offset = 150
 
@@ -595,6 +595,20 @@ let tx_rollup_operation_rejection_tag = tx_rollup_operation_tag_offset + 6
 
 let tx_rollup_operation_dispatch_tickets_tag =
   tx_rollup_operation_tag_offset + 7
+
+(** The following operation tags cannot be used again, it is checked
+    at compilation time. *)
+let tx_rollup_forbidden_operation_tags =
+  [
+    tx_rollup_operation_origination_tag;
+    tx_rollup_operation_submit_batch_tag;
+    tx_rollup_operation_commit_tag;
+    tx_rollup_operation_return_bond_tag;
+    tx_rollup_operation_finalize_commitment_tag;
+    tx_rollup_operation_remove_commitment_tag;
+    tx_rollup_operation_rejection_tag;
+    tx_rollup_operation_dispatch_tickets_tag;
+  ]
 
 let transfer_ticket_tag = tx_rollup_operation_tag_offset + 8
 
@@ -618,7 +632,7 @@ let sc_rollup_operation_recover_bond_tag = sc_rollup_operation_tag_offset + 7
 
 let dal_offset = 230
 
-let dal_publish_slot_header_tag = dal_offset + 0
+let dal_publish_commitment_tag = dal_offset + 0
 
 let zk_rollup_operation_tag_offset = 250
 
@@ -631,8 +645,15 @@ let zk_rollup_operation_update_tag = zk_rollup_operation_tag_offset + 2
 module Encoding = struct
   open Data_encoding
 
-  (** These tags are reserved for future extensions: [fd] - [ff]. *)
-  let reserved_tag t = Compare.Int.(t >= 0xfd)
+  (** These tags can not be used yet for operations. *)
+  let reserved_tag t =
+    (* These tags are reserved for future extensions: [fd] - [ff]. *)
+    Compare.Int.(t >= 0xfd)
+    ||
+    (* These tags were used by old operations.
+          The operations have been removed in protocol proposal N, it can
+          be unblocked in the future (e.g. proposal O, P etc.). *)
+    List.exists (Compare.Int.equal t) tx_rollup_forbidden_operation_tags
 
   let signature_prefix_tag = 0xff
 
@@ -663,10 +684,13 @@ module Encoding = struct
         {
           tag = 0;
           name = "reveal";
-          encoding = obj1 (req "public_key" Signature.Public_key.encoding);
+          encoding =
+            obj2
+              (req "public_key" Signature.Public_key.encoding)
+              (opt "proof" (dynamic_size Bls.encoding));
           select = (function Manager (Reveal _ as op) -> Some op | _ -> None);
-          proj = (function Reveal pkh -> pkh);
-          inj = (fun pkh -> Reveal pkh);
+          proj = (function Reveal {public_key; proof} -> (public_key, proof));
+          inj = (fun (public_key, proof) -> Reveal {public_key; proof});
         }
 
     let transaction_case =
@@ -714,7 +738,7 @@ module Encoding = struct
           encoding =
             obj3
               (req "balance" Tez_repr.encoding)
-              (opt "delegate" Signature.Public_key_hash.encoding)
+              (opt "delegate" Implicit_account_repr.encoding)
               (req "script" Script_repr.encoding);
           select =
             (function Manager (Origination _ as op) -> Some op | _ -> None);
@@ -732,7 +756,7 @@ module Encoding = struct
         {
           tag = 3;
           name = "delegation";
-          encoding = obj1 (opt "delegate" Signature.Public_key_hash.encoding);
+          encoding = obj1 (opt "delegate" Implicit_account_repr.encoding);
           select =
             (function Manager (Delegation _ as op) -> Some op | _ -> None);
           proj = (function Delegation key -> key);
@@ -747,7 +771,8 @@ module Encoding = struct
           encoding = obj1 (req "value" Script_repr.lazy_expr_encoding);
           select =
             (function
-            | Manager (Register_global_constant _ as op) -> Some op | _ -> None);
+            | Manager (Register_global_constant _ as op) -> Some op
+            | _ -> None);
           proj = (function Register_global_constant {value} -> value);
           inj = (fun value -> Register_global_constant {value});
         }
@@ -760,7 +785,8 @@ module Encoding = struct
           encoding = obj1 (opt "limit" Tez_repr.encoding);
           select =
             (function
-            | Manager (Set_deposits_limit _ as op) -> Some op | _ -> None);
+            | Manager (Set_deposits_limit _ as op) -> Some op
+            | _ -> None);
           proj = (function Set_deposits_limit key -> key);
           inj = (fun key -> Set_deposits_limit key);
         }
@@ -776,7 +802,8 @@ module Encoding = struct
               (req "destination" Contract_repr.originated_encoding);
           select =
             (function
-            | Manager (Increase_paid_storage _ as op) -> Some op | _ -> None);
+            | Manager (Increase_paid_storage _ as op) -> Some op
+            | _ -> None);
           proj =
             (function
             | Increase_paid_storage {amount_in_bytes; destination} ->
@@ -793,245 +820,47 @@ module Encoding = struct
         {
           tag = update_consensus_key_tag;
           name = "update_consensus_key";
-          encoding = obj1 (req "pk" Signature.Public_key.encoding);
-          select =
-            (function
-            | Manager (Update_consensus_key _ as op) -> Some op | _ -> None);
-          proj = (function Update_consensus_key consensus_pk -> consensus_pk);
-          inj = (fun consensus_pk -> Update_consensus_key consensus_pk);
-        }
-
-    let tx_rollup_origination_case =
-      MCase
-        {
-          tag = tx_rollup_operation_origination_tag;
-          name = "tx_rollup_origination";
-          encoding = obj1 (req "tx_rollup_origination" Data_encoding.unit);
-          select =
-            (function
-            | Manager (Tx_rollup_origination as op) -> Some op | _ -> None);
-          proj = (function Tx_rollup_origination -> ());
-          inj = (fun () -> Tx_rollup_origination);
-        }
-
-    let tx_rollup_submit_batch_case =
-      MCase
-        {
-          tag = tx_rollup_operation_submit_batch_tag;
-          name = "tx_rollup_submit_batch";
-          encoding =
-            obj3
-              (req "rollup" Tx_rollup_repr.encoding)
-              (req "content" (string Hex))
-              (opt "burn_limit" Tez_repr.encoding);
-          select =
-            (function
-            | Manager (Tx_rollup_submit_batch _ as op) -> Some op | _ -> None);
-          proj =
-            (function
-            | Tx_rollup_submit_batch {tx_rollup; content; burn_limit} ->
-                (tx_rollup, content, burn_limit));
-          inj =
-            (fun (tx_rollup, content, burn_limit) ->
-              Tx_rollup_submit_batch {tx_rollup; content; burn_limit});
-        }
-
-    let tx_rollup_commit_case =
-      MCase
-        {
-          tag = tx_rollup_operation_commit_tag;
-          name = "tx_rollup_commit";
           encoding =
             obj2
-              (req "rollup" Tx_rollup_repr.encoding)
-              (req "commitment" Tx_rollup_commitment_repr.Full.encoding);
+              (req "pk" Signature.Public_key.encoding)
+              (opt "proof" (dynamic_size Bls.encoding));
           select =
             (function
-            | Manager (Tx_rollup_commit _ as op) -> Some op | _ -> None);
+            | Manager
+                (Update_consensus_key
+                   {public_key = _; proof = _; kind = Consensus} as op) ->
+                Some op
+            | _ -> None);
           proj =
-            (function
-            | Tx_rollup_commit {tx_rollup; commitment} -> (tx_rollup, commitment));
+            (fun (Update_consensus_key {public_key; proof; kind = _}) ->
+              (public_key, proof));
           inj =
-            (fun (tx_rollup, commitment) ->
-              Tx_rollup_commit {tx_rollup; commitment});
+            (fun (public_key, proof) ->
+              Update_consensus_key {public_key; proof; kind = Consensus});
         }
 
-    let tx_rollup_return_bond_case =
+    let update_companion_key_case =
       MCase
         {
-          tag = tx_rollup_operation_return_bond_tag;
-          name = "tx_rollup_return_bond";
-          encoding = obj1 (req "rollup" Tx_rollup_repr.encoding);
-          select =
-            (function
-            | Manager (Tx_rollup_return_bond _ as op) -> Some op | _ -> None);
-          proj = (function Tx_rollup_return_bond {tx_rollup} -> tx_rollup);
-          inj = (fun tx_rollup -> Tx_rollup_return_bond {tx_rollup});
-        }
-
-    let tx_rollup_finalize_commitment_case =
-      MCase
-        {
-          tag = tx_rollup_operation_finalize_commitment_tag;
-          name = "tx_rollup_finalize_commitment";
-          encoding = obj1 (req "rollup" Tx_rollup_repr.encoding);
-          select =
-            (function
-            | Manager (Tx_rollup_finalize_commitment _ as op) -> Some op
-            | _ -> None);
-          proj =
-            (function Tx_rollup_finalize_commitment {tx_rollup} -> tx_rollup);
-          inj = (fun tx_rollup -> Tx_rollup_finalize_commitment {tx_rollup});
-        }
-
-    let tx_rollup_remove_commitment_case =
-      MCase
-        {
-          tag = tx_rollup_operation_remove_commitment_tag;
-          name = "tx_rollup_remove_commitment";
-          encoding = obj1 (req "rollup" Tx_rollup_repr.encoding);
-          select =
-            (function
-            | Manager (Tx_rollup_remove_commitment _ as op) -> Some op
-            | _ -> None);
-          proj =
-            (function Tx_rollup_remove_commitment {tx_rollup} -> tx_rollup);
-          inj = (fun tx_rollup -> Tx_rollup_remove_commitment {tx_rollup});
-        }
-
-    let tx_rollup_rejection_case =
-      MCase
-        {
-          tag = tx_rollup_operation_rejection_tag;
-          name = "tx_rollup_rejection";
+          tag = 32;
+          name = "update_companion_key";
           encoding =
-            obj10
-              (req "rollup" Tx_rollup_repr.encoding)
-              (req "level" Tx_rollup_level_repr.encoding)
-              (req "message" Tx_rollup_message_repr.encoding)
-              (req "message_position" n)
-              (req "message_path" Tx_rollup_inbox_repr.Merkle.path_encoding)
-              (req
-                 "message_result_hash"
-                 Tx_rollup_message_result_hash_repr.encoding)
-              (req
-                 "message_result_path"
-                 Tx_rollup_commitment_repr.Merkle.path_encoding)
-              (req
-                 "previous_message_result"
-                 Tx_rollup_message_result_repr.encoding)
-              (req
-                 "previous_message_result_path"
-                 Tx_rollup_commitment_repr.Merkle.path_encoding)
-              (req "proof" Tx_rollup_l2_proof.serialized_encoding);
+            obj2
+              (req "pk" Signature.Public_key.encoding)
+              (opt "proof" (dynamic_size Bls.encoding));
           select =
             (function
-            | Manager (Tx_rollup_rejection _ as op) -> Some op | _ -> None);
-          proj =
-            (function
-            | Tx_rollup_rejection
-                {
-                  tx_rollup;
-                  level;
-                  message;
-                  message_position;
-                  message_path;
-                  message_result_hash;
-                  message_result_path;
-                  previous_message_result;
-                  previous_message_result_path;
-                  proof;
-                } ->
-                ( tx_rollup,
-                  level,
-                  message,
-                  Z.of_int message_position,
-                  message_path,
-                  message_result_hash,
-                  message_result_path,
-                  previous_message_result,
-                  previous_message_result_path,
-                  proof ));
-          inj =
-            (fun ( tx_rollup,
-                   level,
-                   message,
-                   message_position,
-                   message_path,
-                   message_result_hash,
-                   message_result_path,
-                   previous_message_result,
-                   previous_message_result_path,
-                   proof ) ->
-              Tx_rollup_rejection
-                {
-                  tx_rollup;
-                  level;
-                  message;
-                  message_position = Z.to_int message_position;
-                  message_path;
-                  message_result_hash;
-                  message_result_path;
-                  previous_message_result;
-                  previous_message_result_path;
-                  proof;
-                });
-        }
-
-    let tx_rollup_dispatch_tickets_case =
-      MCase
-        {
-          tag = tx_rollup_operation_dispatch_tickets_tag;
-          name = "tx_rollup_dispatch_tickets";
-          encoding =
-            obj6
-              (req "tx_rollup" Tx_rollup_repr.encoding)
-              (req "level" Tx_rollup_level_repr.encoding)
-              (req "context_hash" Context_hash.encoding)
-              (req "message_index" int31)
-              (req
-                 "message_result_path"
-                 Tx_rollup_commitment_repr.Merkle.path_encoding)
-              (req
-                 "tickets_info"
-                 (Data_encoding.list Tx_rollup_reveal_repr.encoding));
-          select =
-            (function
-            | Manager (Tx_rollup_dispatch_tickets _ as op) -> Some op
+            | Manager
+                (Update_consensus_key
+                   {public_key = _; proof = _; kind = Companion} as op) ->
+                Some op
             | _ -> None);
           proj =
-            (function
-            | Tx_rollup_dispatch_tickets
-                {
-                  tx_rollup;
-                  level;
-                  context_hash;
-                  message_index;
-                  message_result_path;
-                  tickets_info;
-                } ->
-                ( tx_rollup,
-                  level,
-                  context_hash,
-                  message_index,
-                  message_result_path,
-                  tickets_info ));
+            (fun (Update_consensus_key {public_key; proof; kind = _}) ->
+              (public_key, proof));
           inj =
-            (fun ( tx_rollup,
-                   level,
-                   context_hash,
-                   message_index,
-                   message_result_path,
-                   tickets_info ) ->
-              Tx_rollup_dispatch_tickets
-                {
-                  tx_rollup;
-                  level;
-                  context_hash;
-                  message_index;
-                  message_result_path;
-                  tickets_info;
-                });
+            (fun (public_key, proof) ->
+              Update_consensus_key {public_key; proof; kind = Companion});
         }
 
     let transfer_ticket_case =
@@ -1048,8 +877,7 @@ module Encoding = struct
               (req "destination" Contract_repr.encoding)
               (req "entrypoint" Entrypoint_repr.simple_encoding);
           select =
-            (function
-            | Manager (Transfer_ticket _ as op) -> Some op | _ -> None);
+            (function Manager (Transfer_ticket _ as op) -> Some op | _ -> None);
           proj =
             (function
             | Transfer_ticket
@@ -1078,7 +906,8 @@ module Encoding = struct
               (req "nb_ops" int31);
           select =
             (function
-            | Manager (Zk_rollup_origination _ as op) -> Some op | _ -> None);
+            | Manager (Zk_rollup_origination _ as op) -> Some op
+            | _ -> None);
           proj =
             (function
             | Zk_rollup_origination
@@ -1105,7 +934,8 @@ module Encoding = struct
                       (option Zk_rollup_ticket_repr.encoding)));
           select =
             (function
-            | Manager (Zk_rollup_publish _ as op) -> Some op | _ -> None);
+            | Manager (Zk_rollup_publish _ as op) -> Some op
+            | _ -> None);
           proj =
             (function Zk_rollup_publish {zk_rollup; ops} -> (zk_rollup, ops));
           inj = (fun (zk_rollup, ops) -> Zk_rollup_publish {zk_rollup; ops});
@@ -1122,7 +952,8 @@ module Encoding = struct
               (req "update" Zk_rollup_update_repr.encoding);
           select =
             (function
-            | Manager (Zk_rollup_update _ as op) -> Some op | _ -> None);
+            | Manager (Zk_rollup_update _ as op) -> Some op
+            | _ -> None);
           proj =
             (function
             | Zk_rollup_update {zk_rollup; update} -> (zk_rollup, update));
@@ -1139,37 +970,38 @@ module Encoding = struct
             obj4
               (req "pvm_kind" Sc_rollups.Kind.encoding)
               (req "kernel" (string Hex))
-              (req "origination_proof" Sc_rollup_proof_repr.serialized_encoding)
-              (req "parameters_ty" Script_repr.lazy_expr_encoding);
+              (req "parameters_ty" Script_repr.lazy_expr_encoding)
+              (opt "whitelist" Sc_rollup_whitelist_repr.encoding);
           select =
             (function
-            | Manager (Sc_rollup_originate _ as op) -> Some op | _ -> None);
+            | Manager (Sc_rollup_originate _ as op) -> Some op
+            | _ -> None);
           proj =
             (function
-            | Sc_rollup_originate
-                {kind; boot_sector; origination_proof; parameters_ty} ->
-                (kind, boot_sector, origination_proof, parameters_ty));
+            | Sc_rollup_originate {kind; boot_sector; parameters_ty; whitelist}
+              ->
+                (kind, boot_sector, parameters_ty, whitelist));
           inj =
-            (fun (kind, boot_sector, origination_proof, parameters_ty) ->
-              Sc_rollup_originate
-                {kind; boot_sector; origination_proof; parameters_ty});
+            (fun (kind, boot_sector, parameters_ty, whitelist) ->
+              Sc_rollup_originate {kind; boot_sector; parameters_ty; whitelist});
         }
 
-    let dal_publish_slot_header_case =
+    let dal_publish_commitment_case =
       MCase
         {
-          tag = dal_publish_slot_header_tag;
-          name = "dal_publish_slot_header";
+          tag = dal_publish_commitment_tag;
+          name = "dal_publish_commitment";
           encoding =
             obj1
               (req
                  "slot_header"
-                 Dal_operations_repr.Publish_slot_header.encoding);
+                 Dal_operations_repr.Publish_commitment.encoding);
           select =
             (function
-            | Manager (Dal_publish_slot_header _ as op) -> Some op | _ -> None);
-          proj = (function Dal_publish_slot_header slot_header -> slot_header);
-          inj = (fun slot_header -> Dal_publish_slot_header slot_header);
+            | Manager (Dal_publish_commitment _ as op) -> Some op
+            | _ -> None);
+          proj = (function Dal_publish_commitment slot_header -> slot_header);
+          inj = (fun slot_header -> Dal_publish_commitment slot_header);
         }
 
     let sc_rollup_add_messages_case =
@@ -1180,7 +1012,8 @@ module Encoding = struct
           encoding = obj1 (req "message" (list (string Hex)));
           select =
             (function
-            | Manager (Sc_rollup_add_messages _ as op) -> Some op | _ -> None);
+            | Manager (Sc_rollup_add_messages _ as op) -> Some op
+            | _ -> None);
           proj = (function Sc_rollup_add_messages {messages} -> messages);
           inj = (fun messages -> Sc_rollup_add_messages {messages});
         }
@@ -1190,18 +1023,13 @@ module Encoding = struct
         {
           tag = sc_rollup_operation_cement_tag;
           name = "smart_rollup_cement";
-          encoding =
-            obj2
-              (req "rollup" Sc_rollup_repr.encoding)
-              (req "commitment" Sc_rollup_commitment_repr.Hash.encoding);
+          encoding = obj1 (req "rollup" Sc_rollup_repr.encoding);
           select =
             (function
-            | Manager (Sc_rollup_cement _ as op) -> Some op | _ -> None);
-          proj =
-            (function
-            | Sc_rollup_cement {rollup; commitment} -> (rollup, commitment));
-          inj =
-            (fun (rollup, commitment) -> Sc_rollup_cement {rollup; commitment});
+            | Manager (Sc_rollup_cement _ as op) -> Some op
+            | _ -> None);
+          proj = (function Sc_rollup_cement {rollup} -> rollup);
+          inj = (fun rollup -> Sc_rollup_cement {rollup});
         }
 
     let sc_rollup_publish_case =
@@ -1215,7 +1043,8 @@ module Encoding = struct
               (req "commitment" Sc_rollup_commitment_repr.encoding);
           select =
             (function
-            | Manager (Sc_rollup_publish _ as op) -> Some op | _ -> None);
+            | Manager (Sc_rollup_publish _ as op) -> Some op
+            | _ -> None);
           proj =
             (function
             | Sc_rollup_publish {rollup; commitment} -> (rollup, commitment));
@@ -1235,7 +1064,8 @@ module Encoding = struct
               (req "refutation" Sc_rollup_game_repr.refutation_encoding);
           select =
             (function
-            | Manager (Sc_rollup_refute _ as op) -> Some op | _ -> None);
+            | Manager (Sc_rollup_refute _ as op) -> Some op
+            | _ -> None);
           proj =
             (function
             | Sc_rollup_refute {rollup; opponent; refutation} ->
@@ -1256,10 +1086,10 @@ module Encoding = struct
               (req "stakers" Sc_rollup_game_repr.Index.encoding);
           select =
             (function
-            | Manager (Sc_rollup_timeout _ as op) -> Some op | _ -> None);
+            | Manager (Sc_rollup_timeout _ as op) -> Some op
+            | _ -> None);
           proj =
-            (function
-            | Sc_rollup_timeout {rollup; stakers} -> (rollup, stakers));
+            (function Sc_rollup_timeout {rollup; stakers} -> (rollup, stakers));
           inj = (fun (rollup, stakers) -> Sc_rollup_timeout {rollup; stakers});
         }
 
@@ -1298,10 +1128,11 @@ module Encoding = struct
           encoding =
             obj2
               (req "rollup" Sc_rollup_repr.Address.encoding)
-              (req "staker" Signature.Public_key_hash.encoding);
+              (req "staker" Implicit_account_repr.encoding);
           select =
             (function
-            | Manager (Sc_rollup_recover_bond _ as op) -> Some op | _ -> None);
+            | Manager (Sc_rollup_recover_bond _ as op) -> Some op
+            | _ -> None);
           proj =
             (function
             | Sc_rollup_recover_bond {sc_rollup; staker} -> (sc_rollup, staker));
@@ -1322,114 +1153,176 @@ module Encoding = struct
       }
         -> 'b case
 
-  let preendorsement_case =
+  let preattestation_case =
     Case
       {
         tag = 20;
-        name = "preendorsement";
+        name = "preattestation";
         encoding = consensus_content_encoding;
         select =
-          (function Contents (Preendorsement _ as op) -> Some op | _ -> None);
-        proj = (fun (Preendorsement preendorsement) -> preendorsement);
-        inj = (fun preendorsement -> Preendorsement preendorsement);
+          (function Contents (Preattestation _ as op) -> Some op | _ -> None);
+        proj = (fun (Preattestation preattestation) -> preattestation);
+        inj = (fun preattestation -> Preattestation preattestation);
       }
 
-  let preendorsement_encoding =
-    let make (Case {tag; name; encoding; select = _; proj; inj}) =
-      case (Tag tag) name encoding (fun o -> Some (proj o)) (fun x -> inj x)
-    in
-    let to_list : Kind.preendorsement contents_list -> _ = function
-      | Single o -> o
-    in
-    let of_list : Kind.preendorsement contents -> _ = function
-      | o -> Single o
-    in
-    def "inlined.preendorsement"
-    @@ conv
-         (fun ({shell; protocol_data = {contents; signature}} : _ operation) ->
-           (shell, (contents, signature)))
-         (fun (shell, (contents, signature)) : _ operation ->
-           {shell; protocol_data = {contents; signature}})
-         (merge_objs
-            Operation.shell_header_encoding
-            (obj2
-               (req
-                  "operations"
-                  (conv to_list of_list
-                  @@ def "inlined.preendorsement.contents"
-                  @@ union [make preendorsement_case]))
-               (varopt "signature" Signature.encoding)))
+  let dal_content_encoding =
+    conv
+      (fun {attestations} -> attestations)
+      (fun attestations -> {attestations})
+      Dal_attestations_repr.encoding
 
-  let endorsement_encoding =
-    obj4
-      (req "slot" Slot_repr.encoding)
-      (req "level" Raw_level_repr.encoding)
-      (req "round" Round_repr.encoding)
-      (req "block_payload_hash" Block_payload_hash.encoding)
+  let consensus_content_with_dal_encoding =
+    merge_objs
+      consensus_content_encoding
+      (obj1 (req "dal_attestation" dal_content_encoding))
 
-  let endorsement_case =
+  (* Precondition: [dal_content = None]. *)
+  let attestation_encoding_proj
+      (Attestation {consensus_content; dal_content = _}) =
+    consensus_content
+
+  let attestation_encoding_inj consensus_content =
+    Attestation {consensus_content; dal_content = None}
+
+  (* Precondition: [dal_content <> None]. Check usage! *)
+  let attestation_with_dal_encoding_proj
+      (Attestation {consensus_content; dal_content}) =
+    match dal_content with
+    | None -> assert false
+    | Some dal_content -> (consensus_content, dal_content)
+
+  let attestation_with_dal_encoding_inj (consensus_content, dal_content) =
+    Attestation {consensus_content; dal_content = Some dal_content}
+
+  let attestation_case =
     Case
       {
         tag = 21;
-        name = "endorsement";
-        encoding = endorsement_encoding;
+        name = "attestation";
+        encoding = consensus_content_encoding;
         select =
-          (function Contents (Endorsement _ as op) -> Some op | _ -> None);
-        proj =
-          (fun (Endorsement consensus_content) ->
-            ( consensus_content.slot,
-              consensus_content.level,
-              consensus_content.round,
-              consensus_content.block_payload_hash ));
-        inj =
-          (fun (slot, level, round, block_payload_hash) ->
-            Endorsement {slot; level; round; block_payload_hash});
+          (function
+          | Contents (Attestation {dal_content = None; _} as op) -> Some op
+          | _ -> None);
+        proj = attestation_encoding_proj;
+        inj = attestation_encoding_inj;
       }
 
-  let endorsement_encoding =
-    let make (Case {tag; name; encoding; select = _; proj; inj}) =
-      case (Tag tag) name encoding (fun o -> Some (proj o)) (fun x -> inj x)
+  let attestation_with_dal_case =
+    Case
+      {
+        tag = 23;
+        name = "attestation_with_dal";
+        encoding = consensus_content_with_dal_encoding;
+        select =
+          (function
+          | Contents (Attestation {dal_content = Some _; _} as op) -> Some op
+          | _ -> None);
+        proj = attestation_with_dal_encoding_proj;
+        inj = attestation_with_dal_encoding_inj;
+      }
+
+  let attestations_aggregate_encoding =
+    obj2
+      (req "consensus_content" consensus_aggregate_content_encoding)
+      (req
+         "committee"
+         (list
+            (obj2
+               (req "slot" Slot_repr.encoding)
+               (opt "dal_attestation" dal_content_encoding))))
+
+  let attestations_aggregate_case =
+    Case
+      {
+        tag = 31;
+        name = "attestations_aggregate";
+        encoding = attestations_aggregate_encoding;
+        select =
+          (function
+          | Contents (Attestations_aggregate _ as op) -> Some op
+          | _ -> None);
+        proj =
+          (fun (Attestations_aggregate {consensus_content; committee}) ->
+            (consensus_content, committee));
+        inj =
+          (fun (consensus_content, committee) ->
+            Attestations_aggregate {consensus_content; committee});
+      }
+
+  let preattestations_aggregate_encoding =
+    obj2
+      (req "consensus_content" consensus_aggregate_content_encoding)
+      (req "committee" (list Slot_repr.encoding))
+
+  let preattestations_aggregate_case =
+    Case
+      {
+        tag = 30;
+        name = "preattestations_aggregate";
+        encoding = preattestations_aggregate_encoding;
+        select =
+          (function
+          | Contents (Preattestations_aggregate _ as op) -> Some op
+          | _ -> None);
+        proj =
+          (fun (Preattestations_aggregate {consensus_content; committee}) ->
+            (consensus_content, committee));
+        inj =
+          (fun (consensus_content, committee) ->
+            Preattestations_aggregate {consensus_content; committee});
+      }
+
+  type packed_consensus_operation_contents =
+    | Consensus_op_contents :
+        'a Kind.consensus contents
+        -> packed_consensus_operation_contents
+
+  type packed_consensus_operation =
+    | Consensus_op : 'a Kind.consensus operation -> packed_consensus_operation
+
+  (* For denunciations *)
+  let inlined_consensus_operation_encoding =
+    let make (Case {tag; name; encoding; select; proj; inj}) =
+      assert (not @@ reserved_tag tag) ;
+      case
+        (Tag tag)
+        name
+        encoding
+        (function
+          | Consensus_op_contents o -> (
+              match select (Contents o) with
+              | None -> None
+              | Some o -> Some (proj o)))
+        (fun x -> Consensus_op_contents (inj x))
     in
-    let to_list : Kind.endorsement contents_list -> _ = fun (Single o) -> o in
-    let of_list : Kind.endorsement contents -> _ = fun o -> Single o in
-    def "inlined.endorsement"
+    let consensus_operation_contents_encoding =
+      def "inlined.consensus_operation.contents"
+      @@ union
+           [
+             make preattestation_case;
+             make attestation_case;
+             make attestation_with_dal_case;
+             make preattestations_aggregate_case;
+             make attestations_aggregate_case;
+           ]
+    in
+    def "inlined.consensus_operation"
     @@ conv
-         (fun ({shell; protocol_data = {contents; signature}} : _ operation) ->
-           (shell, (contents, signature)))
-         (fun (shell, (contents, signature)) : _ operation ->
-           {shell; protocol_data = {contents; signature}})
+         (fun (Consensus_op
+                 {
+                   shell;
+                   protocol_data = {contents = Single contents; signature};
+                 })
+            -> (shell, (Consensus_op_contents contents, signature)))
+         (fun (shell, (Consensus_op_contents contents, signature)) ->
+           Consensus_op
+             {shell; protocol_data = {contents = Single contents; signature}})
          (merge_objs
             Operation.shell_header_encoding
             (obj2
-               (req
-                  "operations"
-                  (conv to_list of_list
-                  @@ def "inlined.endorsement_mempool.contents"
-                  @@ union [make endorsement_case]))
+               (req "operations" consensus_operation_contents_encoding)
                (varopt "signature" Signature.encoding)))
-
-  let dal_attestation_encoding =
-    obj3
-      (req "attestor" Signature.Public_key_hash.encoding)
-      (req "attestation" Dal_attestation_repr.encoding)
-      (req "level" Raw_level_repr.encoding)
-
-  let dal_attestation_case =
-    Case
-      {
-        tag = 22;
-        name = "dal_attestation";
-        encoding = dal_attestation_encoding;
-        select =
-          (function Contents (Dal_attestation _ as op) -> Some op | _ -> None);
-        proj =
-          (fun (Dal_attestation
-                 Dal_attestation_repr.{attestor; attestation; level}) ->
-            (attestor, attestation, level));
-        inj =
-          (fun (attestor, attestation, level) ->
-            Dal_attestation Dal_attestation_repr.{attestor; attestation; level});
-      }
 
   let seed_nonce_revelation_case =
     Case
@@ -1442,7 +1335,8 @@ module Encoding = struct
             (req "nonce" Seed_repr.nonce_encoding);
         select =
           (function
-          | Contents (Seed_nonce_revelation _ as op) -> Some op | _ -> None);
+          | Contents (Seed_nonce_revelation _ as op) -> Some op
+          | _ -> None);
         proj = (fun (Seed_nonce_revelation {level; nonce}) -> (level, nonce));
         inj = (fun (level, nonce) -> Seed_nonce_revelation {level; nonce});
       }
@@ -1459,40 +1353,32 @@ module Encoding = struct
         inj = (fun solution -> Vdf_revelation {solution});
       }
 
-  let double_preendorsement_evidence_case :
-      Kind.double_preendorsement_evidence case =
-    Case
-      {
-        tag = 7;
-        name = "double_preendorsement_evidence";
-        encoding =
-          obj2
-            (req "op1" (dynamic_size preendorsement_encoding))
-            (req "op2" (dynamic_size preendorsement_encoding));
-        select =
-          (function
-          | Contents (Double_preendorsement_evidence _ as op) -> Some op
-          | _ -> None);
-        proj = (fun (Double_preendorsement_evidence {op1; op2}) -> (op1, op2));
-        inj = (fun (op1, op2) -> Double_preendorsement_evidence {op1; op2});
-      }
-
-  let double_endorsement_evidence_case : Kind.double_endorsement_evidence case =
+  let double_consensus_operation_evidence_case :
+      Kind.double_consensus_operation_evidence case =
     Case
       {
         tag = 2;
-        name = "double_endorsement_evidence";
+        name = "double_consensus_operation_evidence";
         encoding =
-          obj2
-            (req "op1" (dynamic_size endorsement_encoding))
-            (req "op2" (dynamic_size endorsement_encoding));
+          obj3
+            (req "slot" Slot_repr.encoding)
+            (req "op1" (dynamic_size inlined_consensus_operation_encoding))
+            (req "op2" (dynamic_size inlined_consensus_operation_encoding));
         select =
           (function
-          | Contents (Double_endorsement_evidence _ as op) -> Some op
+          | Contents (Double_consensus_operation_evidence _ as op) -> Some op
           | _ -> None);
-        proj = (fun (Double_endorsement_evidence {op1; op2}) -> (op1, op2));
-        inj = (fun (op1, op2) -> Double_endorsement_evidence {op1; op2});
+        proj =
+          (fun (Double_consensus_operation_evidence {slot; op1; op2}) ->
+            (slot, Consensus_op op1, Consensus_op op2));
+        inj =
+          (fun (slot, Consensus_op op1, Consensus_op op2) ->
+            Double_consensus_operation_evidence {slot; op1; op2});
       }
+
+  (* Note: tag = 7 was used for Double_preattestation_evidence, before
+     it was merged with Double_attestation_evidence into
+     Double_consensus_operation_evidence. It is now free. *)
 
   let double_baking_evidence_case =
     Case
@@ -1505,7 +1391,8 @@ module Encoding = struct
             (req "bh2" (dynamic_size Block_header_repr.encoding));
         select =
           (function
-          | Contents (Double_baking_evidence _ as op) -> Some op | _ -> None);
+          | Contents (Double_baking_evidence _ as op) -> Some op
+          | _ -> None);
         proj = (fun (Double_baking_evidence {bh1; bh2}) -> (bh1, bh2));
         inj = (fun (bh1, bh2) -> Double_baking_evidence {bh1; bh2});
       }
@@ -1520,8 +1407,7 @@ module Encoding = struct
             (req "pkh" Ed25519.Public_key_hash.encoding)
             (req "secret" Blinded_public_key_hash.activation_code_encoding);
         select =
-          (function
-          | Contents (Activate_account _ as op) -> Some op | _ -> None);
+          (function Contents (Activate_account _ as op) -> Some op | _ -> None);
         proj =
           (fun (Activate_account {id; activation_code}) ->
             (id, activation_code));
@@ -1536,7 +1422,7 @@ module Encoding = struct
         name = "proposals";
         encoding =
           obj3
-            (req "source" Signature.Public_key_hash.encoding)
+            (req "source" Implicit_account_repr.encoding)
             (req "period" int32)
             (req
                "proposals"
@@ -1560,7 +1446,7 @@ module Encoding = struct
         name = "ballot";
         encoding =
           obj4
-            (req "source" Signature.Public_key_hash.encoding)
+            (req "source" Implicit_account_repr.encoding)
             (req "period" int32)
             (req "proposal" Protocol_hash.encoding)
             (req "ballot" Vote_repr.ballot_encoding);
@@ -1582,8 +1468,8 @@ module Encoding = struct
         encoding =
           obj3
             (req "consensus_key" Signature.Public_key_hash.encoding)
-            (req "delegate" Signature.Public_key_hash.encoding)
-            (req "destination" Signature.Public_key_hash.encoding);
+            (req "delegate" Implicit_account_repr.encoding)
+            (req "destination" Implicit_account_repr.encoding);
         select =
           (function Contents (Drain_delegate _ as op) -> Some op | _ -> None);
         proj =
@@ -1607,9 +1493,59 @@ module Encoding = struct
         inj = (function message -> Failing_noop message);
       }
 
+  let dal_entrapment_evidence_case : Kind.dal_entrapment_evidence case =
+    Case
+      {
+        tag = 24;
+        name = "dal_entrapment_evidence";
+        encoding =
+          obj5
+            (req
+               "attestation"
+               (dynamic_size inlined_consensus_operation_encoding))
+            (req "consensus_slot" Slot_repr.encoding)
+            (req "slot_index" Dal_slot_index_repr.encoding)
+            (opt "lag_index" Data_encoding.uint8)
+            (req "shard_with_proof" Dal_slot_repr.Shard_with_proof.encoding);
+        select =
+          (function
+          | Contents (Dal_entrapment_evidence _ as op) -> Some op
+          | _ -> None);
+        proj =
+          (fun (Dal_entrapment_evidence
+                  {
+                    attestation;
+                    consensus_slot;
+                    slot_index;
+                    lag_index_opt;
+                    shard_with_proof;
+                  })
+             ->
+            ( Consensus_op attestation,
+              consensus_slot,
+              slot_index,
+              lag_index_opt,
+              shard_with_proof ));
+        inj =
+          (function
+          | ( Consensus_op attestation,
+              consensus_slot,
+              slot_index,
+              lag_index_opt,
+              shard_with_proof ) ->
+              Dal_entrapment_evidence
+                {
+                  attestation;
+                  consensus_slot;
+                  slot_index;
+                  lag_index_opt;
+                  shard_with_proof;
+                });
+      }
+
   let manager_encoding =
     obj5
-      (req "source" Signature.Public_key_hash.encoding)
+      (req "source" Implicit_account_repr.encoding)
       (req "fee" Tez_repr.encoding)
       (req "counter" Manager_counter_repr.encoding_for_operation)
       (req "gas_limit" (check_size 10 Gas_limit_repr.Arith.n_integral_encoding))
@@ -1667,55 +1603,18 @@ module Encoding = struct
   let update_consensus_key_case =
     make_manager_case 114 Manager_operations.update_consensus_key_case
 
-  let tx_rollup_origination_case =
-    make_manager_case
-      tx_rollup_operation_tag_offset
-      Manager_operations.tx_rollup_origination_case
-
-  let tx_rollup_submit_batch_case =
-    make_manager_case
-      tx_rollup_operation_submit_batch_tag
-      Manager_operations.tx_rollup_submit_batch_case
-
-  let tx_rollup_commit_case =
-    make_manager_case
-      tx_rollup_operation_commit_tag
-      Manager_operations.tx_rollup_commit_case
-
-  let tx_rollup_return_bond_case =
-    make_manager_case
-      tx_rollup_operation_return_bond_tag
-      Manager_operations.tx_rollup_return_bond_case
-
-  let tx_rollup_finalize_commitment_case =
-    make_manager_case
-      tx_rollup_operation_finalize_commitment_tag
-      Manager_operations.tx_rollup_finalize_commitment_case
-
-  let tx_rollup_remove_commitment_case =
-    make_manager_case
-      tx_rollup_operation_remove_commitment_tag
-      Manager_operations.tx_rollup_remove_commitment_case
-
-  let tx_rollup_rejection_case =
-    make_manager_case
-      tx_rollup_operation_rejection_tag
-      Manager_operations.tx_rollup_rejection_case
-
-  let tx_rollup_dispatch_tickets_case =
-    make_manager_case
-      tx_rollup_operation_dispatch_tickets_tag
-      Manager_operations.tx_rollup_dispatch_tickets_case
+  let update_companion_key_case =
+    make_manager_case 115 Manager_operations.update_companion_key_case
 
   let transfer_ticket_case =
     make_manager_case
       transfer_ticket_tag
       Manager_operations.transfer_ticket_case
 
-  let dal_publish_slot_header_case =
+  let dal_publish_commitment_case =
     make_manager_case
-      dal_publish_slot_header_tag
-      Manager_operations.dal_publish_slot_header_case
+      dal_publish_commitment_tag
+      Manager_operations.dal_publish_commitment_case
 
   let sc_rollup_originate_case =
     make_manager_case
@@ -1774,16 +1673,15 @@ module Encoding = struct
 
   type packed_case = PCase : 'b case -> packed_case
 
-  let contents_cases =
+  let contents_cases_common =
     [
-      PCase endorsement_case;
-      PCase preendorsement_case;
-      PCase dal_attestation_case;
+      PCase attestations_aggregate_case;
+      PCase preattestations_aggregate_case;
+      PCase double_consensus_operation_evidence_case;
       PCase seed_nonce_revelation_case;
       PCase vdf_revelation_case;
-      PCase double_endorsement_evidence_case;
-      PCase double_preendorsement_evidence_case;
       PCase double_baking_evidence_case;
+      PCase dal_entrapment_evidence_case;
       PCase activate_account_case;
       PCase proposals_case;
       PCase ballot_case;
@@ -1794,19 +1692,12 @@ module Encoding = struct
       PCase set_deposits_limit_case;
       PCase increase_paid_storage_case;
       PCase update_consensus_key_case;
+      PCase update_companion_key_case;
       PCase drain_delegate_case;
       PCase failing_noop_case;
       PCase register_global_constant_case;
-      PCase tx_rollup_origination_case;
-      PCase tx_rollup_submit_batch_case;
-      PCase tx_rollup_commit_case;
-      PCase tx_rollup_return_bond_case;
-      PCase tx_rollup_finalize_commitment_case;
-      PCase tx_rollup_remove_commitment_case;
-      PCase tx_rollup_rejection_case;
-      PCase tx_rollup_dispatch_tickets_case;
       PCase transfer_ticket_case;
-      PCase dal_publish_slot_header_case;
+      PCase dal_publish_commitment_case;
       PCase sc_rollup_originate_case;
       PCase sc_rollup_add_messages_case;
       PCase sc_rollup_cement_case;
@@ -1819,6 +1710,10 @@ module Encoding = struct
       PCase zk_rollup_publish_case;
       PCase zk_rollup_update_case;
     ]
+
+  let contents_cases =
+    PCase attestation_case :: PCase attestation_with_dal_case
+    :: PCase preattestation_case :: contents_cases_common
 
   let contents_encoding =
     let make (PCase (Case {tag; name; encoding; select; proj; inj})) =
@@ -1906,6 +1801,7 @@ module Encoding = struct
     (packed_contents, prefix)
 
   let protocol_data_binary_encoding =
+    let open Result_syntax in
     conv_with_guard
       (fun (Operation_data {contents; signature}) ->
         let contents_list =
@@ -1926,7 +1822,6 @@ module Encoding = struct
         in
         (contents_and_signature_prefix, sig_suffix))
       (fun (contents_and_signature_prefix, suffix) ->
-        let open Result_syntax in
         let* Contents_list contents, prefix =
           of_contents_and_signature_prefix contents_and_signature_prefix
         in
@@ -1953,9 +1848,10 @@ module Encoding = struct
 
      The JSON encoding is the same as in the previous protocols.
 
-     To support BLS signatures, we extract the prefix of the signature and fit
-     it inside the field [contents] while keeping the 64 bytes suffix in the
-     same place as the other signature kinds (i.e. at the end).
+     To support BLS and MLDSA44 signatures, we extract the prefix of the
+     signature and fit it inside the field [contents] while keeping the 64
+     bytes suffix in the same place as the other signature kinds (i.e. at the
+     end).
 
      For instance the binary protocol data for a transfer operation signed by a
      Ed25519 key would look like:
@@ -1982,10 +1878,26 @@ module Encoding = struct
      | 6C |  ... | 00 | ff |   03 (BLS)    | (96 bytes BLS signature) |
      +----+------+----+----+---------------+--------------------------+
 
-     NOTE: BLS only supports the tagged format and Ed25519, Secp256k1 and P256
-     signatures only support the untagged one. The latter restriction is only
-     here to guarantee unicity of the binary representation for signatures.
-  *)
+     The same transfer signed by a ML-DSA-44 key would be instead:
+
+     +----------------+------------------------------+------------------+
+     |  Transaction   |      signature prefix        | signature suffix |
+     +----+------+----+----+----+--------------------+------------------+
+     | 6C |  ... | 00 | ff | 04 | (first 2356 bytes) | (last 64 bytes)  |
+     +----+------+----+----+----+--------------------+------------------+
+
+     Which can also be viewed with an equivalent schema:
+
+     +----------------+----+----------------+----------------------------------+
+     |  Transaction   | ff | signature tag  |        signature                 |
+     +----+------+----+----+----------------+----------------------------------+
+     | 6C |  ... | 00 | ff |   04 (MLDSA44) | (2420 bytes ML-DSA-44 signature) |
+     +----+------+----+----+----------------+----------------------------------+
+
+     NOTE: BLS and ML-DSA-44 only support the tagged format and Ed25519,
+     Secp256k1 and P256 signatures only support the untagged one. The latter
+     restriction is only here to guarantee unicity of the binary representation
+     for signatures. *)
   let protocol_data_encoding =
     def "operation.alpha.contents_and_signature"
     @@ splitted
@@ -2003,6 +1915,83 @@ module Encoding = struct
     @@ merge_objs
          Operation.shell_header_encoding
          (obj1 (req "contents" contents_list_encoding))
+
+  (* Encoding for signing and verifying operations signed by BLS keys.
+     Differs only for attestations and preattestations, where the signed payload
+     omits slots to ensure that all delegates sign the same message,
+     which is required for BLS proof of possession aggregation. *)
+  module Bls_mode = struct
+    let preattestation_case =
+      Case
+        {
+          tag = 40;
+          name = "bls_mode_preattestation";
+          encoding = consensus_aggregate_content_encoding;
+          select =
+            (function Contents (Preattestation _ as op) -> Some op | _ -> None);
+          proj =
+            (fun (Preattestation {level; round; block_payload_hash; _}) ->
+              {level; round; block_payload_hash});
+          inj =
+            (fun {level; round; block_payload_hash} ->
+              Preattestation
+                {level; round; block_payload_hash; slot = Slot_repr.zero});
+        }
+
+    let attestation_case =
+      Case
+        {
+          tag = 41;
+          name = "bls_mode_attestation";
+          encoding = consensus_aggregate_content_encoding;
+          select =
+            (function Contents (Attestation _ as op) -> Some op | _ -> None);
+          proj =
+            (fun (Attestation {consensus_content; dal_content = _}) ->
+              {
+                level = consensus_content.level;
+                round = consensus_content.round;
+                block_payload_hash = consensus_content.block_payload_hash;
+              });
+          inj =
+            (fun {level; round; block_payload_hash} ->
+              Attestation
+                {
+                  consensus_content =
+                    {slot = Slot_repr.zero; level; round; block_payload_hash};
+                  dal_content = None;
+                });
+        }
+
+    let contents_cases =
+      PCase attestation_case (* attestations without slots *)
+      :: PCase preattestation_case (* preattestations without slots *)
+      :: contents_cases_common
+
+    let contents_encoding =
+      let make (PCase (Case {tag; name; encoding; select; proj; inj})) =
+        assert (not @@ reserved_tag tag) ;
+        case
+          (Tag tag)
+          name
+          encoding
+          (fun o ->
+            match select o with None -> None | Some o -> Some (proj o))
+          (fun x -> Contents (inj x))
+      in
+      def "operation.alpha.bls_mode_contents"
+      @@ union (List.map make contents_cases)
+
+    let contents_list_encoding =
+      conv_with_guard to_list of_list_internal (Variable.list contents_encoding)
+
+    let encoding =
+      let open Data_encoding in
+      def "operation.alpha.bls_mode_unsigned_operation"
+      @@ merge_objs
+           Operation.shell_header_encoding
+           (obj1 (req "contents" contents_list_encoding))
+  end
 end
 
 let encoding = Encoding.operation_encoding
@@ -2014,6 +2003,8 @@ let contents_list_encoding = Encoding.contents_list_encoding
 let protocol_data_encoding = Encoding.protocol_data_encoding
 
 let unsigned_operation_encoding = Encoding.unsigned_operation_encoding
+
+let bls_mode_unsigned_operation_encoding = Encoding.Bls_mode.encoding
 
 let raw ({shell; protocol_data} : _ operation) =
   let proto =
@@ -2040,16 +2031,17 @@ let acceptable_pass (op : packed_operation) =
   let (Operation_data protocol_data) = op.protocol_data in
   match protocol_data.contents with
   | Single (Failing_noop _) -> None
-  | Single (Preendorsement _) -> Some consensus_pass
-  | Single (Endorsement _) -> Some consensus_pass
-  | Single (Dal_attestation _) -> Some consensus_pass
+  | Single (Preattestation _) -> Some consensus_pass
+  | Single (Attestation _) -> Some consensus_pass
+  | Single (Preattestations_aggregate _) -> Some consensus_pass
+  | Single (Attestations_aggregate _) -> Some consensus_pass
   | Single (Proposals _) -> Some voting_pass
   | Single (Ballot _) -> Some voting_pass
   | Single (Seed_nonce_revelation _) -> Some anonymous_pass
   | Single (Vdf_revelation _) -> Some anonymous_pass
-  | Single (Double_endorsement_evidence _) -> Some anonymous_pass
-  | Single (Double_preendorsement_evidence _) -> Some anonymous_pass
+  | Single (Double_consensus_operation_evidence _) -> Some anonymous_pass
   | Single (Double_baking_evidence _) -> Some anonymous_pass
+  | Single (Dal_entrapment_evidence _) -> Some anonymous_pass
   | Single (Activate_account _) -> Some anonymous_pass
   | Single (Drain_delegate _) -> Some anonymous_pass
   | Single (Manager_operation _) -> Some manager_pass
@@ -2107,50 +2099,49 @@ let () =
     (function Contents_list_error s -> Some s | _ -> None)
     (fun s -> Contents_list_error s)
 
-let check_signature (type kind) key chain_id
-    ({shell; protocol_data} : kind operation) =
-  let check ~watermark contents signature =
-    let unsigned_operation =
-      Data_encoding.Binary.to_bytes_exn
-        unsigned_operation_encoding
-        (shell, contents)
-    in
-    if Signature.check ~watermark key signature unsigned_operation then Ok ()
-    else error Invalid_signature
+let serialize_unsigned_operation (type kind) encoding
+    ({shell; protocol_data} : kind operation) : bytes =
+  Data_encoding.Binary.to_bytes_exn
+    encoding
+    (shell, Contents_list protocol_data.contents)
+
+let unsigned_operation_length (type kind)
+    ({shell; protocol_data} : kind operation) : int =
+  Data_encoding.Binary.length
+    unsigned_operation_encoding
+    (shell, Contents_list protocol_data.contents)
+
+let bls_mode_unsigned_operation_length (type kind)
+    ({shell; protocol_data} : kind operation) : int =
+  Data_encoding.Binary.length
+    bls_mode_unsigned_operation_encoding
+    (shell, Contents_list protocol_data.contents)
+
+let check_signature (type kind) encoding key chain_id (op : kind operation) =
+  let open Result_syntax in
+  let serialized_operation = serialize_unsigned_operation encoding op in
+  let check ~watermark signature =
+    if Signature.check ~watermark key signature serialized_operation then
+      return_unit
+    else tzfail Invalid_signature
   in
-  match protocol_data.signature with
-  | None -> error Missing_signature
-  | Some signature -> (
-      match protocol_data.contents with
-      | Single (Preendorsement _) as contents ->
-          check
-            ~watermark:(to_watermark (Preendorsement chain_id))
-            (Contents_list contents)
-            signature
-      | Single (Endorsement _) as contents ->
-          check
-            ~watermark:(to_watermark (Endorsement chain_id))
-            (Contents_list contents)
-            signature
-      | Single (Dal_attestation _) as contents ->
-          check
-            ~watermark:(to_watermark (Dal_attestation chain_id))
-            (Contents_list contents)
-            signature
-      | Single
-          ( Failing_noop _ | Proposals _ | Ballot _ | Seed_nonce_revelation _
-          | Vdf_revelation _ | Double_endorsement_evidence _
-          | Double_preendorsement_evidence _ | Double_baking_evidence _
-          | Activate_account _ | Drain_delegate _ | Manager_operation _ ) ->
-          check
-            ~watermark:Generic_operation
-            (Contents_list protocol_data.contents)
-            signature
-      | Cons (Manager_operation _, _ops) ->
-          check
-            ~watermark:Generic_operation
-            (Contents_list protocol_data.contents)
-            signature)
+  match op.protocol_data.signature with
+  | None -> tzfail Missing_signature
+  | Some signature ->
+      let watermark =
+        match op.protocol_data.contents with
+        | Single (Preattestation _) -> to_watermark (Preattestation chain_id)
+        | Single (Attestation _) -> to_watermark (Attestation chain_id)
+        | Single
+            ( Failing_noop _ | Proposals _ | Ballot _ | Seed_nonce_revelation _
+            | Vdf_revelation _ | Double_consensus_operation_evidence _
+            | Double_baking_evidence _ | Dal_entrapment_evidence _
+            | Activate_account _ | Drain_delegate _ | Manager_operation _
+            | Preattestations_aggregate _ | Attestations_aggregate _ ) ->
+            Generic_operation
+        | Cons (Manager_operation _, _ops) -> Generic_operation
+      in
+      check ~watermark signature
 
 let hash_raw = Operation.hash
 
@@ -2170,8 +2161,8 @@ let hash_packed (o : packed_operation) =
 
 type ('a, 'b) eq = Eq : ('a, 'a) eq
 
-let equal_manager_operation_kind :
-    type a b. a manager_operation -> b manager_operation -> (a, b) eq option =
+let equal_manager_operation_kind : type a b.
+    a manager_operation -> b manager_operation -> (a, b) eq option =
  fun op1 op2 ->
   match (op1, op2) with
   | Reveal _, Reveal _ -> Some Eq
@@ -2190,26 +2181,10 @@ let equal_manager_operation_kind :
   | Increase_paid_storage _, _ -> None
   | Update_consensus_key _, Update_consensus_key _ -> Some Eq
   | Update_consensus_key _, _ -> None
-  | Tx_rollup_origination, Tx_rollup_origination -> Some Eq
-  | Tx_rollup_origination, _ -> None
-  | Tx_rollup_submit_batch _, Tx_rollup_submit_batch _ -> Some Eq
-  | Tx_rollup_submit_batch _, _ -> None
-  | Tx_rollup_commit _, Tx_rollup_commit _ -> Some Eq
-  | Tx_rollup_commit _, _ -> None
-  | Tx_rollup_return_bond _, Tx_rollup_return_bond _ -> Some Eq
-  | Tx_rollup_return_bond _, _ -> None
-  | Tx_rollup_finalize_commitment _, Tx_rollup_finalize_commitment _ -> Some Eq
-  | Tx_rollup_finalize_commitment _, _ -> None
-  | Tx_rollup_remove_commitment _, Tx_rollup_remove_commitment _ -> Some Eq
-  | Tx_rollup_remove_commitment _, _ -> None
-  | Tx_rollup_rejection _, Tx_rollup_rejection _ -> Some Eq
-  | Tx_rollup_rejection _, _ -> None
-  | Tx_rollup_dispatch_tickets _, Tx_rollup_dispatch_tickets _ -> Some Eq
-  | Tx_rollup_dispatch_tickets _, _ -> None
   | Transfer_ticket _, Transfer_ticket _ -> Some Eq
   | Transfer_ticket _, _ -> None
-  | Dal_publish_slot_header _, Dal_publish_slot_header _ -> Some Eq
-  | Dal_publish_slot_header _, _ -> None
+  | Dal_publish_commitment _, Dal_publish_commitment _ -> Some Eq
+  | Dal_publish_commitment _, _ -> None
   | Sc_rollup_originate _, Sc_rollup_originate _ -> Some Eq
   | Sc_rollup_originate _, _ -> None
   | Sc_rollup_add_messages _, Sc_rollup_add_messages _ -> Some Eq
@@ -2238,23 +2213,26 @@ let equal_contents_kind : type a b. a contents -> b contents -> (a, b) eq option
     =
  fun op1 op2 ->
   match (op1, op2) with
-  | Preendorsement _, Preendorsement _ -> Some Eq
-  | Preendorsement _, _ -> None
-  | Endorsement _, Endorsement _ -> Some Eq
-  | Endorsement _, _ -> None
-  | Dal_attestation _, Dal_attestation _ -> Some Eq
-  | Dal_attestation _, _ -> None
+  | Preattestation _, Preattestation _ -> Some Eq
+  | Preattestation _, _ -> None
+  | Attestation _, Attestation _ -> Some Eq
+  | Attestation _, _ -> None
+  | Preattestations_aggregate _, Preattestations_aggregate _ -> Some Eq
+  | Preattestations_aggregate _, _ -> None
+  | Attestations_aggregate _, Attestations_aggregate _ -> Some Eq
+  | Attestations_aggregate _, _ -> None
   | Seed_nonce_revelation _, Seed_nonce_revelation _ -> Some Eq
   | Seed_nonce_revelation _, _ -> None
   | Vdf_revelation _, Vdf_revelation _ -> Some Eq
   | Vdf_revelation _, _ -> None
-  | Double_endorsement_evidence _, Double_endorsement_evidence _ -> Some Eq
-  | Double_endorsement_evidence _, _ -> None
-  | Double_preendorsement_evidence _, Double_preendorsement_evidence _ ->
+  | Double_consensus_operation_evidence _, Double_consensus_operation_evidence _
+    ->
       Some Eq
-  | Double_preendorsement_evidence _, _ -> None
+  | Double_consensus_operation_evidence _, _ -> None
   | Double_baking_evidence _, Double_baking_evidence _ -> Some Eq
   | Double_baking_evidence _, _ -> None
+  | Dal_entrapment_evidence _, Dal_entrapment_evidence _ -> Some Eq
+  | Dal_entrapment_evidence _, _ -> None
   | Activate_account _, Activate_account _ -> Some Eq
   | Activate_account _, _ -> None
   | Proposals _, Proposals _ -> Some Eq
@@ -2271,8 +2249,8 @@ let equal_contents_kind : type a b. a contents -> b contents -> (a, b) eq option
       | Some Eq -> Some Eq)
   | Manager_operation _, _ -> None
 
-let rec equal_contents_kind_list :
-    type a b. a contents_list -> b contents_list -> (a, b) eq option =
+let rec equal_contents_kind_list : type a b.
+    a contents_list -> b contents_list -> (a, b) eq option =
  fun op1 op2 ->
   match (op1, op2) with
   | Single op1, Single op2 -> equal_contents_kind op1 op2
@@ -2346,39 +2324,119 @@ let compare_inner_pass : type a b. a pass -> b pass -> int =
    failed to convert in a {!int}, the value of [round] is (-1). *)
 type round_infos = {level : int32; round : int}
 
-(** [endorsement_infos] is the pair of a {!round_infos} and a [slot]
+(** [preattestation_infos] is the pair of a {!round_infos} and a [slot]
    convert into an {!int}. *)
-type endorsement_infos = {round : round_infos; slot : int}
+type preattestation_infos = {round : round_infos; slot : int}
+
+(** [aggregate_infos] is the pair of a {!round_infos} and a [committee] that is
+    a list of slots converted into a {!int list}. *)
+type aggregate_infos = {round : round_infos; committee : int list}
+
+(** [attestation_infos] is the tuple consisting of a {!round_infos} value, a
+    [slot], and the weight of the DAL content in the attestation. *)
+type attestation_infos = {
+  round_infos : round_infos;
+  slot : int;
+  dal_weight : int;
+}
 
 (** [double_baking_infos] is the pair of a {!round_infos} and a
     {!block_header} hash. *)
 type double_baking_infos = {round : round_infos; bh_hash : Block_hash.t}
 
-(** Compute a {!round_infos} from a {consensus_content} of a valid
-   operation. Hence, the [round] must convert in {!int}.
+(** Builds {!type-round_infos} from [level] and [round], handling the
+    conversions from protocol types to integers.
 
-    Precondition: [c] comes from a valid operation. The [round] from a
-   valid operation should succeed to convert in {!int}. Hence, for the
-   unreachable path where the convertion failed, we put (-1) as
-   [round] value. *)
-let round_infos_from_consensus_content (c : consensus_content) =
-  let level = Raw_level_repr.to_int32 c.level in
-  match Round_repr.to_int c.round with
+    Precondition: [level] and [round] come from the consensus content
+    of a valid operation. This means that [round] should successfully
+    convert to {!int}. Hence, for the unreachable path where the
+    convertion failed, we put (-1) as [round] value. *)
+let round_infos ~level ~round =
+  let level = Raw_level_repr.to_int32 level in
+  match Round_repr.to_int round with
   | Ok round -> {level; round}
   | Error _ -> {level; round = -1}
 
-(** Compute a {!endorsement_infos} from a {!consensus_content}. It is
-   used to compute the weight of {!Endorsement} and {!Preendorsement}.
+(** Builds {!type-round_infos} from a {!consensus_content}.
 
-    Precondition: [c] comes from a valid operation. The {!Endorsement}
-   or {!Preendorsement} is valid, so its [round] must succeed to
+    Precondition: the {!consensus_content} comes from a valid
+    operation; see {!val-round_infos}. *)
+let round_infos_from_consensus_content
+    {level; round; block_payload_hash = _; slot = _} =
+  round_infos ~level ~round
+
+(** Compute a {!attestation_infos} from a {!consensus_content}. It is
+   used to compute the weight of {!Attestation} and {!Preattestation}.
+
+    Precondition: [c] comes from a valid operation. The {!Attestation}
+   or {!Preattestation} is valid, so its [round] must succeed to
    convert into an {!int}. Hence, for the unreachable path where the
    convertion fails, we put (-1) as [round] value (see
    {!round_infos_from_consensus_content}). *)
-let endorsement_infos_from_consensus_content (c : consensus_content) =
+let attestation_infos_from_consensus_content (c : consensus_content) =
   let slot = Slot_repr.to_int c.slot in
   let round = round_infos_from_consensus_content c in
   {round; slot}
+
+(** Compute a {!attestation_infos} value from a {!consensus_content} value
+    and an optional {!dal_content} value. It is used to compute the weight of
+    an {!Attestation}.
+
+    An {!Attestation} with no DAL content or with a DAL content that has 0
+    attested DAL slots have the same weight (everything else being
+    equal). That's ok, because they are semantically equal, therefore it
+    does not matter which one is picked.
+
+    Precondition: [c] and [d] come from a valid operation.  *)
+let attestation_infos_from_content (c : consensus_content)
+    (d : dal_content option) =
+  let slot = Slot_repr.to_int c.slot in
+  let round_infos = round_infos_from_consensus_content c in
+  {
+    round_infos;
+    slot;
+    dal_weight =
+      Option.fold
+        ~none:0
+        ~some:(fun d -> Dal_attestations_repr.weight d.attestations)
+        d;
+  }
+
+(** Compute an {!aggregate_info} value from {!consensus_aggregate_content}
+    and {!Slot_repr.t list} values. It is used to compute the weight of an
+    {!Aggregate_attestation}.
+
+    Precondition: [aggregate_consensus_content] and [committee] come from a
+    valid operation.  *)
+let aggregate_infos_from_content (proposal : consensus_aggregate_content)
+    (committee : Slot_repr.t list) =
+  let level = Raw_level_repr.to_int32 proposal.level in
+  let round =
+    match Round_repr.to_int proposal.round with
+    | Ok round -> round
+    | Error _ -> -1
+  in
+  let round_infos = {level; round} in
+  let committee = List.map Slot_repr.to_int committee in
+  {round = round_infos; committee}
+
+(** Computes {!type-round_infos} from the contents of a
+    [Double_consensus_operation_evidence] operation. Used to compute
+    the weight of such an operation.
+
+    Precondition: the contents comes from a valid operation; see
+    {!val-round_infos}. *)
+let round_infos_from_double_consensus
+    (Double_consensus_operation_evidence {op1; _}) =
+  match op1.protocol_data.contents with
+  | Single
+      (Attestation {consensus_content; _} | Preattestation consensus_content) ->
+      round_infos_from_consensus_content consensus_content
+  | Single
+      ( Attestations_aggregate {consensus_content = {level; round; _}; _}
+      | Preattestations_aggregate {consensus_content = {level; round; _}; _} )
+    ->
+      round_infos ~level ~round
 
 (** Compute a {!double_baking_infos} and a {!Block_header_repr.hash}
    from a {!Block_header_repr.t}. It is used to compute the weight of
@@ -2403,18 +2461,46 @@ let consensus_infos_and_hash_from_block_header (bh : Block_header_repr.t) =
   in
   {round; bh_hash}
 
+type dal_entrapment_info = {level : int32; weight : int}
+
+let dal_entrapment_info
+    (Dal_entrapment_evidence {attestation; consensus_slot; _}) =
+  let level, dal_content =
+    match attestation.protocol_data.contents with
+    | Single (Attestation {consensus_content; dal_content}) ->
+        (consensus_content.level, dal_content)
+    | Single (Attestations_aggregate {consensus_content; committee}) ->
+        let dal_content =
+          List.assoc_opt ~equal:Slot_repr.equal consensus_slot committee
+          |> Option.join
+        in
+        (consensus_content.level, dal_content)
+    (* Preattestation and Preattestations_aggregate cases should not
+       be possible for a valid Dal_entrapment_evidence, but these
+       cases are easy to cover anyway. *)
+    | Single (Preattestation consensus_content) ->
+        (consensus_content.level, None)
+    | Single (Preattestations_aggregate {consensus_content; _}) ->
+        (consensus_content.level, None)
+  in
+  {
+    level = Raw_level_repr.to_int32 level;
+    weight =
+      Option.fold
+        ~none:0
+        ~some:(fun d -> Dal_attestations_repr.weight d.attestations)
+        dal_content;
+  }
+
 (** The weight of an operation.
 
    Given an operation, its [weight] carries on static information that
    is used to compare it to an operation of the same pass.
     Operation weight are defined by validation pass.
 
-    The [weight] of an {!Endorsement} or {!Preendorsement} depends on
-   its {!endorsement_infos}.
-
-    The [weight] of a {!Dal_attestation} depends on the pair of
-   the size of its bitset, {!Dal_attestation_repr.t}, and the
-   signature of its attestor {! Signature.Public_key_hash.t}.
+    The [weight] of an {!Attestation} or {!Preattestation} depends on its
+    {!attestation_infos}. For {!Attestation}s it also depends on the number of
+    attested DAL slots.
 
    The [weight] of a voting operation depends on the pair of its
    [period] and [source].
@@ -2424,14 +2510,17 @@ let consensus_infos_and_hash_from_block_header (bh : Block_header_repr.t) =
    The [weight] of a {!Seed_nonce_revelation} depends on its [level]
    converted in {!int32}.
 
-    The [weight] of a {!Double_preendorsement} or
-   {!Double_endorsement} depends on the [level] and [round] of their
+    The [weight] of a {!Double_preattestation} or
+   {!Double_attestation} depends on the [level] and [round] of their
    first denounciated operations. The [level] and [round] are wrapped
    in a {!round_infos}.
 
     The [weight] of a {!Double_baking} depends on the [level], [round]
    and [hash] of its first denounciated block_header. the [level] and
    [round] are wrapped in a {!double_baking_infos}.
+
+    The [weight] of a {!Dal_entrapment_evidence} is the level and the number of
+    DAL attested slots of the included attestation.
 
     The [weight] of an {!Activate_account} depends on its public key
    hash.
@@ -2442,30 +2531,31 @@ let consensus_infos_and_hash_from_block_header (bh : Block_header_repr.t) =
     The [weight] of {!Manager_operation} depends on its [fee] and
    [gas_limit] ratio expressed in {!Q.t}. *)
 type _ weight =
-  | Weight_endorsement : endorsement_infos -> consensus_pass_type weight
-  | Weight_preendorsement : endorsement_infos -> consensus_pass_type weight
-  | Weight_dal_attestation :
-      (* attestor * num_attestations * level *)
-      (Signature.Public_key_hash.t * int * int32)
+  | Weight_attestation : attestation_infos -> consensus_pass_type weight
+  | Weight_preattestation : preattestation_infos -> consensus_pass_type weight
+  | Weight_attestations_aggregate :
+      aggregate_infos
       -> consensus_pass_type weight
   | Weight_proposals :
-      int32 * Signature.Public_key_hash.t
+      int32 * Implicit_account_repr.t
       -> voting_pass_type weight
-  | Weight_ballot :
-      int32 * Signature.Public_key_hash.t
-      -> voting_pass_type weight
+  | Weight_ballot : int32 * Implicit_account_repr.t -> voting_pass_type weight
   | Weight_seed_nonce_revelation : int32 -> anonymous_pass_type weight
   | Weight_vdf_revelation : Seed_repr.vdf_solution -> anonymous_pass_type weight
-  | Weight_double_preendorsement : round_infos -> anonymous_pass_type weight
-  | Weight_double_endorsement : round_infos -> anonymous_pass_type weight
+  | Weight_double_consensus_operation :
+      round_infos
+      -> anonymous_pass_type weight
   | Weight_double_baking : double_baking_infos -> anonymous_pass_type weight
+  | Weight_dal_entrapment_evidence :
+      dal_entrapment_info
+      -> anonymous_pass_type weight
   | Weight_activate_account :
       Ed25519.Public_key_hash.t
       -> anonymous_pass_type weight
   | Weight_drain_delegate :
-      Signature.Public_key_hash.t
+      Implicit_account_repr.t
       -> anonymous_pass_type weight
-  | Weight_manager : Q.t * Signature.public_key_hash -> manager_pass_type weight
+  | Weight_manager : Q.t * Implicit_account_repr.t -> manager_pass_type weight
   | Weight_noop : noop_pass_type weight
 
 (** The weight of an operation is the pair of its pass and weight. *)
@@ -2477,8 +2567,7 @@ type operation_weight = W : 'pass pass * 'pass weight -> operation_weight
     Precondition: [op] is a valid manager operation: its sum
     of accumulated [fee] must succeed. Hence, in the unreachable path where
     the [fee] sum fails, we put [Tez_repr.zero] as its value. *)
-let cumulate_fee_and_gas_of_manager :
-    type kind.
+let cumulate_fee_and_gas_of_manager : type kind.
     kind Kind.manager contents_list ->
     Tez_repr.t * Gas_limit_repr.Arith.integral =
  fun op ->
@@ -2487,19 +2576,19 @@ let cumulate_fee_and_gas_of_manager :
     | Ok v -> v
     | Error _ -> (* This cannot happen *) acc
   in
-  let rec loop :
-      type kind. 'a -> 'b -> kind Kind.manager contents_list -> 'a * 'b =
+  let rec loop : type kind.
+      'a -> 'b -> kind Kind.manager contents_list -> 'a * 'b =
    fun fees_acc gas_limit_acc -> function
-    | Single (Manager_operation {fee; gas_limit; _}) ->
-        let total_fees = add_without_error fees_acc fee in
-        let total_gas_limit =
-          Gas_limit_repr.Arith.add gas_limit_acc gas_limit
-        in
-        (total_fees, total_gas_limit)
-    | Cons (Manager_operation {fee; gas_limit; _}, manops) ->
-        let fees_acc = add_without_error fees_acc fee in
-        let gas_limit_acc = Gas_limit_repr.Arith.add gas_limit gas_limit_acc in
-        loop fees_acc gas_limit_acc manops
+     | Single (Manager_operation {fee; gas_limit; _}) ->
+         let total_fees = add_without_error fees_acc fee in
+         let total_gas_limit =
+           Gas_limit_repr.Arith.add gas_limit_acc gas_limit
+         in
+         (total_fees, total_gas_limit)
+     | Cons (Manager_operation {fee; gas_limit; _}, manops) ->
+         let fees_acc = add_without_error fees_acc fee in
+         let gas_limit_acc = Gas_limit_repr.Arith.add gas_limit gas_limit_acc in
+         loop fees_acc gas_limit_acc manops
   in
   loop Tez_repr.zero Gas_limit_repr.Arith.zero op
 
@@ -2511,9 +2600,8 @@ let cumulate_fee_and_gas_of_manager :
    never be zero. We treat this case the same as gas_limit = 1 for the
    sake of simplicity.
 *)
-let weight_manager :
-    type kind.
-    kind Kind.manager contents_list -> Q.t * Signature.public_key_hash =
+let weight_manager : type kind.
+    kind Kind.manager contents_list -> Q.t * Implicit_account_repr.t =
  fun op ->
   let fee, glimit = cumulate_fee_and_gas_of_manager op in
   let source =
@@ -2536,24 +2624,28 @@ let weight_of : packed_operation -> operation_weight =
   let (Operation_data protocol_data) = op.protocol_data in
   match protocol_data.contents with
   | Single (Failing_noop _) -> W (Noop, Weight_noop)
-  | Single (Preendorsement consensus_content) ->
+  | Single (Preattestation consensus_content) ->
       W
         ( Consensus,
-          Weight_preendorsement
-            (endorsement_infos_from_consensus_content consensus_content) )
-  | Single (Endorsement consensus_content) ->
+          Weight_preattestation
+            (attestation_infos_from_consensus_content consensus_content) )
+  | Single (Attestation {consensus_content; dal_content}) ->
       W
         ( Consensus,
-          Weight_endorsement
-            (endorsement_infos_from_consensus_content consensus_content) )
-  | Single (Dal_attestation Dal_attestation_repr.{attestor; attestation; level})
-    ->
-      W
-        ( Consensus,
-          Weight_dal_attestation
-            ( attestor,
-              Dal_attestation_repr.occupied_size_in_bits attestation,
-              Raw_level_repr.to_int32 level ) )
+          Weight_attestation
+            (attestation_infos_from_content consensus_content dal_content) )
+  | Single (Preattestations_aggregate {consensus_content; committee}) ->
+      let aggregate_infos =
+        aggregate_infos_from_content consensus_content committee
+      in
+      W (Consensus, Weight_attestations_aggregate aggregate_infos)
+  | Single (Attestations_aggregate {consensus_content; committee}) ->
+      let aggregate_infos =
+        aggregate_infos_from_content
+          consensus_content
+          (committee_slots committee)
+      in
+      W (Consensus, Weight_attestations_aggregate aggregate_infos)
   | Single (Proposals {period; source; _}) ->
       W (Voting, Weight_proposals (period, source))
   | Single (Ballot {period; source; _}) ->
@@ -2562,25 +2654,19 @@ let weight_of : packed_operation -> operation_weight =
       W (Anonymous, Weight_seed_nonce_revelation (Raw_level_repr.to_int32 level))
   | Single (Vdf_revelation {solution}) ->
       W (Anonymous, Weight_vdf_revelation solution)
-  | Single (Double_endorsement_evidence {op1; _}) -> (
-      match op1.protocol_data.contents with
-      | Single (Endorsement consensus_content) ->
-          W
-            ( Anonymous,
-              Weight_double_endorsement
-                (round_infos_from_consensus_content consensus_content) ))
-  | Single (Double_preendorsement_evidence {op1; _}) -> (
-      match op1.protocol_data.contents with
-      | Single (Preendorsement consensus_content) ->
-          W
-            ( Anonymous,
-              Weight_double_preendorsement
-                (round_infos_from_consensus_content consensus_content) ))
+  | Single (Double_consensus_operation_evidence _ as contents) ->
+      W
+        ( Anonymous,
+          Weight_double_consensus_operation
+            (round_infos_from_double_consensus contents) )
   | Single (Double_baking_evidence {bh1; _}) ->
       let double_baking_infos =
         consensus_infos_and_hash_from_block_header bh1
       in
       W (Anonymous, Weight_double_baking double_baking_infos)
+  | Single (Dal_entrapment_evidence _ as contents) ->
+      let info = dal_entrapment_info contents in
+      W (Anonymous, Weight_dal_entrapment_evidence info)
   | Single (Activate_account {id; _}) ->
       W (Anonymous, Weight_activate_account id)
   | Single (Drain_delegate {delegate; _}) ->
@@ -2592,33 +2678,30 @@ let weight_of : packed_operation -> operation_weight =
       let manweight, src = weight_manager ops in
       W (Manager, Weight_manager (manweight, src))
 
-(** {3 Comparisons of operations {!weight}} *)
+(** {3 Comparisons of operations' {!weight}} *)
 
 (** {4 Helpers} *)
 
-(** compare a pair of elements in lexicographic order. *)
+(** Compare a pair of elements in lexicographic order. *)
 let compare_pair_in_lexico_order ~cmp_fst ~cmp_snd (a1, b1) (a2, b2) =
   let resa = cmp_fst a1 a2 in
   if Compare.Int.(resa <> 0) then resa else cmp_snd b1 b2
 
-(** compare in reverse order. *)
+(** Compare in reverse order. *)
 let compare_reverse (cmp : 'a -> 'a -> int) a b = cmp b a
 
 (** {4 Comparison of {!consensus_infos}} *)
 
-(** Two {!round_infos} compares as the pair of [level, round] in
+(** Two {!round_infos} pairs [(level, round)] compare in
    lexicographic order: the one with the greater [level] being the
    greater [round_infos]. When levels are the same, the one with the
    greater [round] being the better.
 
-    The greater {!round_infos} is the farther to the current state
+    The better {!round_infos} is farther to the current state
    when part of the weight of a valid consensus operation.
 
-    The best {!round_infos} is the nearer to the current state when
+    The better {!round_infos} is nearer to the current state when
    part of the weight of a valid denunciation.
-
-    In both case, that is the greater according to the lexicographic
-   order.
 
    Precondition: the {!round_infos} are from valid operation. They
    have been computed by either {!round_infos_from_consensus_content}
@@ -2626,47 +2709,21 @@ let compare_reverse (cmp : 'a -> 'a -> int) a b = cmp b a
    parameter from valid operations and put (-1) to the [round] in the
    unreachable path where the original round fails to convert in
    {!int}. *)
-let compare_round_infos infos1 infos2 =
+let compare_round_infos (infos1 : round_infos) (infos2 : round_infos) =
   compare_pair_in_lexico_order
     ~cmp_fst:Compare.Int32.compare
     ~cmp_snd:Compare.Int.compare
     (infos1.level, infos1.round)
     (infos2.level, infos2.round)
 
-(** When comparing {!Endorsement} to {!Preendorsement} or
-   {!Double_endorsement_evidence} to {!Double_preendorsement}, in case
-   of {!round_infos} equality, the position is relevant to compute the
-   order. *)
-type prioritized_position = Nopos | Fstpos | Sndpos
-
-(** Comparison of two {!round_infos} with priority in case of
-   {!round_infos} equality. *)
-let compare_round_infos_with_prioritized_position ~prioritized_position infos1
-    infos2 =
-  let cmp = compare_round_infos infos1 infos2 in
-  if Compare.Int.(cmp <> 0) then cmp
-  else match prioritized_position with Fstpos -> 1 | Sndpos -> -1 | Nopos -> 0
-
-(** When comparing consensus operation with {!endorsement_infos}, in
-   case of equality of their {!round_infos}, either they are of the
-   same kind and their [slot] have to be compared in the reverse
-   order, otherwise the {!Endorsement} is better and
-   [prioritized_position] gives its position. *)
-let compare_prioritized_position_or_slot ~prioritized_position =
-  match prioritized_position with
-  | Nopos -> compare_reverse Compare.Int.compare
-  | Fstpos -> fun _ _ -> 1
-  | Sndpos -> fun _ _ -> -1
-
-(** Two {!endorsement_infos} are compared by their {!round_infos}.
+(** Two {!Preattestation}s are compared by their {!preattestation_infos}.
    When their {!round_infos} are equal, they are compared according to
-   their priority or their [slot], see
-   {!compare_prioritized_position_or_slot} for more details. *)
-let compare_endorsement_infos ~prioritized_position (infos1 : endorsement_infos)
-    (infos2 : endorsement_infos) =
+   their [slot]: the smaller the better. *)
+let compare_preattestation_infos (infos1 : preattestation_infos)
+    (infos2 : preattestation_infos) =
   compare_pair_in_lexico_order
     ~cmp_fst:compare_round_infos
-    ~cmp_snd:(compare_prioritized_position_or_slot ~prioritized_position)
+    ~cmp_snd:(compare_reverse Compare.Int.compare)
     (infos1.round, infos1.slot)
     (infos2.round, infos2.slot)
 
@@ -2680,50 +2737,84 @@ let compare_baking_infos infos1 infos2 =
     (infos1.round, infos1.bh_hash)
     (infos2.round, infos2.bh_hash)
 
-(** Two valid {!Dal_attestation} are compared in the
-   lexicographic order of their pairs of bitsets size and attestor
-   hash. *)
-let compare_dal_attestation (attestor1, endorsements1, level1)
-    (attestor2, endorsements2, level2) =
+(** Two {!Attestation}s are compared by their {!attestation_infos}. When their
+    {!round_infos} are equal, they are compared according to their [slot]: the
+    smaller the better. When the slots are also equal they are compared
+    according to the number of attested DAL slots: the more the better. *)
+let compare_attestation_infos
+    {round_infos = infos1; slot = slot1; dal_weight = n1}
+    {round_infos = infos2; slot = slot2; dal_weight = n2} =
   compare_pair_in_lexico_order
     ~cmp_fst:
       (compare_pair_in_lexico_order
-         ~cmp_fst:Compare.Int32.compare
-         ~cmp_snd:Compare.Int.compare)
-    ~cmp_snd:Signature.Public_key_hash.compare
-    ((level1, endorsements1), attestor1)
-    ((level2, endorsements2), attestor2)
+         ~cmp_fst:compare_round_infos
+         ~cmp_snd:(compare_reverse Compare.Int.compare))
+    ~cmp_snd:Compare.Int.compare
+    ((infos1, slot1), n1)
+    ((infos2, slot2), n2)
+
+let compare_dal_entrapment_infos infos1 infos2 =
+  compare_pair_in_lexico_order
+    ~cmp_fst:Compare.Int32.compare
+    ~cmp_snd:Compare.Int.compare
+    (infos1.level, infos1.weight)
+    (infos2.level, infos2.weight)
+
+(** Two {!Attestations_aggregate} are compared by their {!aggregate_infos}. When their
+    {!round_infos} are equal, they are compared according to their [committee]
+    by lexicographic order. *)
+let compare_attestations_aggregate_infos
+    {round = infos1; committee = committee1}
+    {round = infos2; committee = committee2} =
+  compare_pair_in_lexico_order
+    ~cmp_fst:compare_round_infos
+    ~cmp_snd:(List.compare Compare.Int.compare)
+    (infos1, committee1)
+    (infos2, committee2)
 
 (** {4 Comparison of valid operations of the same validation pass} *)
 
 (** {5 Comparison of valid consensus operations} *)
 
-(** Comparing consensus operations by their [weight] uses the
-   comparison on {!endorsement_infos} for {!Endorsement} and
-   {!Preendorsement}: see {!endorsement_infos} for more details.
+(** Comparing consensus operations by their [weight] uses the comparison on
+    {!attestation_infos} for {!Attestation}s and {!Preattestation}s. In case of
+    equality of their {!round_infos}, either they are of the same kind and their
+    [slot]s have to be compared in the reverse order, otherwise the
+    {!Attestation}s are better. In case of {!Attestation}s, the number of
+    attested DAL slots is taken into account when all else is equal.
 
     {!Dal_attestation} is smaller than the other kinds of
    consensus operations. Two valid {!Dal_attestation} are
    compared by {!compare_dal_attestation}. *)
 let compare_consensus_weight w1 w2 =
   match (w1, w2) with
-  | Weight_endorsement infos1, Weight_endorsement infos2 ->
-      compare_endorsement_infos ~prioritized_position:Nopos infos1 infos2
-  | Weight_preendorsement infos1, Weight_preendorsement infos2 ->
-      compare_endorsement_infos ~prioritized_position:Nopos infos1 infos2
-  | Weight_endorsement infos1, Weight_preendorsement infos2 ->
-      compare_endorsement_infos ~prioritized_position:Fstpos infos1 infos2
-  | Weight_preendorsement infos1, Weight_endorsement infos2 ->
-      compare_endorsement_infos ~prioritized_position:Sndpos infos1 infos2
-  | ( Weight_dal_attestation (attestor1, size1, lvl1),
-      Weight_dal_attestation (attestor2, size2, lvl2) ) ->
-      compare_dal_attestation (attestor1, size1, lvl1) (attestor2, size2, lvl2)
-  | Weight_dal_attestation _, (Weight_endorsement _ | Weight_preendorsement _)
+  | Weight_attestation infos1, Weight_attestation infos2 ->
+      compare_attestation_infos infos1 infos2
+  | Weight_preattestation infos1, Weight_preattestation infos2 ->
+      compare_preattestation_infos infos1 infos2
+  | ( Weight_attestation {round_infos = round_infos1; _},
+      Weight_preattestation {round = round_infos2; _} ) ->
+      let cmp = compare_round_infos round_infos1 round_infos2 in
+      if Compare.Int.(cmp <> 0) then cmp else 1
+  | ( Weight_preattestation {round = round_infos1; _},
+      Weight_attestation {round_infos = round_infos2; _} ) ->
+      let cmp = compare_round_infos round_infos1 round_infos2 in
+      if Compare.Int.(cmp <> 0) then cmp else -1
+  | Weight_attestations_aggregate infos1, Weight_attestations_aggregate infos2
     ->
-      -1
-  | (Weight_endorsement _ | Weight_preendorsement _), Weight_dal_attestation _
-    ->
-      1
+      compare_attestations_aggregate_infos infos1 infos2
+  | ( Weight_attestations_aggregate {round = round_infos1; _},
+      Weight_preattestation {round = round_infos2; _} )
+  | ( Weight_attestations_aggregate {round = round_infos1; _},
+      Weight_attestation {round_infos = round_infos2; _} ) ->
+      let cmp = compare_round_infos round_infos1 round_infos2 in
+      if Compare.Int.(cmp <> 0) then cmp else 1
+  | ( Weight_preattestation {round = round_infos1; _},
+      Weight_attestations_aggregate {round = round_infos2; _} )
+  | ( Weight_attestation {round_infos = round_infos1; _},
+      Weight_attestations_aggregate {round = round_infos2; _} ) ->
+      let cmp = compare_round_infos round_infos1 round_infos2 in
+      if Compare.Int.(cmp <> 0) then cmp else -1
 
 (** {5 Comparison of valid voting operations} *)
 
@@ -2736,7 +2827,7 @@ let compare_vote_weight w1 w2 =
       (i1, source1)
       (i2, source2)
       ~cmp_fst:Compare.Int32.compare
-      ~cmp_snd:Signature.Public_key_hash.compare
+      ~cmp_snd:Implicit_account_repr.compare
   in
   match (w1, w2) with
   | Weight_proposals (i1, source1), Weight_proposals (i2, source2) ->
@@ -2748,14 +2839,15 @@ let compare_vote_weight w1 w2 =
 
 (** {5 Comparison of valid anonymous operations} *)
 
-(** Comparing two {!Double_endorsement_evidence}, or two
-   {!Double_preendorsement_evidence}, or comparing them to each other
-   is comparing their {!round_infos}, see {!compare_round_infos} for
-   more details.
+(** Comparing two {!Double_consensus_operation_evidence} is comparing
+   their {!round_infos}, see {!compare_round_infos} for more details.
 
-    Comparing two {!Double_baking_evidence} is comparing as their
+   Comparing two {!Double_baking_evidence} is comparing as their
    {!double_baking_infos}, see {!compare_double_baking_infos} for more
    details.
+
+   Two {!Dal_entrapment_evidence} ops are compared by their level and the number of
+   slots they attest.
 
    Two {!Seed_nonce_revelation} are compared by their [level].
 
@@ -2763,44 +2855,45 @@ let compare_vote_weight w1 w2 =
 
    Two {!Activate_account} are compared as their [id].
 
-   When comparing different kind of anonymous operations, the order is
-   as follows: {!Double_preendorsement_evidence} >
-   {!Double_endorsement_evidence} > {!Double_baking_evidence} >
-   {!Vdf_revelation} > {!Seed_nonce_revelation} > {!Activate_account}.
-   *)
+   When comparing different kind of anonymous operations, the order is as
+   follows: {!Double_consensus_operation_evidence} >
+   {!Double_baking_evidence} > {!Dal_entrapment_evidence} > {!Vdf_revelation} >
+   {!Seed_nonce_revelation} > {!Activate_account}.  *)
 let compare_anonymous_weight w1 w2 =
   match (w1, w2) with
-  | Weight_double_preendorsement infos1, Weight_double_preendorsement infos2 ->
+  | ( Weight_double_consensus_operation infos1,
+      Weight_double_consensus_operation infos2 ) ->
       compare_round_infos infos1 infos2
-  | Weight_double_preendorsement infos1, Weight_double_endorsement infos2 ->
-      compare_round_infos_with_prioritized_position
-        ~prioritized_position:Fstpos
-        infos1
-        infos2
-  | Weight_double_endorsement infos1, Weight_double_preendorsement infos2 ->
-      compare_round_infos_with_prioritized_position
-        ~prioritized_position:Sndpos
-        infos1
-        infos2
-  | Weight_double_endorsement infos1, Weight_double_endorsement infos2 ->
-      compare_round_infos infos1 infos2
-  | ( ( Weight_double_baking _ | Weight_seed_nonce_revelation _
-      | Weight_vdf_revelation _ | Weight_activate_account _
-      | Weight_drain_delegate _ ),
-      (Weight_double_preendorsement _ | Weight_double_endorsement _) ) ->
+  | ( ( Weight_double_baking _ | Weight_dal_entrapment_evidence _
+      | Weight_seed_nonce_revelation _ | Weight_vdf_revelation _
+      | Weight_activate_account _ | Weight_drain_delegate _ ),
+      Weight_double_consensus_operation _ ) ->
       -1
-  | ( (Weight_double_preendorsement _ | Weight_double_endorsement _),
-      ( Weight_double_baking _ | Weight_seed_nonce_revelation _
-      | Weight_vdf_revelation _ | Weight_activate_account _
-      | Weight_drain_delegate _ ) ) ->
+  | ( Weight_double_consensus_operation _,
+      ( Weight_double_baking _ | Weight_dal_entrapment_evidence _
+      | Weight_seed_nonce_revelation _ | Weight_vdf_revelation _
+      | Weight_activate_account _ | Weight_drain_delegate _ ) ) ->
       1
   | Weight_double_baking infos1, Weight_double_baking infos2 ->
       compare_baking_infos infos1 infos2
-  | ( ( Weight_seed_nonce_revelation _ | Weight_vdf_revelation _
-      | Weight_activate_account _ | Weight_drain_delegate _ ),
+  | ( ( Weight_dal_entrapment_evidence _ | Weight_seed_nonce_revelation _
+      | Weight_vdf_revelation _ | Weight_activate_account _
+      | Weight_drain_delegate _ ),
       Weight_double_baking _ ) ->
       -1
   | ( Weight_double_baking _,
+      ( Weight_dal_entrapment_evidence _ | Weight_seed_nonce_revelation _
+      | Weight_vdf_revelation _ | Weight_activate_account _
+      | Weight_drain_delegate _ ) ) ->
+      1
+  | Weight_dal_entrapment_evidence info1, Weight_dal_entrapment_evidence info2
+    ->
+      compare_dal_entrapment_infos info1 info2
+  | ( ( Weight_seed_nonce_revelation _ | Weight_vdf_revelation _
+      | Weight_activate_account _ | Weight_drain_delegate _ ),
+      Weight_dal_entrapment_evidence _ ) ->
+      -1
+  | ( Weight_dal_entrapment_evidence _,
       ( Weight_seed_nonce_revelation _ | Weight_vdf_revelation _
       | Weight_activate_account _ | Weight_drain_delegate _ ) ) ->
       1
@@ -2827,7 +2920,7 @@ let compare_anonymous_weight w1 w2 =
   | Weight_drain_delegate _, Weight_activate_account _ -> -1
   | Weight_activate_account _, Weight_drain_delegate _ -> 1
   | Weight_drain_delegate pkh1, Weight_drain_delegate pkh2 ->
-      Signature.Public_key_hash.compare pkh1 pkh2
+      Implicit_account_repr.compare pkh1 pkh2
 
 (** {5 Comparison of valid {!Manager_operation}} *)
 
@@ -2842,7 +2935,7 @@ let compare_manager_weight weight1 weight2 =
         (manweight1, source1)
         (manweight2, source2)
         ~cmp_fst:Compare.Q.compare
-        ~cmp_snd:Signature.Public_key_hash.compare
+        ~cmp_snd:Implicit_account_repr.compare
 
 (** Two {!operation_weight} are compared by their [pass], see
    {!compare_inner_pass} for more details. When they have the same
@@ -2873,3 +2966,8 @@ let compare (oph1, op1) (oph2, op2) =
   else
     let cmp = compare_operation_weight (weight_of op1) (weight_of op2) in
     if Compare.Int.(cmp = 0) then cmp_h else cmp
+
+module Internal_for_benchmarking = struct
+  let serialize_unsigned_operation (type kind) (op : kind operation) : bytes =
+    serialize_unsigned_operation unsigned_operation_encoding op
+end

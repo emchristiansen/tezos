@@ -44,12 +44,13 @@ let () =
 (** Main *)
 
 module Term = struct
-  let process args sandbox_file progress_display_mode =
+  let process data_dir config_file sandbox_file progress_display_mode =
     let run =
       let open Lwt_result_syntax in
-      let*! () = Log_config.init_internal_events_with_defaults () in
-      let* node_config = Shared_arg.read_and_patch_config_file args in
-      let data_dir = node_config.data_dir in
+      let*! () = Tezos_base_unix.Internal_event_unix.init () in
+      let* data_dir, node_config =
+        Shared_arg.resolve_data_dir_and_config_file ?data_dir ?config_file ()
+      in
       let ({genesis; _} : Config_file.blockchain_network) =
         node_config.blockchain_network
       in
@@ -67,11 +68,10 @@ module Term = struct
                 tzfail (Node_run_command.Invalid_sandbox_file filename)
             | Ok json -> return_some ("sandbox_parameter", json))
       in
-      Lwt_lock_file.try_with_lock
-        ~when_locked:(fun () -> tzfail Locked_directory)
+      Lwt_lock_file.with_lock
+        ~when_locked:(`Fail Locked_directory)
         ~filename:(Data_version.lock_file data_dir)
       @@ fun () ->
-      let context_dir = Data_version.context_dir data_dir in
       let store_dir = Data_version.store_dir data_dir in
       let patch_context =
         Patch_context.patch_context genesis sandbox_parameters
@@ -79,7 +79,7 @@ module Term = struct
       Reconstruction.reconstruct
         ~patch_context
         ~store_dir
-        ~context_dir
+        ~data_dir
         genesis
         ~user_activated_upgrades:
           node_config.blockchain_network.user_activated_upgrades
@@ -89,7 +89,11 @@ module Term = struct
           node_config.shell.block_validator_limits.operation_metadata_size_limit
         ~progress_display_mode
     in
-    match Lwt_main.run @@ Lwt_exit.wrap_and_exit run with
+    Lwt.Exception_filter.(set handle_all_except_runtime) ;
+    match
+      Tezos_base_unix.Event_loop.main_run ~process_name:"node reconstruct"
+      @@ fun () -> Lwt_exit.wrap_and_exit run
+    with
     | Ok () -> `Ok ()
     | Error err -> `Error (false, Format.asprintf "%a" pp_print_trace err)
 
@@ -132,7 +136,9 @@ module Term = struct
 
   let term =
     let open Cmdliner.Term in
-    ret (const process $ Shared_arg.Term.args $ sandbox $ progress_display_mode)
+    ret
+      (const process $ Shared_arg.Term.data_dir $ Shared_arg.Term.config_file
+     $ sandbox $ progress_display_mode)
 end
 
 module Manpage = struct

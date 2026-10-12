@@ -6,13 +6,14 @@
  (instrumentation (backend bisect_ppx))
  (libraries
   tezt.core
-  tezos-base
+  bls12-381.archive
+  octez-libs.base
   tezt-tezos
-  tezos-protocol-alpha
-  tezos-client-alpha
-  tezos-protocol-plugin-alpha
-  tezos-alpha-test-helpers
-  tezos-micheline)
+  tezos-protocol-alpha.protocol
+  octez-protocol-alpha-libs.client
+  octez-protocol-alpha-libs.plugin
+  octez-protocol-alpha-libs.test-helpers
+  octez-libs.micheline)
  (library_flags (:standard -linkall))
  (flags
   (:standard)
@@ -29,7 +30,9 @@
 
 (executable
  (name main)
+ (instrumentation (backend bisect_ppx --bisect-sigterm))
  (libraries
+  octez-rust-deps
   src_proto_alpha_lib_protocol_test_regression_tezt_lib
   tezt)
  (link_flags
@@ -38,12 +41,13 @@
  (modules main))
 
 (rule
- (alias runtezt)
+ (alias runtest)
  (package tezos-protocol-alpha-tests)
  (deps
   (glob_files contracts/*.tz)
   (glob_files expected/test_logging.ml/*.out))
- (action (run %{dep:./main.exe})))
+ (enabled_if (<> false %{env:RUNTEZTALIAS=true}))
+ (action (run %{dep:./main.exe} /flaky /ci_disabled)))
 
 (rule
  (targets main.ml)

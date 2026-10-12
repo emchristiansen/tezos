@@ -379,6 +379,7 @@ module Make (P : Sigs.PROTOCOL) : Sigs.MAIN = struct
         match code_opt with
         | Error `AlreadyWarned -> Lwt.return (m, i)
         | Ok (script, code_costs) ->
+            let* ctxt, script = P.Global_constants.expand ctxt script in
             let+ add_storage =
               if Config.(collect_lambdas || collect_storage || collect_gas) then
                 let* storage_opt =
@@ -506,9 +507,9 @@ module Make (P : Sigs.PROTOCOL) : Sigs.MAIN = struct
       else return Contract_size.zero
     in
     (if Config.collect_storage then
-     let dirname = Filename.concat output_dir (hash_string ^ ".storage") in
-     let storages = ExprMap.map (fun {storage; _} -> storage) ctr.storages in
-     File_helpers.print_expr_dir ~dirname ~ext:".storage" storages) ;
+       let dirname = Filename.concat output_dir (hash_string ^ ".storage") in
+       let storages = ExprMap.map (fun {storage; _} -> storage) ctr.storages in
+       File_helpers.print_expr_dir ~dirname ~ext:".storage" storages) ;
     return @@ Contract_size.add contract_size total_size
 
   let write_gas_file ~output_dir contract_map =
@@ -770,7 +771,7 @@ let commands =
         let* store =
           Tezos_store.Store.init
             ~store_dir:(Filename.concat data_dir "store")
-            ~context_dir:(Filename.concat data_dir "context")
+            ~data_dir
             ~allow_testchains:true
             ~readonly:true
             genesis

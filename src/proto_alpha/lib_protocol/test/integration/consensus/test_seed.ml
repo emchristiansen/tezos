@@ -26,9 +26,8 @@
 (** Testing
     -------
     Component:    Protocol (seed)
-    Invocation:   dune exec \
-                  src/proto_alpha/lib_protocol/test/integration/consensus/main.exe \
-                  -- test "^seed$"
+    Invocation:   dune exec src/proto_alpha/lib_protocol/test/integration/consensus/main.exe \
+                  -- --file test_seed.ml
     Subject:      - seed_nonce_hash included in some blocks
                   - revelation operation of seed_nonce that should correspond
                   to each seed_nonce_hash
@@ -66,14 +65,14 @@ let test_seed_no_commitment () =
     let* s = Context.get_seed (B b) in
     let seed_bytes = Data_encoding.Binary.to_bytes_exn Seed.seed_encoding s in
     (if expected_seed <> seed_bytes then
-     let seed_pp =
-       Hex.show
-         (Hex.of_string
-            (Data_encoding.Binary.to_string_exn Seed.seed_encoding s))
-     in
-     let expected_seed_pp = Hex.show (Hex.of_bytes expected_seed) in
-     Stdlib.failwith
-       (Format.sprintf "Seed: %s\nExpected: %s\n\n" seed_pp expected_seed_pp)) ;
+       let seed_pp =
+         Hex.show
+           (Hex.of_string
+              (Data_encoding.Binary.to_string_exn Seed.seed_encoding s))
+       in
+       let expected_seed_pp = Hex.show (Hex.of_bytes expected_seed) in
+       Stdlib.failwith
+         (Format.sprintf "Seed: %s\nExpected: %s\n\n" seed_pp expected_seed_pp)) ;
     return b
   in
   let rec bake_and_check_seed b = function
@@ -87,7 +86,7 @@ let test_seed_no_commitment () =
   let* b, _delegates =
     Context.init3
       ~blocks_per_cycle:8l
-      ~consensus_threshold:0
+      ~consensus_threshold_size:0
       ~nonce_revelation_threshold:2l
       ()
   in
@@ -99,7 +98,7 @@ let test_seed_no_commitment () =
     commitment fails with an "Invalid commitment in block header" error. *)
 let test_no_commitment () =
   let open Lwt_result_syntax in
-  let* b, _contracts = Context.init_n ~consensus_threshold:0 5 () in
+  let* b, _contracts = Context.init_n ~consensus_threshold_size:0 5 () in
   let* {parametric = {blocks_per_commitment; _}; _} =
     Context.get_constants (B b)
   in
@@ -108,9 +107,8 @@ let test_no_commitment () =
   let* b = Block.bake_n (blocks_per_commitment - 2) b in
   (* Forge a block with empty commitment and apply it *)
   let* header = Block.Forge.forge_header b in
-  let* header =
-    Block.Forge.set_seed_nonce_hash None header |> Block.Forge.sign_header
-  in
+  let* header = Block.Forge.set_seed_nonce_hash None header in
+  let* header = Block.Forge.sign_header header in
   let*! e = Block.apply header b in
   Assert.proto_error_with_info
     ~loc:__LOC__
@@ -126,14 +124,14 @@ let test_no_commitment () =
 let test_revelation_early_wrong_right_twice () =
   let open Lwt_result_syntax in
   let open Assert in
-  let* b, _contracts = Context.init_n ~consensus_threshold:0 5 () in
+  let* b, _contracts = Context.init_n ~consensus_threshold_size:0 5 () in
   let* csts = Context.get_constants (B b) in
-  let tip = csts.parametric.seed_nonce_revelation_tip in
+  let* tip = Context.get_seed_nonce_revelation_tip (B b) in
   let blocks_per_commitment =
     Int32.to_int csts.parametric.blocks_per_commitment
   in
-  let baking_reward_fixed_portion =
-    csts.parametric.baking_reward_fixed_portion
+  let* baking_reward_fixed_portion =
+    Context.get_baking_reward_fixed_portion (B b)
   in
   (* get the pkh of a baker *)
   let* pkh, _, _, _ = Block.get_next_baker b in
@@ -142,18 +140,21 @@ let test_revelation_early_wrong_right_twice () =
   (* bake until commitment - 2, excluding id *)
   let* b = Block.bake_n ~policy (blocks_per_commitment - 2) b in
   let* bal_main = Context.Contract.balance (B b) id in
+  let cycle_for_rewards = Block.current_cycle b in
   (* the baker [id] will include a seed_nonce commitment *)
   let* b = Block.bake ~policy:(Block.By_account pkh) b in
   let*? level_commitment = Context.get_level (B b) in
   let* committed_hash = Context.get_seed_nonce_hash (B b) in
   (* test that the baking reward is received *)
-  let* () =
-    balance_was_credited
-      ~loc:__LOC__
+  let* reward_to_liquid =
+    Adaptive_issuance_helpers.portion_of_rewards_to_liquid_for_cycle
       (B b)
-      id
-      bal_main
+      cycle_for_rewards
+      pkh
       baking_reward_fixed_portion
+  in
+  let* () =
+    balance_was_credited ~loc:__LOC__ (B b) id bal_main reward_to_liquid
   in
   (* test that revealing too early produces an error *)
   let operation =
@@ -165,8 +166,8 @@ let test_revelation_early_wrong_right_twice () =
   let*! e = Block.bake ~policy ~operation b in
   let* () =
     Assert.proto_error ~loc:__LOC__ e (function
-        | Nonce_storage.Too_early_revelation -> true
-        | _ -> false)
+      | Nonce_storage.Too_early_revelation -> true
+      | _ -> false)
   in
   (* finish the cycle excluding the committing baker, id *)
   let* b = Block.bake_until_cycle_end ~policy b in
@@ -182,8 +183,8 @@ let test_revelation_early_wrong_right_twice () =
   let*! e = Block.bake ~operation b in
   let* () =
     Assert.proto_error ~loc:__LOC__ e (function
-        | Nonce_storage.Inconsistent_nonce -> true
-        | _ -> false)
+      | Nonce_storage.Inconsistent_nonce -> true
+      | _ -> false)
   in
   (* reveals correctly *)
   let operation =
@@ -204,18 +205,32 @@ let test_revelation_early_wrong_right_twice () =
   in
   let* () =
     Assert.proto_error ~loc:__LOC__ e (function
-        | Validate_errors.Anonymous.Conflicting_nonce_revelation _ -> true
-        | _ -> false)
+      | Validate_errors.Anonymous.Conflicting_nonce_revelation _ -> true
+      | _ -> false)
   in
+  let cycle_for_rewards = Block.current_cycle b in
   let* b = Block.bake ~policy:(Block.By_account baker_pkh) ~operation b in
   (* test that the baker gets the tip reward plus the baking reward*)
-  let* () =
-    balance_was_credited
-      ~loc:__LOC__
+  let* tip_to_liquid =
+    Adaptive_issuance_helpers.portion_of_rewards_to_liquid_for_cycle
       (B b)
-      baker
-      baker_bal
-      Test_tez.(tip +! baking_reward_fixed_portion)
+      cycle_for_rewards
+      pkh
+      tip
+  in
+  let* baking_reward_to_liquid =
+    Adaptive_issuance_helpers.portion_of_rewards_to_liquid_for_cycle
+      (B b)
+      cycle_for_rewards
+      pkh
+      baking_reward_fixed_portion
+  in
+  let reward_to_liquid =
+    Tez_helpers.(baking_reward_to_liquid +! tip_to_liquid)
+  in
+
+  let* () =
+    balance_was_credited ~loc:__LOC__ (B b) baker baker_bal reward_to_liquid
   in
   (* test that revealing twice produces an error *)
   let operation =
@@ -226,8 +241,8 @@ let test_revelation_early_wrong_right_twice () =
   in
   let*! e = Block.bake ~operation ~policy b in
   Assert.proto_error ~loc:__LOC__ e (function
-      | Nonce_storage.Already_revealed_nonce -> true
-      | _ -> false)
+    | Nonce_storage.Already_revealed_nonce -> true
+    | _ -> false)
 
 (** Test that revealing too late produces an error. Note that a
     committer who doesn't reveal at cycle 1 is not punished.*)
@@ -235,7 +250,7 @@ let test_revelation_missing_and_late () =
   let open Lwt_result_syntax in
   let open Context in
   let open Assert in
-  let* b, _contracts = Context.init_n ~consensus_threshold:0 5 () in
+  let* b, _contracts = Context.init_n ~consensus_threshold_size:0 5 () in
   let* csts = get_constants (B b) in
   let blocks_per_commitment =
     Int32.to_int csts.parametric.blocks_per_commitment
@@ -264,8 +279,8 @@ let test_revelation_missing_and_late () =
   let*! e = Block.bake ~operation ~policy b in
   let* () =
     Assert.proto_error ~loc:__LOC__ e (function
-        | Nonce_storage.Too_late_revelation -> true
-        | _ -> false)
+      | Nonce_storage.Too_late_revelation -> true
+      | _ -> false)
   in
   (* finish cycle 1 excluding the committing baker [id] *)
   let* b = Block.bake_until_cycle_end ~policy b in
@@ -278,10 +293,10 @@ let test_revelation_missing_and_late () =
   in
   let*! e = Block.bake ~operation b in
   Assert.proto_error ~loc:__LOC__ e (function
-      | Nonce_storage.Too_late_revelation -> true
-      | _ -> false)
+    | Nonce_storage.Too_late_revelation -> true
+    | _ -> false)
 
-(** Test that we do not distribute endorsing rewards if the nonce was
+(** Test that we do not distribute attesting rewards if the nonce was
     not revealed. *)
 let test_unrevealed () =
   let open Lwt_result_syntax in
@@ -289,11 +304,17 @@ let test_unrevealed () =
   let constants =
     {
       Default_parameters.constants_test with
-      endorsing_reward_per_slot = Tez.one_mutez;
-      baking_reward_bonus_per_slot = Tez.zero;
-      baking_reward_fixed_portion = Tez.zero;
-      seed_nonce_revelation_tip = Tez.zero;
-      consensus_threshold = 0;
+      issuance_weights =
+        {
+          base_total_issued_per_minute = Tez.one;
+          attesting_reward_weight = 1;
+          baking_reward_bonus_weight = 0;
+          baking_reward_fixed_portion_weight = 0;
+          seed_nonce_revelation_tip_weight = 0;
+          vdf_revelation_tip_weight = 0;
+          dal_rewards_weight = 0;
+        };
+      consensus_threshold_size = 0;
       minimal_participation_ratio = Ratio.{numerator = 0; denominator = 1};
     }
   in
@@ -304,15 +325,16 @@ let test_unrevealed () =
   let blocks_per_commitment =
     Int32.to_int csts.parametric.blocks_per_commitment
   in
-  let bake_and_endorse_block ?policy (_pred_b, b) =
-    let* slots = Context.get_endorsers (B b) in
-    let* endorsements =
+  let bake_and_attest_block ?policy (_pred_b, b) =
+    let* slots = Context.get_attesters (B b) in
+    let* attestations =
       List.map_es
-        (fun {Plugin.RPC.Validators.consensus_key; _} ->
-          Op.endorsement ~delegate:consensus_key b)
+        (fun attester ->
+          let attesting_slot = Op.attesting_slot_of_attester attester in
+          Op.attestation ~attesting_slot b)
         slots
     in
-    Block.bake ?policy ~operations:endorsements b
+    Block.bake ?policy ~operations:attestations b
   in
   (* Bake until commitment *)
   let* b = Block.bake_n (blocks_per_commitment - 2) b in
@@ -321,7 +343,7 @@ let test_unrevealed () =
   let* b = Block.bake_until_cycle_end ~policy b in
   let* info_before = Context.Delegate.info (B b) delegate2 in
   let* b' = Block.bake ~policy b in
-  let* b = bake_and_endorse_block ~policy (b, b') in
+  let* b = bake_and_attest_block ~policy (b, b') in
   (* Finish cycle 1 excluding the first baker *)
   let* b = Block.bake_until_cycle_end ~policy b in
   let* info_after = Context.Delegate.info (B b) delegate2 in
@@ -337,7 +359,7 @@ let test_unrevealed () =
 
 let test_vdf_status () =
   let open Lwt_result_syntax in
-  let* b, _ = Context.init3 ~consensus_threshold:0 () in
+  let* b, _ = Context.init3 ~consensus_threshold_size:0 () in
   let* b = Block.bake b in
   let* status = Context.get_seed_computation (B b) in
   assert (status = Alpha_context.Seed.Nonce_revelation_stage) ;
@@ -366,7 +388,7 @@ let test_vdf_status () =
 let test_early_incorrect_unverified_correct_already_vdf () =
   let open Lwt_result_syntax in
   let open Assert in
-  let* b, _ = Context.init3 ~consensus_threshold:0 () in
+  let* b, _ = Context.init3 ~consensus_threshold_size:0 () in
   let* csts = Context.get_constants (B b) in
   let blocks_per_commitment =
     Int32.to_int csts.parametric.blocks_per_commitment
@@ -374,11 +396,13 @@ let test_early_incorrect_unverified_correct_already_vdf () =
   let nonce_revelation_threshold =
     Int32.to_int csts.parametric.nonce_revelation_threshold
   in
-  let baking_reward_fixed_portion =
-    csts.parametric.baking_reward_fixed_portion
+  let* baking_reward_fixed_portion =
+    Context.get_baking_reward_fixed_portion (B b)
   in
-  let seed_nonce_revelation_tip = csts.parametric.seed_nonce_revelation_tip in
-  let vdf_nonce_revelation_tip = csts.parametric.seed_nonce_revelation_tip in
+  let* seed_nonce_revelation_tip =
+    Context.get_seed_nonce_revelation_tip (B b)
+  in
+  let* vdf_nonce_revelation_tip = Context.get_vdf_revelation_tip (B b) in
   (* get the pkh of a baker *)
   let* pkh, _, _, _ = Block.get_next_baker b in
   let id = Alpha_context.Contract.Implicit pkh in
@@ -387,17 +411,20 @@ let test_early_incorrect_unverified_correct_already_vdf () =
   let* b = Block.bake_n ~policy (blocks_per_commitment - 2) b in
   let* bal_main = Context.Contract.balance (B b) id in
   (* the baker [id] will include a seed_nonce commitment *)
+  let cycle_for_rewards = Block.current_cycle b in
   let* b = Block.bake ~policy:(Block.By_account pkh) b in
   let*? level_commitment = Context.get_level (B b) in
   let* committed_hash = Context.get_seed_nonce_hash (B b) in
   (* test that the baking reward is received *)
-  let* () =
-    balance_was_credited
-      ~loc:__LOC__
+  let* reward_to_liquid =
+    Adaptive_issuance_helpers.portion_of_rewards_to_liquid_for_cycle
       (B b)
-      id
-      bal_main
+      cycle_for_rewards
+      pkh
       baking_reward_fixed_portion
+  in
+  let* () =
+    balance_was_credited ~loc:__LOC__ (B b) id bal_main reward_to_liquid
   in
   (* finish the cycle excluding the committing baker, id *)
   let* b = Block.bake_until_cycle_end ~policy b in
@@ -411,15 +438,28 @@ let test_early_incorrect_unverified_correct_already_vdf () =
   let* baker_pkh, _, _, _ = Block.get_next_baker ~policy b in
   let baker = Alpha_context.Contract.Implicit baker_pkh in
   let* baker_bal = Context.Contract.balance (B b) baker in
+  let cycle_for_rewards = Block.current_cycle b in
   let* b = Block.bake ~policy:(Block.By_account baker_pkh) ~operation b in
   (* test that the baker gets the tip reward plus the baking reward*)
-  let* () =
-    balance_was_credited
-      ~loc:__LOC__
+  let* tip_to_liquid =
+    Adaptive_issuance_helpers.portion_of_rewards_to_liquid_for_cycle
       (B b)
-      baker
-      baker_bal
-      Test_tez.(seed_nonce_revelation_tip +! baking_reward_fixed_portion)
+      cycle_for_rewards
+      pkh
+      seed_nonce_revelation_tip
+  in
+  let* baking_reward_to_liquid =
+    Adaptive_issuance_helpers.portion_of_rewards_to_liquid_for_cycle
+      (B b)
+      cycle_for_rewards
+      pkh
+      baking_reward_fixed_portion
+  in
+  let reward_to_liquid =
+    Tez_helpers.(tip_to_liquid +! baking_reward_to_liquid)
+  in
+  let* () =
+    balance_was_credited ~loc:__LOC__ (B b) baker baker_bal reward_to_liquid
   in
   (* test that revealing the VDF early produces an error *)
   let dummy_solution =
@@ -433,8 +473,8 @@ let test_early_incorrect_unverified_correct_already_vdf () =
   let*! e = Block.bake ~operation b in
   let* () =
     Assert.proto_error ~loc:__LOC__ e (function
-        | Seed_storage.Too_early_revelation -> true
-        | _ -> false)
+      | Seed_storage.Too_early_revelation -> true
+      | _ -> false)
   in
   (* bake until nonce reveal period finishes *)
   let* b = Block.bake_n ~policy nonce_revelation_threshold b in
@@ -443,8 +483,8 @@ let test_early_incorrect_unverified_correct_already_vdf () =
   let*! e = Block.bake ~operation b in
   let* () =
     Assert.proto_error ~loc:__LOC__ e (function
-        | Seed_storage.Unverified_vdf -> true
-        | _ -> false)
+      | Seed_storage.Unverified_vdf -> true
+      | _ -> false)
   in
   let* seed_status = Context.get_seed_computation (B b) in
   match seed_status with
@@ -469,8 +509,8 @@ let test_early_incorrect_unverified_correct_already_vdf () =
       let*! e = Block.bake ~operation b in
       let* () =
         Assert.proto_error ~loc:__LOC__ e (function
-            | Seed_storage.Unverified_vdf -> true
-            | _ -> false)
+          | Seed_storage.Unverified_vdf -> true
+          | _ -> false)
       in
       (* test with correct input *)
       (* compute the VDF solution (the result and the proof ) *)
@@ -491,18 +531,31 @@ let test_early_incorrect_unverified_correct_already_vdf () =
       in
       let* () =
         Assert.proto_error ~loc:__LOC__ e (function
-            | Validate_errors.Anonymous.Conflicting_vdf_revelation _ -> true
-            | _ -> false)
+          | Validate_errors.Anonymous.Conflicting_vdf_revelation _ -> true
+          | _ -> false)
       in
       (* verify the balance was credited following operation inclusion *)
+      let cycle_for_rewards = Block.current_cycle b in
       let* b = Block.bake ~policy:(Block.By_account baker_pkh) ~operation b in
-      let* () =
-        balance_was_credited
-          ~loc:__LOC__
+      let* tip_to_liquid =
+        Adaptive_issuance_helpers.portion_of_rewards_to_liquid_for_cycle
           (B b)
-          baker
-          baker_bal
-          Test_tez.(vdf_nonce_revelation_tip +! baking_reward_fixed_portion)
+          cycle_for_rewards
+          pkh
+          vdf_nonce_revelation_tip
+      in
+      let* baking_reward_to_liquid =
+        Adaptive_issuance_helpers.portion_of_rewards_to_liquid_for_cycle
+          (B b)
+          cycle_for_rewards
+          pkh
+          baking_reward_fixed_portion
+      in
+      let reward_to_liquid =
+        Tez_helpers.(tip_to_liquid +! baking_reward_to_liquid)
+      in
+      let* () =
+        balance_was_credited ~loc:__LOC__ (B b) baker baker_bal reward_to_liquid
       in
       (* verify the seed status has changed *)
       let* seed_status = Context.get_seed_computation (B b) in
@@ -515,8 +568,8 @@ let test_early_incorrect_unverified_correct_already_vdf () =
           let*! e = Block.bake ~operation b in
           let* () =
             Assert.proto_error ~loc:__LOC__ e (function
-                | Seed_storage.Already_accepted -> true
-                | _ -> false)
+              | Seed_storage.Already_accepted -> true
+              | _ -> false)
           in
           (* verify the stored seed has the expected value *)
           let open Data_encoding.Binary in
@@ -525,7 +578,7 @@ let test_early_incorrect_unverified_correct_already_vdf () =
           let* b =
             Block.bake_until_n_cycle_end
               ~policy
-              (csts.parametric.preserved_cycles + 1)
+              (csts.parametric.consensus_rights_delay + 1)
               b
           in
           let* stored_seed = Context.get_seed (B b) in
@@ -544,10 +597,11 @@ let test_early_incorrect_unverified_correct_already_vdf () =
 
 (* We check that bounds used in [Seed_storage.for_cycle] are as expected. *)
 let test_cycle_bounds () =
-  Context.init1 ~consensus_threshold:0 () >>=? fun (b, _accounts) ->
-  Context.get_constants (B b) >>=? fun csts ->
-  let past_offset = csts.parametric.max_slashing_period - 1 in
-  let future_offset = csts.parametric.preserved_cycles in
+  let open Lwt_result_syntax in
+  let* b, _accounts = Context.init1 ~consensus_threshold_size:0 () in
+  let* csts = Context.get_constants (B b) in
+  let past_offset = Constants_repr.slashing_delay in
+  let future_offset = csts.parametric.consensus_rights_delay in
   let open Alpha_context.Cycle in
   let expected_error_message direction current_cycle =
     match direction with
@@ -578,46 +632,54 @@ let test_cycle_bounds () =
           cycle
   in
   let cycle = root in
-  Context.get_bakers ~cycle:(add cycle future_offset) (B b)
-  >>=? fun (_ : _ list) ->
+  let* (_ : _ list) =
+    Context.get_bakers ~cycle:(add cycle future_offset) (B b)
+  in
   let future_cycle = add cycle (future_offset + 1) in
-  Context.get_bakers ~cycle:future_cycle (B b) >>= fun res ->
+  let*! res = Context.get_bakers ~cycle:future_cycle (B b) in
   (* the first cycle is special *)
-  Assert.proto_error_with_info
-    ~loc:__LOC__
-    ~error_info_field:`Message
-    res
-    (expected_error_message (`Missing_sampler_state future_cycle) cycle)
-  >>=? fun () ->
-  Block.bake_until_cycle_end b >>=? fun b ->
+  let* () =
+    Assert.proto_error_with_info
+      ~loc:__LOC__
+      ~error_info_field:`Message
+      res
+      (expected_error_message (`Missing_sampler_state future_cycle) cycle)
+  in
+  let* b = Block.bake_until_cycle_end b in
   let cycle = add cycle 1 in
-  Context.get_bakers ~cycle:root (B b) >>=? fun (_ : _ list) ->
-  Context.get_bakers ~cycle:(add cycle future_offset) (B b)
-  >>=? fun (_ : _ list) ->
-  Context.get_bakers ~cycle:(add cycle (future_offset + 1)) (B b) >>= fun res ->
-  Assert.proto_error_with_info
-    ~loc:__LOC__
-    res
-    ~error_info_field:`Message
-    (expected_error_message `Future cycle)
-  >>=? fun () ->
-  Block.bake_until_n_cycle_end past_offset b >>=? fun b ->
+  let* (_ : _ list) = Context.get_bakers ~cycle:root (B b) in
+  let* (_ : _ list) =
+    Context.get_bakers ~cycle:(add cycle future_offset) (B b)
+  in
+  let*! res = Context.get_bakers ~cycle:(add cycle (future_offset + 1)) (B b) in
+  let* () =
+    Assert.proto_error_with_info
+      ~loc:__LOC__
+      res
+      ~error_info_field:`Message
+      (expected_error_message `Future cycle)
+  in
+  let* b = Block.bake_until_n_cycle_end past_offset b in
   let cycle = add cycle past_offset in
-  Context.get_bakers ~cycle:(Stdlib.Option.get (sub cycle past_offset)) (B b)
-  >>=? fun (_ : _ list) ->
-  Context.get_bakers
-    ~cycle:(Stdlib.Option.get (sub cycle (past_offset + 1)))
-    (B b)
-  >>= fun res ->
-  Assert.proto_error_with_info
-    ~loc:__LOC__
-    res
-    ~error_info_field:`Message
-    (expected_error_message `Past cycle)
-  >>=? fun () ->
-  Context.get_bakers ~cycle:(add cycle future_offset) (B b)
-  >>=? fun (_ : _ list) ->
-  Context.get_bakers ~cycle:(add cycle (future_offset + 1)) (B b) >>= fun res ->
+  let* (_ : _ list) =
+    Context.get_bakers ~cycle:(Stdlib.Option.get (sub cycle past_offset)) (B b)
+  in
+  let*! res =
+    Context.get_bakers
+      ~cycle:(Stdlib.Option.get (sub cycle (past_offset + 1)))
+      (B b)
+  in
+  let* () =
+    Assert.proto_error_with_info
+      ~loc:__LOC__
+      res
+      ~error_info_field:`Message
+      (expected_error_message `Past cycle)
+  in
+  let* (_ : _ list) =
+    Context.get_bakers ~cycle:(add cycle future_offset) (B b)
+  in
+  let*! res = Context.get_bakers ~cycle:(add cycle (future_offset + 1)) (B b) in
   Assert.proto_error_with_info
     ~loc:__LOC__
     res
@@ -639,11 +701,14 @@ let tests =
       "revelation_missing_and_late"
       `Quick
       test_revelation_missing_and_late;
-    Tztest.tztest "test unrevealed" `Quick test_unrevealed;
+    Tztest.tztest "unrevealed" `Quick test_unrevealed;
     Tztest.tztest
-      "test_early_incorrect_unverified_correct_already_vdf"
+      "early_incorrect_unverified_correct_already_vdf"
       `Quick
       test_early_incorrect_unverified_correct_already_vdf;
-    Tztest.tztest "test VDF status" `Quick test_vdf_status;
+    Tztest.tztest "VDF status" `Quick test_vdf_status;
     Tztest.tztest "for_cycle cycle bounds" `Quick test_cycle_bounds;
   ]
+
+let () =
+  Alcotest_lwt.run ~__FILE__ Protocol.name [("seed", tests)] |> Lwt_main.run

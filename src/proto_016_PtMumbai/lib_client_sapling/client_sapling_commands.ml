@@ -70,9 +70,7 @@ let bound_data_of_public_key_hash cctxt dst =
   let open Tezos_micheline in
   let open Protocol.Michelson_v1_primitives in
   let pkh_bytes =
-    Data_encoding.Binary.to_bytes_exn
-      Tezos_crypto.Signature.Public_key_hash.encoding
-      dst
+    Data_encoding.Binary.to_bytes_exn Signature.Public_key_hash.encoding dst
   in
   let micheline_bytes = Micheline.(Bytes (0, pkh_bytes) |> strip_locations) in
   let micheline_pkh_type =
@@ -161,13 +159,13 @@ let shield_cmd =
          ~name:"qty"
          ~desc:"Amount taken from transparent wallet of source."
     @@ Tezos_clic.prefix "from"
-    @@ ContractAlias.destination_param
+    @@ Contract_alias.destination_param
          ~name:"src-tz"
          ~desc:"Transparent source account."
     @@ Tezos_clic.prefix "to"
     @@ Tezos_clic.string ~name:"dst-sap" ~desc:"Sapling address of destination."
     @@ Tezos_clic.prefix "using"
-    @@ OriginatedContractAlias.destination_param
+    @@ Originated_contract_alias.destination_param
          ~name:"sapling contract"
          ~desc:"Smart contract to submit this transaction to."
     @@ Tezos_clic.stop)
@@ -184,7 +182,8 @@ let shield_cmd =
          source
          sapling_dst
          contract_dst
-         cctxt ->
+         cctxt
+       ->
       keys_of_implicit_account cctxt source >>=? fun (pkh, src_pk, src_sk) ->
       let open Context in
       cctxt#warning
@@ -253,11 +252,11 @@ let unshield_cmd =
          ~name:"src-sap"
          ~desc:"Sapling account of source."
     @@ Tezos_clic.prefix "to"
-    @@ ContractAlias.destination_param
+    @@ Contract_alias.destination_param
          ~name:"dst-tz"
          ~desc:"Transparent destination account."
     @@ Tezos_clic.prefix "using"
-    @@ OriginatedContractAlias.destination_param
+    @@ Originated_contract_alias.destination_param
          ~name:"sapling contract"
          ~desc:"Smart contract to submit this transaction to."
     @@ Tezos_clic.stop)
@@ -273,7 +272,8 @@ let unshield_cmd =
          (name, _sapling_uri)
          tz_dst
          contract_dst
-         cctxt ->
+         cctxt
+       ->
       let open Context in
       let stez = Shielded_tez.of_tez amount in
       cctxt#warning
@@ -359,7 +359,7 @@ let forge_shielded_cmd =
     @@ Tezos_clic.prefix "to"
     @@ Tezos_clic.string ~name:"dst-sap" ~desc:"Sapling address of destination."
     @@ Tezos_clic.prefix "using"
-    @@ OriginatedContractAlias.destination_param
+    @@ Originated_contract_alias.destination_param
          ~name:"sapling contract"
          ~desc:"Smart contract to submit this transaction to."
     @@ Tezos_clic.stop)
@@ -378,7 +378,8 @@ let forge_shielded_cmd =
          (name, _sapling_uri)
          destination
          contract_dst
-         cctxt ->
+         cctxt
+       ->
       let open Context in
       let stez = Shielded_tez.of_tez amount in
       do_sapling_transfer cctxt ?message contract_dst name stez destination
@@ -386,19 +387,19 @@ let forge_shielded_cmd =
       let file = Option.value ~default:sapling_transaction_file file in
       cctxt#message "Writing transaction to %s@." file >>= fun () ->
       (if use_json_format then
-       save_json_to_file
-         (Data_encoding.Json.construct UTXO.transaction_encoding transaction)
-         file
-      else
-        let bytes =
-          Hex.of_bytes
-            (Data_encoding.Binary.to_bytes_exn
-               UTXO.transaction_encoding
-               transaction)
-        in
-        let file = open_out_bin file in
-        Printf.fprintf file "0x%s" (Hex.show bytes) ;
-        close_out file) ;
+         save_json_to_file
+           (Data_encoding.Json.construct UTXO.transaction_encoding transaction)
+           file
+       else
+         let bytes =
+           Hex.of_bytes
+             (Data_encoding.Binary.to_bytes_exn
+                UTXO.transaction_encoding
+                transaction)
+         in
+         let file = open_out_bin file in
+         Printf.fprintf file "0x%s" (Hex.show bytes) ;
+         close_out file) ;
       return_unit)
 
 let submit_shielded_cmd =
@@ -425,11 +426,11 @@ let submit_shielded_cmd =
          ~name:"file"
          ~desc:"Filename of the forged transaction."
     @@ Tezos_clic.prefix "from"
-    @@ ContractAlias.destination_param
+    @@ Contract_alias.destination_param
          ~name:"alias-tz"
          ~desc:"Transparent account paying the fees."
     @@ Tezos_clic.prefix "using"
-    @@ OriginatedContractAlias.destination_param
+    @@ Originated_contract_alias.destination_param
          ~name:"sapling contract"
          ~desc:"Smart contract to submit this transaction to."
     @@ Tezos_clic.stop)
@@ -445,7 +446,8 @@ let submit_shielded_cmd =
          filename
          source
          destination
-         (cctxt : Protocol_client_context.full) ->
+         (cctxt : Protocol_client_context.full)
+       ->
       cctxt#message
         "Reading forge transaction from file %s -- sending it to %a@."
         filename
@@ -454,18 +456,18 @@ let submit_shielded_cmd =
       >>= fun () ->
       let open Context in
       (if use_json_format then
-       Lwt_utils_unix.Json.read_file filename >>=? fun json ->
-       return @@ Data_encoding.Json.destruct UTXO.transaction_encoding json
-      else
-        Lwt_utils_unix.read_file filename >>= fun hex ->
-        let hex =
-          (* remove 0x *)
-          String.sub hex 2 (String.length hex - 2)
-        in
-        return
-        @@ Data_encoding.Binary.of_bytes_exn
-             UTXO.transaction_encoding
-             Hex.(to_bytes_exn (`Hex hex)))
+         Lwt_utils_unix.Json.read_file filename >>=? fun json ->
+         return @@ Data_encoding.Json.destruct UTXO.transaction_encoding json
+       else
+         Lwt_utils_unix.read_file filename >>= fun hex ->
+         let hex =
+           (* remove 0x *)
+           String.sub hex 2 (String.length hex - 2)
+         in
+         return
+         @@ Data_encoding.Binary.of_bytes_exn
+              UTXO.transaction_encoding
+              Hex.(to_bytes_exn (`Hex hex)))
       >>=? fun transaction ->
       return (sapling_transaction_as_arg transaction) >>=? fun contract_input ->
       let chain = cctxt#chain and block = cctxt#block in
@@ -500,7 +502,7 @@ let submit_shielded_cmd =
       | Some (_res, _contracts) -> return_unit)
 
 let for_contract_arg =
-  Client_proto_contracts.OriginatedContractAlias.destination_arg
+  Client_proto_contracts.Originated_contract_alias.destination_arg
     ~name:"for-contract"
     ~doc:"name of the contract to associate new key with"
     ()
@@ -543,14 +545,15 @@ let use_key_for_contract_cmd =
          ~name:"sapling-key"
          ~desc:"Sapling key to use for the contract."
     @@ Tezos_clic.prefixes ["for"; "contract"]
-    @@ Client_proto_contracts.OriginatedContractAlias.destination_param
+    @@ Client_proto_contracts.Originated_contract_alias.destination_param
          ~name:"contract"
          ~desc:"Contract the key will be used on."
     @@ Tezos_clic.stop)
     (fun default_memo_size
          (name, _sapling_uri)
          contract
-         (cctxt : Protocol_client_context.full) ->
+         (cctxt : Protocol_client_context.full)
+       ->
       Wallet.find_vk cctxt name >>=? fun vk ->
       Context.Client_state.register
         cctxt
@@ -575,7 +578,8 @@ let import_key_cmd =
     @@ Sapling_key.fresh_alias_param @@ Tezos_clic.stop)
     (fun (force, unencrypted, mnemonic_opt)
          fresh_name
-         (cctxt : Protocol_client_context.full) ->
+         (cctxt : Protocol_client_context.full)
+       ->
       (match mnemonic_opt with
       | None ->
           let rec loop_words (acc : string list) i =
@@ -632,7 +636,8 @@ let commands () =
            fresh_name
            (existing_name, _existing_uri)
            child_index
-           (cctxt : Protocol_client_context.full) ->
+           (cctxt : Protocol_client_context.full)
+         ->
         Sapling_key.of_fresh cctxt force fresh_name >>=? fun new_name ->
         Wallet.derive
           cctxt
@@ -662,7 +667,10 @@ let commands () =
       (Tezos_clic.args1 index_arg)
       (Tezos_clic.prefixes ["sapling"; "gen"; "address"]
       @@ Sapling_key.alias_param @@ Tezos_clic.stop)
-      (fun index_opt (name, _sapling_uri) (cctxt : Protocol_client_context.full) ->
+      (fun index_opt
+           (name, _sapling_uri)
+           (cctxt : Protocol_client_context.full)
+         ->
         Wallet.new_address cctxt name index_opt
         >>=? fun (_, corrected_index, address) ->
         let address_b58 =
@@ -686,7 +694,11 @@ let commands () =
            ~desc:"Filename."
            Client_proto_args.string_parameter
       @@ Tezos_clic.stop)
-      (fun () (name, _sapling_uri) file (cctxt : Protocol_client_context.full) ->
+      (fun ()
+           (name, _sapling_uri)
+           file
+           (cctxt : Protocol_client_context.full)
+         ->
         Wallet.export_vk cctxt name >>=? fun vk_json ->
         return (save_json_to_file vk_json file));
     Tezos_clic.command
@@ -703,14 +715,15 @@ let commands () =
            ~name:"sapling-key"
            ~desc:"Sapling key we get balance for."
       @@ Tezos_clic.prefixes ["in"; "contract"]
-      @@ Client_proto_contracts.OriginatedContractAlias.destination_param
+      @@ Client_proto_contracts.Originated_contract_alias.destination_param
            ~name:"contract"
            ~desc:"Contract we get balance from."
       @@ Tezos_clic.stop)
       (fun verbose
            (name, _sapling_uri)
            contract
-           (cctxt : Protocol_client_context.full) ->
+           (cctxt : Protocol_client_context.full)
+         ->
         Wallet.find_vk cctxt name >>= function
         | Error _ -> cctxt#error "Account %s not found" name
         | Ok vk -> (
@@ -720,12 +733,12 @@ let commands () =
             | None -> cctxt#error "Account %s not found" name
             | Some account ->
                 (if verbose then
-                 cctxt#answer
-                   "@[<v 2>Received Sapling transactions for %s@,@[<v>%a@]@]"
-                   name
-                   Context.Account.pp_unspent
-                   account
-                else Lwt.return_unit)
+                   cctxt#answer
+                     "@[<v 2>Received Sapling transactions for %s@,@[<v>%a@]@]"
+                     name
+                     Context.Account.pp_unspent
+                     account
+                 else Lwt.return_unit)
                 >>= fun () ->
                 cctxt#answer
                   "Total Sapling funds %a%s"

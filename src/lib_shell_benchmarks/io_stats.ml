@@ -90,15 +90,28 @@ let load_tree context key =
   Context.fold
     context
     key
-    ~order:`Sorted
+    ~order:`Undefined
     ~init:Io_helpers.Key_map.empty
     ~f:(fun path t tree ->
       let+ o = Context.Tree.to_value t in
       match o with
       | Some bytes ->
           let len = Bytes.length bytes in
-          Io_helpers.Key_map.insert path len tree
+          Io_helpers.Key_map.insert (key @ path) len tree
       | None -> tree)
+
+let fold_tree base_dir context_hash key init f =
+  Format.eprintf "Loading the trees of %a@." Context_hash.pp context_hash ;
+  let open Lwt.Syntax in
+  let* context, index =
+    Io_helpers.load_context_from_disk_lwt base_dir context_hash
+  in
+  let* acc =
+    Context.fold context key ~order:`Undefined ~init ~f:(fun path t acc ->
+        f acc (key @ path) t)
+  in
+  let+ () = Tezos_context.Context.close index in
+  acc
 
 let context_statistics base_dir context_hash =
   let open Lwt_syntax in
@@ -145,4 +158,4 @@ let plot_histograms pdf_file {degrees; depths; sizes; _} =
       [Histogram.hist ~bins:50 ~points ()]
   in
   let plots = [|[|Some degree; Some depth; Some size|]|] in
-  run_matrix ~target:(pdf ~cm_size:(30.0, 20.0) ~pdf_file ()) exec plots
+  run_matrix ~target:(pdf ~cm_size:(30.0, 20.0) ~pdf_file ()) plots

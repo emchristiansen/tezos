@@ -1,0 +1,110 @@
+(*****************************************************************************)
+(*                                                                           *)
+(* SPDX-License-Identifier: MIT                                              *)
+(* Copyright (c) 2025 Functori <contact@functori.com>                        *)
+(* Copyright (c) 2025 Nomadic Labs <contact@nomadic-labs.com>                *)
+(*                                                                           *)
+(*****************************************************************************)
+
+type level = {
+  level : int32;
+      (** The level of the block relative to genesis. This
+      is also the Shell's notion of level. *)
+  cycle : int32;
+      (** The current cycle's number. Note that cycles are a protocol-specific
+      notion. As a result, the cycle number starts at 0 with the first block of
+      the first version of protocol alpha. *)
+  cycle_position : int32;
+      (** The current level of the block relative to the first block of the current
+      cycle. *)
+}
+
+(** [convert_using_serialization ~dst ~src value] Conversion from one type with
+    encoding [src] to another with encoding [dst], through serialization.
+    Costly, but useful to build instances of a type when no builder is
+    accessible. *)
+val convert_using_serialization :
+  name:string ->
+  dst:'a Data_encoding.t ->
+  src:'b Data_encoding.t ->
+  'b ->
+  'a tzresult
+
+(** Converts a protocol [Chain_id.t] to its L2 counterpart using
+    little-endian byte interpretation, consistent with the kernel's
+    [to_le_bytes()] convention. *)
+val l2_chain_id_from_protocol_chain_id : Chain_id.t -> L2_types.chain_id
+
+(** Imports the type Contract.t from Alpha_context. Not everything is imported
+    from Alpha_context.Contract as most of it require a context, which we
+    can't provide.
+ *)
+module Contract : sig
+  type t = Tezlink_imports.Imported_context.Contract.t
+
+  type implicit = Signature.V3.Public_key_hash.t
+
+  val encoding : t Data_encoding.t
+
+  val implicit_encoding : Signature.V3.public_key_hash Data_encoding.t
+
+  val to_b58check : t -> string
+
+  val of_b58check : string -> t tzresult
+
+  val of_implicit : Signature.V3.public_key_hash -> t
+
+  val of_originated : Tezlink_imports.Imported_protocol.Contract_hash.t -> t
+
+  val of_hex : string -> Signature.V3.public_key_hash option
+end
+
+module Tez : sig
+  include module type of Tezlink_imports.Imported_context.Tez
+
+  type nanotez = Nanotez of Q.t
+
+  type wei = Wei of Z.t
+
+  val of_string_exn : string -> t
+
+  val to_mutez_z : t -> Z.t
+
+  val of_mutez_z : Z.t -> t tzresult
+
+  val of_wei : wei -> t tzresult
+
+  val nanotez_of_wei : wei -> nanotez
+
+  val to_wei : t -> wei
+
+  val of_nanotez_ceil : nanotez -> t tzresult
+end
+
+module Operation : sig
+  type t = {
+    source : Signature.V3.public_key_hash;
+    first_counter : Z.t;
+    length : int;
+    op : Tezlink_imports.Imported_context.packed_operation;
+    raw : bytes;
+    fee : Tez.t;
+    gas_limit : Z.t;
+  }
+
+  val counter_to_z :
+    Tezlink_imports.Imported_context.Manager_counter.t -> Z.t tzresult
+
+  val hash_operation : t -> Ethereum_types.hash
+
+  val encoding : t Data_encoding.t
+
+  val gas_limit_to_z :
+    Tezlink_imports.Imported_context.Gas.Arith.integral -> Z.t
+
+  (** Underapproximation of the size of the smallest operation, defined as a
+      Reveal of tz1 key, with zero fees/gas limit/storage limit/....*)
+  val minimum_operation_size : int
+end
+
+module Manager = Tezlink_imports.Imported_protocol.Manager_repr

@@ -23,189 +23,232 @@
 (*                                                                           *)
 (*****************************************************************************)
 
-module Selected_distribution_for_cycle = struct
-  module Cache_client = struct
-    type cached_value = (Signature.Public_key_hash.t * Tez_repr.t) list
+module Private_selected_distribution = Selected_distribution_storage
 
-    let namespace = Cache_repr.create_namespace "stake_distribution"
+let set_selected_distribution_for_cycle ctxt cycle distrib total_stake =
+  Private_selected_distribution.set_selected_distribution_for_cycle
+    ctxt
+    cycle
+    distrib
+    total_stake
 
-    let cache_index = 1
+let get_selected_distribution ctxt cycle =
+  Private_selected_distribution.get_selected_distribution ctxt cycle
 
-    let value_of_identifier ctxt identifier =
-      let cycle = Cycle_repr.of_string_exn identifier in
-      Storage.Stake.Selected_distribution_for_cycle.get ctxt cycle
-  end
+let find_selected_distribution ctxt cycle =
+  Private_selected_distribution.find_selected_distribution ctxt cycle
 
-  module Cache = (val Cache_repr.register_exn (module Cache_client))
+let get_selected_distribution_as_map ctxt cycle =
+  Private_selected_distribution.get_selected_distribution_as_map ctxt cycle
 
-  let identifier_of_cycle cycle = Format.asprintf "%a" Cycle_repr.pp cycle
+let prepare_stake_distribution =
+  Private_selected_distribution.prepare_stake_distribution
 
-  let init ctxt cycle stakes =
-    let id = identifier_of_cycle cycle in
-    Storage.Stake.Selected_distribution_for_cycle.init ctxt cycle stakes
-    >>=? fun ctxt ->
-    let size = 1 (* that's symbolic: 1 cycle = 1 entry *) in
-    Cache.update ctxt id (Some (stakes, size)) >>?= fun ctxt -> return ctxt
+let get_total_active_stake =
+  Private_selected_distribution.get_total_active_stake
 
-  let get ctxt cycle =
-    let id = identifier_of_cycle cycle in
-    Cache.find ctxt id >>=? function
-    | None -> Storage.Stake.Selected_distribution_for_cycle.get ctxt cycle
-    | Some v -> return v
+let clear_at_cycle_end ctxt ~new_cycle =
+  let open Lwt_result_syntax in
+  match Cycle_storage.cycle_to_clear_of_sampling_data ~new_cycle with
+  | None -> return ctxt
+  | Some cycle_to_clear ->
+      let* ctxt =
+        Storage.Stake.Total_active_stake.remove_existing ctxt cycle_to_clear
+      in
+      Private_selected_distribution.Selected_distribution_for_cycle
+      .remove_existing
+        ctxt
+        cycle_to_clear
 
-  let remove_existing ctxt cycle =
-    let id = identifier_of_cycle cycle in
-    Cache.update ctxt id None >>?= fun ctxt ->
-    Storage.Stake.Selected_distribution_for_cycle.remove_existing ctxt cycle
-end
+let get_full_staking_balance = Storage.Stake.Staking_balance.get
 
-let get_staking_balance = Storage.Stake.Staking_balance.get
-
-let get_initialized_stake ctxt delegate =
-  Storage.Stake.Staking_balance.find ctxt delegate >>=? function
-  | Some staking_balance -> return (staking_balance, ctxt)
-  | None ->
-      Frozen_deposits_storage.init ctxt delegate >>=? fun ctxt ->
-      let balance = Tez_repr.zero in
-      Storage.Stake.Staking_balance.init ctxt delegate balance >>=? fun ctxt ->
-      return (balance, ctxt)
-
-let remove_stake ctxt delegate amount =
-  get_initialized_stake ctxt delegate >>=? fun (staking_balance_before, ctxt) ->
-  Tez_repr.(staking_balance_before -? amount) >>?= fun staking_balance ->
-  Storage.Stake.Staking_balance.update ctxt delegate staking_balance
-  >>=? fun ctxt ->
+let has_minimal_stake ctxt staking_balance =
   let minimal_stake = Constants_storage.minimal_stake ctxt in
-  if Tez_repr.(staking_balance_before >= minimal_stake) then
-    Delegate_activation_storage.is_inactive ctxt delegate >>=? fun inactive ->
-    if (not inactive) && Tez_repr.(staking_balance < minimal_stake) then
-      Storage.Stake.Active_delegates_with_minimal_stake.remove ctxt delegate
-      >>= fun ctxt -> return ctxt
-    else return ctxt
-  else
-    (* The delegate was not in Stake.Active_delegates_with_minimal_stake,
-       either because it was inactive, or because it did not have a
-       the minimal required stake, in which case it still does not have it. *)
-    return ctxt
+  Full_staking_balance_repr.has_minimal_stake_to_be_considered
+    ~minimal_stake
+    staking_balance
 
-let add_stake ctxt delegate amount =
-  get_initialized_stake ctxt delegate >>=? fun (staking_balance_before, ctxt) ->
-  Tez_repr.(amount +? staking_balance_before) >>?= fun staking_balance ->
-  Storage.Stake.Staking_balance.update ctxt delegate staking_balance
-  >>=? fun ctxt ->
-  let minimal_stake = Constants_storage.minimal_stake ctxt in
-  if Tez_repr.(staking_balance >= minimal_stake) then
-    Delegate_activation_storage.is_inactive ctxt delegate >>=? fun inactive ->
-    if inactive || Tez_repr.(staking_balance_before >= minimal_stake) then
-      return ctxt
-    else
-      Storage.Stake.Active_delegates_with_minimal_stake.add ctxt delegate ()
-      >>= fun ctxt -> return ctxt
-  else
-    (* The delegate was not in Stake.Active_delegates_with_minimal_stake,
-       because it did not have the minimal required stake (as otherwise it
-       would also have it now). *)
+let initialize_delegate ctxt delegate ~delegated =
+  let open Lwt_result_syntax in
+  let current_level = Raw_context.current_level ctxt in
+  let balance =
+    Full_staking_balance_repr.init
+      ~own_frozen:Tez_repr.zero
+      ~staked_frozen:Tez_repr.zero
+      ~delegated
+      ~current_level
+  in
+  let* ctxt = Storage.Stake.Staking_balance.init ctxt delegate balance in
+  if has_minimal_stake ctxt balance then
+    let*! ctxt =
+      Storage.Stake.Active_delegates_with_minimal_stake.add ctxt delegate
+    in
     return ctxt
+  else return ctxt
+
+let update_stake ~f ctxt delegate =
+  let open Lwt_result_syntax in
+  let* staking_balance_before = get_full_staking_balance ctxt delegate in
+  let*? staking_balance = f staking_balance_before in
+  let* ctxt =
+    Storage.Stake.Staking_balance.update ctxt delegate staking_balance
+  in
+  (* Since the staking balance has changed, the delegate might have
+     moved across the minimal stake barrier. If so we may need to
+     update the set of active delegates with minimal stake. *)
+  let had_minimal_stake_before =
+    has_minimal_stake ctxt staking_balance_before
+  in
+  let has_minimal_stake_after = has_minimal_stake ctxt staking_balance in
+  match (had_minimal_stake_before, has_minimal_stake_after) with
+  | true, false ->
+      (* Decrease below the minimal stake. *)
+      let* inactive = Delegate_activation_storage.is_inactive ctxt delegate in
+      if inactive then
+        (* The delegate is inactive so it wasn't in the set and we
+           don't need to update it. *)
+        return ctxt
+      else
+        let*! ctxt =
+          Storage.Stake.Active_delegates_with_minimal_stake.remove ctxt delegate
+        in
+        return ctxt
+  | false, true ->
+      (* Increase above the minimal stake. *)
+      let* inactive = Delegate_activation_storage.is_inactive ctxt delegate in
+      if inactive then
+        (* The delegate is inactive so we don't need to add it to the
+           set. *)
+        return ctxt
+      else
+        let*! ctxt =
+          Storage.Stake.Active_delegates_with_minimal_stake.add ctxt delegate
+        in
+        return ctxt
+  | false, false | true, true -> return ctxt
+
+let remove_delegated_stake ctxt delegate amount =
+  let current_level = Raw_context.current_level ctxt in
+  let cycle_eras = Raw_context.cycle_eras ctxt in
+  let f =
+    Full_staking_balance_repr.remove_delegated
+      ~cycle_eras
+      ~current_level
+      ~amount
+  in
+  update_stake ctxt delegate ~f
+
+let remove_own_frozen_stake ctxt delegate amount =
+  let f = Full_staking_balance_repr.remove_own_frozen ~amount in
+  update_stake ctxt delegate ~f
+
+let remove_staked_frozen_stake ctxt delegate amount =
+  let f = Full_staking_balance_repr.remove_staked_frozen ~amount in
+  update_stake ctxt delegate ~f
+
+let remove_frozen_stake_only_call_from_token ctxt staker amount =
+  match staker with
+  | Frozen_staker_repr.Baker delegate ->
+      remove_own_frozen_stake ctxt delegate amount
+  | Frozen_staker_repr.Baker_edge delegate ->
+      (* This case should not happen because [Baker_edge] is only
+         intended to be used for rewards. *)
+      remove_own_frozen_stake ctxt delegate amount
+  | Single_staker {staker = _; delegate} | Shared_between_stakers {delegate} ->
+      remove_staked_frozen_stake ctxt delegate amount
+
+let add_delegated_stake ctxt delegate amount =
+  let current_level = Raw_context.current_level ctxt in
+  let cycle_eras = Raw_context.cycle_eras ctxt in
+  let f =
+    Full_staking_balance_repr.add_delegated ~cycle_eras ~current_level ~amount
+  in
+  update_stake ctxt delegate ~f
+
+let add_own_frozen_stake ctxt delegate amount =
+  let f = Full_staking_balance_repr.add_own_frozen ~amount in
+  update_stake ctxt delegate ~f
+
+let add_staked_frozen_stake ctxt delegate amount =
+  let f = Full_staking_balance_repr.add_staked_frozen ~amount in
+  update_stake ctxt delegate ~f
+
+let set_stez_frozen_stake ctxt delegate amount =
+  let f = Full_staking_balance_repr.set_stez_frozen ~amount in
+  update_stake ctxt delegate ~f
+
+let clear_stez_frozen_stake ctxt delegate =
+  let f = Full_staking_balance_repr.clear_stez_frozen in
+  update_stake ctxt delegate ~f
+
+let add_frozen_stake_only_call_from_token ctxt staker amount =
+  match staker with
+  | Frozen_staker_repr.Baker delegate ->
+      add_own_frozen_stake ctxt delegate amount
+  | Frozen_staker_repr.Baker_edge delegate ->
+      add_own_frozen_stake ctxt delegate amount
+  | Single_staker {staker = _; delegate} | Shared_between_stakers {delegate} ->
+      add_staked_frozen_stake ctxt delegate amount
 
 let set_inactive ctxt delegate =
-  Delegate_activation_storage.set_inactive ctxt delegate >>= fun ctxt ->
+  let open Lwt_syntax in
+  let* ctxt = Delegate_activation_storage.set_inactive ctxt delegate in
   Storage.Stake.Active_delegates_with_minimal_stake.remove ctxt delegate
 
 let set_active ctxt delegate =
-  Delegate_activation_storage.set_active ctxt delegate
-  >>=? fun (ctxt, inactive) ->
+  let open Lwt_result_syntax in
+  let* ctxt, inactive = Delegate_activation_storage.set_active ctxt delegate in
   if not inactive then return ctxt
   else
-    get_initialized_stake ctxt delegate >>=? fun (staking_balance, ctxt) ->
-    let minimal_stake = Constants_storage.minimal_stake ctxt in
-    if Tez_repr.(staking_balance >= minimal_stake) then
-      Storage.Stake.Active_delegates_with_minimal_stake.add ctxt delegate ()
-      >>= fun ctxt -> return ctxt
+    let* staking_balance = get_full_staking_balance ctxt delegate in
+    if has_minimal_stake ctxt staking_balance then
+      let*! ctxt =
+        Storage.Stake.Active_delegates_with_minimal_stake.add ctxt delegate
+      in
+      return ctxt
     else return ctxt
 
-let snapshot ctxt =
-  Storage.Stake.Last_snapshot.get ctxt >>=? fun index ->
-  Storage.Stake.Last_snapshot.update ctxt (index + 1) >>=? fun ctxt ->
-  Storage.Stake.Staking_balance.snapshot ctxt index >>=? fun ctxt ->
-  Storage.Stake.Active_delegates_with_minimal_stake.snapshot ctxt index
-
-let max_snapshot_index = Storage.Stake.Last_snapshot.get
-
-let set_selected_distribution_for_cycle ctxt cycle stakes total_stake =
-  let stakes = List.sort (fun (_, x) (_, y) -> Tez_repr.compare y x) stakes in
-  Selected_distribution_for_cycle.init ctxt cycle stakes >>=? fun ctxt ->
-  Storage.Stake.Total_active_stake.add ctxt cycle total_stake >>= fun ctxt ->
-  (* cleanup snapshots *)
-  Storage.Stake.Staking_balance.Snapshot.clear ctxt >>= fun ctxt ->
-  Storage.Stake.Active_delegates_with_minimal_stake.Snapshot.clear ctxt
-  >>= fun ctxt -> Storage.Stake.Last_snapshot.update ctxt 0
-
-let clear_cycle ctxt cycle =
-  Storage.Stake.Total_active_stake.remove_existing ctxt cycle >>=? fun ctxt ->
-  Selected_distribution_for_cycle.remove_existing ctxt cycle
-
-let fold ctxt ~f ~order init =
+let fold_on_active_delegates_with_minimal_stake_es ctxt ~f ~order ~init =
+  let open Lwt_result_syntax in
   Storage.Stake.Active_delegates_with_minimal_stake.fold
     ctxt
     ~order
     ~init:(Ok init)
-    ~f:(fun delegate () acc ->
-      acc >>?= fun acc ->
-      get_staking_balance ctxt delegate >>=? fun stake ->
-      f (delegate, stake) acc)
+    ~f:(fun delegate acc ->
+      let*? acc in
+      f delegate acc)
 
-let fold_snapshot ctxt ~index ~f ~init =
-  Storage.Stake.Active_delegates_with_minimal_stake.fold_snapshot
-    ctxt
-    index
-    ~order:`Sorted
-    ~init
-    ~f:(fun delegate () acc ->
-      Storage.Stake.Staking_balance.Snapshot.get ctxt (index, delegate)
-      >>=? fun stake -> f (delegate, stake) acc)
-
-let clear_at_cycle_end ctxt ~new_cycle =
-  let max_slashing_period = Constants_storage.max_slashing_period ctxt in
-  match Cycle_repr.sub new_cycle max_slashing_period with
-  | None -> return ctxt
-  | Some cycle_to_clear -> clear_cycle ctxt cycle_to_clear
-
-let get ctxt delegate =
-  Storage.Stake.Active_delegates_with_minimal_stake.mem ctxt delegate
-  >>= function
-  | true -> get_staking_balance ctxt delegate
-  | false -> return Tez_repr.zero
-
-let fold_on_active_delegates_with_minimal_stake =
+let fold_on_active_delegates_with_minimal_stake_s =
   Storage.Stake.Active_delegates_with_minimal_stake.fold
 
-let get_selected_distribution = Selected_distribution_for_cycle.get
-
-let find_selected_distribution =
-  Storage.Stake.Selected_distribution_for_cycle.find
-
-let prepare_stake_distribution ctxt =
-  let level = Level_storage.current ctxt in
-  Selected_distribution_for_cycle.get ctxt level.cycle >>=? fun stakes ->
-  let stake_distribution =
-    List.fold_left
-      (fun map (pkh, stake) -> Signature.Public_key_hash.Map.add pkh stake map)
-      Signature.Public_key_hash.Map.empty
-      stakes
-  in
-  return
-    (Raw_context.init_stake_distribution_for_current_cycle
-       ctxt
-       stake_distribution)
-
-let get_total_active_stake = Storage.Stake.Total_active_stake.get
-
-let remove_contract_stake ctxt contract amount =
-  Contract_delegate_storage.find ctxt contract >>=? function
+let remove_contract_delegated_stake ctxt contract amount =
+  let open Lwt_result_syntax in
+  let* delegate_opt = Contract_delegate_storage.find ctxt contract in
+  match delegate_opt with
   | None -> return ctxt
-  | Some delegate -> remove_stake ctxt delegate amount
+  | Some delegate -> remove_delegated_stake ctxt delegate amount
 
-let add_contract_stake ctxt contract amount =
-  Contract_delegate_storage.find ctxt contract >>=? function
+let add_contract_delegated_stake ctxt contract amount =
+  let open Lwt_result_syntax in
+  let* delegate_opt = Contract_delegate_storage.find ctxt contract in
+  match delegate_opt with
   | None -> return ctxt
-  | Some delegate -> add_stake ctxt delegate amount
+  | Some delegate -> add_delegated_stake ctxt delegate amount
+
+module For_RPC = struct
+  let get_staking_balance ctxt delegate =
+    let open Lwt_result_syntax in
+    let* staking_balance = Storage.Stake.Staking_balance.get ctxt delegate in
+    Lwt.return (Full_staking_balance_repr.current_total staking_balance)
+end
+
+module Internal_for_tests = struct
+  let get ctxt delegate =
+    let open Lwt_result_syntax in
+    let*! result =
+      Storage.Stake.Active_delegates_with_minimal_stake.mem ctxt delegate
+    in
+    match result with
+    | true -> For_RPC.get_staking_balance ctxt delegate
+    | false -> return Tez_repr.zero
+end

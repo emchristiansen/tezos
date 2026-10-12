@@ -2,6 +2,7 @@
 (*                                                                           *)
 (* Open Source License                                                       *)
 (* Copyright (c) 2022 Trili Tech, <contact@trili.com>                        *)
+(* Copyright (c) 2023  Marigold <contact@marigold.dev>                       *)
 (*                                                                           *)
 (* Permission is hereby granted, free of charge, to any person obtaining a   *)
 (* copy of this software and associated documentation files (the "Software"),*)
@@ -24,9 +25,10 @@
 (*****************************************************************************)
 
 open Protocol
+open Benchmarks_proto
 open Alpha_context
 
-let ns = Namespace.make Registration_helpers.ns "tickets"
+let ns = Namespace.make Registration.ns "tickets"
 
 let fv s = Free_variable.of_namespace (ns s)
 
@@ -83,14 +85,18 @@ module Compare_ticket_hash_benchmark : Benchmark.S = struct
 
   let info = "Compare cost for Ticket_hash"
 
-  let compare_model =
+  let module_filename = __FILE__
+
+  let purpose = Benchmark.Generate_code "ticket"
+
+  let group = Benchmark.Group "tickets"
+
+  let model =
     Model.make
       ~conv:(fun () -> ())
-      ~model:(Model.unknown_const1 ~name ~const:(fv "compare_ticket_hash"))
+      (Model.unknown_const1 ~const:(fv "compare_ticket_hash"))
 
-  let models = [("compare_tickets", compare_model)]
-
-  let benchmark rng_state _conf () =
+  let create_benchmark ~rng_state _conf =
     let bytes = Base_samplers.bytes rng_state ~size:{min = 1; max = 64} in
     let hash =
       Ticket_hash.of_script_expr_hash @@ Script_expr_hash.hash_bytes [bytes]
@@ -101,12 +107,9 @@ module Compare_ticket_hash_benchmark : Benchmark.S = struct
     let workload = () in
     let closure () = ignore (Ticket_hash.compare hash hash2) in
     Generator.Plain {workload; closure}
-
-  let create_benchmarks ~rng_state ~bench_num config =
-    List.repeat bench_num (benchmark rng_state config)
 end
 
-let () = Registration_helpers.register (module Compare_ticket_hash_benchmark)
+let () = Registration.register (module Compare_ticket_hash_benchmark)
 
 (** A benchmark for {!Ticket_costs.Constants.cost_compare_key_contract}.
 
@@ -134,14 +137,18 @@ module Compare_key_contract_benchmark : Benchmark.S = struct
 
   let info = "Compare cost for Contracts"
 
-  let compare_model =
+  let module_filename = __FILE__
+
+  let purpose = Benchmark.Generate_code "ticket"
+
+  let group = Benchmark.Group "tickets"
+
+  let model =
     Model.make
       ~conv:(fun () -> ())
-      ~model:(Model.unknown_const1 ~name ~const:(fv "compare_contract"))
+      (Model.unknown_const1 ~const:(fv "compare_contract"))
 
-  let models = [("compare_tickets", compare_model)]
-
-  let benchmark rng_state _conf () =
+  let create_benchmark ~rng_state _conf =
     let bytes = Base_samplers.bytes rng_state ~size:{min = 32; max = 64} in
     let branch = Block_hash.hash_bytes [bytes] in
     let op_hash = Operation.hash_raw {shell = {branch}; proto = bytes} in
@@ -151,12 +158,9 @@ module Compare_key_contract_benchmark : Benchmark.S = struct
     let workload = () in
     let closure () = ignore (Contract.compare contract contract2) in
     Generator.Plain {workload; closure}
-
-  let create_benchmarks ~rng_state ~bench_num config =
-    List.repeat bench_num (benchmark rng_state config)
 end
 
-let () = Registration_helpers.register (module Compare_key_contract_benchmark)
+let () = Registration.register (module Compare_key_contract_benchmark)
 
 (* A simple ticket type for use in the benchmarks. *)
 let ticket_ty =
@@ -192,9 +196,15 @@ module Has_tickets_type_benchmark : Benchmark.S = struct
 
   let info = "Benchmarking type_has_tickets"
 
+  let module_filename = __FILE__
+
+  let purpose = Benchmark.Generate_code "ticket"
+
+  let group = Benchmark.Group "tickets"
+
   let make_bench_helper rng_state config () =
     let open Result_syntax in
-    let* ctxt, _ = Lwt_main.run (Execution_context.make ~rng_state) in
+    let* ctxt, _ = Lwt_main.run (Execution_context.make ~rng_state ()) in
     let ctxt = Gas_helpers.set_limit ctxt in
     let size = Random.State.int rng_state config.max_size in
     let (Ex_ty ty) = dummy_type_generator ~rng_state size in
@@ -204,36 +214,30 @@ module Has_tickets_type_benchmark : Benchmark.S = struct
     in
     let workload = {nodes} in
     let closure () = ignore (Ticket_scanner.type_has_tickets ctxt ty) in
-    ok (Generator.Plain {workload; closure})
+    return (Generator.Plain {workload; closure})
 
-  let make_bench rng_state config () =
+  let create_benchmark ~rng_state config =
     match make_bench_helper rng_state config () with
     | Ok closure -> closure
     | Error trace ->
         raise (Ticket_benchmark_error {benchmark_name = name; trace})
 
-  let size_model =
+  let model =
     Model.make
+      ~takes_saturation_reprs:true
       ~conv:(function {nodes} -> (nodes, ()))
-      ~model:
-        (Model.affine
-           ~name
-           ~intercept:
-             (fv (Format.asprintf "%s_const" (Namespace.basename name)))
-           ~coeff:(fv (Format.asprintf "%s_coeff" (Namespace.basename name))))
-
-  let models = [("size_has_tickets_model", size_model)]
-
-  let create_benchmarks ~rng_state ~bench_num config =
-    List.repeat bench_num (make_bench rng_state config)
+      Model.affine
 end
 
-let () = Registration_helpers.register (module Has_tickets_type_benchmark)
+let () = Registration.register (module Has_tickets_type_benchmark)
 
 let ticket_sampler rng_state =
   let seed = Base_samplers.uniform_bytes ~nbytes:32 rng_state in
   let pkh, _, _ = Signature.generate_key ~algo:Signature.Ed25519 ~seed () in
-  let ticketer = Alpha_context.Contract.Implicit pkh in
+  (* FIXME-PA *)
+  let ticketer =
+    Alpha_context.Contract.Implicit (Implicit_account_repr.Forbidden.of_pkh pkh)
+  in
   Script_typed_ir.
     {ticketer; contents = Script_int.zero; amount = Ticket_amount.one}
 
@@ -245,10 +249,16 @@ module Collect_tickets_benchmark : Benchmark.S = struct
 
   let info = "Benchmarking tickets_of_value"
 
+  let module_filename = __FILE__
+
+  let purpose = Benchmark.Generate_code "ticket"
+
+  let group = Benchmark.Group "tickets"
+
   let make_bench_helper rng_state config () =
     let open Script_typed_ir in
     let open Result_syntax in
-    let* ctxt, _ = Lwt_main.run (Execution_context.make ~rng_state) in
+    let* ctxt, _ = Lwt_main.run (Execution_context.make ~rng_state ()) in
     let ctxt = Gas_helpers.set_limit ctxt in
     let ty =
       match list_t (-1) ticket_ty with Error _ -> assert false | Ok t -> t
@@ -272,28 +282,15 @@ module Collect_tickets_benchmark : Benchmark.S = struct
                  has_tickets
                  boxed_ticket_list))
        in
-       ok (Generator.Plain {workload; closure})
+       return (Generator.Plain {workload; closure})
 
-  let make_bench rng_state config () =
+  let create_benchmark ~rng_state config =
     match make_bench_helper rng_state config () with
     | Ok closure -> closure
     | Error trace ->
         raise (Ticket_benchmark_error {benchmark_name = name; trace})
 
-  let size_model =
-    Model.make
-      ~conv:(function {nodes} -> (nodes, ()))
-      ~model:
-        (Model.affine
-           ~name
-           ~intercept:
-             (fv (Format.asprintf "%s_const" (Namespace.basename name)))
-           ~coeff:(fv (Format.asprintf "%s_coeff" (Namespace.basename name))))
-
-  let models = [("size_collect_tickets_step_model", size_model)]
-
-  let create_benchmarks ~rng_state ~bench_num config =
-    List.repeat bench_num (make_bench rng_state config)
+  let model = Model.make ~conv:(function {nodes} -> (nodes, ())) Model.affine
 end
 
-let () = Registration_helpers.register (module Collect_tickets_benchmark)
+let () = Registration.register (module Collect_tickets_benchmark)

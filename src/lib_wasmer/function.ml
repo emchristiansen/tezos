@@ -23,15 +23,24 @@
 (*                                                                           *)
 (*****************************************************************************)
 
+(** WebAssembly function creation and invocation.
+
+    Handles both directions of the FFI boundary:
+    - Creating host functions that WebAssembly modules can call
+      (via {!create}), using [Lwt_preemptive.run_in_main] to re-enter
+      the Lwt event loop from the Wasmer thread.
+    - Calling exported WebAssembly functions from OCaml (via {!call}),
+      using [Lwt_preemptive.detach] for non-blocking execution. *)
+
 open Api
 open Vectors
 
-type owned =
-  (* TODO: https://gitlab.com/tezos/tezos/-/issues/4026
-     Ensure that ownership and lifetime of [Types.Func.t] is respected.
-  *)
-  Types.Func.t Ctypes.ptr
+(** An owned Wasmer function pointer. *)
+type owned = Types.Func.t Ctypes.ptr
 
+(** [call_with_inputs params f inputs] applies the WebAssembly input values
+    from [inputs] to the OCaml function [f] according to the parameter
+    types described by [params]. *)
 let call_with_inputs params f inputs =
   let rec go : type f r. (f, r) Function_type.params -> f -> int -> r =
    fun params f index ->
@@ -46,6 +55,8 @@ let call_with_inputs params f inputs =
   in
   go params f 0
 
+(** [pack_outputs results r outputs] writes the OCaml return value [r]
+    into the Wasmer output value vector [outputs]. *)
 let pack_outputs results r outputs =
   Value_vector.init_uninitialized outputs (Function_type.num_results results) ;
   let rec go : type r. r Function_type.results -> r -> int -> unit =
@@ -65,6 +76,27 @@ let pack_outputs results r outputs =
 
 module Func_callback_maker = (val Types.Func_callback.m)
 
+let () =
+  (* The Ctypes library tries to detect leaked function pointers. However, this
+     does not work correctly for our use cases because we don't keep the
+     underlying function pointers on the OCaml side. Instead we pass them to
+     Wasmer where they will be kept. This means we mustn't prematurely free
+     function pointers just because they are no longer accessible from the
+     OCaml side. *)
+  Foreign.report_leaked_funptr := Fun.const ()
+
+(* Side-channel for host function exceptions. When a host callback raises an
+   OCaml exception, we store it here instead of converting it to a Wasmer trap.
+   This avoids Wasmer's signal-based trap propagation (SIGILL/SIGSEGV) which
+   conflicts with OCaml's runtime signal handlers on macOS ARM64. After WASM
+   execution returns, we check this ref and re-raise the original exception
+   with its full type preserved. This is safe because the Wasmer C API is
+   single-threaded per store. *)
+let host_function_exn : exn option ref = ref None
+
+(** [create store typ f] creates a Wasmer host function from the OCaml
+    function [f] with signature [typ]. Returns the owned function pointer
+    and a cleanup function that frees the callback closure. *)
 let create : type f. Store.t -> f Function_type.t -> f -> owned * (unit -> unit)
     =
  fun store typ f ->
@@ -77,27 +109,55 @@ let create : type f. Store.t -> f Function_type.t -> f -> owned * (unit -> unit)
     pack_outputs results result outputs
   in
   let try_run inputs outputs =
-    try
-      let () = run inputs outputs in
-      Trap.none
-    with exn -> Trap.from_string store (Printexc.to_string exn)
+    match !host_function_exn with
+    | Some _ ->
+        (* A previous host callback already failed. Return a no-op success to
+           Wasmer so that it unwinds without triggering signal-based trap
+           propagation. The stored exception will be re-raised after WASM
+           execution returns. *)
+        Trap.none
+    | None -> (
+        try
+          let () = run inputs outputs in
+          Trap.none
+        with exn ->
+          host_function_exn := Some exn ;
+          Trap.none)
   in
   let try_run = Func_callback_maker.of_fun try_run in
   let free () = Func_callback_maker.free try_run in
   let try_run =
     Ctypes.coerce Func_callback_maker.t Types.Func_callback.t try_run
   in
-  (Functions.Func.new_ store func_type try_run, free)
+  let owned = Functions.Func.new_ store func_type try_run in
+  (* [wasm_func_new] doesn't consume [func_type], therefore we must manually
+     garbage collect it. *)
+  Functions.Functype.delete func_type ;
+  (owned, free)
 
+(** [call_raw func inputs] invokes the Wasmer function [func] with the
+    given input value vector in a detached thread. Raises {!Trap.Trap}
+    if a trap occurs. *)
 let call_raw func inputs =
   let open Lwt.Syntax in
   let outputs = Value_vector.uninitialized (Functions.Func.result_arity func) in
+  (* Clear side-channel before call *)
+  host_function_exn := None ;
   let+ trap =
     Lwt_preemptive.detach
       (fun (inputs, outputs) ->
         Functions.Func.call func (Ctypes.addr inputs) (Ctypes.addr outputs))
       (inputs, outputs)
   in
+  (* Check side-channel first: if a host callback stored an exception, re-raise
+     it directly. This preserves the original exception type and avoids going
+     through Wasmer's trap mechanism. *)
+  (match !host_function_exn with
+  | Some exn ->
+      host_function_exn := None ;
+      if not (Ctypes.is_null trap) then Functions.Trap.delete trap ;
+      raise exn
+  | None -> ()) ;
   Trap.check trap ;
   outputs
 
@@ -124,19 +184,20 @@ exception
 
 let () =
   Printexc.register_printer (function
-      | Not_enough_outputs {got; expected} ->
-          Some
-            (Printf.sprintf
-               "Function did return less values (%s) than expected (%s)"
-               (Unsigned.Size_t.to_string got)
-               (Unsigned.Size_t.to_string got))
-      | _ -> None)
+    | Not_enough_outputs {got; expected} ->
+        Some
+          (Printf.sprintf
+             "Function did return less values (%s) than expected (%s)"
+             (Unsigned.Size_t.to_string got)
+             (Unsigned.Size_t.to_string got))
+    | _ -> None)
 
 let unpack_outputs results outputs =
   let got = Value_vector.length outputs in
   let expected = Function_type.num_results results in
-  if (* Fewer outputs than expected. *)
-     Unsigned.Size_t.compare got expected < 0
+  if
+    (* Fewer outputs than expected. *)
+    Unsigned.Size_t.compare got expected < 0
   then raise (Not_enough_outputs {got; expected}) ;
   let rec go : type r x. r Function_type.results -> int -> (r -> x) -> x =
    fun params index k ->
@@ -150,7 +211,12 @@ let unpack_outputs results outputs =
   in
   go results 0 Fun.id
 
+(** [call func typ] type-checks [func] against [typ] and returns a
+    callable OCaml function that invokes the WebAssembly function. *)
 let call func typ =
-  Function_type.check_types typ (Functions.Func.type_ func) ;
+  let func_type = Functions.Func.type_ func in
+  Function_type.check_types typ func_type ;
+  (* Once the types have been checked, [func_type] can be deleted. *)
+  Functions.Functype.delete func_type ;
   let (Function_type.Function (params, results)) = typ in
   pack_inputs params func (unpack_outputs results)

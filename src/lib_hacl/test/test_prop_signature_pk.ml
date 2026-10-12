@@ -26,7 +26,7 @@
 (** Testing
     -------
     Component:    Crypto
-    Invocation:   dune build @src/lib_hacl/runtest
+    Invocation:   dune exec src/lib_hacl/test/main.exe
     Subject:      Property-tests over the interface Hacl.SIGNATURE checking
                   the equivalence between [pk_of_bytes_without_validation]
                   and [pk_of_bytes] on valid public keys.
@@ -37,10 +37,11 @@ open Qcheck2_helpers
 
 open QCheck2
 
-module Pk_Properties (Desc : sig
-  val name : string
-end)
-(X : Hacl.SIGNATURE) =
+module Pk_Properties
+    (Desc : sig
+      val name : string
+    end)
+    (X : Hacl.SIGNATURE) =
 struct
   (** Checks that [pk_of_bytes_without_validation] and [pk_of_bytes] have
       the same output on valid public keys and always return a Some. *)
@@ -75,5 +76,6 @@ module P256_Props =
 
 let () =
   Alcotest.run
+    ~__FILE__
     "tezos-crypto-signature-pk"
     [("P256_Pros", qcheck_wrap P256_Props.tests)]

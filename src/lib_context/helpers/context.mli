@@ -29,6 +29,10 @@ module Env = Env
 
 module type DB = Irmin.Generic_key.S with module Schema = Schema
 
+type raw = [`Value of bytes | `Tree of raw String.Map.t]
+
+val raw_encoding : raw Data_encoding.t
+
 module Make_tree (Conf : Conf) (DB : DB) : sig
   include
     Tezos_context_sigs.Context.TREE
@@ -70,7 +74,9 @@ end
 
 module Proof_encoding = Tezos_context_merkle_proof_encoding
 
-module Make_proof (DB : DB) (Store_conf : Tezos_context_encoding.Context.Conf) : sig
+module Make_proof
+    (DB : DB)
+    (Store_conf : Tezos_context_encoding.Context.Conf) : sig
   module Proof : Tezos_context_sigs.Context.PROOF
 
   type kinded_key := [`Value of DB.contents_key | `Node of DB.node_key]

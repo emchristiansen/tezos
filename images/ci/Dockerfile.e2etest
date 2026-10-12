@@ -1,0 +1,150 @@
+# runtime + end-to-end test dependencies
+#
+# This image builds on the runtime dependencies and additionally includes:
+#
+# - ocamlformat and bisect-ppx-report, copied from the
+#   build image.
+# - eth-cli, installed from npm
+# - some utilities used in the Tezt integration test suite: git, file
+#
+# This image is intended for
+# - Running end-to-end tests (mostly Tezt) in the tezos/tezos CI.
+
+# hadolint ignore=DL3006
+FROM monitoring AS foundry-binaries
+
+# Satisfies DL4006: Ensure any failure in a pipe fails the build
+SHELL ["/bin/ash", "-eo", "pipefail", "-c"]
+
+USER root
+WORKDIR /tmp
+
+# Install required tools
+# NB: curl already in Dockerfile.monitoring
+# hadolint ignore=DL3018
+RUN apk update && apk add --no-cache tar ca-certificates
+
+ARG TARGETARCH
+
+# https://github.com/foundry-rs/foundry/releases/nightly-efdf0ff81807fa8dc426cbf1316503945aa5544e
+ARG FOUNDRY_TAG=nightly-efdf0ff81807fa8dc426cbf1316503945aa5544e
+ARG CHECKSUM_AMD64="628f6682e011247ecf9b92981fd0f5144060675416afb71355dfcd1e2ba6722b"
+ARG CHECKSUM_ARM64="0f38061652335e637f211e506206bc7e8c228123cde8de734b2a3e576a8cc6c4"
+
+# We use the 'alpine' version instead of the 'linux' one to avoid glibc incompatibility
+ARG BINARY_FILE="foundry_nightly_alpine_${TARGETARCH}.tar.gz"
+ARG URL_BASE="https://github.com/foundry-rs/foundry/releases/download/${FOUNDRY_TAG}"
+
+# Fetch foundry through the kisscache proxy with kiss-fetch.sh instead of
+# pulling from GitHub directly, to improve reliability.
+# Falls back to a direct download when kisscache is unreachable.
+RUN kiss-fetch.sh -sS -o "${BINARY_FILE}" "${URL_BASE}/${BINARY_FILE}"; \
+    # Assign the correct hash based on the architecture
+    case "${TARGETARCH}" in \
+        "amd64") \
+            EXPECTED_HASH="${CHECKSUM_AMD64}" ;; \
+        "arm64") \
+            EXPECTED_HASH="${CHECKSUM_ARM64}" ;; \
+        *) \
+            echo "Unsupported architecture: ${TARGETARCH}"; exit 1 ;; \
+    esac; \
+    \
+    # Verify the hash against the downloaded .tar.gz file
+    # We use the pipe method to avoid creating a checksum file on disk
+    echo "${EXPECTED_HASH}  ${BINARY_FILE}" | sha256sum -c -; \
+    # Extract cast and forge only
+    tar -xzf "$BINARY_FILE" -C /bin cast forge; \
+    chmod +x /bin/cast /bin/forge; \
+    # Clean-up
+    rm -rf /tmp/*
+
+USER tezos
+WORKDIR /home/tezos
+
+# this is needed because we COPY --from=build below
+# hadolint ignore=DL3006
+FROM build AS build
+
+ARG OCAML_IMAGE
+ARG BUILD_IMAGE
+
+# hadolint ignore=DL3006
+FROM monitoring AS e2etest
+
+LABEL org.opencontainers.image.title="e2etest"
+
+USER root
+
+# SHELL already set in runtime
+
+WORKDIR /tmp
+
+# Automatically set if you use Docker buildx
+ARG TARGETARCH
+
+# Retrieve ocamlformat, used in the snoop tests.
+ARG OCAML_VERSION
+COPY --from=build \
+    /home/tezos/.opam/ocaml-base-compiler.${OCAML_VERSION}/bin/ocamlformat \
+    /home/tezos/.opam/ocaml-base-compiler.${OCAML_VERSION}/bin/bisect-ppx-report \
+    /bin/
+
+COPY --from=foundry-binaries /bin/cast /bin/
+COPY --from=foundry-binaries /bin/forge /bin/
+
+# TODO: https://gitlab.com/tezos/tezos/-/issues/5026
+# We could install npm via nvm if we tackle this issue.
+# In the meantime, removes nvm installed in test and
+# install npm via apk.
+
+# Fixing some ipv6 issues on the runner. Always prioritizing ipv4
+ENV NODE_OPTIONS="--dns-result-order=ipv4first"
+
+# We need curl since a bunch of tezt tests use curl.
+# Same, some tests use [file].
+
+# Use alpine /bin/ash and set shell options
+# See https://docs.docker.com/build/building/best-practices/#using-pipes
+SHELL ["/bin/ash", "-euo", "pipefail", "-c"]
+
+# hadolint ignore=DL3018,DL3019
+RUN apk update \
+ && apk add --no-cache git file websocat gcc clang lld \
+ && apk add --no-cache ca-certificates build-base musl-dev libusb-dev linux-headers procps-ng npm pandoc
+# Install desync from edge repo as its not yet available in alpine 3.20
+# hadolint ignore=DL3018,DL3019
+RUN apk add --repository=https://dl-cdn.alpinelinux.org/alpine/edge/testing --no-cache desync
+
+
+# Install dal SRS setup (need curl)
+COPY scripts/install_dal_trusted_setup.sh scripts/version.sh /tmp/
+RUN mkdir -p /usr/share/dal-trusted-setup && \
+    DAL_TRUSTED_SETUP=/usr/share/dal-trusted-setup \
+    sh /tmp/install_dal_trusted_setup.sh && \
+    rm /tmp/install_dal_trusted_setup.sh /tmp/version.sh
+
+# Set NPM registry
+# NPM_REGISTRY_DOMAIN and NPM_REGISTRY are set in the GitLab CI/CD
+ARG NPM_REGISTRY_DOMAIN
+ARG NPM_REGISTRY
+
+COPY images/ci/e2etest/package.json images/ci/e2etest/package-lock.json /usr/local/lib/
+# Etherlink tests have hardcoded /usr/local/lib as path,
+# and `npm ci` installs the node_modules directory locally.
+# The registry npm resolved is echoed before the install: nothing else in this
+# step names it, so a build that fell back to the public registry -- because
+# NPM_REGISTRY is unset, or because ci-images.hcl declared no secret -- is
+# otherwise indistinguishable from an authenticated one. [npm config get
+# registry] prints no credentials, unlike [npm config list].
+# hadolint ignore=DL3003
+RUN --mount=type=secret,id=npm_token \
+    if [ -n "$NPM_REGISTRY" ] ; then \
+      npm set registry "$NPM_REGISTRY" && \
+      npm set //"${NPM_REGISTRY_DOMAIN}":_authToken="$(cat /run/secrets/npm_token)"; \
+    fi \
+    && cd /usr/local/lib/ \
+    && echo "### npm registry: $(npm config get registry)" \
+    && npm ci
+
+USER tezos
+WORKDIR /home/tezos

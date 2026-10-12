@@ -29,9 +29,66 @@ type cors = Resto_cohttp.Cors.t = {
   allowed_origins : string list;
 }
 
-module RPC_logging = Internal_event.Legacy_logging.Make (struct
-  let name = "rpc_http_event"
-end)
+module RPC_logging = struct
+  open Internal_event
+  open Internal_event.Simple
+
+  let rpc_http_event name level =
+    declare_1
+      ~section:["rpc_server"]
+      ~name
+      ~msg:"{msg}"
+      ~level
+      ~pp1:Format.pp_print_text
+      ("msg", Data_encoding.string)
+
+  let rpc_http_event_debug = rpc_http_event "rpc_http_event_debug" Debug
+
+  let rpc_http_event_info = rpc_http_event "rpc_http_event_info" Info
+
+  let rpc_http_event_notice = rpc_http_event "rpc_http_event_notice" Notice
+
+  let rpc_http_event_warning = rpc_http_event "rpc_http_event_warning" Warning
+
+  let rpc_http_event_error = rpc_http_event "rpc_http_event_error" Error
+
+  let emit_async event fmt =
+    Format.kasprintf
+      (fun message ->
+        Lwt.ignore_result
+          (emit
+             event
+             (Printf.sprintf "[pid:%d][resto] %s" (Unix.getpid ()) message)))
+      fmt
+
+  let emit_lwt event fmt =
+    Format.kasprintf
+      (fun message ->
+        emit
+          event
+          (Printf.sprintf "[pid:%d][resto] %s" (Unix.getpid ()) message))
+      fmt
+
+  let log_debug f = emit_async rpc_http_event_debug f
+
+  let log_info f = emit_async rpc_http_event_info f
+
+  let log_notice f = emit_async rpc_http_event_notice f
+
+  let log_warn f = emit_async rpc_http_event_warning f
+
+  let log_error f = emit_async rpc_http_event_error f
+
+  let lwt_log_debug f = emit_lwt rpc_http_event_debug f
+
+  let lwt_log_info f = emit_lwt rpc_http_event_info f
+
+  let lwt_log_notice f = emit_lwt rpc_http_event_notice f
+
+  let lwt_log_warn f = emit_lwt rpc_http_event_warning f
+
+  let lwt_log_error f = emit_lwt rpc_http_event_error f
+end
 
 include Resto_cohttp_server.Server.Make (Tezos_rpc.Encoding) (RPC_logging)
 
@@ -51,7 +108,24 @@ module Acl = struct
             [
               "GET /chains/*/blocks";
               "GET /chains/*/blocks/*";
-              "GET /chains/*/blocks/*/context/**";
+              "GET /chains/*/chain_id";
+              "GET /chains/*/checkpoint";
+              "GET /chains/*/blocks/*/context/adaptive_issuance_launch_cycle";
+              "GET /chains/*/blocks/*/context/big_maps/*/*";
+              "GET /chains/*/blocks/*/context/cache/**";
+              "GET /chains/*/blocks/*/context/constants";
+              "GET /chains/*/blocks/*/context/contracts/*/**";
+              "GET /chains/*/blocks/*/context/delegates/*/**";
+              "GET /chains/*/blocks/*/context/denunciations";
+              "GET /chains/*/blocks/*/context/issuance";
+              "GET /chains/*/blocks/*/context/issuance/*";
+              "GET /chains/*/blocks/*/context/liquidity_baking/*";
+              "GET /chains/*/blocks/*/context/nonces/*";
+              "GET /chains/*/blocks/*/context/sapling/**";
+              "GET /chains/*/blocks/*/context/seed_computation";
+              "GET /chains/*/blocks/*/context/selected_snapshot";
+              "GET /chains/*/blocks/*/context/total_frozen_stake";
+              "GET /chains/*/blocks/*/context/total_supply";
               "GET /chains/*/blocks/*/hash";
               "GET /chains/*/blocks/*/header";
               "GET /chains/*/blocks/*/header/**";
@@ -62,39 +136,29 @@ module Acl = struct
               "GET /chains/*/blocks/*/minimal_valid_time";
               "GET /chains/*/blocks/*/operation_hashes";
               "GET /chains/*/blocks/*/operation_hashes/**";
-              "GET /chains/*/blocks/*/operation_metadata_hash";
+              "GET /chains/*/blocks/*/operation_metadata_hashes";
               "GET /chains/*/blocks/*/operations";
               "GET /chains/*/blocks/*/operations/**";
               "GET /chains/*/blocks/*/operations_metadata_hash";
               "GET /chains/*/blocks/*/protocols";
-              "GET /chains/*/blocks/*/required_endorsements";
+              "GET /chains/*/blocks/*/resulting_context_hash";
               "GET /chains/*/blocks/*/votes/**";
-              "GET /chains/*/chain_id";
-              "GET /chains/*/checkpoint";
               "GET /chains/*/invalid_blocks";
               "GET /chains/*/invalid_blocks/*";
               "GET /chains/*/is_bootstrapped";
+              "GET /chains/*/levels/*";
               "GET /chains/*/mempool/filter";
-              "GET /chains/*/mempool/monitor_operations";
               "GET /chains/*/mempool/pending_operations";
+              "GET /config/history_mode";
               "GET /config/network/user_activated_protocol_overrides";
               "GET /config/network/user_activated_upgrades";
-              "GET /describe/**";
-              "GET /errors";
-              "GET /monitor/**";
-              "GET /network/greylist/ips";
-              "GET /network/greylist/peers";
-              "GET /network/self";
-              "GET /network/self";
+              "GET /config/network/dal";
               "GET /network/stat";
-              "GET /network/version";
-              "GET /network/versions";
               "GET /protocols";
-              "GET /protocols/*";
               "GET /protocols/*/environment";
               "GET /version";
               "POST /chains/*/blocks/*/context/contracts/*/big_map_get";
-              "POST /chains/*/blocks/*/endorsing_power";
+              "POST /chains/*/blocks/*/context/seed";
               "POST /injection/operation";
             ];
       }
@@ -247,3 +311,66 @@ module Acl = struct
     in
     Internal_for_test.resolve_domain_names resolve
 end
+
+module Max_active_rpc_connections = struct
+  type t = Unlimited | Limited of int
+
+  let default = Limited 100
+
+  let encoding =
+    let open Data_encoding in
+    def
+      "max_active_rpc_connections"
+      ~title:"max_active_rpc_connections"
+      ~description:"The maximum alowed number of RPC connections"
+      (union
+         ~tag_size:`Uint8
+         [
+           case
+             ~title:"unlimited"
+             ~description:
+               "There is not limit of the number of RPC connections allowed."
+             (Tag 0)
+             (constant "unlimited")
+             (function Unlimited -> Some () | _ -> None)
+             (fun () -> Unlimited);
+           case
+             ~title:"limited"
+             ~description:
+               "The number of maximum RPC connections allowed is limited to \
+                the given integer's value."
+             (Tag 1)
+             int31
+             (function Limited i -> Some i | _ -> None)
+             (fun i -> Limited i);
+         ])
+
+  let pp_parameter ppf = function
+    | Unlimited -> Format.fprintf ppf "unlimited"
+    | Limited limit -> Format.fprintf ppf "%l" limit
+end
+
+(* [launch] starts a Resto server which will handle the incoming connections.
+   If the client dies or drops the connection while we are handling the request,
+   this can lead to resources being spent on a request which is already abandoned.
+   Some requests are potentially endless, e.g., streamed RPC. In this case,
+   the resources are never released unless we are actively waiting for EOF.
+   The check for EOF is done periodically with [sleep_fn].
+   The selected period is 1 second which is a balance between CPU load for checks
+   and resource usage for abandoned requests. *)
+let eof_active_wait_delay = 1.0
+
+let launch ?host server ?conn_closed ?callback
+    ?(max_active_connections = Max_active_rpc_connections.default) mode =
+  (* TODO: backport max_active_connections in resto *)
+  (match max_active_connections with
+  | Unlimited -> ()
+  | Limited max_active_connections ->
+      Conduit_lwt_unix.set_max_active max_active_connections) ;
+  launch
+    ?host
+    server
+    ?conn_closed
+    ?callback
+    ~sleep_fn:(fun () -> Lwt_unix.sleep eof_active_wait_delay)
+    mode

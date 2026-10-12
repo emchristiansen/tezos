@@ -26,6 +26,7 @@
 
 type error +=
   | (* `Temporary *) Sc_rollup_disputed
+  | (* `Temporary *) Sc_rollup_no_valid_commitment_to_cement
   | (* `Temporary *) Sc_rollup_does_not_exist of Sc_rollup_repr.t
   | (* `Temporary *) Sc_rollup_no_conflict
   | (* `Temporary *) Sc_rollup_no_stakers
@@ -48,21 +49,25 @@ type error +=
   | (* `Temporary *)
       Sc_rollup_unknown_commitment of
       Sc_rollup_commitment_repr.Hash.t
-  | (* `Temporary *) Sc_rollup_bad_inbox_level
+  | (* `Temporary *)
+      Sc_rollup_bad_inbox_level of {
+      expected : Raw_level_repr.t;
+      provided : Raw_level_repr.t;
+    }
   | (* `Temporary *) Sc_rollup_game_already_started
   | (* `Temporary *)
       Sc_rollup_max_number_of_parallel_games_reached of
-      Signature.Public_key_hash.t
+      Implicit_account_repr.t
   | (* `Temporary *) Sc_rollup_wrong_turn
   | (* `Temporary *) Sc_rollup_no_game
   | (* `Temporary *)
       Sc_rollup_staker_in_game of
-      [ `Refuter of Signature.public_key_hash
-      | `Defender of Signature.public_key_hash
-      | `Both of Signature.public_key_hash * Signature.public_key_hash ]
+      [ `Refuter of Implicit_account_repr.t
+      | `Defender of Implicit_account_repr.t
+      | `Both of Implicit_account_repr.t * Implicit_account_repr.t ]
   | (* `Temporary *)
       Sc_rollup_timeout_level_not_reached of
-      int32 * Signature.public_key_hash
+      int32 * Implicit_account_repr.t
   | (* `Temporary *)
       Sc_rollup_max_number_of_messages_reached_for_commitment_period
   | (* `Permanent *) Sc_rollup_add_zero_messages
@@ -71,7 +76,7 @@ type error +=
   | (* `Temporary *) Sc_rollup_outbox_message_already_applied
   | (* `Temporary *)
       Sc_rollup_staker_funds_too_low of {
-      staker : Signature.public_key_hash;
+      staker : Implicit_account_repr.t;
       sc_rollup : Sc_rollup_repr.t;
       staker_balance : Tez_repr.t;
       min_expected_balance : Tez_repr.t;
@@ -83,24 +88,28 @@ type error +=
   | (* `Permanent *)
       Sc_rollup_not_valid_commitments_conflict of
       Sc_rollup_commitment_repr.Hash.t
-      * Signature.public_key_hash
+      * Implicit_account_repr.t
       * Sc_rollup_commitment_repr.Hash.t
-      * Signature.public_key_hash
+      * Implicit_account_repr.t
   | (* `Permanent *)
       Sc_rollup_wrong_staker_for_conflict_commitment of
-      Signature.public_key_hash * Sc_rollup_commitment_repr.Hash.t
-  | (* `Permanent *)
-      Sc_rollup_invalid_commitment_to_cement of {
-      valid_candidate : Sc_rollup_commitment_repr.Hash.t;
-      invalid_candidate : Sc_rollup_commitment_repr.Hash.t;
-    }
+      Implicit_account_repr.t * Sc_rollup_commitment_repr.Hash.t
   | (* `Permanent *)
       Sc_rollup_commitment_too_old of {
       last_cemented_inbox_level : Raw_level_repr.t;
       commitment_inbox_level : Raw_level_repr.t;
     }
   | (* `Temporary *)
-      Sc_rollup_no_commitment_to_cement of Raw_level_repr.t
+      Sc_rollup_no_commitment_to_cement of
+      Raw_level_repr.t
+  | (* `Permanent *)
+      Sc_rollup_double_publish of
+      Sc_rollup_commitment_repr.Hash.t
+  | Sc_rollup_empty_whitelist
+  | Sc_rollup_whitelist_disabled
+  | Sc_rollup_staker_not_in_whitelist
+  | Sc_rollup_duplicated_key_in_whitelist
+  | Sc_rollup_is_public
 
 let () =
   register_error_kind
@@ -111,24 +120,20 @@ let () =
     ~pp:(fun ppf staker ->
       let busy ppf = function
         | `Refuter sc ->
-            Format.fprintf
-              ppf
-              "the refuter (%a) is"
-              Signature.Public_key_hash.pp
-              sc
+            Format.fprintf ppf "the refuter (%a) is" Implicit_account_repr.pp sc
         | `Defender sc ->
             Format.fprintf
               ppf
               "the defender (%a) is"
-              Signature.Public_key_hash.pp
+              Implicit_account_repr.pp
               sc
         | `Both (refuter, defender) ->
             Format.fprintf
               ppf
               "both the refuter (%a) and the defender (%a) are"
-              Signature.Public_key_hash.pp
+              Implicit_account_repr.pp
               refuter
-              Signature.Public_key_hash.pp
+              Implicit_account_repr.pp
               defender
       in
       Format.fprintf
@@ -142,21 +147,21 @@ let () =
           case
             (Tag 0)
             ~title:"Refuter"
-            (obj1 (req "refuter" Signature.Public_key_hash.encoding))
+            (obj1 (req "refuter" Implicit_account_repr.encoding))
             (function `Refuter sc -> Some sc | _ -> None)
             (fun sc -> `Refuter sc);
           case
             (Tag 1)
             ~title:"Defender"
-            (obj1 (req "defender" Signature.Public_key_hash.encoding))
+            (obj1 (req "defender" Implicit_account_repr.encoding))
             (function `Defender sc -> Some sc | _ -> None)
             (fun sc -> `Defender sc);
           case
             (Tag 2)
             ~title:"Both"
             (obj2
-               (req "refuter" Signature.Public_key_hash.encoding)
-               (req "defender" Signature.Public_key_hash.encoding))
+               (req "refuter" Implicit_account_repr.encoding)
+               (req "defender" Implicit_account_repr.encoding))
             (function
               | `Both (refuter, defender) -> Some (refuter, defender)
               | _ -> None)
@@ -175,13 +180,13 @@ let () =
         ppf
         "%s. The player %a has %ld left blocks to play."
         description
-        Signature.Public_key_hash.pp_short
+        Implicit_account_repr.pp_short
         staker
         blocks_left)
     Data_encoding.(
       obj2
         (req "level_timeout" int32)
-        (req "staker" Signature.Public_key_hash.encoding))
+        (req "staker" Implicit_account_repr.encoding))
     (function
       | Sc_rollup_timeout_level_not_reached (blocks_left, staker) ->
           Some (blocks_left, staker)
@@ -245,6 +250,19 @@ let () =
     Data_encoding.unit
     (function Sc_rollup_add_zero_messages -> Some () | _ -> None)
     (fun () -> Sc_rollup_add_zero_messages) ;
+  let description =
+    "Attempted to cement a commitment but there is no valid commitment to \
+     cement."
+  in
+  register_error_kind
+    `Temporary
+    ~id:"smart_rollup_no_valid_commitment_to_cement"
+    ~title:"No valid commitment to cement"
+    ~description
+    ~pp:(fun ppf () -> Format.fprintf ppf "%s" description)
+    Data_encoding.empty
+    (function Sc_rollup_no_valid_commitment_to_cement -> Some () | _ -> None)
+    (fun () -> Sc_rollup_no_valid_commitment_to_cement) ;
   let description = "Attempted to cement a disputed commitment." in
   register_error_kind
     `Temporary
@@ -410,10 +428,24 @@ let () =
     ~id:"smart_rollup_bad_inbox_level"
     ~title:"Committing to a bad inbox level"
     ~description
-    ~pp:(fun ppf () -> Format.fprintf ppf "%s" description)
-    Data_encoding.empty
-    (function Sc_rollup_bad_inbox_level -> Some () | _ -> None)
-    (fun () -> Sc_rollup_bad_inbox_level) ;
+    ~pp:(fun ppf (expected, provided) ->
+      Format.fprintf
+        ppf
+        "%s (expected %a, got %a)"
+        description
+        Raw_level_repr.pp
+        expected
+        Raw_level_repr.pp
+        provided)
+    Data_encoding.(
+      obj2
+        (req "expected" Raw_level_repr.encoding)
+        (req "provided" Raw_level_repr.encoding))
+    (function
+      | Sc_rollup_bad_inbox_level {expected; provided} ->
+          Some (expected, provided)
+      | _ -> None)
+    (fun (expected, provided) -> Sc_rollup_bad_inbox_level {expected; provided}) ;
   let description = "Invalid rollup outbox message index" in
   register_error_kind
     `Temporary
@@ -456,7 +488,7 @@ let () =
         "Staker (%a) doesn't have enough funds to make the deposit for smart \
          rollup (%a). Staker's balance is %a while a balance of at least %a is \
          required."
-        Signature.Public_key_hash.pp
+        Implicit_account_repr.pp
         staker
         Sc_rollup_repr.pp
         sc_rollup
@@ -466,7 +498,7 @@ let () =
         min_expected_balance)
     Data_encoding.(
       obj4
-        (req "staker" Signature.Public_key_hash.encoding)
+        (req "staker" Implicit_account_repr.encoding)
         (req "smart_rollup" Sc_rollup_repr.encoding)
         (req "staker_balance" Tez_repr.encoding)
         (req "min_expected_balance" Tez_repr.encoding))
@@ -556,10 +588,10 @@ let () =
       Format.fprintf
         ppf
         "%a has reached the limit for number of parallel games"
-        Signature.Public_key_hash.pp
+        Implicit_account_repr.pp
         staker)
     ~description
-    Data_encoding.(obj1 (req "staker" Signature.Public_key_hash.encoding))
+    Data_encoding.(obj1 (req "staker" Implicit_account_repr.encoding))
     (function
       | Sc_rollup_max_number_of_parallel_games_reached staker -> Some staker
       | _ -> None)
@@ -577,19 +609,19 @@ let () =
          direct predecessor is the same."
         Sc_rollup_commitment_repr.Hash.pp
         c1
-        Signature.Public_key_hash.pp_short
+        Implicit_account_repr.pp_short
         s1
         Sc_rollup_commitment_repr.Hash.pp
         c2
-        Signature.Public_key_hash.pp_short
+        Implicit_account_repr.pp_short
         s2)
     ~description
     Data_encoding.(
       obj4
         (req "commitment" Sc_rollup_commitment_repr.Hash.encoding)
-        (req "player" Signature.Public_key_hash.encoding)
+        (req "player" Implicit_account_repr.encoding)
         (req "opponent_commitment" Sc_rollup_commitment_repr.Hash.encoding)
-        (req "opponent" Signature.Public_key_hash.encoding))
+        (req "opponent" Implicit_account_repr.encoding))
     (function
       | Sc_rollup_not_valid_commitments_conflict (c1, s1, c2, s2) ->
           Some (c1, s1, c2, s2)
@@ -605,14 +637,14 @@ let () =
       Format.fprintf
         ppf
         "The staker %a has not staked commitment %a"
-        Signature.Public_key_hash.pp
+        Implicit_account_repr.pp
         staker
         Sc_rollup_commitment_repr.Hash.pp
         commitment)
     ~description
     Data_encoding.(
       obj2
-        (req "player" Signature.Public_key_hash.encoding)
+        (req "player" Implicit_account_repr.encoding)
         (req "commitment" Sc_rollup_commitment_repr.Hash.encoding))
     (function
       | Sc_rollup_wrong_staker_for_conflict_commitment (staker, commitment) ->
@@ -620,35 +652,6 @@ let () =
       | _ -> None)
     (fun (staker, commitment) ->
       Sc_rollup_wrong_staker_for_conflict_commitment (staker, commitment)) ;
-  let description = "Given commitment cannot be cemented" in
-  register_error_kind
-    `Permanent
-    ~id:"smart_rollup_invalid_commitment_to_cement"
-    ~title:description
-    ~pp:(fun ppf (valid_candidate, invalid_candidate) ->
-      Format.fprintf
-        ppf
-        "The commitment %a cannot be cemented. %a is a valid candidate to \
-         cementation, but %a is not."
-        Sc_rollup_commitment_repr.Hash.pp
-        invalid_candidate
-        Sc_rollup_commitment_repr.Hash.pp
-        valid_candidate
-        Sc_rollup_commitment_repr.Hash.pp
-        invalid_candidate)
-    ~description
-    Data_encoding.(
-      obj2
-        (req "valid_candidate" Sc_rollup_commitment_repr.Hash.encoding)
-        (req "invalid_candidate" Sc_rollup_commitment_repr.Hash.encoding))
-    (function
-      | Sc_rollup_invalid_commitment_to_cement
-          {valid_candidate; invalid_candidate} ->
-          Some (valid_candidate, invalid_candidate)
-      | _ -> None)
-    (fun (valid_candidate, invalid_candidate) ->
-      Sc_rollup_invalid_commitment_to_cement
-        {valid_candidate; invalid_candidate}) ;
 
   let description = "Published commitment is too old" in
   register_error_kind
@@ -694,4 +697,79 @@ let () =
     (function
       | Sc_rollup_no_commitment_to_cement inbox_level -> Some inbox_level
       | _ -> None)
-    (fun inbox_level -> Sc_rollup_no_commitment_to_cement inbox_level)
+    (fun inbox_level -> Sc_rollup_no_commitment_to_cement inbox_level) ;
+  register_error_kind
+    `Permanent
+    ~id:"smart_rollup_double_publish"
+    ~title:"The commitment was published twice by the operator"
+    ~pp:(fun ppf commitment_hash ->
+      Format.fprintf
+        ppf
+        "The operator publishing %a already published this commitment."
+        Sc_rollup_commitment_repr.Hash.pp
+        commitment_hash)
+    ~description
+    Data_encoding.(
+      obj1 (req "commitment_hash" Sc_rollup_commitment_repr.Hash.encoding))
+    (function
+      | Sc_rollup_double_publish commitment_hash -> Some commitment_hash
+      | _ -> None)
+    (fun commitment_hash -> Sc_rollup_double_publish commitment_hash) ;
+  register_error_kind
+    `Permanent
+    ~id:"smart_rollup_empty_whitelist"
+    ~title:"Invalid whitelist: whitelist cannot be empty"
+    ~description:"Smart rollup whitelist cannot be empty"
+    ~pp:(fun ppf () ->
+      Format.fprintf ppf "Smart rollup whitelist cannot be empty.")
+    Data_encoding.empty
+    (function Sc_rollup_empty_whitelist -> Some () | _ -> None)
+    (fun () -> Sc_rollup_empty_whitelist) ;
+  register_error_kind
+    `Permanent
+    ~id:"smart_rollup_whitelist_disabled"
+    ~title:"Invalid whitelist: must be None when the feature is deactivated"
+    ~description:"The whitelist must be None when the feature is deactivated."
+    ~pp:(fun ppf () ->
+      Format.fprintf ppf "Private smart rollup with whitelist ACL is disabled.")
+    Data_encoding.empty
+    (function Sc_rollup_whitelist_disabled -> Some () | _ -> None)
+    (fun () -> Sc_rollup_whitelist_disabled) ;
+  register_error_kind
+    `Temporary
+    ~id:"smart_rollup_staker_not_in_whitelist"
+    ~title:description
+    ~description
+    ~pp:(fun ppf () ->
+      Format.pp_print_string
+        ppf
+        "The rollup is private and the submitter of the commitment is not \
+         present in the whitelist.")
+    Data_encoding.empty
+    (function Sc_rollup_staker_not_in_whitelist -> Some () | _ -> None)
+    (fun () -> Sc_rollup_staker_not_in_whitelist) ;
+  register_error_kind
+    `Temporary
+    ~id:"smart_rollup_duplicated_key_in_whitelist"
+    ~title:description
+    ~description
+    ~pp:(fun ppf () ->
+      Format.pp_print_string
+        ppf
+        "The whitelist contains twice the same key. This is forbidden and all \
+         keys in the whitelist should be disctinct.")
+    Data_encoding.empty
+    (function Sc_rollup_duplicated_key_in_whitelist -> Some () | _ -> None)
+    (fun () -> Sc_rollup_duplicated_key_in_whitelist) ;
+  register_error_kind
+    `Permanent
+    ~id:"smart_rollup_rollup_is_public"
+    ~title:description
+    ~description
+    ~pp:(fun ppf () ->
+      Format.pp_print_string
+        ppf
+        "The rollup is public, no update whitelist message can be executed.")
+    Data_encoding.empty
+    (function Sc_rollup_is_public -> Some () | _ -> None)
+    (fun () -> Sc_rollup_is_public)

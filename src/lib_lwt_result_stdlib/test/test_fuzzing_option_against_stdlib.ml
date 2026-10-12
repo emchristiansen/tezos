@@ -23,6 +23,14 @@
 (*                                                                           *)
 (*****************************************************************************)
 
+(* Testing
+   -------
+   Component:    Stdlib
+   Invocation:   dune exec src/lib_lwt_result_stdlib/test/main.exe \
+                  -- --file test_fuzzing_option_against_stdlib.ml
+   Subject:      Test fuzzing option against stdlib
+*)
+
 open Test_fuzzing_lib
 
 let map =
@@ -70,7 +78,7 @@ let iter =
           (fun x ->
             let* y = f x in
             acc := Some y ;
-            return ())
+            return_unit)
           o
       in
       return !acc)
@@ -82,7 +90,7 @@ let iter =
           (fun x ->
             let* y = f x in
             acc := Some y ;
-            return ())
+            return_unit)
           o
       in
       return !acc)
@@ -94,7 +102,7 @@ let iter =
           (fun x ->
             let* y = f x in
             acc := Some y ;
-            return ())
+            return_unit)
           o
       in
       return !acc)
@@ -165,4 +173,4 @@ let all_option : unit Alcotest.test_case list =
     filter_right;
   ]
 
-let () = Alcotest.run "FuzzRef" [("Option", all_option)]
+let () = Alcotest.run ~__FILE__ "FuzzRef" [("Option", all_option)]

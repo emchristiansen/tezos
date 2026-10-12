@@ -3,10 +3,10 @@
 
 (library
  (name tezos_protocol_environment_demo_noops)
- (public_name tezos-protocol-demo-noops.environment)
+ (public_name tezos-protocol-demo-noops.protocol.environment)
  (instrumentation (backend bisect_ppx))
  (libraries
-  tezos-protocol-environment)
+  octez-proto-libs.protocol-environment)
  (library_flags (:standard -linkall))
  (modules Tezos_protocol_environment_demo_noops))
 
@@ -15,14 +15,14 @@
  (action
   (write-file
    %{targets}
-   "module Name = struct let name = \"demo-noops\" end\ninclude Tezos_protocol_environment.V9.Make(Name)()\n")))
+   "module Name = struct let name = \"demo-noops\" end\ninclude Tezos_protocol_environment.V17.Make(Name)()\n")))
 
 (library
  (name tezos_raw_protocol_demo_noops)
- (public_name tezos-protocol-demo-noops.raw)
+ (public_name tezos-protocol-demo-noops.protocol.raw)
  (instrumentation (backend bisect_ppx))
  (libraries
-  tezos-protocol-demo-noops.environment)
+  tezos-protocol-demo-noops.protocol.environment)
  (library_flags (:standard -linkall))
  (flags
   (:standard)
@@ -35,12 +35,12 @@
 
 (library
  (name tezos_protocol_demo_noops)
- (public_name tezos-protocol-demo-noops)
+ (public_name tezos-protocol-demo-noops.protocol)
  (instrumentation (backend bisect_ppx))
  (libraries
-  tezos-protocol-environment
-  tezos-protocol-environment.sigs
-  tezos-protocol-demo-noops.raw)
+  octez-proto-libs.protocol-environment
+  octez-proto-libs.protocol-environment.sigs
+  tezos-protocol-demo-noops.protocol.raw)
  (flags
   (:standard)
   -nopervasives)
@@ -49,7 +49,7 @@
 (install
  (package tezos-protocol-demo-noops)
  (section lib)
- (files (TEZOS_PROTOCOL as raw/TEZOS_PROTOCOL)))
+ (files (TEZOS_PROTOCOL as protocol/raw/TEZOS_PROTOCOL)))
 
 (rule
  (targets protocol.ml)
@@ -71,10 +71,31 @@
  (action (run %{bin:octez-protocol-compiler} -no-hash-check -warn-error +a .)))
 
 (library
+ (name tezos_protocol_demo_noops_lifted)
+ (public_name tezos-protocol-demo-noops.protocol.lifted)
+ (instrumentation (backend bisect_ppx))
+ (libraries
+  octez-proto-libs.protocol-environment
+  octez-proto-libs.protocol-environment.sigs
+  tezos-protocol-demo-noops.protocol)
+ (flags
+  (:standard)
+  -nopervasives
+  -open Tezos_protocol_demo_noops)
+ (modules Lifted_protocol))
+
+(rule
+ (targets lifted_protocol.ml)
+ (action
+  (write-file
+   %{targets}
+   "\ninclude Environment.Lift (Protocol)\nlet hash = Protocol.hash\n")))
+
+(library
  (name tezos_protocol_demo_noops_functor)
  (libraries
-  tezos-protocol-environment
-  tezos-protocol-environment.sigs)
+  octez-proto-libs.protocol-environment
+  octez-proto-libs.protocol-environment.sigs)
  (flags
   (:standard)
   -nopervasives)
@@ -92,12 +113,12 @@
 
 (library
  (name tezos_embedded_protocol_demo_noops)
- (public_name tezos-embedded-protocol-demo-noops)
+ (public_name tezos-protocol-demo-noops.embedded-protocol)
  (instrumentation (backend bisect_ppx))
  (libraries
-  tezos-protocol-demo-noops
-  tezos-protocol-updater
-  tezos-protocol-environment)
+  tezos-protocol-demo-noops.protocol
+  octez-shell-libs.protocol-updater
+  octez-proto-libs.protocol-environment)
  (library_flags (:standard -linkall))
  (modules Registerer))
 

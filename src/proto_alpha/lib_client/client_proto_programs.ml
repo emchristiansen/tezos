@@ -44,80 +44,119 @@ module Program = Client_aliases.Alias (struct
       (fun source -> Michelson_v1_parser.parse_toplevel source)
       Data_encoding.string
 
-  let of_source source = return (Michelson_v1_parser.parse_toplevel source)
+  let of_source source =
+    let open Lwt_result_syntax in
+    return (Michelson_v1_parser.parse_toplevel source)
 
-  let to_source ({Michelson_v1_parser.source; _}, _) = return source
+  let to_source ({Michelson_v1_parser.source; _}, _) =
+    let open Lwt_result_syntax in
+    return source
 
   let name = "script"
 end)
 
 let print_errors ?parsed (cctxt : #Protocol_client_context.full) errs
     ~show_source =
-  Michelson_v1_error_reporter.enrich_runtime_errors
-    cctxt
-    ~chain:cctxt#chain
-    ~block:cctxt#block
-    ~parsed
-    errs
-  >>= fun errs ->
-  cctxt#warning
-    "%a"
-    (Michelson_v1_error_reporter.report_errors
-       ~details:false
-       ?parsed
-       ~show_source)
-    errs
-  >>= fun () ->
-  cctxt#error "error running script" >>= fun () -> return_unit
+  let open Lwt_result_syntax in
+  let parsed = Option.map Michelson_v1_parser.unrecognize_prims parsed in
+  let*! errs =
+    Michelson_v1_error_reporter.enrich_runtime_errors
+      cctxt
+      ~chain:cctxt#chain
+      ~block:cctxt#block
+      ~parsed
+      errs
+  in
+  let*! () =
+    cctxt#warning
+      "%a"
+      (Michelson_v1_error_reporter.report_errors
+         ~details:false
+         ?parsed
+         ~show_source)
+      errs
+  in
+  let*! () = cctxt#error "error running script" in
+  return_unit
 
-let print_view_result (cctxt : #Protocol_client_context.full) = function
-  | Ok expr -> cctxt#message "%a" print_expr expr >>= fun () -> return_unit
+let print_view_result (cctxt : #Protocol_client_context.full) =
+  let open Lwt_result_syntax in
+  function
+  | Ok expr ->
+      let*! () = cctxt#message "%a" print_expr expr in
+      return_unit
   | Error errs -> print_errors cctxt ~show_source:false errs
 
-let print_run_result (cctxt : #Client_context.printer) ~show_source ~parsed =
+let print_run_result (cctxt : Protocol_client_context.full) ~show_source ~parsed
+    =
+  let open Lwt_result_syntax in
   function
   | Ok (storage, operations, maybe_lazy_storage_diff) ->
-      cctxt#message
-        "@[<v 0>@[<v 2>storage@,\
-         %a@]@,\
-         @[<v 2>emitted operations@,\
-         %a@]@,\
-         @[<v 2>big_map diff@,\
-         %a@]@]@."
-        print_expr
-        storage
-        (Format.pp_print_list Operation_result.pp_internal_operation)
-        operations
-        (fun ppf -> function
-          | None -> ()
-          | Some diff -> print_big_map_diff ppf diff)
-        maybe_lazy_storage_diff
-      >>= fun () -> return_unit
+      let* operations =
+        List.map_es
+          (Operation_result.normalize_internal_operation cctxt Readable)
+          operations
+      in
+      let*! () =
+        cctxt#message
+          "@[<v 0>@[<v 2>storage@,\
+           %a@]@,\
+           @[<v 2>emitted operations@,\
+           %a@]@,\
+           @[<v 2>big_map diff@,\
+           %a@]@]@."
+          print_expr
+          storage
+          (Format.pp_print_list Operation_result.pp_internal_operation)
+          operations
+          (fun ppf -> function
+            | None -> () | Some diff -> print_big_map_diff ppf diff)
+          maybe_lazy_storage_diff
+      in
+      return_unit
   | Error errs -> print_errors cctxt errs ~show_source ~parsed
 
 let print_trace_result (cctxt : #Client_context.printer) ~show_source ~parsed =
+  let open Lwt_result_syntax in
   function
   | Ok (storage, operations, trace, maybe_lazy_storage_diff) ->
-      cctxt#message
-        "@[<v 0>@[<v 2>storage@,\
-         %a@]@,\
-         @[<v 2>emitted operations@,\
-         %a@]@,\
-         @[<v 2>big_map diff@,\
-         %a@]@,\
-         @[<v 2>trace@,\
-         %a@]@]@."
-        print_expr
-        storage
-        (Format.pp_print_list Operation_result.pp_internal_operation)
-        operations
-        (fun ppf -> function
-          | None -> ()
-          | Some diff -> print_big_map_diff ppf diff)
-        maybe_lazy_storage_diff
-        print_execution_trace
-        trace
-      >>= fun () -> return_unit
+      let*! () =
+        cctxt#message
+          "@[<v 0>@[<v 2>storage@,\
+           %a@]@,\
+           @[<v 2>emitted operations@,\
+           %a@]@,\
+           @[<v 2>big_map diff@,\
+           %a@]@,\
+           @[<v 2>trace@,\
+           %a@]@]@."
+          print_expr
+          storage
+          (Format.pp_print_list Operation_result.pp_internal_operation)
+          operations
+          (fun ppf -> function
+            | None -> () | Some diff -> print_big_map_diff ppf diff)
+          maybe_lazy_storage_diff
+          print_execution_trace
+          trace
+      in
+      return_unit
+  | Error errs -> print_errors cctxt errs ~show_source ~parsed
+
+let print_run_instr_result (cctxt : #Client_context.printer) ~show_source
+    ~parsed =
+  let open Lwt_result_syntax in
+  function
+  | Ok (stack, gas) ->
+      let*! () =
+        cctxt#message
+          "@[<v 0>@[<v 2>Result@,%a@]@,@[<v 2>Gas remaining: %a@]@]@."
+          Michelson_v1_printer.print_typed_stack
+          stack
+          Alpha_context.Gas.pp
+          gas
+      in
+      return_unit
   | Error errs -> print_errors cctxt errs ~show_source ~parsed
 
 type simulation_params = {
@@ -125,9 +164,11 @@ type simulation_params = {
   unparsing_mode : Script_ir_unparser.unparsing_mode;
   now : Script_timestamp.t option;
   level : Script_int.n Script_int.num option;
-  source : Contract.t option;
+  sender : Contract.t option;
   payer : Signature.public_key_hash option;
   gas : Gas.Arith.integral option;
+  other_contracts : RPC.Scripts.S.other_contract_description list option;
+  extra_big_maps : RPC.Scripts.S.extra_big_map_description list option;
 }
 
 type run_view_params = {
@@ -153,61 +194,115 @@ type run_params = {
   self : Contract_hash.t option;
 }
 
+type run_instr_params = {
+  shared_params : simulation_params;
+  amount : Tez.t;
+  balance : Tez.t option;
+  stack : (Script.expr * Script.expr) list;
+  self : Contract_hash.t option;
+  parameter : Script.expr option;
+  legacy : bool;
+}
+
 let run_view (cctxt : #Protocol_client_context.rpc_context)
     ~(chain : Chain_services.chain) ~block (params : run_view_params) =
+  let open Lwt_result_syntax in
   let {
-    shared_params = {input; unparsing_mode; now; level; source; payer; gas};
+    shared_params =
+      {
+        input;
+        unparsing_mode;
+        now;
+        level;
+        sender;
+        payer;
+        gas;
+        other_contracts;
+        extra_big_maps;
+      };
     contract;
     entrypoint;
   } =
     params
   in
-  Chain_services.chain_id cctxt ~chain () >>=? fun chain_id ->
+  let* chain_id = Chain_services.chain_id cctxt ~chain () in
+  (* FIXME-PA *)
+  let payer = Option.map Implicit_account_repr.Forbidden.of_pkh payer in
   Plugin.RPC.Scripts.run_tzip4_view
     cctxt
     (chain, block)
-    ?gas
+    ~gas
     ~contract
     ~entrypoint
     ~input:input.expanded
     ~chain_id
-    ?source
-    ?payer
+    ~sender
+    ~payer
     ~unparsing_mode
     ~now
     ~level
+    ~other_contracts
+    ~extra_big_maps
 
 let run_script_view (cctxt : #Protocol_client_context.rpc_context)
     ~(chain : Chain_services.chain) ~block (params : run_script_view_params) =
+  let open Lwt_result_syntax in
   let {
-    shared_params = {input; unparsing_mode; now; level; source; payer; gas};
+    shared_params =
+      {
+        input;
+        unparsing_mode;
+        now;
+        level;
+        sender;
+        payer;
+        gas;
+        other_contracts;
+        extra_big_maps;
+      };
     contract;
     view;
     unlimited_gas;
   } =
     params
   in
-  Chain_services.chain_id cctxt ~chain () >>=? fun chain_id ->
+  let* chain_id = Chain_services.chain_id cctxt ~chain () in
+  (* FIXME-PA *)
+  let payer = Option.map Implicit_account_repr.Forbidden.of_pkh payer in
   Plugin.RPC.Scripts.run_script_view
     cctxt
     (chain, block)
-    ?gas
+    ~gas
     ~contract
     ~view
     ~input:input.expanded
     ~unlimited_gas
     ~chain_id
-    ?source
-    ?payer
+    ~sender
+    ~payer
     ~unparsing_mode
     ~now
     ~level
+    ~other_contracts
+    ~extra_big_maps
 
 let run (cctxt : #Protocol_client_context.rpc_context)
     ~(chain : Chain_services.chain) ~block (params : run_params) =
-  Chain_services.chain_id cctxt ~chain () >>=? fun chain_id ->
+  let open Lwt_result_syntax in
+  let* chain_id = Chain_services.chain_id cctxt ~chain () in
   let {
-    shared_params = {input; unparsing_mode; now; level; source; payer; gas};
+    shared_params =
+      {
+        input;
+        unparsing_mode;
+        now;
+        level;
+        sender;
+        payer;
+        gas;
+        other_contracts;
+        extra_big_maps;
+      };
     program;
     amount;
     balance;
@@ -218,29 +313,46 @@ let run (cctxt : #Protocol_client_context.rpc_context)
     params
   in
   let amount = Option.value ~default:Tez.fifty_cents amount in
+  let entrypoint = Option.value ~default:Entrypoint.default entrypoint in
+  (* FIXME-PA *)
+  let payer = Option.map Implicit_account_repr.Forbidden.of_pkh payer in
   Plugin.RPC.Scripts.run_code
     cctxt
     (chain, block)
-    ?gas
-    ?entrypoint
-    ~unparsing_mode
+    ~gas
+    ~entrypoint
+    ~unparsing_mode:(Some unparsing_mode)
     ~script:program.expanded
     ~storage:storage.expanded
     ~input:input.expanded
     ~amount
-    ?balance
+    ~balance
     ~chain_id
-    ~source
+    ~sender
     ~payer
     ~self
     ~now
     ~level
+    ~other_contracts
+    ~extra_big_maps
 
 let trace (cctxt : #Protocol_client_context.rpc_context)
     ~(chain : Chain_services.chain) ~block (params : run_params) =
-  Chain_services.chain_id cctxt ~chain () >>=? fun chain_id ->
+  let open Lwt_result_syntax in
+  let* chain_id = Chain_services.chain_id cctxt ~chain () in
   let {
-    shared_params = {input; unparsing_mode; now; level; source; payer; gas};
+    shared_params =
+      {
+        input;
+        unparsing_mode;
+        now;
+        level;
+        sender;
+        payer;
+        gas;
+        other_contracts;
+        extra_big_maps;
+      };
     program;
     amount;
     balance;
@@ -251,57 +363,106 @@ let trace (cctxt : #Protocol_client_context.rpc_context)
     params
   in
   let amount = Option.value ~default:Tez.fifty_cents amount in
+  let entrypoint = Option.value ~default:Entrypoint.default entrypoint in
+  (* FIXME-PA *)
+  let payer = Option.map Implicit_account_repr.Forbidden.of_pkh payer in
   Plugin.RPC.Scripts.trace_code
     cctxt
     (chain, block)
-    ?gas
-    ?entrypoint
-    ~unparsing_mode
+    ~gas
+    ~entrypoint
+    ~unparsing_mode:(Some unparsing_mode)
     ~script:program.expanded
     ~storage:storage.expanded
     ~input:input.expanded
     ~amount
-    ?balance
+    ~balance
     ~chain_id
-    ~source
+    ~sender
     ~payer
     ~self
     ~now
     ~level
+    ~other_contracts
+    ~extra_big_maps
 
-let typecheck_data cctxt ~(chain : Chain_services.chain) ~block ?gas ?legacy
+let run_instr (cctxt : #Protocol_client_context.rpc_context)
+    ~(chain : Chain_services.chain) ~block (params : run_instr_params) =
+  let open Lwt_result_syntax in
+  let* chain_id = Chain_services.chain_id cctxt ~chain () in
+  let {shared_params; amount; balance; stack; self; parameter; legacy} =
+    params
+  in
+  let {
+    input;
+    unparsing_mode;
+    now;
+    level;
+    sender;
+    payer;
+    gas;
+    other_contracts;
+    extra_big_maps;
+  } =
+    shared_params
+  in
+  (* FIXME-PA *)
+  let payer = Option.map Implicit_account_repr.Forbidden.of_pkh payer in
+  Plugin.RPC.Scripts.run_instr
+    ~gas
+    ~legacy
+    ~input:stack
+    ~code:input.expanded
+    ~chain_id
+    ~now
+    ~level
+    ~unparsing_mode:(Some unparsing_mode)
+    ~source:payer
+    ~sender
+    ~self
+    ~parameter
+    ~amount
+    ~balance
+    ~other_contracts
+    ~extra_big_maps
+    cctxt
+    (chain, block)
+
+let typecheck_data cctxt ~(chain : Chain_services.chain) ~block ~gas ~legacy
     ~(data : Michelson_v1_parser.parsed) ~(ty : Michelson_v1_parser.parsed) () =
   Plugin.RPC.Scripts.typecheck_data
     cctxt
     (chain, block)
-    ?gas
-    ?legacy
+    ~gas
+    ~legacy
     ~data:data.expanded
     ~ty:ty.expanded
 
-let typecheck_program cctxt ~(chain : Chain_services.chain) ~block ?gas ?legacy
+let typecheck_program cctxt ~(chain : Chain_services.chain) ~block ~gas ~legacy
     ~show_types (program : Michelson_v1_parser.parsed) =
   Plugin.RPC.Scripts.typecheck_code
     cctxt
     (chain, block)
-    ?gas
-    ?legacy
+    ~gas
+    ~legacy
     ~script:program.expanded
     ~show_types
 
-let script_size cctxt ~(chain : Chain_services.chain) ~block ?gas ?legacy
+let script_size cctxt ~(chain : Chain_services.chain) ~block ~gas ~legacy
     ~(program : Michelson_v1_parser.parsed)
     ~(storage : Michelson_v1_parser.parsed) () =
   Plugin.RPC.Scripts.script_size
     cctxt
     (chain, block)
-    ?gas
-    ?legacy
+    ~gas
+    ~legacy
     ~script:program.expanded
     ~storage:storage.expanded
 
-let print_typecheck_result ~emacs ~show_types ~print_source_on_error program res
+let print_typecheck_result ~emacs ~show_types ~print_source_on_error
+    ~display_names ~name ~keep_going program res
     (cctxt : #Client_context.printer) =
+  let open Lwt_result_syntax in
   if emacs then
     let type_map, errs, _gas =
       match res with
@@ -313,32 +474,47 @@ let print_typecheck_result ~emacs ~show_types ~print_source_on_error program res
           (type_map, errs, None)
       | Error errs -> ([], errs, None)
     in
-    cctxt#message
-      "(@[<v 0>(types . %a)@ (errors . %a)@])"
-      Michelson_v1_emacs.print_type_map
-      (program, type_map)
-      Michelson_v1_emacs.report_errors
-      (program, errs)
-    >>= fun () -> return_unit
+    let*! () =
+      cctxt#message
+        "(@[<v 0>(types . %a)@ (errors . %a)@])"
+        Michelson_v1_emacs.print_type_map
+        (program, type_map)
+        Michelson_v1_emacs.report_errors
+        (program, errs)
+    in
+    return_true
   else
     match res with
     | Ok (type_map, gas) ->
         let program = Michelson_v1_printer.inject_types type_map program in
-        cctxt#message "@[<v 0>Well typed@,Gas remaining: %a@]" Gas.pp gas
-        >>= fun () ->
+        let*! () =
+          cctxt#message
+            "@[Well typed (Gas remaining: %a)\t%t@]"
+            Gas.pp
+            gas
+            (fun fmt -> if display_names then Format.pp_print_string fmt name)
+        in
         if show_types then
-          cctxt#message "%a" Micheline_printer.print_expr program >>= fun () ->
-          return_unit
-        else return_unit
+          let*! () = cctxt#message "%a" Micheline_printer.print_expr program in
+          return_true
+        else return_true
     | Error errs ->
-        cctxt#warning
-          "%a"
-          (Michelson_v1_error_reporter.report_errors
-             ~details:show_types
-             ~show_source:print_source_on_error
-             ~parsed:program)
-          errs
-        >>= fun () -> cctxt#error "ill-typed script"
+        let*! () =
+          cctxt#warning
+            "%a"
+            (Michelson_v1_error_reporter.report_errors
+               ~details:show_types
+               ~show_source:print_source_on_error
+               ~parsed:(Michelson_v1_parser.unrecognize_prims program))
+            errs
+        in
+        if keep_going then
+          let*! () =
+            cctxt#warning "@[Ill typed\t%t@]" (fun fmt ->
+                if display_names then Format.pp_print_string fmt name)
+          in
+          return_false
+        else cctxt#error "script %S is ill-typed" name
 
 let entrypoint_type cctxt ~(chain : Chain_services.chain) ~block
     (program : Michelson_v1_parser.parsed) ~entrypoint =

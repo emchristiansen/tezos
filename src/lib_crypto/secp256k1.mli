@@ -2,6 +2,7 @@
 (*                                                                           *)
 (* Open Source License                                                       *)
 (* Copyright (c) 2018 Dynamic Ledger Solutions, Inc. <contact@tezos.com>     *)
+(* Copyright (c) 2023 Functori <contact@functori.com>                        *)
 (*                                                                           *)
 (* Permission is hereby granted, free of charge, to any person obtaining a   *)
 (* copy of this software and associated documentation files (the "Software"),*)
@@ -28,3 +29,19 @@
 include S.SIGNATURE with type watermark = Bytes.t
 
 include S.RAW_DATA with type t := t
+
+(** Signs the Keccak256 hash of bytes, instead of BLAKE2b. *)
+val sign_keccak256 : Secret_key.t -> bytes -> t
+
+(** Check the Keccak256 hash of bytes, instead of BLAKE2b. *)
+val check_keccak256 : Public_key.t -> t -> bytes -> bool
+
+(** [recover_caller signature msg] recovers the caller of signature
+    [signature] on message [msg]. The "caller" in this context is
+    the rightmost 160-bits of the Keccak-256 hash of the corresponding
+    ECDSA public key. *)
+val recover : bytes -> bytes -> (bytes, string) result
+
+(** [eth_address_of_public_key pk] computes the Ethereum address of an
+    Externally Owned Account (EOA) using this public key. *)
+val eth_address_of_public_key : Public_key.t -> bytes

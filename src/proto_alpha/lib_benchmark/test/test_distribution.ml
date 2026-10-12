@@ -1,3 +1,10 @@
+(*****************************************************************************)
+(*                                                                           *)
+(* SPDX-License-Identifier: MIT                                              *)
+(* Copyright (c) 2024 Nomadic Labs, <contact@nomadic-labs.com>               *)
+(*                                                                           *)
+(*****************************************************************************)
+
 open Michelson_samplers
 open Protocol
 open Internal_for_tests
@@ -49,8 +56,8 @@ end
 
 module Type_name_hashtbl = Stdlib.Hashtbl.Make (Type_name)
 
-let rec tnames_of_type :
-    type a ac. (a, ac) Script_typed_ir.ty -> type_name list -> type_name list =
+let rec tnames_of_type : type a ac.
+    (a, ac) Script_typed_ir.ty -> type_name list -> type_name list =
  fun t acc ->
   match t with
   | Script_typed_ir.Unit_t -> `TUnit :: acc
@@ -64,7 +71,6 @@ let rec tnames_of_type :
   | Script_typed_ir.Key_t -> `TKey :: acc
   | Script_typed_ir.Timestamp_t -> `TTimestamp :: acc
   | Script_typed_ir.Address_t -> `TAddress :: acc
-  | Script_typed_ir.Tx_rollup_l2_address_t -> assert false
   | Script_typed_ir.Bool_t -> `TBool :: acc
   | Script_typed_ir.Pair_t (lty, rty, _, _) ->
       tnames_of_type lty (tnames_of_type rty (`TPair :: acc))
@@ -133,7 +139,7 @@ let rec sample nsamples acc =
     let* size =
       Base_samplers.(sample_in_interval ~range:{min = 1; max = 1000})
     in
-    let* (Ex_ty ty) = Sampler.Random_type.m_type ~size in
+    let* (Ex_ty ty) = Sampler.Random_type.m_type ~size () in
     let* acc = sample (nsamples - 1) acc in
     return (tnames_of_type ty acc)
 

@@ -2,6 +2,7 @@
 (*                                                                           *)
 (* Open Source License                                                       *)
 (* Copyright (c) 2018 Dynamic Ledger Solutions, Inc. <contact@tezos.com>     *)
+(* Copyright (c) 2024 Marigold, <contact@marigold.dev>                       *)
 (*                                                                           *)
 (* Permission is hereby granted, free of charge, to any person obtaining a   *)
 (* copy of this software and associated documentation files (the "Software"),*)
@@ -34,8 +35,10 @@ let create_context () =
   Block.alpha_context (Account.make_bootstrap_accounts accounts)
 
 let expr_to_hash expr =
+  let open Result_syntax in
   let lexpr = Script_repr.lazy_expr expr in
-  Script_repr.force_bytes lexpr >|? fun b -> Script_expr_hash.hash_bytes [b]
+  let+ b = Script_repr.force_bytes lexpr in
+  Script_expr_hash.hash_bytes [b]
 
 let assert_expr_equal loc =
   Assert.equal
@@ -83,6 +86,7 @@ module Generators = struct
       D_Some;
       D_True;
       D_Unit;
+      D_Ticket;
       I_PACK;
       I_UNPACK;
       I_BLAKE2B;

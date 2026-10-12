@@ -3,10 +3,10 @@
 
 (library
  (name tezos_protocol_environment_013_PtJakart)
- (public_name tezos-protocol-013-PtJakart.environment)
+ (public_name tezos-protocol-013-PtJakart.protocol.environment)
  (instrumentation (backend bisect_ppx))
  (libraries
-  tezos-protocol-environment)
+  octez-proto-libs.protocol-environment)
  (library_flags (:standard -linkall))
  (modules Tezos_protocol_environment_013_PtJakart))
 
@@ -19,14 +19,14 @@
 
 (library
  (name tezos_raw_protocol_013_PtJakart)
- (public_name tezos-protocol-013-PtJakart.raw)
+ (public_name tezos-protocol-013-PtJakart.protocol.raw)
  (instrumentation (backend bisect_ppx))
  (libraries
-  tezos-protocol-013-PtJakart.environment)
+  tezos-protocol-013-PtJakart.protocol.environment)
  (library_flags (:standard -linkall))
  (flags
   (:standard)
-  -w -51
+  -w -32-34-51
   -nostdlib
   -nopervasives
   -open Tezos_protocol_environment_013_PtJakart
@@ -215,22 +215,22 @@
 
 (library
  (name tezos_protocol_013_PtJakart)
- (public_name tezos-protocol-013-PtJakart)
+ (public_name tezos-protocol-013-PtJakart.protocol)
  (instrumentation (backend bisect_ppx))
  (libraries
-  tezos-protocol-environment
-  tezos-protocol-environment.sigs
-  tezos-protocol-013-PtJakart.raw)
+  octez-proto-libs.protocol-environment
+  octez-proto-libs.protocol-environment.sigs
+  tezos-protocol-013-PtJakart.protocol.raw)
  (flags
   (:standard)
-  -w -51
+  -w -32-34-51
   -nopervasives)
  (modules Protocol Tezos_protocol_013_PtJakart))
 
 (install
  (package tezos-protocol-013-PtJakart)
  (section lib)
- (files (TEZOS_PROTOCOL as raw/TEZOS_PROTOCOL)))
+ (files (TEZOS_PROTOCOL as protocol/raw/TEZOS_PROTOCOL)))
 
 (rule
  (targets protocol.ml)
@@ -430,16 +430,39 @@
   alpha_services.ml alpha_services.mli
   main.ml main.mli
   (:src_dir TEZOS_PROTOCOL))
- (action (run %{bin:octez-protocol-compiler} -warning -51 -warn-error +a .)))
+ (action
+  (run %{bin:octez-protocol-compiler} -warning -32-34-51 -warn-error +a .)))
+
+(library
+ (name tezos_protocol_013_PtJakart_lifted)
+ (public_name tezos-protocol-013-PtJakart.protocol.lifted)
+ (instrumentation (backend bisect_ppx))
+ (libraries
+  octez-proto-libs.protocol-environment
+  octez-proto-libs.protocol-environment.sigs
+  tezos-protocol-013-PtJakart.protocol)
+ (flags
+  (:standard)
+  -w -32-34-51
+  -nopervasives
+  -open Tezos_protocol_013_PtJakart)
+ (modules Lifted_protocol))
+
+(rule
+ (targets lifted_protocol.ml)
+ (action
+  (write-file
+   %{targets}
+   "\ninclude Environment.Lift (Protocol)\nlet hash = Protocol.hash\n")))
 
 (library
  (name tezos_protocol_013_PtJakart_functor)
  (libraries
-  tezos-protocol-environment
-  tezos-protocol-environment.sigs)
+  octez-proto-libs.protocol-environment
+  octez-proto-libs.protocol-environment.sigs)
  (flags
   (:standard)
-  -w -51
+  -w -32-34-51
   -nopervasives)
  (modules Functor))
 
@@ -635,16 +658,16 @@
 
 (library
  (name tezos_embedded_protocol_013_PtJakart)
- (public_name tezos-embedded-protocol-013-PtJakart)
+ (public_name tezos-protocol-013-PtJakart.embedded-protocol)
  (instrumentation (backend bisect_ppx))
  (libraries
-  tezos-protocol-013-PtJakart
-  tezos-protocol-updater
-  tezos-protocol-environment)
+  tezos-protocol-013-PtJakart.protocol
+  octez-shell-libs.protocol-updater
+  octez-proto-libs.protocol-environment)
  (library_flags (:standard -linkall))
  (flags
   (:standard)
-  -w -51)
+  -w -32-34-51)
  (modules Registerer))
 
 (rule

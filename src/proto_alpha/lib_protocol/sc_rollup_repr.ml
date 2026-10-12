@@ -26,32 +26,13 @@
 (*****************************************************************************)
 
 module Address = struct
+  include Smart_rollup.Address
+
   let prefix = "sr1"
 
-  let encoded_size = 36
+  let () = Base58.check_encoded_prefix b58check_encoding prefix 36
 
-  let decoded_prefix = "\006\124\117" (* "sr1(36)" decoded from base 58. *)
-
-  module H =
-    Blake2B.Make
-      (Base58)
-      (struct
-        let name = "Smart_rollup_hash"
-
-        let title = "A smart rollup address"
-
-        let b58check_prefix = decoded_prefix
-
-        let size = Some 20
-      end)
-
-  include H
-
-  let () = Base58.check_encoded_prefix b58check_encoding prefix encoded_size
-
-  include Path_encoding.Make_hex (H)
-
-  let of_b58data = function H.Data h -> Some h | _ -> None
+  let of_b58data = function Smart_rollup.Address.Data h -> Some h | _ -> None
 end
 
 module Internal_for_tests = struct
@@ -62,77 +43,32 @@ module Internal_for_tests = struct
     Address.hash_bytes [data]
 end
 
-(* 32 *)
-let state_hash_prefix = "\017\165\235\240" (* srs1(54) *)
+module State_hash = Smart_rollup.State_hash
 
-module State_hash = struct
-  let prefix = "srs1"
-
-  let encoded_size = 54
-
-  module H =
-    Blake2B.Make
-      (Base58)
-      (struct
-        let name = "Smart_rollup_state_hash"
-
-        let title = "The hash of the VM state of a smart rollup"
-
-        let b58check_prefix = state_hash_prefix
-
-        (* defaults to 32 *)
-        let size = None
-      end)
-
-  include H
-
-  let () = Base58.check_encoded_prefix b58check_encoding prefix encoded_size
-
-  include Path_encoding.Make_hex (H)
-
-  let context_hash_to_state_hash =
-    (* Both State_hash and Context_hash's hashes are supposed to have the
-       same size. This top-level check enforces this invariant, in which case,
-       no exception could be thrown by [of_bytes_exn] below *)
-    let () = assert (Compare.Int.equal size Context_hash.size) in
-    fun h -> of_bytes_exn @@ Context_hash.to_bytes h
-
-  (* Hackish way to disable hash_bytes and hash_string to force people to use
-     context_hash_to_state_hash (without changing content of HASH.S) *)
-  type unreachable = |
-
-  let hash_bytes = function (_ : unreachable) -> .
-
-  let hash_string = function (_ : unreachable) -> .
-end
+(* TODO: https://gitlab.com/tezos/tezos/-/issues/5506
+   Remove type and module aliases for Smart_rollup.Address. *)
 
 type t = Address.t
 
-let description =
-  "A smart rollup is identified by a base58 address starting with "
-  ^ Address.prefix
-
 let pp = Address.pp
 
-let encoding =
-  let open Data_encoding in
-  def
-    "smart_rollup_address"
-    ~title:"A smart rollup address"
-    ~description
-    Address.encoding
+let encoding = Address.encoding
 
-let rpc_arg =
-  RPC_arg.like
-    Address.rpc_arg
-    ~descr:"A smart rollup address."
-    "smart_rollup_address"
+let rpc_arg = Address.rpc_arg
 
 let in_memory_size (_ : t) =
   let open Cache_memory_helpers in
   h1w +! string_size_gen Address.size
 
-module Staker = Signature.Public_key_hash
+module Staker = struct
+  include Implicit_account_repr
+
+  let rpc_arg_staker1 =
+    RPC_arg.like rpc_arg ?descr:(RPC_arg.descr rpc_arg).descr "staker1_pkh"
+
+  let rpc_arg_staker2 =
+    RPC_arg.like rpc_arg ?descr:(RPC_arg.descr rpc_arg).descr "staker2_pkh"
+end
 
 module Index = struct
   type t = Address.t
@@ -169,4 +105,22 @@ module Number_of_ticks = struct
     match of_value 0L with
     | Some zero -> zero
     | None -> assert false (* unreachable case, since [min_int = 0l] *)
+end
+
+module Past_commitment_period = struct
+  type t = {
+    commitment_period_in_blocks : int;
+    next_protocol_activation : Raw_level_repr.t;
+  }
+
+  let encoding =
+    Data_encoding.(
+      conv
+        (fun {commitment_period_in_blocks; next_protocol_activation} ->
+          (commitment_period_in_blocks, next_protocol_activation))
+        (fun (commitment_period_in_blocks, next_protocol_activation) ->
+          {commitment_period_in_blocks; next_protocol_activation})
+      @@ obj2
+           (req "commitment_period" int31)
+           (req "next_protocol_activation" Raw_level_repr.encoding))
 end

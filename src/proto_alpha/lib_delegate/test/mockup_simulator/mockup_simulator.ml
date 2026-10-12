@@ -149,7 +149,7 @@ module type Hooks = sig
 
   val on_start_baker :
     baker_position:int ->
-    delegates:Baking_state.consensus_key list ->
+    delegates:Baking_state_types.Key.t list ->
     cctxt:Protocol_client_context.full ->
     unit Lwt.t
 
@@ -161,6 +161,7 @@ end
 let locate_blocks (state : state)
     (block : Tezos_shell_services.Block_services.block) :
     block list tzresult Lwt.t =
+  let open Lwt_result_syntax in
   match block with
   | `Hash (hash, rel) -> (
       match Block_hash.Table.find state.chain_table hash with
@@ -179,13 +180,16 @@ let locate_blocks (state : state)
 (** Similar to [locate_blocks], but only returns the first block. *)
 let locate_block (state : state)
     (block : Tezos_shell_services.Block_services.block) : block tzresult Lwt.t =
-  locate_blocks state block >>=? function
+  let open Lwt_result_syntax in
+  let* blocks = locate_blocks state block in
+  match blocks with
   | [] -> failwith "locate_block: can't find the block"
   | x :: _ -> return x
 
 (** Return the collection of live blocks for a given block identifier. *)
 let live_blocks (state : state) block =
-  locate_blocks state block >>=? fun chain ->
+  let open Lwt_result_syntax in
+  let* chain = locate_blocks state block in
   let segment, _ = List.split_n state.live_depth chain in
   return
     (List.fold_left
@@ -198,6 +202,7 @@ let live_blocks (state : state) block =
 
 (** Extract the round number from raw fitness. *)
 let round_from_raw_fitness raw_fitness =
+  let open Lwt_result_syntax in
   match Protocol.Alpha_context.Fitness.from_raw raw_fitness with
   | Ok fitness ->
       return
@@ -207,6 +212,7 @@ let round_from_raw_fitness raw_fitness =
 
 (** Extract level from a block header. *)
 let get_block_level (block_header : Block_header.t) =
+  let open Lwt_result_syntax in
   return block_header.shell.level
 
 (** Extract round from a block header. *)
@@ -215,6 +221,7 @@ let get_block_round (block_header : Block_header.t) =
 
 (** Parse protocol data. *)
 let parse_protocol_data (protocol_data : Bytes.t) =
+  let open Lwt_result_syntax in
   match
     Data_encoding.Binary.of_bytes_opt
       Protocol.Alpha_context.Block_header.protocol_data_encoding
@@ -226,28 +233,32 @@ let parse_protocol_data (protocol_data : Bytes.t) =
 (** Broadcast an operation or block according to the given propagation
     vector. *)
 let handle_propagation msg propagation_vector broadcast_pipes =
-  List.iter_s
-    (fun (propagation, pipe) ->
-      match propagation with
-      | Block -> Lwt.return ()
-      | Pass ->
-          Lwt_pipe.Unbounded.push pipe msg ;
-          Lwt.return_unit
-      | Delay s ->
-          Lwt.dont_wait
-            (fun () ->
-              Lwt_unix.sleep s >>= fun () ->
-              Lwt_pipe.Unbounded.push pipe msg ;
-              Lwt.return_unit)
-            (fun _exn -> ()) ;
-          Lwt.return ())
-    (List.combine_drop propagation_vector broadcast_pipes)
-  >>= fun () -> return ()
+  let open Lwt_result_syntax in
+  let*! () =
+    List.iter_s
+      (fun (propagation, pipe) ->
+        match propagation with
+        | Block -> Lwt.return_unit
+        | Pass ->
+            Lwt_pipe.Unbounded.push pipe msg ;
+            Lwt.return_unit
+        | Delay s ->
+            Lwt.dont_wait
+              (fun () ->
+                let*! () = Lwt_unix.sleep s in
+                Lwt_pipe.Unbounded.push pipe msg ;
+                Lwt.return_unit)
+              (fun _exn -> ()) ;
+            Lwt.return_unit)
+      (List.combine_drop propagation_vector broadcast_pipes)
+  in
+  return_unit
 
 (** Use the [user_hooks] to produce a module of functions that will perform
     the heavy lifting for the RPC implementations. *)
 let make_mocked_services_hooks (state : state) (user_hooks : (module Hooks)) :
     Faked_services.hooks =
+  let open Lwt_result_syntax in
   let module User_hooks = (val user_hooks : Hooks) in
   let module Impl : Faked_services.Mocked_services_hooks = struct
     type mempool = Mockup.M.Block_services.Mempool.t
@@ -255,13 +266,16 @@ let make_mocked_services_hooks (state : state) (user_hooks : (module Hooks)) :
     let monitor_validated_blocks () =
       let next () =
         let rec pop_until_ok () =
-          Lwt_pipe.Unbounded.pop state.validated_blocks_pipe
-          >>= fun (block_hash, block_header, operations) ->
-          User_hooks.on_new_validated_block
-            ~block_hash
-            ~block_header
-            ~operations
-          >>= function
+          let*! block_hash, block_header, operations =
+            Lwt_pipe.Unbounded.pop state.validated_blocks_pipe
+          in
+          let*! result =
+            User_hooks.on_new_validated_block
+              ~block_hash
+              ~block_header
+              ~operations
+          in
+          match result with
           | None -> pop_until_ok ()
           | Some (hash, head, operations) ->
               Lwt.return_some (chain_id, hash, head, operations)
@@ -274,11 +288,13 @@ let make_mocked_services_hooks (state : state) (user_hooks : (module Hooks)) :
     let monitor_heads () =
       let next () =
         let rec pop_until_ok () =
-          Lwt_pipe.Unbounded.pop state.heads_pipe
-          >>= fun (block_hash, block_header) ->
+          let*! block_hash, block_header =
+            Lwt_pipe.Unbounded.pop state.heads_pipe
+          in
           (* Sleep a 0.1s to simulate a block application delay *)
-          Lwt_unix.sleep 0.1 >>= fun () ->
-          User_hooks.on_new_head ~block_hash ~block_header >>= function
+          let*! () = Lwt_unix.sleep 0.1 in
+          let*! head_opt = User_hooks.on_new_head ~block_hash ~block_header in
+          match head_opt with
           | None -> pop_until_ok ()
           | Some head -> Lwt.return_some head
         in
@@ -302,7 +318,7 @@ let make_mocked_services_hooks (state : state) (user_hooks : (module Hooks)) :
       Tezos_rpc.Answer.{next; shutdown}
 
     let protocols (block : Tezos_shell_services.Block_services.block) =
-      locate_block state block >>=? fun x ->
+      let* x = locate_block state block in
       let hash = x.rpc_context.block_hash in
       let is_predecessor_of_genesis =
         match block with
@@ -321,13 +337,13 @@ let make_mocked_services_hooks (state : state) (user_hooks : (module Hooks)) :
           {
             current_protocol =
               (if
-               Block_hash.equal hash genesis_block_hash
-               || is_predecessor_of_genesis
-              then Protocol_hash.zero
-              else Protocol.hash);
+                 Block_hash.equal hash genesis_block_hash
+                 || is_predecessor_of_genesis
+               then Protocol_hash.zero
+               else Protocol.hash);
             next_protocol =
               (if is_predecessor_of_genesis then Protocol_hash.zero
-              else Protocol.hash);
+               else Protocol.hash);
           }
 
     let may_lie_on_proto_level block x =
@@ -335,7 +351,7 @@ let make_mocked_services_hooks (state : state) (user_hooks : (module Hooks)) :
          blocks from "normal" blocks by comparing the [proto_level] of
          the shell header and its predecessor. If the predecessor's
          one is different, it must mean that we are considering an
-         activation block and must not endorse. Here, we do a bit of
+         activation block and must not attest. Here, we do a bit of
          hacking in order to return a different proto_level for the
          predecessor of the genesis block which is considered as the
          current protocol activation block. To perfectly mimic what is
@@ -358,7 +374,7 @@ let make_mocked_services_hooks (state : state) (user_hooks : (module Hooks)) :
 
     let raw_header (block : Tezos_shell_services.Block_services.block) :
         bytes tzresult Lwt.t =
-      locate_block state block >>=? fun x ->
+      let* x = locate_block state block in
       let shell = may_lie_on_proto_level block x in
       let protocol_data =
         Data_encoding.Binary.to_bytes_exn
@@ -372,7 +388,7 @@ let make_mocked_services_hooks (state : state) (user_hooks : (module Hooks)) :
 
     let header (block : Tezos_shell_services.Block_services.block) :
         Mockup.M.Block_services.block_header tzresult Lwt.t =
-      locate_block state block >>=? fun x ->
+      let* x = locate_block state block in
       let shell = may_lie_on_proto_level block x in
       return
         {
@@ -385,23 +401,26 @@ let make_mocked_services_hooks (state : state) (user_hooks : (module Hooks)) :
     let resulting_context_hash
         (block : Tezos_shell_services.Block_services.block) :
         Context_hash.t tzresult Lwt.t =
-      locate_block state block >>=? fun x -> return x.resulting_context_hash
+      let* x = locate_block state block in
+      return x.resulting_context_hash
 
     let operations block =
-      locate_block state block >>=? fun x -> return x.operations
+      let* x = locate_block state block in
+      return x.operations
 
     let inject_block block_hash (block_header : Block_header.t) operations =
-      parse_protocol_data block_header.protocol_data >>=? fun protocol_data ->
-      get_block_level block_header >>=? fun level ->
-      get_block_round block_header >>=? fun round ->
-      User_hooks.on_inject_block
-        ~level
-        ~round
-        ~block_hash
-        ~block_header
-        ~operations
-        ~protocol_data
-      >>=? fun (block_hash1, block_header1, operations1, propagation_vector) ->
+      let* protocol_data = parse_protocol_data block_header.protocol_data in
+      let* level = get_block_level block_header in
+      let* round = get_block_round block_header in
+      let* block_hash1, block_header1, operations1, propagation_vector =
+        User_hooks.on_inject_block
+          ~level
+          ~round
+          ~block_hash
+          ~block_header
+          ~operations
+          ~protocol_data
+      in
       handle_propagation
         (Broadcast_block (block_hash1, block_header1, operations1))
         propagation_vector
@@ -423,15 +442,17 @@ let make_mocked_services_hooks (state : state) (user_hooks : (module Hooks)) :
 
     let broadcast_block ?dests block_hash (block_header : Block_header.t)
         operations =
-      all_pipes_or_select dests >>=? fun pipes ->
-      List.iter_s
-        (fun pipe ->
-          Lwt_pipe.Unbounded.push
-            pipe
-            (Broadcast_block (block_hash, block_header, operations)) ;
-          Lwt.return ())
-        pipes
-      >>= return
+      let* pipes = all_pipes_or_select dests in
+      let*! () =
+        List.iter_s
+          (fun pipe ->
+            Lwt_pipe.Unbounded.push
+              pipe
+              (Broadcast_block (block_hash, block_header, operations)) ;
+            Lwt.return_unit)
+          pipes
+      in
+      return_unit
 
     let inject_operation (Operation.{shell; proto} as op) =
       let op_hash = Operation.hash op in
@@ -444,31 +465,36 @@ let make_mocked_services_hooks (state : state) (user_hooks : (module Hooks)) :
           let op : Protocol.Alpha_context.packed_operation =
             {shell; protocol_data}
           in
-          User_hooks.on_inject_operation ~op_hash ~op
-          >>=? fun (op_hash1, op1, propagation_vector) ->
-          handle_propagation
-            (Broadcast_op (op_hash1, op1))
-            propagation_vector
-            state.broadcast_pipes
-          >>=? fun () -> return op_hash1
+          let* op_hash1, op1, propagation_vector =
+            User_hooks.on_inject_operation ~op_hash ~op
+          in
+          let* () =
+            handle_propagation
+              (Broadcast_op (op_hash1, op1))
+              propagation_vector
+              state.broadcast_pipes
+          in
+          return op_hash1
 
     let broadcast_operation ?dests
         (op : Protocol.Alpha_context.packed_operation) =
-      all_pipes_or_select dests >>=? fun pipes ->
+      let* pipes = all_pipes_or_select dests in
       let op_hash = Alpha_context.Operation.hash_packed op in
-      List.iter_s
-        (fun pipe ->
-          Lwt_pipe.Unbounded.push pipe (Broadcast_op (op_hash, op)) ;
-          Lwt.return ())
-        pipes
-      >>= return
+      let*! () =
+        List.iter_s
+          (fun pipe ->
+            Lwt_pipe.Unbounded.push pipe (Broadcast_op (op_hash, op)) ;
+            Lwt.return_unit)
+          pipes
+      in
+      return_unit
 
     let pending_operations () =
       let ops = state.mempool in
       Lwt.return
         Mockup.M.Block_services.Mempool.
           {
-            applied = ops;
+            validated = ops;
             refused = Operation_hash.Map.empty;
             outdated = Operation_hash.Map.empty;
             branch_refused = Operation_hash.Map.empty;
@@ -476,8 +502,9 @@ let make_mocked_services_hooks (state : state) (user_hooks : (module Hooks)) :
             unprocessed = Operation_hash.Map.empty;
           }
 
-    let monitor_operations ~applied ~branch_delayed ~branch_refused ~refused =
-      ignore applied ;
+    let monitor_operations ~version ~validated ~branch_delayed ~branch_refused
+        ~refused =
+      ignore validated ;
       ignore branch_delayed ;
       ignore branch_refused ;
       ignore refused ;
@@ -485,15 +512,19 @@ let make_mocked_services_hooks (state : state) (user_hooks : (module Hooks)) :
       state.streaming_operations <- true ;
       let next () =
         let rec loop () =
-          Lwt_stream.get state.operations_stream >>= function
-          | None when !streamed -> Lwt.return None
+          let*! ops_opt = Lwt_stream.get state.operations_stream in
+          match ops_opt with
+          | None when !streamed -> Lwt.return_none
           | None ->
               streamed := true ;
-              Lwt.return (Some [])
+              Lwt.return_some (version, [])
           | Some ops -> (
-              List.filter_map_s User_hooks.on_new_operation ops >>= function
+              let*! result =
+                List.filter_map_s User_hooks.on_new_operation ops
+              in
+              match result with
               | [] -> loop ()
-              | l -> Lwt.return_some (List.map (fun x -> (x, None)) l))
+              | l -> Lwt.return_some (version, List.map (fun x -> (x, None)) l))
         in
         loop ()
       in
@@ -501,7 +532,8 @@ let make_mocked_services_hooks (state : state) (user_hooks : (module Hooks)) :
       Tezos_rpc.Answer.{next; shutdown}
 
     let rpc_context_callback block =
-      locate_block state block >>=? fun x -> return x.rpc_context
+      let* x = locate_block state block in
+      return x.rpc_context
 
     let list_blocks ~heads ~length ~min_date:_ =
       let compare_block_fitnesses block0 block1 =
@@ -511,7 +543,7 @@ let make_mocked_services_hooks (state : state) (user_hooks : (module Hooks)) :
       in
       let hash_of_block block = block.rpc_context.block_hash in
       let lookup_head head =
-        locate_blocks state (`Hash (head, 0)) >>=? fun xs ->
+        let* xs = locate_blocks state (`Hash (head, 0)) in
         let segment =
           match length with None -> xs | Some n -> List.take_n n xs
         in
@@ -523,12 +555,14 @@ let make_mocked_services_hooks (state : state) (user_hooks : (module Hooks)) :
     let live_blocks block = live_blocks state block
 
     let raw_protocol_data block =
-      locate_block state block >>=? fun x -> return x.raw_protocol_data
+      let* x = locate_block state block in
+      return x.raw_protocol_data
   end in
   (module Impl)
 
 (** Return the current head. *)
 let head {chain; _} =
+  let open Lwt_result_syntax in
   match List.hd chain with
   | None -> failwith "mockup_simulator.ml: empty chain"
   | Some hd -> return hd
@@ -536,13 +570,14 @@ let head {chain; _} =
 (** Clear from the mempool operations whose branch does not point to
     a live block with respect to the current head. *)
 let clear_mempool state =
-  head state >>=? fun head ->
+  let open Lwt_result_syntax in
+  let* head = head state in
   let included_ops_hashes =
     List.map
       (fun (op : Mockup.M.Block_services.operation) -> op.hash)
       (List.flatten head.operations)
   in
-  live_blocks state (`Head 0) >>=? fun live_set ->
+  let* live_set = live_blocks state (`Head 0) in
   let mempool =
     List.filter
       (fun (_oph, (op : Mockup.M.Protocol.operation)) ->
@@ -587,34 +622,41 @@ let finalize_validation_and_application (validation_state, application_state)
 (** Apply a block to the given [rpc_context]. *)
 let reconstruct_context (rpc_context : Tezos_protocol_environment.rpc_context)
     (operations : Operation.t list list) (block_header : Block_header.t) =
+  let open Lwt_result_syntax in
   let predecessor = rpc_context.block_header in
   let predecessor_context = rpc_context.context in
-  parse_protocol_data block_header.protocol_data >>=? fun protocol_data ->
-  begin_validation_and_application
-    predecessor_context
-    chain_id
-    (Application {shell = block_header.shell; protocol_data})
-    ~predecessor
-    ~cache:`Lazy
-  >>=? fun state ->
+  let* protocol_data = parse_protocol_data block_header.protocol_data in
+  let* state =
+    begin_validation_and_application
+      predecessor_context
+      chain_id
+      (Application {shell = block_header.shell; protocol_data})
+      ~predecessor
+      ~cache:`Lazy
+  in
   let i = ref 0 in
-  List.fold_left_es
-    (List.fold_left_es (fun (state, results) op ->
-         incr i ;
-         let oph = Operation.hash op in
-         let operation_data =
-           Data_encoding.Binary.of_bytes_exn
-             Mockup.M.Protocol.operation_data_encoding
-             op.Operation.proto
-         in
-         let op =
-           {Mockup.M.Protocol.shell = op.shell; protocol_data = operation_data}
-         in
-         validate_and_apply_operation state oph op >>=? fun (state, receipt) ->
-         return (state, receipt :: results)))
-    (state, [])
-    operations
-  >>=? fun (state, _) -> finalize_validation_and_application state None
+  let* state, _ =
+    List.fold_left_es
+      (List.fold_left_es (fun (state, results) op ->
+           incr i ;
+           let oph = Operation.hash op in
+           let operation_data =
+             Data_encoding.Binary.of_bytes_exn
+               Mockup.M.Protocol.operation_data_encoding
+               op.Operation.proto
+           in
+           let op =
+             {
+               Mockup.M.Protocol.shell = op.shell;
+               protocol_data = operation_data;
+             }
+           in
+           let* state, receipt = validate_and_apply_operation state oph op in
+           return (state, receipt :: results)))
+      (state, [])
+      operations
+  in
+  finalize_validation_and_application state None
 
 (** Process an incoming block. If validation succeeds:
     - update the current head to this new block
@@ -623,9 +665,10 @@ let reconstruct_context (rpc_context : Tezos_protocol_environment.rpc_context)
     Note that this implementation does not handle concurrent branches. *)
 let rec process_block state block_hash (block_header : Block_header.t)
     operations =
+  let open Lwt_result_syntax in
   let get_predecessor () =
     let predecessor_hash = block_header.Block_header.shell.predecessor in
-    head state >>=? fun head ->
+    let* head = head state in
     match Block_hash.Table.find state.chain_table predecessor_hash with
     | None | Some [] -> (
         (* Even if the predecessor is not known locally, it might be known by
@@ -660,12 +703,14 @@ let rec process_block state block_hash (block_header : Block_header.t)
                 predecessor.operations
             in
             (* If the block is found, apply it before proceeding. *)
-            process_block
-              state
-              predecessor.rpc_context.block_hash
-              predecessor_block_header
-              predecessor_ops
-            >>=? fun () -> return predecessor)
+            let* () =
+              process_block
+                state
+                predecessor.rpc_context.block_hash
+                predecessor_block_header
+                predecessor_ops
+            in
+            return predecessor)
     | Some (predecessor :: _) ->
         if
           Int32.sub
@@ -680,10 +725,11 @@ let rec process_block state block_hash (block_header : Block_header.t)
       (* The block is already known. *)
       return_unit
   | None ->
-      get_predecessor () >>=? fun predecessor ->
-      head state >>=? fun head ->
-      reconstruct_context predecessor.rpc_context operations block_header
-      >>=? fun ({context; message; _}, _) ->
+      let* predecessor = get_predecessor () in
+      let* head = head state in
+      let* {context; message; _}, _ =
+        reconstruct_context predecessor.rpc_context operations block_header
+      in
       let resulting_context_hash =
         Tezos_context_ops.Context_ops.hash
           ~time:block_header.shell.timestamp
@@ -715,7 +761,7 @@ let rec process_block state block_hash (block_header : Block_header.t)
               pass)
           operations
       in
-      parse_protocol_data block_header.protocol_data >>=? fun protocol_data ->
+      let* protocol_data = parse_protocol_data block_header.protocol_data in
       let new_block =
         {
           rpc_context;
@@ -742,7 +788,7 @@ let rec process_block state block_hash (block_header : Block_header.t)
           block_header.shell.fitness > head.rpc_context.block_header.fitness)
       then (
         state.chain <- new_chain ;
-        clear_mempool state >>=? fun () ->
+        let* () = clear_mempool state in
         (* The head changed: notify that the stream ended. *)
         state.operations_stream_push None ;
         state.streaming_operations <- false ;
@@ -757,31 +803,41 @@ let rec process_block state block_hash (block_header : Block_header.t)
 (** This process listens to broadcast block and operations and incorporates
     them in the context of the fake node. *)
 let rec listener ~(user_hooks : (module Hooks)) ~state ~broadcast_pipe =
+  let open Lwt_result_syntax in
   let module User_hooks = (val user_hooks : Hooks) in
-  Lwt_pipe.Unbounded.pop broadcast_pipe >>= function
+  let*! result = Lwt_pipe.Unbounded.pop broadcast_pipe in
+  match result with
   | Broadcast_op (operation_hash, packed_operation) ->
-      (if
-       List.mem_assoc ~equal:Operation_hash.equal operation_hash state.mempool
-      then return_unit
-      else (
-        state.mempool <- (operation_hash, packed_operation) :: state.mempool ;
-        state.operations_stream_push (Some [(operation_hash, packed_operation)]) ;
-        User_hooks.check_mempool_after_processing ~mempool:state.mempool))
-      >>=? fun () -> listener ~user_hooks ~state ~broadcast_pipe
+      let* () =
+        if
+          List.mem_assoc
+            ~equal:Operation_hash.equal
+            operation_hash
+            state.mempool
+        then return_unit
+        else (
+          state.mempool <- (operation_hash, packed_operation) :: state.mempool ;
+          state.operations_stream_push
+            (Some [(operation_hash, packed_operation)]) ;
+          User_hooks.check_mempool_after_processing ~mempool:state.mempool)
+      in
+      listener ~user_hooks ~state ~broadcast_pipe
   | Broadcast_block (block_hash, block_header, operations) ->
-      get_block_level block_header >>=? fun level ->
-      get_block_round block_header >>=? fun round ->
-      parse_protocol_data block_header.protocol_data >>=? fun protocol_data ->
-      User_hooks.check_block_before_processing
-        ~level
-        ~round
-        ~block_hash
-        ~block_header
-        ~protocol_data
-      >>=? fun () ->
-      process_block state block_hash block_header operations >>=? fun () ->
-      User_hooks.check_chain_after_processing ~level ~round ~chain:state.chain
-      >>=? fun () ->
+      let* level = get_block_level block_header in
+      let* round = get_block_round block_header in
+      let* protocol_data = parse_protocol_data block_header.protocol_data in
+      let* () =
+        User_hooks.check_block_before_processing
+          ~level
+          ~round
+          ~block_hash
+          ~block_header
+          ~protocol_data
+      in
+      let* () = process_block state block_hash block_header operations in
+      let* () =
+        User_hooks.check_chain_after_processing ~level ~round ~chain:state.chain
+      in
       Lwt_pipe.Unbounded.push
         state.validated_blocks_pipe
         (block_hash, block_header, operations) ;
@@ -792,8 +848,9 @@ let rec listener ~(user_hooks : (module Hooks)) ~state ~broadcast_pipe =
 let create_fake_node_state ~i ~live_depth
     ~(genesis_block : Block_header.t * Tezos_protocol_environment.rpc_context)
     ~global_chain_table ~broadcast_pipes =
+  let open Lwt_result_syntax in
   let block_header0, rpc_context0 = genesis_block in
-  parse_protocol_data block_header0.protocol_data >>=? fun protocol_data ->
+  let* protocol_data = parse_protocol_data block_header0.protocol_data in
   let genesis0 =
     {
       rpc_context = rpc_context0;
@@ -849,20 +906,80 @@ let create_fake_node_state ~i ~live_depth
       genesis_block_true_hash;
     }
 
+class tezt_printer : Tezos_client_base.Client_context.printer =
+  let open Tezos_client_base in
+  let open Client_context in
+  let wrap_tezt_log : (_ format4 -> _) -> _ format4 -> _ =
+   fun f x ->
+     Format.kasprintf
+       (fun msg ->
+         f "%s" msg ;
+         Lwt.return_unit)
+       x
+  in
+  object
+    method error : type a b. (a, b) lwt_format -> a =
+      Format.kasprintf (fun msg -> Lwt.fail (Failure msg))
+
+    method warning : type a. (a, unit) lwt_format -> a =
+      wrap_tezt_log Tezt_core.Log.warn
+
+    method message : type a. (a, unit) lwt_format -> a =
+      wrap_tezt_log (fun x -> Tezt_core.Log.info x)
+
+    method answer : type a. (a, unit) lwt_format -> a =
+      wrap_tezt_log (fun x -> Tezt_core.Log.info x)
+
+    method log : type a. string -> (a, unit) lwt_format -> a =
+      fun _log_output -> wrap_tezt_log (fun x -> Tezt_core.Log.info x)
+  end
+
+(** Create context index from state's context table. *)
+let create_context_index (state : state) : Abstract_context_index.t =
+  let open Abstract_context_index in
+  {
+    sync_fun = Lwt.return;
+    checkout_fun =
+      (fun hash ->
+        Context_hash.Table.find state.ctxt_table hash
+        |> Option.map (fun Tezos_protocol_environment.{context; _} -> context)
+        |> Lwt.return);
+    finalize_fun = Lwt.return;
+  }
+
+(** Register delegates in wallet. *)
+let register_delegates_in_wallet
+    ~(wallet : #Tezos_client_base.Client_context.wallet)
+    ~(delegates : Baking_state_types.Key.t list) =
+  let open Lwt_result_syntax in
+  List.iter_es
+    (fun ({alias; public_key; id; secret_key_uri} : Baking_state_types.Key.t) ->
+      let* public_key_uri = Client_keys.neuterize secret_key_uri in
+      let pkh = Baking_state_types.Key_id.to_pkh id in
+      Client_keys.register_key
+        wallet
+        ~force:false
+        (pkh, public_key_uri, secret_key_uri)
+        ~public_key
+        alias)
+    delegates
+
 (** Start baker process. *)
-let baker_process ~(delegates : Baking_state.consensus_key list) ~base_dir
+let baker_process ~(delegates : Baking_state_types.Key.t list) ~base_dir
     ~(genesis_block : Block_header.t * Tezos_protocol_environment.rpc_context)
     ~i ~global_chain_table ~broadcast_pipes ~(user_hooks : (module Hooks)) =
+  let open Lwt_result_syntax in
   let broadcast_pipe =
     List.nth broadcast_pipes i |> WithExceptions.Option.get ~loc:__LOC__
   in
-  create_fake_node_state
-    ~i
-    ~live_depth:60
-    ~genesis_block
-    ~global_chain_table
-    ~broadcast_pipes
-  >>=? fun state ->
+  let* state =
+    create_fake_node_state
+      ~i
+      ~live_depth:60
+      ~genesis_block
+      ~global_chain_table
+      ~broadcast_pipes
+  in
   let filesystem = String.Hashtbl.create 10 in
   let wallet = new Faked_client_context.faked_io_wallet ~base_dir ~filesystem in
   let cctxt =
@@ -875,33 +992,9 @@ let baker_process ~(delegates : Baking_state.consensus_key list) ~base_dir
          ~hooks)
   in
   let module User_hooks = (val user_hooks : Hooks) in
-  User_hooks.on_start_baker ~baker_position:i ~delegates ~cctxt >>= fun () ->
-  List.iter_es
-    (fun ({alias; public_key; public_key_hash; secret_key_uri} :
-           Baking_state.consensus_key) ->
-      let open Tezos_client_base in
-      let name = alias |> WithExceptions.Option.get ~loc:__LOC__ in
-      Client_keys.neuterize secret_key_uri >>=? fun public_key_uri ->
-      Client_keys.register_key
-        wallet
-        ~force:false
-        (public_key_hash, public_key_uri, secret_key_uri)
-        ~public_key
-        name)
-    delegates
-  >>=? fun () ->
-  let context_index =
-    let open Abstract_context_index in
-    {
-      sync_fun = Lwt.return;
-      checkout_fun =
-        (fun hash ->
-          Context_hash.Table.find state.ctxt_table hash
-          |> Option.map (fun Tezos_protocol_environment.{context; _} -> context)
-          |> Lwt.return);
-      finalize_fun = Lwt.return;
-    }
-  in
+  let*! () = User_hooks.on_start_baker ~baker_position:i ~delegates ~cctxt in
+  let* () = register_delegates_in_wallet ~wallet ~delegates in
+  let context_index = create_context_index state in
   let module User_hooks = (val user_hooks : Hooks) in
   let listener_process () = listener ~user_hooks ~state ~broadcast_pipe in
   let stop_on_event event = User_hooks.stop_on_event event in
@@ -913,7 +1006,7 @@ let baker_process ~(delegates : Baking_state.consensus_key list) ~base_dir
       ~context_index
       ~delegates
   in
-  Lwt.pick [listener_process (); baker_process ()] >>=? fun () ->
+  let* () = Lwt.pick [listener_process (); baker_process ()] in
   User_hooks.check_chain_on_success ~chain:state.chain
 
 let genesis_protocol_data (baker_sk : Signature.secret_key)
@@ -928,6 +1021,13 @@ let genesis_protocol_data (baker_sk : Signature.secret_key)
       ~payload_round:Alpha_context.Round.zero
       []
   in
+  let per_block_votes =
+    {
+      Protocol.Per_block_votes_repr.liquidity_baking_vote =
+        Baking_configuration.default_votes_config
+          .Baking_configuration.liquidity_baking_vote;
+    }
+  in
   let contents =
     Protocol.Alpha_context.Block_header.
       {
@@ -935,8 +1035,7 @@ let genesis_protocol_data (baker_sk : Signature.secret_key)
         payload_round = Alpha_context.Round.zero;
         proof_of_work_nonce;
         seed_nonce_hash = None;
-        liquidity_baking_toggle_vote =
-          Baking_configuration.default_liquidity_baking_toggle_vote;
+        per_block_votes;
       }
   in
   let unsigned_header =
@@ -962,15 +1061,17 @@ let deduce_baker_sk
       * Tezos_mockup_commands.Mockup_wallet.bootstrap_secret)
       list) (total_accounts : int) (level : int) :
     Signature.secret_key tzresult Lwt.t =
-  (match (total_accounts, level) with
-  | _, 0 -> return 0 (* apparently this doesn't really matter *)
-  | _ ->
-      failwith
-        "cannot deduce baker for a genesis block, total accounts = %d, level = \
-         %d"
-        total_accounts
-        level)
-  >>=? fun baker_index ->
+  let open Lwt_result_syntax in
+  let* baker_index =
+    match (total_accounts, level) with
+    | _, 0 -> return 0 (* apparently this doesn't really matter *)
+    | _ ->
+        failwith
+          "cannot deduce baker for a genesis block, total accounts = %d, level \
+           = %d"
+          total_accounts
+          level
+  in
   let _, secret =
     List.nth accounts_with_secrets baker_index
     |> WithExceptions.Option.get ~loc:__LOC__
@@ -982,8 +1083,9 @@ let deduce_baker_sk
 
 (** Generate the two initial genesis blocks. *)
 let make_genesis_context ~delegate_selection ~initial_seed ~round0 ~round1
-    ~consensus_committee_size ~consensus_threshold accounts_with_secrets
+    ~consensus_committee_size ~consensus_threshold_size accounts_with_secrets
     (total_accounts : int) =
+  let open Lwt_result_syntax in
   let default_constants = Mockup.Protocol_parameters.default_value.constants in
   let round_durations =
     let open Alpha_context in
@@ -998,7 +1100,7 @@ let make_genesis_context ~delegate_selection ~initial_seed ~round0 ~round1
       default_constants with
       initial_seed;
       consensus_committee_size;
-      consensus_threshold;
+      consensus_threshold_size;
       minimal_block_delay = Alpha_context.Period.of_seconds_exn (max 1L round0);
       delay_increment_per_round =
         Alpha_context.Period.of_seconds_exn Int64.(max 1L (sub round1 round0));
@@ -1019,50 +1121,58 @@ let make_genesis_context ~delegate_selection ~initial_seed ~round0 ~round1
       (Data_encoding.list Mockup.Parsed_account.encoding)
       (List.mapi from_bootstrap_account accounts_with_secrets)
   in
-  List.map_e
-    (fun (level, round_delegates) ->
-      Raw_level_repr.of_int32 level >>? fun level ->
-      List.map_e
-        (fun (round, delegate) ->
-          Round_repr.of_int32 round >|? fun round -> (round, delegate))
-        round_delegates
-      >|? fun round_delegates -> (level, round_delegates))
-    delegate_selection
-  |> Environment.wrap_tzresult
-  >>?= fun delegate_selection ->
-  (match (delegate_selection, constants.initial_seed) with
-  | [], seed_opt -> return seed_opt
-  | selection, (Some _ as seed) -> (
-      Faked_client_context.logger#warning "Checking provided seed."
-      >>= fun () ->
-      Tenderbrute.check_seed
-        ~bootstrap_accounts_json:bootstrap_accounts
-        ~parameters:Mockup.Protocol_parameters.{default_value with constants}
-        ~seed
-        selection
-      >>=? function
-      | true -> return seed
-      | false ->
-          failwith "Provided initial seed does not match delegate selection")
-  | _, None ->
-      Faked_client_context.logger#warning
-        "No initial seed provided, bruteforcing."
-      >>= fun () ->
-      Tenderbrute.bruteforce
-        ~max:100_000_000_000
-        ~bootstrap_accounts_json:bootstrap_accounts
-        ~parameters:Mockup.Protocol_parameters.{default_value with constants}
-        delegate_selection)
-  >>=? fun initial_seed ->
-  (match initial_seed with
-  | None -> Lwt.return_unit
-  | _ when initial_seed = constants.initial_seed -> Lwt.return_unit
-  | Some seed ->
-      Faked_client_context.logger#warning
-        "Bruteforced seed is %a, please save into your test."
-        State_hash.pp
-        seed)
-  >>= fun () ->
+  let*? delegate_selection =
+    let open Result_syntax in
+    List.map_e
+      (fun (level, round_delegates) ->
+        let* level = Raw_level_repr.of_int32 level in
+        let+ round_delegates =
+          List.map_e
+            (fun (round, delegate) ->
+              let+ round = Round_repr.of_int32 round in
+              (round, delegate))
+            round_delegates
+        in
+        (level, round_delegates))
+      delegate_selection
+    |> Environment.wrap_tzresult
+  in
+  let cctxt = new tezt_printer in
+  let* initial_seed =
+    match (delegate_selection, constants.initial_seed) with
+    | [], seed_opt -> return seed_opt
+    | selection, (Some _ as seed) -> (
+        let*! () = cctxt#message "Checking provided seed." in
+        let* result =
+          Tenderbrute.check_seed
+            ~bootstrap_accounts_json:bootstrap_accounts
+            ~parameters:
+              Mockup.Protocol_parameters.{default_value with constants}
+            ~seed
+            selection
+        in
+        match result with
+        | true -> return seed
+        | false ->
+            failwith "Provided initial seed does not match delegate selection")
+    | _, None ->
+        let*! () = cctxt#message "No initial seed provided, bruteforcing." in
+        Tenderbrute.bruteforce
+          ~max:100_000_000_000
+          ~bootstrap_accounts_json:bootstrap_accounts
+          ~parameters:Mockup.Protocol_parameters.{default_value with constants}
+          delegate_selection
+  in
+  let*! () =
+    match initial_seed with
+    | None -> Lwt.return_unit
+    | _ when initial_seed = constants.initial_seed -> Lwt.return_unit
+    | Some seed ->
+        cctxt#warning
+          "Bruteforced seed is %a, please save into your test."
+          State_hash.pp
+          seed
+  in
   let constants = {constants with initial_seed} in
   let common_parameters =
     Mockup.Protocol_parameters.{default_value with constants}
@@ -1075,12 +1185,13 @@ let make_genesis_context ~delegate_selection ~initial_seed ~round0 ~round1
            Mockup.Protocol_parameters.encoding
            parameters
     in
-    Mockup.M.init
-      ~cctxt:Faked_client_context.logger
-      ~parameters:reencoded_parameters
-      ~constants_overrides_json:None
-      ~bootstrap_accounts_json:(Some bootstrap_accounts)
-    >>=? fun {chain = _; rpc_context = rpc_context0; protocol_data = _} ->
+    let* {chain = _; rpc_context = rpc_context0; protocol_data = _} =
+      Mockup.M.init
+        ~cctxt
+        ~parameters:reencoded_parameters
+        ~constants_overrides_json:None
+        ~bootstrap_accounts_json:(Some bootstrap_accounts)
+    in
     let block_header0 =
       {
         rpc_context0.block_header with
@@ -1088,7 +1199,7 @@ let make_genesis_context ~delegate_selection ~initial_seed ~round0 ~round1
       }
     in
     let rpc_context = {rpc_context0 with block_header = block_header0} in
-    deduce_baker_sk accounts_with_secrets total_accounts 0 >>=? fun baker_sk ->
+    let* baker_sk = deduce_baker_sk accounts_with_secrets total_accounts 0 in
     let protocol_data =
       genesis_protocol_data
         baker_sk
@@ -1120,48 +1231,49 @@ let default_propagation_vector = List.repeat 5 Pass
 module Default_hooks : Hooks = struct
   let on_inject_block ~level:_ ~round:_ ~block_hash ~block_header ~operations
       ~protocol_data:_ =
+    let open Lwt_result_syntax in
     return (block_hash, block_header, operations, default_propagation_vector)
 
   let on_inject_operation ~op_hash ~op =
+    let open Lwt_result_syntax in
     return (op_hash, op, default_propagation_vector)
 
   let on_new_validated_block ~block_hash ~block_header ~operations =
-    Lwt.return (Some (block_hash, block_header, operations))
+    Lwt.return_some (block_hash, block_header, operations)
 
   let on_new_head ~block_hash ~block_header =
-    Lwt.return (Some (block_hash, block_header))
+    Lwt.return_some (block_hash, block_header)
 
   let on_new_operation x = Lwt.return_some x
 
   let check_block_before_processing ~level:_ ~round:_ ~block_hash:_
       ~block_header:_ ~protocol_data:_ =
-    return_unit
+    Lwt_result_syntax.return_unit
 
-  let check_chain_after_processing ~level:_ ~round:_ ~chain:_ = return_unit
+  let check_chain_after_processing ~level:_ ~round:_ ~chain:_ =
+    Lwt_result_syntax.return_unit
 
-  let check_mempool_after_processing ~mempool:_ = return_unit
+  let check_mempool_after_processing ~mempool:_ = Lwt_result_syntax.return_unit
 
   let stop_on_event _ = false
 
   let on_start_baker ~baker_position:_ ~delegates:_ ~cctxt:_ = Lwt.return_unit
 
-  let check_chain_on_success ~chain:_ = return_unit
+  let check_chain_on_success ~chain:_ = Lwt_result_syntax.return_unit
 end
 
 type config = {
-  debug : bool;
   round0 : int64;
   round1 : int64;
   timeout : int;
   delegate_selection : (int32 * (int32 * Signature.public_key_hash) list) list;
   initial_seed : State_hash.t option;
   consensus_committee_size : int;
-  consensus_threshold : int;
+  consensus_threshold_size : int;
 }
 
 let default_config =
   {
-    debug = false;
     round0 = 2L;
     (* Rounds should be long enough for the bakers to
        exchange all the necessary messages. *)
@@ -1171,25 +1283,41 @@ let default_config =
     initial_seed = None;
     consensus_committee_size =
       Default_parameters.constants_mainnet.consensus_committee_size;
-    consensus_threshold =
-      Default_parameters.constants_mainnet.consensus_threshold;
+    consensus_threshold_size =
+      Default_parameters.constants_mainnet.consensus_threshold_size;
   }
 
 let make_baking_delegate
     ( (account : Alpha_context.Parameters.bootstrap_account),
       (secret : Tezos_mockup_commands.Mockup_wallet.bootstrap_secret) ) :
-    Baking_state.consensus_key =
-  Baking_state.
-    {
-      alias = Some secret.name;
-      public_key = account.public_key |> WithExceptions.Option.get ~loc:__LOC__;
-      public_key_hash = account.public_key_hash;
-      secret_key_uri = secret.sk_uri;
-    }
+    Baking_state_types.Key.t =
+  Baking_state_types.Key.make
+    ~alias:secret.name
+    ~public_key_hash:
+      (* FIXME-PA *)
+      (Protocol.Implicit_account_repr.Forbidden.to_pkh account.public_key_hash)
+    ~public_key:(account.public_key |> WithExceptions.Option.get ~loc:__LOC__)
+    ~secret_key_uri:secret.sk_uri
+
+(** Get bootstrap accounts with secrets and create delegates.
+    This is the common setup used by both [run] and [create_baker_test_env]. *)
+let get_bootstrap_delegates ~num_delegates =
+  let open Lwt_result_syntax in
+  if num_delegates <= 0 then failwith "need at least one delegate"
+  else if num_delegates > 5 then failwith "only up to 5 bootstrap accounts"
+  else
+    let* bootstrap_secrets =
+      Tezos_mockup_commands.Mockup_wallet.default_bootstrap_accounts
+    in
+    let accounts_with_secrets =
+      List.combine_drop (List.take_n num_delegates accounts) bootstrap_secrets
+    in
+    let delegates = List.map make_baking_delegate accounts_with_secrets in
+    return (accounts_with_secrets, delegates)
 
 let run ?(config = default_config) bakers_spec =
-  Tezos_client_base.Client_keys.register_signer
-    (module Tezos_signer_backends.Unencrypted) ;
+  let open Lwt_result_syntax in
+  Client_keys.register_signer (module Tezos_signer_backends.Unencrypted) ;
   let total_accounts =
     List.fold_left (fun acc (n, _) -> acc + n) 0 bakers_spec
   in
@@ -1198,42 +1326,32 @@ let run ?(config = default_config) bakers_spec =
   else if total_accounts > 5 then
     failwith "only up to 5 bootstrap accounts are available"
   else
-    (* When logging is enabled it may cause non-termination:
-
-       https://gitlab.com/nomadic-labs/tezos/-/issues/546
-
-       In particular, it seems that when logging is enabled the baker
-       process can get cancelled without executing its Lwt finalizer. *)
-    (if config.debug then Tezos_base_unix.Internal_event_unix.init ()
-    else Lwt.return_unit)
-    >>= fun () ->
     let total_bakers = List.length bakers_spec in
-    (List.init ~when_negative_length:() total_bakers (fun _ ->
-         Lwt_pipe.Unbounded.create ())
-     |> function
-     | Error () -> failwith "impossible: negative length of the baker spec"
-     | Ok xs -> return xs)
-    >>=? fun broadcast_pipes ->
-    let global_chain_table = Block_hash.Table.create 10 in
-    Tezos_mockup_commands.Mockup_wallet.default_bootstrap_accounts
-    >>=? fun bootstrap_secrets ->
-    let accounts_with_secrets =
-      List.combine_drop (List.take_n total_accounts accounts) bootstrap_secrets
+    let* broadcast_pipes =
+      List.init ~when_negative_length:() total_bakers (fun _ ->
+          Lwt_pipe.Unbounded.create ())
+      |> function
+      | Error () -> failwith "impossible: negative length of the baker spec"
+      | Ok xs -> return xs
     in
-    let all_delegates = List.map make_baking_delegate accounts_with_secrets in
-    make_genesis_context
-      ~delegate_selection:config.delegate_selection
-      ~initial_seed:config.initial_seed
-      ~round0:config.round0
-      ~round1:config.round1
-      ~consensus_committee_size:config.consensus_committee_size
-      ~consensus_threshold:config.consensus_threshold
-      accounts_with_secrets
-      total_accounts
-    >>=? fun genesis_block ->
+    let global_chain_table = Block_hash.Table.create 10 in
+    let* accounts_with_secrets, all_delegates =
+      get_bootstrap_delegates ~num_delegates:total_accounts
+    in
+    let* genesis_block =
+      make_genesis_context
+        ~delegate_selection:config.delegate_selection
+        ~initial_seed:config.initial_seed
+        ~round0:config.round0
+        ~round1:config.round1
+        ~consensus_committee_size:config.consensus_committee_size
+        ~consensus_threshold_size:config.consensus_threshold_size
+        accounts_with_secrets
+        total_accounts
+    in
     let take_third (_, _, x) = x in
     let timeout_process () =
-      Lwt_unix.sleep (Float.of_int config.timeout) >>= fun () ->
+      let*! () = Lwt_unix.sleep (Float.of_int config.timeout) in
       failwith "the test is taking longer than %d seconds@." config.timeout
     in
     Lwt.pick
@@ -1278,6 +1396,7 @@ let bootstrap5 = get_account_pk 4
 
 let check_block_signature ~block_hash ~(block_header : Block_header.t)
     ~public_key =
+  let open Lwt_result_syntax in
   let (protocol_data : Protocol.Alpha_context.Block_header.protocol_data) =
     Data_encoding.Binary.of_bytes_exn
       Protocol.Alpha_context.Block_header.protocol_data_encoding
@@ -1308,8 +1427,10 @@ type op_predicate =
   Operation_hash.t -> Alpha_context.packed_operation -> bool tzresult Lwt.t
 
 let mempool_count_ops ~mempool ~predicate =
-  List.map_es (fun (op_hash, op) -> predicate op_hash op) mempool
-  >>=? fun results ->
+  let open Lwt_result_syntax in
+  let* results =
+    List.map_es (fun (op_hash, op) -> predicate op_hash op) mempool
+  in
   return
     (List.fold_left
        (fun acc result -> if result then acc + 1 else acc)
@@ -1317,28 +1438,33 @@ let mempool_count_ops ~mempool ~predicate =
        results)
 
 let mempool_has_op ~mempool ~predicate =
-  mempool_count_ops ~mempool ~predicate >>=? fun n -> return (n > 0)
+  let open Lwt_result_syntax in
+  let* n = mempool_count_ops ~mempool ~predicate in
+  return (n > 0)
 
 let mempool_has_op_ref ~mempool ~predicate ~var =
-  mempool_has_op ~mempool ~predicate >>=? fun result ->
+  let open Lwt_result_syntax in
+  let* result = mempool_has_op ~mempool ~predicate in
   if result then var := true ;
   return_unit
 
 let op_is_signed_by ~public_key (op_hash : Operation_hash.t)
     (op : Alpha_context.packed_operation) =
+  let open Lwt_result_syntax in
   match op.protocol_data with
   | Operation_data d -> (
-      (match d.contents with
-      | Single op_contents ->
-          return
-            (match op_contents with
-            | Endorsement _ ->
-                Alpha_context.Operation.to_watermark (Endorsement chain_id)
-            | Preendorsement _ ->
-                Alpha_context.Operation.to_watermark (Preendorsement chain_id)
-            | _ -> Signature.Generic_operation)
-      | _ -> failwith "unexpected contents in %a@." Operation_hash.pp op_hash)
-      >>=? fun watermark ->
+      let* watermark =
+        match d.contents with
+        | Single op_contents ->
+            return
+              (match op_contents with
+              | Attestation _ ->
+                  Alpha_context.Operation.to_watermark (Attestation chain_id)
+              | Preattestation _ ->
+                  Alpha_context.Operation.to_watermark (Preattestation chain_id)
+              | _ -> Signature.Generic_operation)
+        | _ -> failwith "unexpected contents in %a@." Operation_hash.pp op_hash
+      in
       match d.signature with
       | None ->
           failwith
@@ -1358,14 +1484,15 @@ let op_is_signed_by ~public_key (op_hash : Operation_hash.t)
                signature
                unsigned_operation_bytes))
 
-let op_is_preendorsement ?level ?round (op_hash : Operation_hash.t)
+let op_is_preattestation ?level ?round (op_hash : Operation_hash.t)
     (op : Alpha_context.packed_operation) =
+  let open Lwt_result_syntax in
   match op.protocol_data with
   | Operation_data d -> (
       match d.contents with
       | Single op_contents -> (
           match op_contents with
-          | Preendorsement consensus_content ->
+          | Preattestation consensus_content ->
               let right_level =
                 match level with
                 | None -> true
@@ -1383,17 +1510,18 @@ let op_is_preendorsement ?level ?round (op_hash : Operation_hash.t)
                       expected_round
               in
               return (right_level && right_round)
-          | _ -> return false)
+          | _ -> return_false)
       | _ -> failwith "unexpected contents in %a@." Operation_hash.pp op_hash)
 
-let op_is_endorsement ?level ?round (op_hash : Operation_hash.t)
+let op_is_attestation ?level ?round (op_hash : Operation_hash.t)
     (op : Alpha_context.packed_operation) =
+  let open Lwt_result_syntax in
   match op.protocol_data with
   | Operation_data d -> (
       match d.contents with
       | Single op_contents -> (
           match op_contents with
-          | Endorsement consensus_content ->
+          | Attestation {consensus_content; _} ->
               let right_level =
                 match level with
                 | None -> true
@@ -1411,15 +1539,17 @@ let op_is_endorsement ?level ?round (op_hash : Operation_hash.t)
                       expected_round
               in
               return (right_level && right_round)
-          | _ -> return false)
+          | _ -> return_false)
       | _ -> failwith "unexpected contents in %a@." Operation_hash.pp op_hash)
 
 let op_is_both f g op_hash op =
-  f op_hash op >>=? fun f_result ->
-  if f_result then g op_hash op else return false
+  let open Lwt_result_syntax in
+  let* f_result = f op_hash op in
+  if f_result then g op_hash op else return_false
 
 let save_proposal_payload
     ~(protocol_data : Alpha_context.Block_header.protocol_data) ~var =
+  let open Lwt_result_syntax in
   var :=
     Some
       (protocol_data.contents.payload_hash, protocol_data.contents.payload_round) ;
@@ -1428,6 +1558,7 @@ let save_proposal_payload
 let verify_payload_hash
     ~(protocol_data : Alpha_context.Block_header.protocol_data)
     ~original_proposal ~message =
+  let open Lwt_result_syntax in
   match !original_proposal with
   | None ->
       failwith
@@ -1445,3 +1576,268 @@ let verify_payload_hash
 
 let get_block_round block =
   round_from_raw_fitness block.rpc_context.block_header.fitness
+
+(** {2 Additional helpers for integration testing} *)
+
+(** Get default protocol constants from mockup parameters. *)
+let get_default_constants () =
+  Mockup.Protocol_parameters.default_value.constants
+
+(** Chain ID used by the mockup simulator. *)
+let get_chain_id () = chain_id
+
+(** Get bootstrap accounts from mockup parameters. *)
+let get_bootstrap_accounts () =
+  Mockup.Protocol_parameters.default_value.bootstrap_accounts
+
+(** {2 Forge Worker Test Infrastructure} *)
+
+(** Result type for [create_baker_test_env]. Contains everything needed
+    to test baker components like the forge worker. *)
+type baker_test_env = {
+  cctxt : Protocol_client_context.full;
+  hooks : Faked_services.hooks;
+  delegates : Baking_state_types.Key.t list;
+  global_state : Baking_state.global_state;
+  automaton_state : Baking_state.automaton_state;
+  genesis_block_info : Baking_state_types.block_info;
+}
+
+(** [wrap_hooks_with_delay ~delay hooks] wraps an existing
+    [Faked_services.hooks] first-class module so that every RPC called by
+    [prepare_unsigned_block] ([rpc_context_callback], [resulting_context_hash],
+    [live_blocks]) sleeps for [delay] seconds before delegating to the original
+    implementation. This simulates a slow node.
+
+    Returns the wrapped hooks and a promise that resolves once [live_blocks]
+    (the last delayed RPC in [prepare_unsigned_block]) has been called and
+    completed. This allows tests to know when the slow node's preparation
+    is fully done. *)
+let wrap_hooks_with_delay ~delay (hooks : Faked_services.hooks) :
+    Faked_services.hooks * unit Lwt.t =
+  let module H = (val hooks : Faked_services.Mocked_services_hooks) in
+  let preparation_done, notify_preparation_done = Lwt.wait () in
+  ( (module struct
+      include H
+
+      let rpc_context_callback block =
+        let open Lwt_syntax in
+        let* () = Lwt_unix.sleep delay in
+        H.rpc_context_callback block
+
+      let resulting_context_hash block =
+        let open Lwt_syntax in
+        let* () = Lwt_unix.sleep delay in
+        H.resulting_context_hash block
+
+      let live_blocks block =
+        let open Lwt_syntax in
+        let* () = Lwt_unix.sleep delay in
+        let* result = H.live_blocks block in
+        Lwt.wakeup_later notify_preparation_done () ;
+        return result
+    end),
+    preparation_done )
+
+(** [create_cctxt ~hooks env] creates a fresh [Protocol_client_context.full]
+    from the given [hooks], with all delegates from [env] registered in
+    its wallet. Use the returned [cctxt] with
+    [Baking_automaton.create_automaton_state] to build an automaton that
+    simulates an additional node. *)
+let create_cctxt =
+  let cctxt_counter = ref 0 in
+  fun ~hooks ({global_state; _} : baker_test_env) ->
+    let open Lwt_result_syntax in
+    incr cctxt_counter ;
+    let base_dir = Format.asprintf "test-extra-%d" !cctxt_counter in
+    let filesystem = String.Hashtbl.create 10 in
+    let wallet =
+      new Faked_client_context.faked_io_wallet ~base_dir ~filesystem
+    in
+    let cctxt =
+      new Protocol_client_context.wrap_full
+        (new Faked_client_context.unix_faked
+           ~base_dir
+           ~filesystem
+           ~chain_id
+           ~hooks)
+    in
+    let* () =
+      register_delegates_in_wallet ~wallet ~delegates:global_state.delegates
+    in
+    return cctxt
+
+(** Create a test environment for baker component testing.
+
+    This function reuses the same setup as [baker_process] in [run]:
+    - Creates a fake node state with genesis block
+    - Creates a client context with mocked RPC services
+    - Registers delegates in the wallet
+    - Creates the global_state needed for forge worker
+
+    @param num_delegates Number of bootstrap delegates to use (max 5)
+    @return A [baker_test_env] with all components needed for testing
+*)
+let create_baker_test_env ?(config = default_config) ~num_delegates () =
+  let open Lwt_result_syntax in
+  (* Register signer - same as run *)
+  Client_keys.register_signer (module Tezos_signer_backends.Unencrypted) ;
+  (* Get bootstrap accounts and delegates - reusing helper *)
+  let* accounts_with_secrets, delegates =
+    get_bootstrap_delegates ~num_delegates
+  in
+  (* Create genesis block - same as run *)
+  let* genesis_block =
+    make_genesis_context
+      ~delegate_selection:config.delegate_selection
+      ~initial_seed:config.initial_seed
+      ~round0:config.round0
+      ~round1:config.round1
+      ~consensus_committee_size:config.consensus_committee_size
+      ~consensus_threshold_size:config.consensus_threshold_size
+      accounts_with_secrets
+      num_delegates
+  in
+  (* Create fake node state - same as baker_process *)
+  let broadcast_pipes = [Lwt_pipe.Unbounded.create ()] in
+  let global_chain_table = Block_hash.Table.create 10 in
+  let* state =
+    create_fake_node_state
+      ~i:0
+      ~live_depth:60
+      ~genesis_block
+      ~global_chain_table
+      ~broadcast_pipes
+  in
+  (* Create client context - same as baker_process *)
+  let base_dir = "test" in
+  let filesystem = String.Hashtbl.create 10 in
+  let wallet = new Faked_client_context.faked_io_wallet ~base_dir ~filesystem in
+  let hooks = make_mocked_services_hooks state (module Default_hooks) in
+  let cctxt =
+    new Protocol_client_context.wrap_full
+      (new Faked_client_context.unix_faked
+         ~base_dir
+         ~filesystem
+         ~chain_id
+         ~hooks)
+  in
+  (* Register delegates in wallet - reusing helper *)
+  let* () = register_delegates_in_wallet ~wallet ~delegates in
+  (* Create context index - reusing helper *)
+  let context_index = create_context_index state in
+  (* Fetch constants via RPC *)
+  let* constants =
+    Node_rpc.constants cctxt ~chain:(`Hash chain_id) ~block:(`Head 0)
+  in
+  (* Create round durations - same as Baking_scheduling.create_round_durations *)
+  let*? round_durations =
+    let first_round_duration = constants.parametric.minimal_block_delay in
+    let delay_increment_per_round =
+      constants.parametric.delay_increment_per_round
+    in
+    Environment.wrap_tzresult
+      (Alpha_context.Round.Durations.create
+         ~first_round_duration
+         ~delay_increment_per_round)
+  in
+  (* Create operation worker - for testing we use a minimal state *)
+  let operation_worker =
+    Operation_worker.Internal_for_tests.make_initial_state
+      ~monitor_node_operations:false
+      ()
+  in
+  (* Create global state - same structure as Baking_scheduling.create_initial_state *)
+  let cache = Baking_state.create_cache () in
+  let dal_included_attestations_cache =
+    Dal_included_attestations_cache.create
+      ~attestation_lags:constants.parametric.dal.attestation_lags
+      ~number_of_slots:constants.parametric.dal.number_of_slots
+  in
+  let name = Uri.to_string cctxt#base in
+  (* Create DAL worker *)
+  let dal_attestable_slots_worker =
+    Dal_attestable_slots_worker.create
+      ~automaton_name:name
+      ~attestation_lag:constants.parametric.dal.attestation_lag
+      ~attestation_lags:constants.parametric.dal.attestation_lags
+      ~number_of_slots:constants.parametric.dal.number_of_slots
+  in
+  let automaton_state =
+    let validation_mode = Baking_state.Local context_index in
+    let forge_event_stream, push_forge_event =
+      let stream, push = Lwt_stream.create () in
+      (stream, fun e -> push (Some e))
+    in
+    Baking_state.
+      {
+        name;
+        cctxt;
+        validation_mode;
+        operation_worker;
+        dal_attestable_slots_worker;
+        push_forge_event;
+        forge_event_stream;
+      }
+  in
+  let global_state =
+    Baking_state.
+      {
+        chain_id;
+        config =
+          {
+            Baking_configuration.default_config with
+            validation = ContextIndex context_index;
+            state_recorder = Memory;
+          };
+        round_durations;
+        constants;
+        forge_worker_hooks =
+          {
+            push_request =
+              (fun _ -> failwith "Forge worker not supported in simulator");
+            cancel_all_pending_tasks = (fun () -> ());
+          };
+        delegates;
+        cache;
+        dal_node_rpc_ctxt = None;
+        dal_included_attestations_cache;
+      }
+  in
+  (* Extract genesis block info *)
+  let* genesis_block_info =
+    match state.chain with
+    | [] -> failwith "No blocks in chain"
+    | block :: _ ->
+        let shell = block.rpc_context.block_header in
+        let* round_int32 = round_from_raw_fitness shell.fitness in
+        let* round =
+          match Alpha_context.Round.of_int32 round_int32 with
+          | Ok r -> return r
+          | Error e -> Lwt.return (Error (Environment.wrap_tztrace e))
+        in
+        return
+          Baking_state_types.
+            {
+              hash = block.rpc_context.block_hash;
+              shell;
+              payload_hash = block.protocol_data.contents.payload_hash;
+              payload_round = block.protocol_data.contents.payload_round;
+              round;
+              prequorum = None;
+              quorum = [];
+              payload = Operation_pool.empty_payload;
+              grandparent = shell.predecessor;
+            }
+  in
+  return
+    {cctxt; hooks; delegates; global_state; automaton_state; genesis_block_info}
+
+(** Create a batch_content for consensus vote testing. *)
+let create_batch_content ~(block_info : Baking_state_types.block_info) :
+    Baking_state.batch_content =
+  {
+    level = Alpha_context.Raw_level.of_int32_exn block_info.shell.level;
+    round = block_info.round;
+    block_payload_hash = block_info.payload_hash;
+  }

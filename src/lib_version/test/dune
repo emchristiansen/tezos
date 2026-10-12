@@ -1,26 +1,37 @@
 ; This file was automatically generated, do not edit.
 ; Edit file manifest/main.ml instead.
 
-(env (_ (env-vars (NODE_PRELOAD hacl-wasm,ocaml-bls12-381,secp256k1-wasm))))
-
-(executable
- (name test_parser)
- (modes native js)
+(library
+ (name src_lib_version_test_tezt_lib)
+ (instrumentation (backend bisect_ppx))
  (libraries
-  tezos-version
-  tezos-version.parser
-  alcotest)
- (js_of_ocaml)
+  tezt.core
+  bls12-381.archive
+  octez-libs.version
+  octez-libs.version.parser
+  octez-libs.qcheck-tezt)
+ (library_flags (:standard -linkall))
  (flags
   (:standard)
-  -open Tezos_version))
+  -open Tezt_core
+  -open Tezt_core.Base
+  -open Tezos_version)
+ (modules test_parser test_octez_node_version))
+
+(executable
+ (name main)
+ (instrumentation (backend bisect_ppx --bisect-sigterm))
+ (libraries
+  src_lib_version_test_tezt_lib
+  tezt)
+ (modules main))
 
 (rule
  (alias runtest)
- (package tezos-version)
- (action (run %{dep:./test_parser.exe})))
+ (package octez-libs)
+ (enabled_if (<> false %{env:RUNTEZTALIAS=true}))
+ (action (run %{dep:./main.exe} /flaky /ci_disabled)))
 
 (rule
- (alias runtest_js)
- (package tezos-version)
- (action (run node %{dep:./test_parser.bc.js})))
+ (targets main.ml)
+ (action (with-stdout-to %{targets} (echo "let () = Tezt.Test.run ()"))))

@@ -32,6 +32,8 @@
                  network.
 *)
 
+let team = Tag.layer1
+
 let protocol_path = "src/bin_client/test/proto_test_injection"
 
 let is_static_binary execname =
@@ -45,12 +47,15 @@ let test_injection_and_activation () : unit =
   Test.register
     ~__FILE__
     ~title:"protocol injection and activation"
-    ~tags:["protocol"; "injection"; "activation"; "network"; "not_static"]
+    ~tags:[team; "protocol"; "injection"; "activation"; "network"; "not_static"]
+    ~uses:[Constant.octez_protocol_compiler]
   @@ fun () ->
   Log.info "Check protocol compiler and protocol availability" ;
   Check.file_exists ~__LOC__ protocol_path ;
-  Check.file_exists ~__LOC__ Constant.tezos_protocol_compiler ;
-  let* compiler_is_static = is_static_binary Constant.tezos_protocol_compiler in
+  Check.file_exists ~__LOC__ (Uses.path Constant.octez_protocol_compiler) ;
+  let* compiler_is_static =
+    is_static_binary (Uses.path Constant.octez_protocol_compiler)
+  in
   Check.is_false
     ~__LOC__
     compiler_is_static
@@ -116,7 +121,7 @@ let test_injection_and_activation () : unit =
       client1
   in
 
-  let activation_block_level = Node.get_level node1 in
+  let* activation_block_level = Node.get_level node1 in
   Log.info
     "Wait for activation block propagation at level %d"
     activation_block_level ;
@@ -125,7 +130,7 @@ let test_injection_and_activation () : unit =
       (fun node ->
         let* (_ : int) = Node.wait_for_level node activation_block_level in
         let* (metadata : RPC.block_metadata) =
-          RPC.Client.call ~protocol_hash:Protocol.genesis_hash client1
+          Client.RPC.call ~protocol_hash:Protocol.genesis_hash client1
           @@ RPC.get_chain_block_metadata ()
         in
         Log.info
@@ -150,7 +155,7 @@ let test_activation () : unit =
   Test.register
     ~__FILE__
     ~title:"protocol activation (protocol already linked to the node)"
-    ~tags:["protocol"; "activation"]
+    ~tags:[team; "protocol"; "activation"]
   @@ fun () ->
   let protocol_hash = Protocol.demo_noops_hash in
   Log.info "Check that %s is known" protocol_hash ;
@@ -166,7 +171,7 @@ let test_activation () : unit =
 
   Log.info "Check that first protocol has the zeroth protocol hash" ;
   let* metadata =
-    RPC.Client.call ~protocol_hash:Protocol.genesis_hash client
+    Client.RPC.call ~protocol_hash:Protocol.genesis_hash client
     @@ RPC.get_chain_block_metadata ()
   in
   Check.(
@@ -190,7 +195,7 @@ let test_activation () : unit =
 
   Log.info "Check that protocol of activation block is genesis" ;
   let* metadata =
-    RPC.Client.call ~protocol_hash:Protocol.genesis_hash client
+    Client.RPC.call ~protocol_hash:Protocol.genesis_hash client
     @@ RPC.get_chain_block_metadata ()
   in
   Check.(
@@ -202,6 +207,76 @@ let test_activation () : unit =
 
   unit
 
+let test_alternative_protocol_hash =
+  Test.register
+    ~__FILE__
+    ~title:"Protocol is compiled with another expected hash"
+    ~tags:[team; "protocol"; "compilation"; "hash"]
+    ~uses:[Constant.octez_protocol_compiler]
+  @@ fun () ->
+  (* First, prepare a new protocol. *)
+  let protocol_desc_file = "TEZOS_PROTOCOL" in
+  let protocol_desc =
+    `O [("modules", `A [`String "Main"]); ("expected_env_version", `Float 13.)]
+    |> JSON.annotate ~origin:""
+  in
+  let protocol_main_file = "main.ml" in
+  let protocol_main = "(* This is a dummy protocol *)" in
+
+  (* And write it in a temporary folder. *)
+  let protocol = Tezt.Temp.dir "protocol" in
+  JSON.encode_to_file
+    (Filename.concat protocol protocol_desc_file)
+    protocol_desc ;
+  Base.write_file
+    (Filename.concat protocol protocol_main_file)
+    ~contents:protocol_main ;
+
+  (* Let's hash the protocol to fill the `TEZOS_PROTOCOL` file. *)
+  let* protocol_hash = Protocol_compiler.compile ~hash_only:true protocol in
+  let protocol_desc_patched =
+    JSON.(
+      put ("hash", annotate ~origin:"" (`String protocol_hash)) protocol_desc)
+  in
+  JSON.encode_to_file
+    (Filename.concat protocol protocol_desc_file)
+    protocol_desc_patched ;
+
+  (* Now we can start patching the files so that we produce different hashes. *)
+  (* This one should be rejected by the protocol compiler, as the hash it will
+     produce is not registered. *)
+  let patched_protocol_main =
+    protocol_main ^ "(* This hash will be rejected. *)"
+  in
+  Base.write_file
+    (Filename.concat protocol protocol_main_file)
+    ~contents:patched_protocol_main ;
+
+  (* Then compile it and see it fail as the hash is inconsistent. *)
+  let failing_compilation_process = Protocol_compiler.spawn_compile protocol in
+  let* () = Process.check ~expect_failure:true failing_compilation_process in
+
+  (* This time, let's patch it so that it produces a hash we are aware of:
+     `Pry4stD6qN1ZagUX6YCHvMxA1xvSjARkdt8bhs86j74JGLoLDKN`. See
+     `src/lib_protocol_compiler/hashes/protocol_hash_representatives.ml`. *)
+  let patched_protocol_main =
+    protocol_main
+    ^ "(* This is a harmless comment that will change the protocol hash. *)"
+  in
+  Base.write_file
+    (Filename.concat protocol protocol_main_file)
+    ~contents:patched_protocol_main ;
+
+  (* This time, the compilation will succeed and the resulting hash will be the
+     one declared in `TEZOS_PROTOCOL`. *)
+  let* hash = Protocol_compiler.compile protocol in
+  Check.(
+    (hash = protocol_hash)
+      string
+      ~error_msg:"Protocol hash expected was %R, but got %L") ;
+  unit
+
 let register_protocol_independent () =
   test_injection_and_activation () ;
-  test_activation ()
+  test_activation () ;
+  test_alternative_protocol_hash

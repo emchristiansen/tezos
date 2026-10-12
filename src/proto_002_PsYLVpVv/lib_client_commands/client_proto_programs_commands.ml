@@ -190,7 +190,10 @@ let commands () =
          no_print_source_flag
          custom_gas_flag)
       (prefixes ["typecheck"; "script"] @@ Program.source_param @@ stop)
-      (fun (show_types, emacs_mode, no_print_source, original_gas) program cctxt ->
+      (fun (show_types, emacs_mode, no_print_source, original_gas)
+           program
+           cctxt
+         ->
         match program with
         | program, [] ->
             resolve_max_gas cctxt cctxt#block original_gas
@@ -328,9 +331,9 @@ let commands () =
       @@ stop)
       (fun () bytes cctxt ->
         (if Bytes.get bytes 0 != '\005' then
-         failwith
-           "Not a piece of packed Michelson data (must start with `0x05`)"
-        else return_unit)
+           failwith
+             "Not a piece of packed Michelson data (must start with `0x05`)"
+         else return_unit)
         >>=? fun () ->
         (* Remove first byte *)
         let bytes = Bytes.sub bytes 1 (Bytes.length bytes - 1) in
@@ -376,7 +379,8 @@ let commands () =
            bytes
            (_, (key_locator, _))
            signature
-           (cctxt : #Alpha_client_context.full) ->
+           (cctxt : #Alpha_client_context.full)
+         ->
         Client_keys_v0.check key_locator signature bytes >>=? function
         | false -> cctxt#error "invalid signature"
         | true ->

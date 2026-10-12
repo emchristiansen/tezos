@@ -76,7 +76,7 @@ let script_string = Script_string.length
 
 let bytes (b : Bytes.t) : t = Bytes.length b
 
-let mutez (_tez : Alpha_context.Tez.tez) : t =
+let mutez (_tez : Alpha_context.Tez.t) : t =
   (* Up to now, mutez are stored on 8 bytes (int64). *)
   8
 
@@ -85,7 +85,7 @@ let bool (_ : bool) : t = 1
 let signature (signature : Script_typed_ir.Script_signature.t) : t =
   Script_typed_ir.Script_signature.size signature
 
-let key_hash (_keyhash : Signature.public_key_hash) : t =
+let key_hash (_keyhash : Signature.Public_key_hash.t) : t =
   Signature.Public_key_hash.size
 
 let public_key (public_key : Signature.public_key) : t =
@@ -99,43 +99,39 @@ let address (addr : Script_typed_ir.address) : t =
   Signature.Public_key_hash.size
   + String.length (Alpha_context.Entrypoint.to_string entrypoint)
 
-let tx_rollup_l2_address x =
-  Tx_rollup_l2_address.Indexable.size @@ Indexable.forget x
-
 let timestamp (tstamp : Script_timestamp.t) : t =
   Z.numbits (Script_timestamp.to_zint tstamp) / 8
 
-let rec size_of_comparable_value :
-    type a. a Script_typed_ir.comparable_ty -> a -> t =
-  fun (type a) (wit : a Script_typed_ir.comparable_ty) (v : a) ->
-   match wit with
-   | Never_t -> ( match v with _ -> .)
-   | Unit_t -> unit
-   | Int_t -> integer v
-   | Nat_t -> integer v
-   | String_t -> script_string v
-   | Bytes_t -> bytes v
-   | Mutez_t -> mutez v
-   | Bool_t -> bool v
-   | Key_hash_t -> key_hash v
-   | Timestamp_t -> timestamp v
-   | Address_t -> address v
-   | Tx_rollup_l2_address_t -> tx_rollup_l2_address v
-   | Pair_t (leaf, node, _, YesYes) ->
-       let lv, rv = v in
-       let size =
-         size_of_comparable_value leaf lv + size_of_comparable_value node rv
-       in
-       size + 1
-   | Or_t (left, right, _, YesYes) ->
-       let size =
-         match v with
-         | L v -> size_of_comparable_value left v
-         | R v -> size_of_comparable_value right v
-       in
-       size + 1
-   | Option_t (ty, _, Yes) -> (
-       match v with None -> 1 | Some x -> size_of_comparable_value ty x + 1)
-   | Signature_t -> signature v
-   | Key_t -> public_key v
-   | Chain_id_t -> chain_id v
+let rec size_of_comparable_value : type a.
+    a Script_typed_ir.comparable_ty -> a -> t =
+ fun (type a) (wit : a Script_typed_ir.comparable_ty) (v : a) ->
+  match wit with
+  | Never_t -> ( match v with _ -> .)
+  | Unit_t -> unit
+  | Int_t -> integer v
+  | Nat_t -> integer v
+  | String_t -> script_string v
+  | Bytes_t -> bytes v
+  | Mutez_t -> mutez v
+  | Bool_t -> bool v
+  | Key_hash_t -> key_hash v
+  | Timestamp_t -> timestamp v
+  | Address_t -> address v
+  | Pair_t (leaf, node, _, YesYes) ->
+      let lv, rv = v in
+      let size =
+        size_of_comparable_value leaf lv + size_of_comparable_value node rv
+      in
+      size + 1
+  | Or_t (left, right, _, YesYes) ->
+      let size =
+        match v with
+        | L v -> size_of_comparable_value left v
+        | R v -> size_of_comparable_value right v
+      in
+      size + 1
+  | Option_t (ty, _, Yes) -> (
+      match v with None -> 1 | Some x -> size_of_comparable_value ty x + 1)
+  | Signature_t -> signature v
+  | Key_t -> public_key v
+  | Chain_id_t -> chain_id v

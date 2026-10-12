@@ -1,0 +1,80 @@
+[package]
+name = "octez-evm-node-wasm-runtime"
+version = "0.0.0-dev"
+authors = ["Etherlink Core Engineers <contact@tezos.com>"]
+edition = "2021"
+resolver = "3"
+
+[lib]
+crate-type = ["staticlib", "cdylib", "rlib"]
+
+[build-dependencies]
+ocaml-build = { version = "1.*", features = ["dune"] }
+
+[dependencies]
+# Pin to match alloy-consensus 1.0.x; newer 1.6.x generates code
+# incompatible with the 1.0.x TransactionEnvelope trait (semver violation).
+alloy-tx-macros = "=1.0.41"
+hex = "*"
+ocaml = { version = "1.2.1" }
+wasmer = { path = "../../src/rust_deps/wasmer-7.2.1/lib/api", default-features = false, features = [
+  "cranelift",
+] }
+wasmer-compiler-cranelift = { path = "../../src/rust_deps/wasmer-7.2.1/lib/compiler-cranelift" }
+tezos_crypto_rs = { version = "0.6", git = "https://gitlab.com/tezos/tezos.git", rev = "c0e4170342cc7c62ced920ecc25af36745447f22", default-features = false }
+log = "0.4"
+env_logger = "0.11"
+octez-riscv-api = { path = "../../src/riscv/api" }
+librustzcash = { path = "../../src/rustzcash_deps" }
+tezos-smart-rollup-core-v1 = { package = "tezos-smart-rollup-core", git = "https://gitlab.com/tezos/tezos.git", rev = "bf6400411c8e74fbd75e2e9500df99993aa124b2" }
+tezos-smart-rollup-host-v1 = { package = "tezos-smart-rollup-host", git = "https://gitlab.com/tezos/tezos.git", rev = "bf6400411c8e74fbd75e2e9500df99993aa124b2" }
+tezos-smart-rollup-core-v2 = { package = "tezos-smart-rollup-core", git = "https://gitlab.com/tezos/tezos.git", rev = "c0e4170342cc7c62ced920ecc25af36745447f22" }
+tezos-smart-rollup-host-v2 = { package = "tezos-smart-rollup-host", git = "https://gitlab.com/tezos/tezos.git", rev = "c0e4170342cc7c62ced920ecc25af36745447f22" }
+# Bifrost kernel
+kernel-bifrost = { package = "evm_kernel_bifrost", path = "../kernel_bifrost/kernel", default-features = false }
+runtime-bifrost = { package = "tezos-evm-runtime-bifrost", path = "../kernel_bifrost/runtime", default-features = false }
+# Calypso
+kernel-calypso = { package = "evm_kernel_calypso", path = "../kernel_calypso/kernel", default-features = false }
+runtime-calypso = { package = "tezos-evm-runtime-calypso", path = "../kernel_calypso/runtime", default-features = false }
+# Calypso 2
+kernel-calypso2 = { package = "evm_kernel_calypso2", path = "../kernel_calypso2/kernel", default-features = false }
+runtime-calypso2 = { package = "tezos-evm-runtime-calypso2", path = "../kernel_calypso2/runtime", default-features = false }
+# Dionysus
+kernel-dionysus = { package = "evm_kernel_dionysus", path = "../kernel_dionysus/kernel", default-features = false }
+runtime-dionysus = { package = "tezos-evm-runtime-dionysus", path = "../kernel_dionysus/runtime", default-features = false }
+
+# Dionysus R1
+kernel-dionysus-r1 = { package = "evm_kernel_dionysus_r1", path = "../kernel_dionysus_r1/kernel", default-features = false }
+runtime-dionysus-r1 = { package = "tezos-evm-runtime-dionysus-r1", path = "../kernel_dionysus_r1/runtime", default-features = false }
+
+# Ebisu
+kernel-ebisu = { package = "evm_kernel_ebisu", path = "../kernel_ebisu/kernel", default-features = false }
+runtime-ebisu = { package = "tezos-evm-runtime-ebisu", path = "../kernel_ebisu/runtime", default-features = false }
+
+# Farfadet
+kernel-farfadet = { package = "evm_kernel_farfadet", path = "../kernel_farfadet/kernel", default-features = false }
+runtime-farfadet = { package = "tezos-evm-runtime-farfadet", path = "../kernel_farfadet/runtime", default-features = false }
+
+# Farfadet R1
+kernel-farfadet-r1 = { package = "evm_kernel_farfadet_r1", path = "../kernel_farfadet_r1/kernel", default-features = false }
+runtime-farfadet-r1 = { package = "tezos-evm-runtime-farfadet-r1", path = "../kernel_farfadet_r1/runtime", default-features = false }
+
+# Farfadet R2 SU
+kernel-farfadet-r2-su = { package = "evm_kernel_farfadet_r2_su", path = "../kernel_farfadet_r2_su/kernel", default-features = false }
+runtime-farfadet-r2-su = { package = "tezos-evm-runtime-farfadet-r2-su", path = "../kernel_farfadet_r2_su/runtime", default-features = false }
+
+# Farfadet R3 SU
+kernel-farfadet-r3-su = { package = "evm_kernel_farfadet_r3_su", path = "../kernel_farfadet_r3_su/kernel", default-features = false }
+runtime-farfadet-r3-su = { package = "tezos-evm-runtime-farfadet-r3-su", path = "../kernel_farfadet_r3_su/runtime", default-features = false }
+
+# Farfadet R4 SU
+kernel-farfadet-r4-su = { package = "evm_kernel_farfadet_r4_su", path = "../kernel_farfadet_r4_su/kernel", default-features = false }
+runtime-farfadet-r4-su = { package = "tezos-evm-runtime-farfadet-r4-su", path = "../kernel_farfadet_r4_su/runtime", default-features = false }
+
+# Farfadet R5 SU
+kernel-farfadet-r5-su = { package = "evm_kernel_farfadet_r5_su", path = "../kernel_farfadet_r5_su/kernel", default-features = false }
+runtime-farfadet-r5-su = { package = "tezos-evm-runtime-farfadet-r5-su", path = "../kernel_farfadet_r5_su/runtime", default-features = false }
+
+# Farfadet R6 SU
+kernel-farfadet-r6-su = { package = "evm_kernel_farfadet_r6_su", path = "../kernel_farfadet_r6_su/kernel", default-features = false }
+runtime-farfadet-r6-su = { package = "tezos-evm-runtime-farfadet-r6-su", path = "../kernel_farfadet_r6_su/runtime", default-features = false }

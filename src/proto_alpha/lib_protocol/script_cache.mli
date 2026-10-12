@@ -45,7 +45,7 @@ type cached_contract = Script.t * Script_ir_translator.ex_script
    - [identifier] is the identifier identifying the [contract] in the cache;
    - [script = None] if there is no such contract in [ctxt];
    - [script = Some (unparsed_script, ir_script)] where
-     - [unparsed_script] is the contract source code and storage;
+     - [unparsed_script] is the contract code and storage;
      - [script_ir] is a typed internal representation of the contract, i.e.,
        the abstract syntax tree of its code as well as its storage.
 
@@ -79,8 +79,3 @@ val size : context -> int
 
 (** [size_limit ctxt] is the maximal size of the cache (in bytes). *)
 val size_limit : context -> int
-
-(** [insert] is a variant of [update] which identifies the contract to update
-    by its address (of type [Contract_hash.t]) instead of its cache identifier. *)
-val insert :
-  context -> Contract_hash.t -> cached_contract -> int -> context tzresult

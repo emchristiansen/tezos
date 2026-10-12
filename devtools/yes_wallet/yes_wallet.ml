@@ -26,6 +26,59 @@
 
 type error = Overwrite_forbiden of string | File_not_found of string
 
+(* We need to exit Lwt + tzResult context from Yes_wallet. *)
+let run_load_bakers_public_keys ?staking_share_opt ?network_opt ?level base_dir
+    ~active_bakers_only alias_pkh_pk_list other_accounts_pkh =
+  let open Yes_wallet_lib in
+  let open Tezos_error_monad in
+  match
+    Lwt_main.run
+      (load_bakers_public_keys
+         ?staking_share_opt
+         ?network_opt
+         ?level
+         base_dir
+         ~active_bakers_only
+         alias_pkh_pk_list
+         other_accounts_pkh)
+  with
+  | Ok alias_pkh_pk_list_and_other_accounts ->
+      alias_pkh_pk_list_and_other_accounts
+  | Error trace ->
+      Format.eprintf "error:@.%a@." Error_monad.pp_print_trace trace ;
+      exit 1
+
+let run_load_contracts ?dump_contracts ?network_opt ?level base_dir =
+  let open Yes_wallet_lib in
+  let open Tezos_error_monad in
+  match
+    Lwt_main.run (load_contracts ?dump_contracts ?network_opt ?level base_dir)
+  with
+  | Ok l -> l
+  | Error trace ->
+      Format.eprintf "error:@.%a@." Error_monad.pp_print_trace trace ;
+      exit 1
+
+let run_build_yes_wallet ?staking_share_opt ?network_opt ?rich_accounts_over
+    base_dir ~active_bakers_only ~aliases ~other_accounts_pkh =
+  let open Yes_wallet_lib in
+  let open Tezos_error_monad in
+  match
+    Lwt_main.run
+      (build_yes_wallet
+         ?staking_share_opt
+         ?network_opt
+         ?rich_accounts_over
+         base_dir
+         ~active_bakers_only
+         ~aliases
+         ~other_accounts_pkh)
+  with
+  | Ok alias_pkh_pk_list -> alias_pkh_pk_list
+  | Error trace ->
+      Format.eprintf "error:@.%a@." Error_monad.pp_print_trace trace ;
+      exit 1
+
 let try_copy ~replace source target =
   if source = target then Ok ()
   else
@@ -47,7 +100,7 @@ let try_copy ~replace source target =
     else Error (File_not_found source)
 
 let convert_wallet ~replace wallet_dir target_dir =
-  let pkh_filename = "public_key_hashs" in
+  let pkh_filename = "Implicit_account_repr.ts" in
   let pk_filename = "public_keys" in
   let sk_filename = "secret_keys" in
   if not (Sys.file_exists wallet_dir) then
@@ -91,11 +144,12 @@ let convert_wallet ~replace wallet_dir target_dir =
         pk_source
 
 let populate_wallet ~replace yes_wallet_dir alias_pkh_pk_list =
-  let pkh_filename = "public_key_hashs" in
-  let pk_filename = "public_keys" in
-  let sk_filename = "secret_keys" in
+  let pkh_filename =
+    Filename.concat yes_wallet_dir "Implicit_account_repr.ts"
+  in
+  let pk_filename = Filename.concat yes_wallet_dir "public_keys" in
+  let sk_filename = Filename.concat yes_wallet_dir "secret_keys" in
   if not (Sys.file_exists yes_wallet_dir) then Unix.mkdir yes_wallet_dir 0o750 ;
-  Unix.chdir yes_wallet_dir ;
   if
     (Sys.file_exists pkh_filename
     || Sys.file_exists pk_filename
@@ -112,16 +166,28 @@ let populate_wallet ~replace yes_wallet_dir alias_pkh_pk_list =
       sk_filename ;
     false)
   else (
-    json_to_file (pkh_list_json alias_pkh_pk_list) pkh_filename ;
-    json_to_file (pk_list_json alias_pkh_pk_list) pk_filename ;
-    json_to_file (sk_list_json alias_pkh_pk_list) sk_filename ;
+    Yes_wallet_lib.write_yes_wallet yes_wallet_dir alias_pkh_pk_list ;
     true)
+
+let alias_file_opt_name = "--aliases"
+
+let alias_file_extension = ".json"
 
 let active_bakers_only_opt_name = "--active-bakers-only"
 
 let force_opt_name = "--force"
 
 let staking_share_opt_name = "--staking-share"
+
+let network_opt_name = "--network"
+
+let level_opt_name = "--level"
+
+let other_accounts_opt_name = "--other-accounts"
+
+let rich_accounts_over_opt_name = "--rich-accounts-over"
+
+let supported_networks = List.map fst Yes_wallet_lib.supported_networks
 
 let force = ref false
 
@@ -142,34 +208,145 @@ let usage () =
      <source-wallet-dir>@]@,\
      @[<v>@[<v 4>> convert wallet <wallet-dir> inplace@,\
      same as above but overwrite the file in the directory <wallet-dir>@]@,\
-     @[<v>@[<v 4>> create minimal in <yes_wallet_dir>@,\
-     creates a yes-wallet with the foundation baker keys in <yes_wallet_dir>@]@,\
      @[<v 4>> create from context <base_dir> in <yes_wallet_dir> [%s] [%s \
-     <NUM>]@,\
+     <NUM>] [%s <%a>]@,\
      creates a yes-wallet with all delegates in the head block of the context \
-     in <base_dir> and store it in <yes_wallet_dir>@,\
+     in <base_dir> and store it in <yes_wallet_dir>. By default, it also \
+     outputs a consensus_keys_mapping file that associates every consensus key \
+     to its actual delegate@,\
      if %s is used the deactivated bakers are filtered out@,\
      if %s <NUM> is used, the first largest bakers that have an accumulated \
-     stake of at least <NUM> percent of the total stake are kept@]@]@,\
-     @[<v>@[<v 4>> dump staking balances from <base_dir> in <csv_file>@,\
-     saves the staking balances of all delegates in the target csv file@]@]@,\
-     @[<v>if %s is used existing files will be overwritten@]@."
+     stake of at least <NUM> percent of the total stake are kept@,\
+     if %s <%a|http://...> is used the store is opened using the right genesis \
+     parameter (default is mainnet) @,\
+     if %s <pkh .. pkh> is used, the generated wallet will also contain the \
+     addresses for the given list of space separated pkh. Consensus keys are \
+     not supported for this parameter @,\
+     if %s <N>,<M> is used, the generated wallet will also contain the <N> \
+     accounts owning at least <M> spendable tokens (in tez) @]@]@,\
+     @[<v>@[<v 4>> compute total supply from <base_dir> [in <csv_file>]@,\
+     computes the total supply form all contracts and commitments. result is \
+     printed in stantdard output, optionally informations on all read \
+     contracts can be dumped into csv_file@]@]@,\
+     @[<v 4>> dump staking balances from <base_dir> in <csv_file>]@,\
+     saves the staking balances of all delegates in the target csv file@,\
+     @[<v>if %s <FILE> is used, it will input aliases from an .json file.See \
+     README.md for the spec of this file and how to generate it.@],@[<v>if %s \
+     is used existing files will be overwritten@]@."
     active_bakers_only_opt_name
     staking_share_opt_name
+    network_opt_name
+    Format.(
+      pp_print_list
+        ~pp_sep:(fun ppf () -> pp_print_string ppf "|")
+        pp_print_string)
+    supported_networks
     active_bakers_only_opt_name
     staking_share_opt_name
+    network_opt_name
+    Format.(
+      pp_print_list
+        ~pp_sep:(fun ppf () -> pp_print_string ppf "|")
+        pp_print_string)
+    supported_networks
+    other_accounts_opt_name
+    rich_accounts_over_opt_name
+    alias_file_opt_name
     force_opt_name
+
+let parse_accounts str_list =
+  let rec aux acc str_list =
+    match str_list with
+    | [] -> (acc, [])
+    | str :: str_list -> (
+        let pkh_result =
+          Tezos_crypto.Signature.Public_key_hash.of_b58check str
+        in
+        match pkh_result with
+        | Ok pkh -> aux (pkh :: acc) str_list
+        | Error _ -> (acc, str :: str_list))
+  in
+  aux [] str_list
+
+let other_accounts_opt argv =
+  let rec parse acc argv =
+    match argv with
+    | [] -> ([], List.rev acc)
+    | opt :: argv when opt = other_accounts_opt_name ->
+        let accounts, argv_tail = parse_accounts argv in
+        (accounts, List.rev_append acc argv_tail)
+    | opt :: argv -> parse (opt :: acc) argv
+  in
+  parse [] argv
 
 let () =
   let argv = Array.to_list Sys.argv in
+  let other_accounts_pkh, argv = other_accounts_opt argv in
   let staking_share_opt =
     let rec aux argv =
       match argv with
       | [] -> None
-      | "--staking-share" :: percentage :: _ ->
+      | str :: percentage :: _ when str = staking_share_opt_name ->
           let percentage = Int64.of_string percentage in
-          assert (0L < percentage && percentage < 100L) ;
+          assert (0L < percentage && percentage <= 100L) ;
           Some percentage
+      | _ :: argv' -> aux argv'
+    in
+    aux argv
+  in
+  let network_opt =
+    let rec aux argv =
+      match argv with
+      | [] -> None
+      | str :: net :: _ when str = network_opt_name -> Some net
+      | _ :: argv' -> aux argv'
+    in
+    aux argv
+  in
+  let level_opt =
+    let rec aux argv =
+      match argv with
+      | [] -> None
+      | str :: level :: _ when str = level_opt_name ->
+          let level = Int32.of_string level in
+          Some level
+      | _ :: argv' -> aux argv'
+    in
+    aux argv
+  in
+  let parse_rich_accounts_over_args n_m =
+    match String.split_on_char ',' n_m with [n; m] -> Some (n, m) | _ -> None
+  in
+  let rich_accounts_over =
+    let rec aux argv =
+      match argv with
+      | [] -> None
+      | str :: n_m :: _ when str = rich_accounts_over_opt_name ->
+          Option.map
+            (fun (x, y) -> (int_of_string x, Int64.of_string y))
+            (parse_rich_accounts_over_args n_m)
+      | _ :: argv' -> aux argv'
+    in
+    aux argv
+  in
+  let is_supported_network net =
+    List.mem (String.lowercase_ascii net) supported_networks
+    || String.starts_with ~prefix:"http" net
+  in
+
+  (* Take an alias file as input. *)
+  let alias_file_opt =
+    let rec aux argv =
+      match argv with
+      | [] -> None
+      | str :: file :: _ when str = alias_file_opt_name ->
+          if Sys.file_exists file then Some file
+          else (
+            Format.eprintf
+              "Warning: %a doesn't point to an existing alias file.\n"
+              Format.pp_print_string
+              file ;
+            None)
       | _ :: argv' -> aux argv'
     in
     aux argv
@@ -178,7 +355,11 @@ let () =
     List.partition
       (fun arg ->
         (String.length arg > 0 && String.get arg 0 = '-')
-        || Str.string_match (Str.regexp "[0-9]+") arg 0)
+        || Str.string_match (Str.regexp "[0-9]+") arg 0
+        (* FIME this is an uggly hack, but hey -lets' force alias files
+           to have a .json extension.*)
+        || String.ends_with ~suffix:alias_file_extension arg
+        || is_supported_network arg)
       argv
   in
   let active_bakers_only =
@@ -195,9 +376,30 @@ let () =
         when opt = staking_share_opt_name
              && Str.string_match (Str.regexp "[0-9]+") num 0 ->
           filter t
+      | opt :: num :: t
+        when opt = level_opt_name
+             && Str.string_match (Str.regexp "[0-9]+") num 0 ->
+          filter t
+      | opt :: file :: t
+        when opt = alias_file_opt_name
+             && String.ends_with ~suffix:alias_file_extension file ->
+          filter t
+      | opt :: net :: t when opt = network_opt_name && is_supported_network net
+        ->
+          filter t
+      | opt :: n_m :: t
+        when opt = rich_accounts_over_opt_name
+             && Option.is_some (parse_rich_accounts_over_args n_m) ->
+          filter t
       | h :: t -> h :: filter t
     in
     filter options
+  in
+  (* load alias file *)
+  let aliases =
+    match alias_file_opt with
+    | None -> []
+    | Some file -> Yes_wallet_lib.load_alias_file file
   in
   if unknown_options <> [] then
     Format.eprintf
@@ -209,31 +411,51 @@ let () =
   | [_] ->
       usage () ;
       exit 0
-  | [_; "create"; "minimal"; "in"; yes_wallet_dir] ->
-      if active_bakers_only then
-        Format.eprintf
-          "Warning: option %s is ignored for create minimal@."
-          active_bakers_only_opt_name ;
-      if
-        populate_wallet
-          ~replace:!force
-          yes_wallet_dir
-          Yes_wallet_lib.alias_pkh_pk_list
-      then Format.printf "Created minimal wallet in %s@." yes_wallet_dir
   | [_; "create"; "from"; "context"; base_dir; "in"; yes_wallet_dir] ->
-      let alias_pkh_pk_list =
-        Yes_wallet_lib.load_mainnet_bakers_public_keys
-          base_dir
-          active_bakers_only
-          staking_share_opt
-        (* get rid of stake *)
-        |> List.map (fun (alias, pkh, pk, _stake) -> (alias, pkh, pk))
-      in
-      Format.printf
-        "@[<h>Number of keys to export:@;<3 0>%d@]@."
-        (List.length alias_pkh_pk_list) ;
-      if populate_wallet ~replace:!force yes_wallet_dir alias_pkh_pk_list then
-        Format.printf "@[<h>Exported path:@;<14 0>%s@]@." yes_wallet_dir
+      if not (Sys.file_exists base_dir) then (
+        Format.eprintf "Invalid --data-dir provided: %s.\n" base_dir ;
+        exit 1)
+      else
+        let yes_alias_list =
+          run_build_yes_wallet
+            ?staking_share_opt
+            ?network_opt
+            ?rich_accounts_over
+            base_dir
+            ~active_bakers_only
+            ~aliases
+            ~other_accounts_pkh
+        in
+        let all_keys_count, consensus_keys_count, companion_keys_count =
+          let consensus_key_re =
+            Re.Str.regexp "^baker_[0-9]+_consensus_key_[0-9]+$"
+          in
+          let companion_key_re =
+            Re.Str.regexp "^baker_[0-9]+_companion_key_[0-9]+$"
+          in
+          List.fold_left
+            (fun (all, consensus, companion) (alias, _, _, _) ->
+              if Re.Str.string_match consensus_key_re alias 0 then
+                (succ all, succ consensus, companion)
+              else if Re.Str.string_match companion_key_re alias 0 then
+                (succ all, consensus, succ companion)
+              else (succ all, consensus, companion))
+            (0, 0, 0)
+            yes_alias_list
+        in
+        let delegate_keys_count =
+          all_keys_count - consensus_keys_count - companion_keys_count
+        in
+        Format.printf
+          "@[<h>Number of keys to export:@;\
+           <3 0>%d (%d delegate keys | %d consensus keys | %d companion \
+           keys)@]@."
+          all_keys_count
+          delegate_keys_count
+          consensus_keys_count
+          companion_keys_count ;
+        if populate_wallet ~replace:!force yes_wallet_dir yes_alias_list then
+          Format.printf "@[<h>Exported path:@;<14 0>%s@]@." yes_wallet_dir
   | [_; "convert"; "wallet"; base_dir; "in"; target_dir] ->
       convert_wallet ~replace:!force base_dir target_dir ;
       Format.printf
@@ -249,12 +471,60 @@ let () =
           "I refuse to rewrite files in %s without confirmation or --force \
            flag@."
           base_dir
+  | _ :: "compute" :: "total" :: "supply" :: "from" :: base_dir :: tl -> (
+      let dump_contracts =
+        match tl with ["in"; csv_file] -> Some csv_file | _ -> None
+      in
+
+      let contracts_list =
+        run_load_contracts ~dump_contracts ?level:level_opt base_dir
+      in
+
+      match dump_contracts with
+      | Some csv_file ->
+          let flags =
+            if !force then [Open_wronly; Open_creat; Open_trunc; Open_text]
+            else [Open_wronly; Open_creat; Open_excl; Open_text]
+          in
+
+          Out_channel.with_open_gen flags 0o666 csv_file (fun oc ->
+              let fmtr = Format.formatter_of_out_channel oc in
+
+              Format.fprintf
+                fmtr
+                "address, balance, frozen_bonds, staked_balance, \
+                 unstaked_frozen_balance, unstaked_finalizable_balance, @." ;
+              List.iter
+                (fun {
+                       address;
+                       balance;
+                       frozen_bonds;
+                       staked_balance;
+                       unstaked_frozen_balance;
+                       unstaked_finalizable_balance;
+                     }
+                   ->
+                  Format.fprintf
+                    fmtr
+                    "%s, %Ld, %Ld, %Ld, %Ld, %Ld@."
+                    address
+                    balance
+                    frozen_bonds
+                    staked_balance
+                    unstaked_frozen_balance
+                    unstaked_finalizable_balance)
+                contracts_list)
+      | None -> exit 0)
   | [_; "dump"; "staking"; "balances"; "from"; base_dir; "in"; csv_file] ->
-      let alias_pkh_pk_list =
-        Yes_wallet_lib.load_mainnet_bakers_public_keys
+      let alias_pkh_pk_list, _, _other_accounts =
+        run_load_bakers_public_keys
+          ?staking_share_opt
+          ?network_opt
+          ?level:level_opt
           base_dir
-          active_bakers_only
-          staking_share_opt
+          ~active_bakers_only
+          aliases
+          other_accounts_pkh
       in
       let flags =
         if !force then [Open_wronly; Open_creat; Open_trunc; Open_text]
@@ -262,9 +532,27 @@ let () =
       in
       Out_channel.with_open_gen flags 0o666 csv_file (fun oc ->
           let fmtr = Format.formatter_of_out_channel oc in
+
+          Format.fprintf
+            fmtr
+            "pkh, stake, spendable_balance, frozen_deposits, \
+             unstake_frozen_deposits\n" ;
           List.iter
-            (fun (_alias, pkh, _pk, stake) ->
-              Format.fprintf fmtr "%s, %Ld\n" pkh stake)
+            (fun ( _alias,
+                   pkh,
+                   _pk,
+                   _ck,
+                   stake,
+                   frozen_deposits,
+                   unstake_frozen_deposits )
+               ->
+              Format.fprintf
+                fmtr
+                "%s, %Ld, %Ld, %Ld\n"
+                pkh
+                stake
+                frozen_deposits
+                unstake_frozen_deposits)
             alias_pkh_pk_list)
   | _ ->
       Format.eprintf "Invalid command. Usage:@." ;

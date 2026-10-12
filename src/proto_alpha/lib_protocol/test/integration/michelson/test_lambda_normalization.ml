@@ -26,9 +26,8 @@
 (** Testing
     -------
     Component:  Protocol (Michelson)
-    Invocation: dune exec \
-                src/proto_alpha/lib_protocol/test/integration/michelson/main.exe \
-                -- test "^lambda normalization"
+    Invocation: dune exec src/proto_alpha/lib_protocol/test/integration/michelson/main.exe \
+                  -- --file test_lambda_normalization.ml
     Subject:    Test that lambdas are normalized to optimized format at elaboration
 *)
 
@@ -47,7 +46,13 @@ let parse_and_project (ty : ((_, _) lambda, _) ty) (node : Script.node) =
   let* ctxt = new_ctxt () in
   let elab_conf = Script_ir_translator_config.make ~legacy:false () in
   let*@ lam, _ctxt =
-    Script_ir_translator.parse_data ~elab_conf ctxt ~allow_forged:false ty node
+    Script_ir_translator.parse_data
+      ~elab_conf
+      ctxt
+      ~allow_forged_tickets:false
+      ~allow_forged_lazy_storage_id:false
+      ty
+      node
   in
   match lam with
   | Lam (_kdescr, node) -> return node
@@ -229,7 +234,11 @@ let test_lambda_normalization () =
 let tests =
   [
     Tztest.tztest
-      "Test that lambdas are normalized to optimized format during elaboration"
+      "lambdas are normalized to optimized format during elaboration"
       `Quick
       test_lambda_normalization;
   ]
+
+let () =
+  Alcotest_lwt.run ~__FILE__ Protocol.name [("lambda normalization", tests)]
+  |> Lwt_main.run

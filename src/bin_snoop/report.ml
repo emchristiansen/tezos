@@ -56,6 +56,8 @@ module Pp_impl : S with type 'a repr = printed and type size = string = struct
 
   type size = string
 
+  let size_ty = Ty.string
+
   let false_ fmtr _c = Format.pp_print_bool fmtr false
 
   let true_ fmtr _c = Format.pp_print_bool fmtr true
@@ -115,7 +117,7 @@ module Pp_impl : S with type 'a repr = printed and type size = string = struct
     unprotect_in_context [Lam_body; If_cond] (fun fmtr () ->
         Format.fprintf fmtr "@[<h>%a@] = @[<h>%a@]" x Arg_app y Arg_app)
 
-  let lam ~name f =
+  let lam' ~name _ty f =
     unprotect_in_context [Lam_body] (fun fmtr () ->
         Format.fprintf
           fmtr
@@ -123,6 +125,8 @@ module Pp_impl : S with type 'a repr = printed and type size = string = struct
           name
           (f (fun fmtr _ -> Format.pp_print_string fmtr name))
           Lam_body)
+
+  let lam ~name = lam' ~name size_ty
 
   let app f arg =
     unprotect_in_context [Fun_app] (fun fmtr () ->
@@ -198,11 +202,7 @@ let maths s =
   Inline_math_blob s
 
 let benchmark_options_table (bench_opts : Measure.options) =
-  let seed =
-    match bench_opts.seed with
-    | None -> normal_text "self-init"
-    | Some seed -> normal_text (string_of_int seed)
-  in
+  let seed = normal_text (string_of_int bench_opts.seed) in
   let nsamples =
     let s = string_of_int bench_opts.nsamples in
     normal_text s
@@ -278,7 +278,7 @@ let workloads_table (type c t) ((module Bench) : (c, t) Benchmark.poly)
   let open Latex_syntax in
   let table = Hashtbl.create 41 in
   List.iter
-    (fun {Measure.workload; measures} ->
+    (fun {Measure.workload; measures; _} ->
       let qties = Hashtbl.find_opt table workload |> Option.value ~default:[] in
       Hashtbl.replace table workload (Maths.vector_to_array measures :: qties))
     workload_data ;
@@ -304,14 +304,14 @@ let model_table (type c t) ((module Bench) : (c, t) Benchmark.poly) =
   let open Latex_syntax in
   let rows =
     List.filter_map
-      (fun (model_name, model) ->
+      (fun (local_model_name, model) ->
         match model with
         | Tezos_benchmark.Model.Aggregate _ -> None
         | Tezos_benchmark.Model.Abstract {model; _} ->
             let module M = (val model) in
             let module Model = M.Def (Pp_impl_abstract) in
             let printed = to_string Model.model in
-            let printed = Format.asprintf "%s: %s" model_name printed in
+            let printed = Format.asprintf "%s: %s" local_model_name printed in
             Some (Row [[normal_text printed]]))
       Bench.models
   in
@@ -387,9 +387,10 @@ type t = Latex_syntax.t
 
 let create_empty ~name = Latex_syntax.{title = name; sections = []}
 
-let add_section ~(measure : Measure.packed_measurement) ~(model_name : string)
-    ~(problem : Inference.problem) ~(solution : Inference.solution)
-    ~overrides_map ~short ~display_options document =
+let add_section ~(measure : Measure.packed_measurement)
+    ~(local_model_name : string) ~(problem : Inference.problem)
+    ~(solution : Inference.solution) ~overrides_map ~short ~display_options
+    document =
   let (Measure.Measurement ((module Bench), _)) = measure in
   let figs_files =
     let plot_target = Display.Save in
@@ -405,7 +406,7 @@ let add_section ~(measure : Measure.packed_measurement) ~(model_name : string)
     Format.eprintf "Saving plot in folder %s@." save_directory ;
     Display.perform_plot
       ~measure
-      ~model_name
+      ~local_model_name
       ~problem
       ~solution
       ~plot_target

@@ -83,17 +83,38 @@ type ('a, 'ctx) arg =
       doc : string;
       label : label;
       placeholder : string;
+      env : string option;
       kind : ('p, 'ctx) parameter;
     }
       -> ('p option, 'ctx) arg
+  | MultipleArg : {
+      doc : string;
+      label : label;
+      placeholder : string;
+      env : string option;
+      env_separator : char;
+      kind : ('p, 'ctx) parameter;
+    }
+      -> ('p list option, 'ctx) arg
   | DefArg : {
+      doc : string;
+      label : label;
+      placeholder : string;
+      env : string option;
+      kind : ('p, 'ctx) parameter;
+      default : string;
+      pp_default : (Format.formatter -> unit) option;
+    }
+      -> ('p, 'ctx) arg
+  | ArgDefSwitch : {
       doc : string;
       label : label;
       placeholder : string;
       kind : ('p, 'ctx) parameter;
       default : string;
+      pp_default : (Format.formatter -> unit) option;
     }
-      -> ('p, 'ctx) arg
+      -> ('p option, 'ctx) arg
   | Switch : {label : label; doc : string} -> (bool, 'ctx) arg
   | Constant : 'a -> ('a, 'ctx) arg
   | Map : {
@@ -153,6 +174,8 @@ type error += Option_expected_argument : string * 'ctx command option -> error
 
 type error += Bad_option_argument : string * 'ctx command option -> error
 
+type error += Bad_env_argument : string * 'ctx command option -> error
+
 type error += Multiple_occurrences : string * 'ctx command option -> error
 
 type error += Extra_arguments : string list * 'ctx command -> error
@@ -170,42 +193,115 @@ let print_desc ppf doc =
           Some (String.sub doc (len + 1) (String.length doc - len - 1)) )
   in
   match long with
-  | None -> Format.fprintf ppf "%s" short
-  | Some doc ->
+  | None -> Format.pp_print_text ppf short
+  | Some long ->
       Format.fprintf
         ppf
-        "%s@{<full>@\n  @[<hov 0>%a@]@}"
+        "%a@{<full>@\n%a@}"
+        Format.pp_print_text
         short
         Format.pp_print_text
-        doc
+        long
 
 let print_label ppf = function
   | {long; short = None} -> Format.fprintf ppf "--%s" long
   | {long; short = Some short} -> Format.fprintf ppf "-%c --%s" short long
 
-let rec print_options_detailed :
-    type ctx a. Format.formatter -> (a, ctx) options -> unit =
+let rec print_options_detailed : type ctx a.
+    Format.formatter -> (a, ctx) options -> unit =
  fun ppf -> function
-  | Arg {label; placeholder; doc; _} ->
+  | Arg {label; placeholder; doc; env; _} ->
+      let doc =
+        match env with
+        | None -> doc
+        | Some env ->
+            Format.sprintf
+              "%s\n\
+               If set, defaults to the value of the environment variable `$%s`."
+              doc
+              env
+      in
       Format.fprintf
         ppf
-        "@{<opt>%a <%s>@}: %a"
+        "@[<hov 2>@{<opt>%a <%s>@}: %a@]"
         print_label
         label
         placeholder
         print_desc
         doc
-  | DefArg {label; placeholder; doc; default; _} ->
+  | MultipleArg {label; placeholder; doc; env; env_separator; _} ->
+      let doc =
+        match env with
+        | None -> doc
+        | Some env ->
+            Format.sprintf
+              "%s\n\
+               If set, defaults to the values listed in the environment \
+               variable `$%s`, separated by '%c'."
+              doc
+              env
+              env_separator
+      in
       Format.fprintf
         ppf
-        "@{<opt>%a <%s>@}: %a"
+        "@[<hov 2>@{<opt>%a <%s>@}: %a@]"
         print_label
         label
         placeholder
         print_desc
-        (doc ^ "\nDefaults to `" ^ default ^ "`.")
+        doc
+  | DefArg {label; placeholder; doc; default; pp_default; env; _} ->
+      let pp_default =
+        match pp_default with
+        | Some pp -> fun fmt _s -> pp fmt
+        | None -> Format.pp_print_string
+      in
+      let doc =
+        match env with
+        | None -> Format.asprintf "%s\nDefaults to `%a`." doc pp_default default
+        | Some env ->
+            Format.asprintf
+              "%s\n\
+               Defaults to the value of the environment variable `$%s` if it \
+               exists, or `%a` otherwise."
+              doc
+              env
+              pp_default
+              default
+      in
+      Format.fprintf
+        ppf
+        "@[<hov 2>@{<opt>%a <%s>@}: %a@]"
+        print_label
+        label
+        placeholder
+        print_desc
+        doc
+  | ArgDefSwitch {label; placeholder; doc; default; pp_default; _} ->
+      let pp_default =
+        match pp_default with
+        | Some pp -> fun fmt _s -> pp fmt
+        | None -> Format.pp_print_string
+      in
+      let doc =
+        Format.asprintf "%s\nDefaults to `%a`." doc pp_default default
+      in
+      Format.fprintf
+        ppf
+        "@[<hov 2>@{<opt>%a [%s]@}: %a@]"
+        print_label
+        label
+        placeholder
+        print_desc
+        doc
   | Switch {label; doc} ->
-      Format.fprintf ppf "@{<opt>%a@}: %a" print_label label print_desc doc
+      Format.fprintf
+        ppf
+        "@[<hov 2>@{<opt>%a@}: %a@]"
+        print_label
+        label
+        print_desc
+        doc
   | Constant _ -> ()
   | Pair (speca, specb) ->
       Format.fprintf
@@ -217,18 +313,28 @@ let rec print_options_detailed :
         specb
   | Map {spec; converter = _} -> print_options_detailed ppf spec
 
+let rec has_argDefSwitch : type a ctx. (a, ctx) arg -> bool = function
+  | ArgDefSwitch _ -> true
+  | Constant _ | Arg _ | MultipleArg _ | DefArg _ | Switch _ -> false
+  | Pair (speca, specb) -> has_argDefSwitch speca || has_argDefSwitch specb
+  | Map {spec; _} -> has_argDefSwitch spec
+
 let rec has_args : type a ctx. (a, ctx) arg -> bool = function
   | Constant _ -> false
-  | Arg _ | DefArg _ | Switch _ -> true
+  | Arg _ | MultipleArg _ | DefArg _ | ArgDefSwitch _ | Switch _ -> true
   | Pair (speca, specb) -> has_args speca || has_args specb
   | Map {spec; _} -> has_args spec
 
-let rec print_options_brief :
-    type ctx a. Format.formatter -> (a, ctx) arg -> unit =
+let rec print_options_brief : type ctx a.
+    Format.formatter -> (a, ctx) arg -> unit =
  fun ppf -> function
   | DefArg {label; placeholder; _} ->
       Format.fprintf ppf "[@{<opt>%a <%s>@}]" print_label label placeholder
+  | ArgDefSwitch {label; placeholder; _} ->
+      Format.fprintf ppf "[@{<opt>%a [%s]@}]" print_label label placeholder
   | Arg {label; placeholder; _} ->
+      Format.fprintf ppf "[@{<opt>%a <%s>@}]" print_label label placeholder
+  | MultipleArg {label; placeholder; _} ->
       Format.fprintf ppf "[@{<opt>%a <%s>@}]" print_label label placeholder
   | Switch {label; _} -> Format.fprintf ppf "[@{<opt>%a@}]" print_label label
   | Constant _ -> ()
@@ -264,61 +370,72 @@ let print_commandline ppf (highlights, options, args) =
   in
   let rec print : type a ctx. Format.formatter -> (a, ctx) params -> unit =
    fun ppf -> function
-    | Stop -> Format.fprintf ppf "%a" print_options_brief options
-    | Seq (n, _, _) when not (has_args options) ->
-        Format.fprintf ppf "[@{<arg>%s@}...]" n
-    | Seq (n, _, _) ->
-        Format.fprintf ppf "[@{<arg>%s@}...] %a" n print_options_brief options
-    | NonTerminalSeq (n, _, _, suffix, Stop) when not (has_args options) ->
-        Format.fprintf ppf "[@{<arg>%s@}...] @{<kwd>%a@}" n print_suffix suffix
-    | NonTerminalSeq (n, _, _, suffix, next) ->
-        Format.fprintf
-          ppf
-          "[@{<arg>%s@}...] @{<kwd>%a@} %a %a"
-          n
-          print_suffix
-          suffix
-          print
-          next
-          print_options_brief
-          options
-    | Prefix (n, Stop) when not (has_args options) ->
-        Format.fprintf ppf "@{<kwd>%a@}" (print_highlight highlights) n
-    | Prefix (n, next) ->
-        Format.fprintf
-          ppf
-          "@{<kwd>%a@} %a"
-          (print_highlight highlights)
-          n
-          print
-          next
-    | Param (n, _, _, Stop) when not (has_args options) ->
-        Format.fprintf ppf "@{<arg>%s@}" n
-    | Param (n, _, _, next) -> Format.fprintf ppf "@{<arg>%s@} %a" n print next
+     | Stop -> Format.fprintf ppf "@{<full>%a@}" print_options_brief options
+     | Seq (n, _, _) when not (has_args options) ->
+         Format.fprintf ppf "[@{<arg>%s@}...]" n
+     | Seq (n, _, _) ->
+         Format.fprintf
+           ppf
+           "[@{<arg>%s@}...]@{<full>@ %a@}"
+           n
+           print_options_brief
+           options
+     | NonTerminalSeq (n, _, _, suffix, Stop) when not (has_args options) ->
+         Format.fprintf
+           ppf
+           "[@{<arg>%s@}...]@ @{<kwd>%a@}"
+           n
+           print_suffix
+           suffix
+     | NonTerminalSeq (n, _, _, suffix, next) ->
+         Format.fprintf
+           ppf
+           "[@{<arg>%s@}...]@ @{<kwd>%a@}@ %a@{<full>@ %a@}"
+           n
+           print_suffix
+           suffix
+           print
+           next
+           print_options_brief
+           options
+     | Prefix (n, Stop) when not (has_args options) ->
+         Format.fprintf ppf "@{<kwd>%a@}" (print_highlight highlights) n
+     | Prefix (n, next) ->
+         Format.fprintf
+           ppf
+           "@{<kwd>%a@}@ %a"
+           (print_highlight highlights)
+           n
+           print
+           next
+     | Param (n, _, _, Stop) when not (has_args options) ->
+         Format.fprintf ppf "@{<arg>%s@}" n
+     | Param (n, _, _, next) ->
+         Format.fprintf ppf "@{<arg>%s@}@ %a" n print next
   in
   Format.fprintf ppf "@{<commandline>%a@}" print args
 
-let rec print_params_detailed :
-    type a b ctx. (b, ctx) arg -> Format.formatter -> (a, ctx) params -> unit =
+let rec print_params_detailed : type a b ctx.
+    (b, ctx) arg -> Format.formatter -> (a, ctx) params -> unit =
  fun spec ppf -> function
-  | Stop -> print_options_detailed ppf spec
+  | Stop -> Format.fprintf ppf "@{<details>%a@}" print_options_detailed spec
   | Seq (n, desc, _) ->
-      Format.fprintf ppf "@{<arg>%s@}: %a" n print_desc (trim desc) ;
+      Format.fprintf ppf "@[<hov 2>@{<arg>%s@}: %a@]" n print_desc (trim desc) ;
       if has_args spec then
-        Format.fprintf ppf "@,%a" print_options_detailed spec
+        Format.fprintf ppf "@{<details>@,%a@}" print_options_detailed spec
   | NonTerminalSeq (n, desc, _, _, next) ->
-      Format.fprintf ppf "@{<arg>%s@}: %a" n print_desc (trim desc) ;
+      Format.fprintf ppf "@[<hov 2>@{<arg>%s@}: %a@]" n print_desc (trim desc) ;
       if has_args spec then
         Format.fprintf ppf "@,%a" (print_params_detailed spec) next
   | Prefix (_, next) -> print_params_detailed spec ppf next
   | Param (n, desc, _, Stop) ->
-      Format.fprintf ppf "@{<arg>%s@}: %a" n print_desc (trim desc) ;
+      Format.fprintf ppf "@[<hov 2>@{<arg>%s@}: %a@]" n print_desc (trim desc) ;
       if has_args spec then
-        Format.fprintf ppf "@,%a" print_options_detailed spec
+        Format.fprintf ppf "@{<details>@,%a@}" print_options_detailed spec
   | Param (n, desc, _, next) ->
       Format.fprintf
         ppf
-        "@{<arg>%s@}: %a@,%a"
+        "@[<hov 2>@{<arg>%s@}: %a@]@,%a"
         n
         print_desc
         (trim desc)
@@ -336,8 +453,7 @@ let contains_params_args : type a ctx. (a, ctx) params -> (_, ctx) arg -> bool =
   in
   help params
 
-let print_command :
-    type ctx.
+let print_command : type ctx.
     ?prefix:(Format.formatter -> unit -> unit) ->
     ?highlights:string list ->
     Format.formatter ->
@@ -350,7 +466,9 @@ let print_command :
   if contains_params_args params options then
     Format.fprintf
       ppf
-      "@{<command>%a%a@{<short>@,@{<commanddoc>%a@,%a@}@}@}"
+      "@{<command>%a%a@{<short>@,\
+       @{<commanddoc>@[<hov 0>%a@]@{<details>@,\
+       %a@}@}@}@}"
       prefix
       ()
       print_commandline
@@ -362,7 +480,7 @@ let print_command :
   else
     Format.fprintf
       ppf
-      "@{<command>%a%a@{<short>@,@{<commanddoc>%a@}@}@}"
+      "@{<command>%a%a@{<short>@,@{<commanddoc>@[<hov 0>%a@]@}@}@}"
       prefix
       ()
       print_commandline
@@ -393,17 +511,20 @@ let group_commands commands =
   in
   List.map
     (fun (g, c) -> (g, List.rev !c))
-    (match ungrouped with
-    | [] -> grouped
+    (match List.rev ungrouped with
+    | [] -> List.rev grouped
     | l ->
-        grouped @ [({name = "misc"; title = "Miscellaneous commands"}, ref l)])
+        List.rev grouped
+        @ [({name = "misc"; title = "Miscellaneous commands"}, ref l)])
 
 let print_group print_command ppf ({title; _}, commands) =
   Format.fprintf
     ppf
-    "@{<title>%s@}@,@{<list>%a@}"
+    "@{<title>%s@}@,@{<short>@,@}@{<list>%a@}"
     title
-    (Format.pp_print_list print_command)
+    (Format.pp_print_list
+       ~pp_sep:(fun ppf () -> Format.fprintf ppf "@,@{<short>@,@}")
+       print_command)
     commands
 
 type formatter_state =
@@ -413,7 +534,7 @@ type format = Plain | Ansi | Html
 
 type verbosity = Terse | Short | Details | Full
 
-let setup_formatter ppf format verbosity =
+let internal_setup_formatter ppf format verbosity cols =
   let skip = ref false in
   let ((orig_out_functions, _, _) as orig_state) =
     ( Format.pp_get_formatter_out_functions ppf (),
@@ -421,6 +542,7 @@ let setup_formatter ppf format verbosity =
       Format.pp_get_print_tags ppf () )
   in
   (Format.pp_print_flush ppf () ;
+   Option.iter (fun c -> Format.pp_set_margin ppf (min 110 c)) cols ;
    Format.pp_set_formatter_out_functions
      ppf
      {
@@ -459,6 +581,7 @@ let setup_formatter ppf format verbosity =
            | "details" -> push_level (Details, op)
            | "short" -> push_level (Short, op)
            | "terse" -> push_level (Terse, op)
+           | tag when Pretty_printing.handles tag -> ()
            | tag ->
                Stdlib.failwith
                  ("Tezos_clic: invalid semantic string tag <" ^ tag ^ ">")
@@ -484,6 +607,7 @@ let setup_formatter ppf format verbosity =
      | Format.String_tag "=short"
      | Format.String_tag "=terse" ->
          pop_level ()
+     | Format.String_tag tag when Pretty_printing.handles tag -> ()
      | Format.String_tag tag ->
          Stdlib.failwith
            ("Tezos_clic: invalid semantic string tag <" ^ tag ^ ">")
@@ -653,16 +777,17 @@ let setup_formatter ppf format verbosity =
              | Format.String_tag "document" ->
                  Format.fprintf
                    ppf
-                   "@[<v 0>\003style\004.cmdline { font-family: monospace \
-                    }.cmddoc { white-space: pre-wrap ; font-family: monospace; \
-                    line-height: 170%%; margin: 0 0 20px 0 }.cmdline { \
-                    background: #343131; padding: 2px 8px; border-radius:10px; \
-                    color: white; margin: 5px; }.cmdline+.cmddoc { margin: \
-                    -5px 5px 0 20px; padding: 5px }.opt,.arg { background: \
-                    #343131; font-weight: bold;  padding: 2px 4px; \
-                    border-radius:5px; }.kwd { font-weight: bold; } .opt { \
-                    color:#CF0; background: #460; } .arg { color: #CEF; \
-                    background: #369; }\003/style\004@\n"
+                   "@[<v 0>\003style\004.cmdline { font-family: monospace; \
+                    font-size: 80%%; }.cmddoc { white-space: pre-wrap ; \
+                    font-family: monospace; font-size: 80%%; line-height: \
+                    170%%; margin: 0 0 2px 0 }.cmdline { background: #343131; \
+                    padding: 2px 8px; border-radius:10px; color: white; \
+                    margin: 5px; }.cmdline+.cmddoc { margin: -5px 5px 0 2px; \
+                    padding: 5px }.opt,.arg { background: #343131; \
+                    font-weight: bold;  padding: 2px 4px; border-radius:5px; \
+                    }.kwd { font-weight: bold; } .opt { color:#CF0; \
+                    background: #460; } .arg { color: #CEF; background: #369; \
+                    }\003/style\004@\n"
              | other -> push_level_tag other);
            print_close_stag =
              (function
@@ -691,9 +816,11 @@ let setup_formatter ppf format verbosity =
          {
            orig_out_functions with
            out_string =
-             (fun s i j ->
-               let buf = Buffer.create (j - i) in
-               for n = i to j - 1 do
+             (fun s i len ->
+               (* [i] is the start position and [len] the number of characters *)
+               let buf = Buffer.create len in
+               let end_pos = i + len - 1 in
+               for n = i to end_pos do
                  match s.[n] with
                  | '\003' -> Buffer.add_char buf '<'
                  | '\004' -> Buffer.add_char buf '>'
@@ -713,60 +840,100 @@ let restore_formatter ppf (out_functions, tag_functions, tags) =
   Format.pp_set_formatter_stag_functions ppf tag_functions ;
   Format.pp_set_print_tags ppf tags
 
-let usage_internal ppf ~executable_name ~global_options ?(highlights = [])
-    commands =
+let usage_internal ppf ~prefix_executable ~executable_name ~global_options
+    ?(highlights = []) commands =
   let by_group = group_commands commands in
   let print_groups =
     Format.pp_print_list
       ~pp_sep:(fun ppf () -> Format.fprintf ppf "@,@,")
       (print_group (fun ppf (Ex command) ->
-           print_command ?prefix:None ~highlights ppf command))
+           print_command
+             ?prefix:
+               (if prefix_executable then
+                  Some (fun ppf () -> Format.fprintf ppf "%s " executable_name)
+                else None)
+             ~highlights
+             ppf
+             command))
+  in
+  let pp_print_global_options ppf = function
+    | Constant _ -> ()
+    | global_options ->
+        Format.fprintf
+          ppf
+          "@{<title>Global options (must come before the command)@}@,\
+           @{<commanddoc>%a@}%a"
+          print_options_detailed
+          global_options
+          (fun ppf () -> if by_group <> [] then Format.fprintf ppf "@,@,")
+          ()
+  in
+  let pp_print_global_options_usage ppf = function
+    | Constant _ -> ()
+    | _ -> Format.fprintf ppf " [@{<opt>global options@}]"
   in
   Format.fprintf
     ppf
     "@{<document>@{<title>Usage@}@,\
-     @{<list>@{<command>@{<commandline>%s [@{<opt>global options@}] \
-     @{<kwd>command@} [@{<opt>command options@}]@}@}@,\
+     @{<list>@{<command>@{<commandline>%s%a @{<kwd>command@} [@{<opt>command \
+     options@}]@}@}@,\
      @{<command>@{<commandline>%s @{<opt>--help@} (for global options)@}@}@,\
-     @{<command>@{<commandline>%s [@{<opt>global options@}] @{<kwd>command@} \
-     @{<opt>--help@} (for command options)@}@}@,\
+     @{<command>@{<commandline>%s%a @{<kwd>command@} @{<opt>--help@} (for \
+     command options)@}@}@,\
      @{<command>@{<commandline>%s @{<opt>--version@} (for version \
      information)@}@}@}@,\
      @,\
      @{<title>To browse the documentation@}@,\
-     @{<list>@{<command>@{<commandline>%s [@{<opt>global options@}] \
-     @{<kwd>man@} (for a list of commands)@}@}@,\
-     @{<command>@{<commandline>%s [@{<opt>global options@}] @{<kwd>man@} \
-     @{<opt>-v 3@} (for the full manual)@}@}@}@,\
+     @{<list>@{<command>@{<commandline>%s%a @{<kwd>man@} (for a list of \
+     commands)@}@}@,\
+     @{<command>@{<commandline>%s%a @{<kwd>man@} @{<opt>-v 3@} (for the full \
+     manual)@}@}@}@,\
      @,\
-     @{<title>Global options (must come before the command)@}@,\
-     @{<commanddoc>%a@}%a%a@}@."
+     %a%a@}@."
     executable_name
-    executable_name
-    executable_name
-    executable_name
-    executable_name
-    executable_name
-    print_options_detailed
+    pp_print_global_options_usage
     global_options
-    (fun ppf () -> if by_group <> [] then Format.fprintf ppf "@,@,")
-    ()
+    executable_name
+    executable_name
+    pp_print_global_options_usage
+    global_options
+    executable_name
+    executable_name
+    pp_print_global_options_usage
+    global_options
+    executable_name
+    pp_print_global_options_usage
+    global_options
+    pp_print_global_options
+    global_options
     print_groups
     by_group
 
 let constant c = Constant c
 
-let arg ~doc ?short ~long ~placeholder kind =
-  Arg {doc; label = {long; short}; placeholder; kind}
+let arg ~doc ?short ~long ~placeholder ?env kind =
+  Arg {doc; label = {long; short}; placeholder; env; kind}
 
-let default_arg ~doc ?short ~long ~placeholder ~default kind =
-  DefArg {doc; placeholder; label = {long; short}; kind; default}
+let multiple_arg ~doc ?short ~long ~placeholder ?env ?(env_separator = ',') kind
+    =
+  MultipleArg
+    {doc; label = {long; short}; env; env_separator; placeholder; kind}
+
+let default_arg ~doc ?short ~long ~placeholder ~default ?pp_default ?env kind =
+  DefArg
+    {doc; placeholder; label = {long; short}; kind; env; default; pp_default}
+
+let arg_or_switch ~doc ?short ~long ~placeholder ~default ?pp_default kind =
+  ArgDefSwitch
+    {doc; placeholder; label = {long; short}; kind; default; pp_default}
 
 let map_arg ~f:converter spec = Map {spec; converter}
 
 let args1 a = a
 
 let args2 a b = Pair (a, b)
+
+let merge_options = args2
 
 let args3 a b c =
   map_arg
@@ -870,30 +1037,246 @@ let args19 a b c d e f g h i j k l m n o p q r s =
         (a, b, c, d, e, f, g, h, i, j, k, l, m, n, o, p, q, r, s))
     (args2 (args16 a b c d e f g h i j k l m n o p) (args3 q r s))
 
+let args20 a b c d e f g h i j k l m n o p q r s t =
+  map_arg
+    ~f:(fun
+        _ ((a, b, c, d, e, f, g, h, i, j, k, l, m, n, o, p), (q, r, s, t)) ->
+      Lwt_result_syntax.return
+        (a, b, c, d, e, f, g, h, i, j, k, l, m, n, o, p, q, r, s, t))
+    (args2 (args16 a b c d e f g h i j k l m n o p) (args4 q r s t))
+
+let args21 a b c d e f g h i j k l m n o p q r s t u =
+  map_arg
+    ~f:(fun
+        _ ((a, b, c, d, e, f, g, h, i, j, k, l, m, n, o, p), (q, r, s, t, u)) ->
+      Lwt_result_syntax.return
+        (a, b, c, d, e, f, g, h, i, j, k, l, m, n, o, p, q, r, s, t, u))
+    (args2 (args16 a b c d e f g h i j k l m n o p) (args5 q r s t u))
+
+let args22 a b c d e f g h i j k l m n o p q r s t u v =
+  map_arg
+    ~f:(fun
+        _
+        ((a, b, c, d, e, f, g, h, i, j, k, l, m, n, o, p), (q, r, s, t, u, v))
+      ->
+      Lwt_result_syntax.return
+        (a, b, c, d, e, f, g, h, i, j, k, l, m, n, o, p, q, r, s, t, u, v))
+    (args2 (args16 a b c d e f g h i j k l m n o p) (args6 q r s t u v))
+
+let args23 a b c d e f g h i j k l m n o p q r s t u v w =
+  map_arg
+    ~f:(fun
+        _
+        ((a, b, c, d, e, f, g, h, i, j, k, l, m, n, o, p), (q, r, s, t, u, v, w))
+      ->
+      Lwt_result_syntax.return
+        (a, b, c, d, e, f, g, h, i, j, k, l, m, n, o, p, q, r, s, t, u, v, w))
+    (args2 (args16 a b c d e f g h i j k l m n o p) (args7 q r s t u v w))
+
+let args24 a b c d e f g h i j k l m n o p q r s t u v w x =
+  map_arg
+    ~f:(fun
+        _
+        ( (a, b, c, d, e, f, g, h, i, j, k, l, m, n, o, p),
+          (q, r, s, t, u, v, w, x) )
+      ->
+      Lwt_result_syntax.return
+        (a, b, c, d, e, f, g, h, i, j, k, l, m, n, o, p, q, r, s, t, u, v, w, x))
+    (args2 (args16 a b c d e f g h i j k l m n o p) (args8 q r s t u v w x))
+
+let args25 a b c d e f g h i j k l m n o p q r s t u v w x y =
+  map_arg
+    ~f:(fun
+        _
+        ( (a, b, c, d, e, f, g, h, i, j, k, l, m, n, o, p),
+          (q, r, s, t, u, v, w, x, y) )
+      ->
+      Lwt_result_syntax.return
+        ( a,
+          b,
+          c,
+          d,
+          e,
+          f,
+          g,
+          h,
+          i,
+          j,
+          k,
+          l,
+          m,
+          n,
+          o,
+          p,
+          q,
+          r,
+          s,
+          t,
+          u,
+          v,
+          w,
+          x,
+          y ))
+    (args2 (args16 a b c d e f g h i j k l m n o p) (args9 q r s t u v w x y))
+
+let args26 a b c d e f g h i j k l m n o p q r s t u v w x y z =
+  map_arg
+    ~f:(fun
+        _
+        ( (a, b, c, d, e, f, g, h, i, j, k, l, m, n, o, p),
+          (q, r, s, t, u, v, w, x, y, z) )
+      ->
+      Lwt_result_syntax.return
+        ( a,
+          b,
+          c,
+          d,
+          e,
+          f,
+          g,
+          h,
+          i,
+          j,
+          k,
+          l,
+          m,
+          n,
+          o,
+          p,
+          q,
+          r,
+          s,
+          t,
+          u,
+          v,
+          w,
+          x,
+          y,
+          z ))
+    (args2
+       (args16 a b c d e f g h i j k l m n o p)
+       (args10 q r s t u v w x y z))
+
+let args27 a b c d e f g h i j k l m n o p q r s t u v w x y z aa =
+  map_arg
+    ~f:(fun
+        _
+        ( (a, b, c, d, e, f, g, h, i, j, k, l, m, n, o, p),
+          (q, r, s, t, u, v, w, x, y, z, aa) )
+      ->
+      Lwt_result_syntax.return
+        ( a,
+          b,
+          c,
+          d,
+          e,
+          f,
+          g,
+          h,
+          i,
+          j,
+          k,
+          l,
+          m,
+          n,
+          o,
+          p,
+          q,
+          r,
+          s,
+          t,
+          u,
+          v,
+          w,
+          x,
+          y,
+          z,
+          aa ))
+    (args2
+       (args16 a b c d e f g h i j k l m n o p)
+       (args11 q r s t u v w x y z aa))
+
 let switch ~doc ?short ~long () = Switch {doc; label = {long; short}}
 
+type occurrence = Occ_empty | Occ_with_value of string
+
+let with_env ~default ?env k =
+  let open Lwt_result_syntax in
+  match env with
+  | None -> return default
+  | Some env -> (
+      match Sys.getenv_opt env with Some s -> k env s | None -> return default)
+
+let with_env_multiple ~default ?env ~env_separator k =
+  let open Lwt_result_syntax in
+  match env with
+  | None -> return default
+  | Some env -> (
+      match Sys.getenv_opt env with
+      | Some s ->
+          k env (List.map String.trim (String.split_on_char env_separator s))
+      | None -> return default)
+
 (* Argument parsing *)
-let rec parse_arg :
-    type a ctx.
+let rec parse_arg : type a ctx.
     ?command:_ command ->
     (a, ctx) arg ->
-    string list StringMap.t ->
+    occurrence list StringMap.t ->
     ctx ->
     a tzresult Lwt.t =
  fun ?command spec args_dict ctx ->
   let open Lwt_result_syntax in
   match spec with
-  | Arg {label = {long; short = _}; kind = {converter; _}; _} -> (
+  | Arg {label = {long; short = _}; kind = {converter; _}; env; _} -> (
       match StringMap.find_opt long args_dict with
-      | None | Some [] -> return_none
-      | Some [s] ->
+      | None | Some [] ->
+          with_env ~default:None ?env @@ fun env s ->
+          let+ x =
+            trace_eval (fun () -> Bad_env_argument (env, command))
+            @@ converter ctx s
+          in
+          Some x
+      | Some [Occ_with_value s] ->
           let+ x =
             trace_eval (fun () -> Bad_option_argument ("--" ^ long, command))
             @@ converter ctx s
           in
           Some x
+      | Some [Occ_empty] ->
+          invalid_arg (Format.sprintf "'%s' must contain a value." long)
       | Some (_ :: _) -> tzfail (Multiple_occurrences ("--" ^ long, command)))
-  | DefArg {label = {long; short = _}; kind = {converter; _}; default; _} -> (
+  | MultipleArg
+      {label = {long; short = _}; kind = {converter; _}; env; env_separator; _}
+    -> (
+      match StringMap.find_opt long args_dict with
+      | None | Some [] ->
+          with_env_multiple ~default:None ?env ~env_separator @@ fun env s ->
+          let+ x =
+            List.map_es
+              (fun x ->
+                trace_eval (fun () -> Bad_env_argument (env, command))
+                @@ converter ctx x)
+              s
+          in
+          Some x
+      | Some l ->
+          let+ x =
+            List.map_es
+              (function
+                | Occ_empty ->
+                    invalid_arg
+                      (Format.sprintf
+                         "'%s' must contain a value for each occurrence."
+                         long)
+                | Occ_with_value s ->
+                    trace_eval (fun () ->
+                        Bad_option_argument ("--" ^ long, command))
+                    @@ converter ctx s)
+              l
+          in
+          Some x)
+  | DefArg {label = {long; short = _}; kind = {converter; _}; default; env; _}
+    -> (
       let*! r = converter ctx default in
       match r with
       | Error _ ->
@@ -904,14 +1287,40 @@ let rec parse_arg :
                long)
       | Ok default -> (
           match StringMap.find_opt long args_dict with
-          | None | Some [] -> return default
-          | Some [s] ->
+          | None | Some [] ->
+              with_env ~default ?env @@ fun env s ->
+              trace (Bad_env_argument (env, command)) (converter ctx s)
+          | Some [Occ_with_value s] ->
               trace (Bad_option_argument (long, command)) (converter ctx s)
+          | Some [Occ_empty] ->
+              invalid_arg (Format.sprintf "'%s' must contain a value." long)
+          | Some (_ :: _) -> tzfail (Multiple_occurrences (long, command))))
+  | ArgDefSwitch {label = {long; short = _}; kind = {converter; _}; default; _}
+    -> (
+      let*! r = converter ctx default in
+      match r with
+      | Error _ ->
+          invalid_arg
+            (Format.sprintf
+               "Value provided as default for '%s' could not be parsed by \
+                converter function."
+               long)
+      | Ok default -> (
+          match StringMap.find_opt long args_dict with
+          | None | Some [] -> return_none
+          | Some [Occ_empty] -> return_some default
+          | Some [Occ_with_value s] ->
+              let+ x =
+                trace_eval (fun () ->
+                    Bad_option_argument ("--" ^ long, command))
+                @@ converter ctx s
+              in
+              Some x
           | Some (_ :: _) -> tzfail (Multiple_occurrences (long, command))))
   | Switch {label = {long; short = _}; _} -> (
       match StringMap.find_opt long args_dict with
       | None | Some [] -> return_false
-      | Some [_] -> return_true
+      | Some [Occ_empty] -> return_true
       | Some (_ :: _) -> tzfail (Multiple_occurrences (long, command)))
   | Constant c -> return c
   | Pair (speca, specb) ->
@@ -924,9 +1333,10 @@ let rec parse_arg :
 
 let empty_args_dict = StringMap.empty
 
-let rec make_arities_dict :
-    type a b.
-    (a, b) arg -> (int * string) StringMap.t -> (int * string) StringMap.t =
+let rec make_arities_dict : type a b.
+    (a, b) arg ->
+    (int list * string) StringMap.t ->
+    (int list * string) StringMap.t =
  fun arg acc ->
   let add {long; short} num =
     (match short with
@@ -936,9 +1346,11 @@ let rec make_arities_dict :
     |> StringMap.add ("--" ^ long) (num, long)
   in
   match arg with
-  | Arg {label; _} -> add label 1
-  | DefArg {label; _} -> add label 1
-  | Switch {label; _} -> add label 0
+  | Arg {label; _} -> add label [1]
+  | MultipleArg {label; _} -> add label [1]
+  | DefArg {label; _} -> add label [1]
+  | ArgDefSwitch {label; _} -> add label [0; 1]
+  | Switch {label; _} -> add label [0]
   | Constant _c -> acc
   | Pair (speca, specb) ->
       let acc = make_arities_dict speca acc in
@@ -962,13 +1374,14 @@ let check_version_flag =
   | _ -> return_unit
 
 let add_occurrence long value acc =
-  match StringMap.find_opt long acc with
-  | Some v -> StringMap.add long v acc
-  | None -> StringMap.add long [value] acc
+  StringMap.update
+    long
+    (function Some v -> Some (v @ [value]) | None -> Some [value])
+    acc
 
-let make_args_dict_consume ?command spec args =
+let make_args_dict_consume_for_global_options ?command spec args =
   let open Lwt_result_syntax in
-  let rec make_args_dict completing arities acc args =
+  let rec make_args_dict arities acc args =
     let* () = check_help_flag ?command args in
     let* () = check_version_flag args in
     match args with
@@ -979,32 +1392,27 @@ let make_args_dict_consume ?command spec args =
           | Some (arity, long) -> (
               let* () = check_help_flag ?command tl in
               match (arity, tl) with
-              | 0, tl' ->
+              | [0], tl' ->
+                  make_args_dict arities (add_occurrence long Occ_empty acc) tl'
+              | [1], value :: tl' ->
                   make_args_dict
-                    completing
                     arities
-                    (add_occurrence long "" acc)
+                    (add_occurrence long (Occ_with_value value) acc)
                     tl'
-              | 1, value :: tl' ->
-                  make_args_dict
-                    completing
-                    arities
-                    (add_occurrence long value acc)
-                    tl'
-              | 1, [] when completing -> return (acc, [])
-              | 1, [] -> tzfail (Option_expected_argument (arg, None))
+              | [1], [] -> tzfail (Option_expected_argument (arg, None))
               | _, _ ->
                   Stdlib.failwith
-                    "cli_entries: Arguments with arity not equal to 1 or 0 \
-                     unsupported")
+                    "cli_entries: Global arguments with arity not equal to [1] \
+                     or [0] unsupported. "
+              (* ArgDefSwitch is the only option with an arity
+                 different to [0; 1], which is not allowed in global
+                 argument. `make_args_dict_consume_for_global_options`
+                 is only used to produce global arg for now. *)
+              )
           | None -> tzfail (Unknown_option (arg, None))
         else return (acc, args)
   in
-  make_args_dict
-    false
-    (make_arities_dict spec StringMap.empty)
-    StringMap.empty
-    args
+  make_args_dict (make_arities_dict spec StringMap.empty) StringMap.empty args
 
 let make_args_dict_filter ?command spec args =
   let open Lwt_result_syntax in
@@ -1017,17 +1425,32 @@ let make_args_dict_filter ?command spec args =
         | Some (arity, long) -> (
             let* () = check_help_flag ?command tl in
             match (arity, tl) with
-            | 0, tl ->
+            | [0; 1], value :: _ when String.length value > 1 && value.[0] = '-'
+              ->
+                (* Using arity 0 of the argument. When value = "-", the argument
+                   is arity 1. *)
                 make_args_dict
                   arities
-                  (add_occurrence long "" dict, other_args)
+                  (add_occurrence long Occ_empty dict, other_args)
                   tl
-            | 1, value :: tl' ->
+            | [0; 1], value :: tl' ->
+                (* Using arity 1 of the argument *)
                 make_args_dict
                   arities
-                  (add_occurrence long value dict, other_args)
+                  (add_occurrence long (Occ_with_value value) dict, other_args)
                   tl'
-            | 1, [] -> tzfail (Option_expected_argument (arg, command))
+            | [0; 1], ([] as tl) (* Using arity 0 of the argument *) | [0], tl
+              ->
+                make_args_dict
+                  arities
+                  (add_occurrence long Occ_empty dict, other_args)
+                  tl
+            | [1], value :: tl' ->
+                make_args_dict
+                  arities
+                  (add_occurrence long (Occ_with_value value) dict, other_args)
+                  tl'
+            | [1], [] -> tzfail (Option_expected_argument (arg, command))
             | _, _ ->
                 Stdlib.failwith
                   "cli_entries: Arguments with arity not equal to 1 or 0 \
@@ -1108,10 +1531,9 @@ let search_command keyword (Command {params; _}) =
 (* Command execution *)
 let exec (type ctx)
     (Command {options = options_spec; params = spec; handler; conv; _} as
-    command) (ctx : ctx) params args_dict =
+     command) (ctx : ctx) params args_dict =
   let open Lwt_result_syntax in
-  let rec exec :
-      type ctx a.
+  let rec exec : type ctx a.
       int -> ctx -> (a, ctx) params -> a -> string list -> unit tzresult Lwt.t =
    fun i ctx spec cb params ->
     match (spec, params) with
@@ -1197,13 +1619,13 @@ and 'ctx tree =
   | TNonTerminalSeq : 'ctx non_terminal_seq_level -> 'ctx tree
   | TEmpty : 'ctx tree
 
-let has_options : type ctx. ctx command -> bool =
- fun (Command {options; _}) -> has_args options
-
-let insert_in_dispatch_tree : type ctx. ctx tree -> ctx command -> ctx tree =
- fun root (Command {params; conv; _} as command) ->
-  let rec insert_tree :
-      type a ictx. (ctx -> ictx) -> ctx tree -> (a, ictx) params -> ctx tree =
+let insert_in_dispatch_tree : type ctx.
+    ?enable_argDefSwitch:bool -> ctx tree -> ctx command -> ctx tree =
+ fun ?(enable_argDefSwitch = false)
+     root
+     (Command {params; conv; options; _} as command) ->
+  let rec insert_tree : type a ictx.
+      (ctx -> ictx) -> ctx tree -> (a, ictx) params -> ctx tree =
    fun conv t c ->
     let insert_tree t c = insert_tree conv t c in
     let rec suffix_to_params suffix next =
@@ -1230,9 +1652,7 @@ let insert_in_dispatch_tree : type ctx. ctx tree -> ctx command -> ctx tree =
         TPrefix {stop = None; prefix = [(n, insert_tree TEmpty next)]}
     | TStop cmd, Param (_, _, {autocomplete; _}, next) ->
         let autocomplete = conv_autocomplete autocomplete in
-        if not (has_options cmd) then
-          TParam {tree = insert_tree TEmpty next; stop = Some cmd; autocomplete}
-        else Stdlib.failwith "Command cannot have both prefix and options"
+        TParam {tree = insert_tree TEmpty next; stop = Some cmd; autocomplete}
     | TStop cmd, Prefix (n, next) ->
         TPrefix {stop = Some cmd; prefix = [(n, insert_tree TEmpty next)]}
     | TStop cmd, NonTerminalSeq (name, desc, {autocomplete; _}, suffix, next) ->
@@ -1274,10 +1694,17 @@ let insert_in_dispatch_tree : type ctx. ctx tree -> ctx command -> ctx tree =
                print_commandline ppf ([], options, params))
              command)
   in
+  let () =
+    if (not enable_argDefSwitch) && has_argDefSwitch options then
+      Stdlib.failwith
+        "Internal error: argDefSwitch is not enabled for this binary. Please \
+         fill an issue at https://gitlab.com/tezos/tezos/-/issues"
+    else ()
+  in
   insert_tree conv root params
 
-let make_dispatch_tree commands =
-  List.fold_left insert_in_dispatch_tree TEmpty commands
+let make_dispatch_tree ?enable_argDefSwitch commands =
+  List.fold_left (insert_in_dispatch_tree ?enable_argDefSwitch) TEmpty commands
 
 let rec gather_commands ?(acc = []) tree =
   match tree with
@@ -1297,17 +1724,22 @@ and gather_assoc ?(acc = []) trees =
 
 let find_command tree initial_arguments =
   let open Lwt_result_syntax in
+  let is_short_option s =
+    String.length s = 2
+    && s.[0] = '-'
+    && match s.[1] with 'a' .. 'z' | 'A' .. 'Z' -> true | _ -> false
+  in
+  let is_long_option s = String.length s >= 2 && s.[0] = '-' && s.[1] = '-' in
+  let is_option s = is_short_option s || is_long_option s in
   let rec traverse tree arguments acc =
     match (tree, arguments) with
-    | ( ( TStop _ | TSeq _
-        | TNonTerminalSeq {stop = Some _; _}
-        | TPrefix {stop = Some _; _}
-        | TParam {stop = Some _; _} ),
-        ("-h" | "--help") :: _ ) -> (
-        match gather_commands tree with
-        | [] -> assert false
-        | [command] -> tzfail (Help (Some command))
-        | more -> tzfail (Unterminated_command (initial_arguments, more)))
+    | ( ( TStop c
+        | TSeq (c, _)
+        | TNonTerminalSeq {stop = Some c; _}
+        | TPrefix {stop = Some c; _}
+        | TParam {stop = Some c; _} ),
+        ("-h" | "--help") :: _ ) ->
+        tzfail (Help (Some c))
     | TStop c, [] -> return (c, empty_args_dict, initial_arguments)
     | TStop (Command {options; _} as command), remaining -> (
         let* args_dict, unparsed =
@@ -1354,6 +1786,18 @@ let find_command tree initial_arguments =
           traverse nts arguments' (parameter :: acc)
     | TPrefix {stop = Some cmd; _}, [] ->
         return (cmd, empty_args_dict, initial_arguments)
+    | ( TPrefix {stop = Some (Command {options; _} as command); _},
+        (hd :: _ as remaining) )
+      when String.length hd > 0 && hd.[0] = '-' -> (
+        let* args_dict, unparsed =
+          make_args_dict_filter ~command options remaining
+        in
+        match unparsed with
+        | [] -> return (command, args_dict, initial_arguments)
+        | hd :: _ ->
+            if String.length hd > 0 && hd.[0] = '-' then
+              tzfail (Unknown_option (hd, Some command))
+            else tzfail (Extra_arguments (unparsed, command)))
     | TPrefix {stop = None; prefix}, ([] | ("-h" | "--help") :: _) ->
         tzfail (Unterminated_command (initial_arguments, gather_assoc prefix))
     | TPrefix {prefix; _}, hd_arg :: tl -> (
@@ -1362,6 +1806,10 @@ let find_command tree initial_arguments =
         | Some tree' -> traverse tree' tl (hd_arg :: acc))
     | TParam {stop = None; _}, ([] | ("-h" | "--help") :: _) ->
         tzfail (Unterminated_command (initial_arguments, gather_commands tree))
+    | TParam {stop = Some c; _}, hd :: _ when is_option hd ->
+        (* If the argument looks like an option, we choose the "stop"
+           command. *)
+        traverse (TStop c) arguments acc
     | TParam {stop = Some c; _}, [] ->
         return (c, empty_args_dict, initial_arguments)
     | TParam {tree; _}, parameter :: arguments' ->
@@ -1376,7 +1824,12 @@ let get_arg {long; short} =
 
 let rec list_args : type a ctx. (a, ctx) arg -> string list = function
   | Constant _ -> []
-  | Arg {label; _} | DefArg {label; _} | Switch {label; _} -> get_arg label
+  | Arg {label; _}
+  | MultipleArg {label; _}
+  | DefArg {label; _}
+  | ArgDefSwitch {label; _}
+  | Switch {label; _} ->
+      get_arg label
   | Pair (speca, specb) -> list_args speca @ list_args specb
   | Map {spec; _} -> list_args spec
 
@@ -1392,26 +1845,35 @@ let rec remaining_spec : type a ctx. StringSet.t -> (a, ctx) arg -> string list
     =
  fun seen -> function
   | Constant _ -> []
-  | Arg {label; _} | DefArg {label; _} | Switch {label; _} ->
+  | Arg {label; _}
+  | MultipleArg {label; _}
+  | DefArg {label; _}
+  | ArgDefSwitch {label; _}
+  | Switch {label; _} ->
       if StringSet.mem label.long seen then [] else get_arg label
   | Pair (speca, specb) -> remaining_spec seen speca @ remaining_spec seen specb
   | Map {spec; _} -> remaining_spec seen spec
 
 let complete_options (type ctx) continuation args args_spec ind (ctx : ctx) =
   let arities = make_arities_dict args_spec StringMap.empty in
-  let rec complete_spec :
-      type a. string -> (a, ctx) arg -> string list option tzresult Lwt.t =
+  let rec complete_spec : type a.
+      string -> (a, ctx) arg -> string list option tzresult Lwt.t =
    fun name ->
     let open Lwt_result_syntax in
     function
     | Constant _ -> return_none
     | DefArg {kind = {autocomplete; _}; label; _}
+    | ArgDefSwitch {kind = {autocomplete; _}; label; _}
     | Arg {kind = {autocomplete; _}; label; _}
       when label.long = name ->
         let* p = complete_func autocomplete ctx in
         return_some p
+    | MultipleArg {kind = {autocomplete; _}; label; _} when label.long = name ->
+        let* p = complete_func autocomplete ctx in
+        return_some p
     | Switch {label; _} when label.long = name -> return_some []
-    | Arg _ | DefArg _ | Switch _ -> return_none
+    | Arg _ | MultipleArg _ | DefArg _ | ArgDefSwitch _ | Switch _ ->
+        return_none
     | Pair (speca, specb) -> (
         let* resa = complete_spec name speca in
         match resa with
@@ -1421,6 +1883,21 @@ let complete_options (type ctx) continuation args args_spec ind (ctx : ctx) =
   in
   let rec help args ind seen =
     let open Lwt_result_syntax in
+    let arity_0_help_cont ind args seen =
+      if ind = 0 then
+        let+ cont_args = continuation args 0 in
+        remaining_spec seen args_spec @ cont_args
+      else help args (ind - 1) seen
+    in
+    let arity_1_help_cont ind arg args seen =
+      if ind = 1 then
+        let* res = complete_spec arg args_spec in
+        return (Option.value ~default:[] res)
+      else
+        match args with
+        | _ :: tl -> help tl (ind - 2) seen
+        | [] -> Stdlib.failwith "cli_entries internal error, invalid arity"
+    in
     match args with
     | _ when ind = 0 ->
         let+ cont_args = continuation args 0 in
@@ -1430,15 +1907,16 @@ let complete_options (type ctx) continuation args args_spec ind (ctx : ctx) =
         match StringMap.find arg arities with
         | Some (arity, long) -> (
             let seen = StringSet.add long seen in
-            match (arity, tl) with
-            | 0, args when ind = 0 ->
-                let+ cont_args = continuation args 0 in
-                remaining_spec seen args_spec @ cont_args
-            | 0, args -> help args (ind - 1) seen
-            | 1, _ when ind = 1 ->
-                let* res = complete_spec arg args_spec in
-                return (Option.value ~default:[] res)
-            | 1, _ :: tl -> help tl (ind - 2) seen
+            match arity with
+            | [0; 1] -> (
+                match List.hd tl with
+                | None -> arity_0_help_cont ind tl seen
+                | Some value ->
+                    if String.length value > 0 && value.[0] = '-' then
+                      arity_0_help_cont ind tl seen
+                    else arity_1_help_cont ind arg tl seen)
+            | [0] -> arity_0_help_cont ind tl seen
+            | [1] -> arity_1_help_cont ind arg tl seen
             | _ -> Stdlib.failwith "cli_entries internal error, invalid arity")
         | None -> continuation args ind)
   in
@@ -1543,13 +2021,25 @@ let autocompletion ~script ~cur_arg ~prev_arg ~args ~global_options commands
 
 let parse_global_options global_options ctx args =
   let open Lwt_result_syntax in
-  let* dict, remaining = make_args_dict_consume global_options args in
-  let* nested = parse_arg global_options dict ctx in
-  return (nested, remaining)
+  if has_argDefSwitch global_options then
+    Stdlib.failwith "ArgDefSwitch is not supported for global options."
+    (* With current code and this failwith removed, an ArgDefSwitch
+       option used as the last global option before the command would
+       consume the first keyword of the command. Support for making
+       `ArgDefSwitch`, would require a rework of how global args
+       works. I think by parsing the line in full instead of parsing
+       first global argument then the rest of the command would
+       work. *)
+  else
+    let* dict, remaining =
+      make_args_dict_consume_for_global_options global_options args
+    in
+    let* nested = parse_arg global_options dict ctx in
+    return (nested, remaining)
 
-let dispatch commands ctx args =
+let dispatch ?enable_argDefSwitch commands ctx args =
   let open Lwt_result_syntax in
-  let tree = make_dispatch_tree commands in
+  let tree = make_dispatch_tree ?enable_argDefSwitch commands in
   match args with
   | []
     when match tree with
@@ -1572,123 +2062,121 @@ let manual_group = {name = "man"; title = "Access the documentation"}
 let add_manual ~executable_name ~global_options format ppf commands =
   let rec with_manual =
     lazy
-      (commands
-      @ [
-          command
-            ~group:manual_group
-            ~desc:
-              "Print documentation of commands.\n\
-               Add search keywords to narrow list.\n\
-               Will display only the commands by default, unless [-verbosity \
-               <2|3>] is passed or the list of matching commands if less than \
-               3."
-            (args2
-               (arg
-                  ~doc:
-                    "level of details\n\
-                     0. Only shows command mnemonics, without documentation.\n\
-                     1. Shows command mnemonics with short descriptions.\n\
-                     2. Show commands and arguments with short descriptions\n\
-                     3. Show everything"
-                  ~long:"verbosity"
-                  ~short:'v'
-                  ~placeholder:"0|1|2|3"
-                  (parameter
-                     ~autocomplete:(fun _ -> Lwt.return_ok ["0"; "1"; "2"; "3"])
-                     (fun _ arg ->
-                       let open Lwt_result_syntax in
-                       match arg with
-                       | "0" -> return Terse
-                       | "1" -> return Short
-                       | "2" -> return Details
-                       | "3" -> return Full
-                       | _ -> failwith "Level of details out of range")))
-               (default_arg
-                  ~doc:"the manual's output format"
-                  ~placeholder:"plain|colors|html"
-                  ~long:"format"
-                  ~default:
-                    (match format with
-                    | Ansi -> "colors"
-                    | Plain -> "plain"
-                    | Html -> "html")
-                  (parameter
-                     ~autocomplete:(fun _ ->
-                       Lwt.return_ok ["colors"; "plain"; "html"])
-                     (fun _ arg ->
-                       let open Lwt_result_syntax in
-                       match arg with
-                       | "colors" -> return Ansi
-                       | "plain" -> return Plain
-                       | "html" -> return Html
-                       | _ -> failwith "Unknown manual format"))))
-            (prefix
-               "man"
-               (seq_of_param
-                  (string
-                     ~name:"keyword"
-                     ~desc:
-                       "keyword to search for\n\
-                        If several are given they must all appear in the \
-                        command.")))
-            (fun (verbosity, format) keywords _ ->
-              let commands =
-                List.fold_left
-                  (fun commands keyword ->
-                    List.filter (search_command keyword) commands)
-                  (Lazy.force with_manual)
-                  keywords
-              in
-              let verbosity =
-                match verbosity with
-                | Some verbosity -> verbosity
-                | None when Compare.List_length_with.(commands <= 3) -> Full
-                | None -> Short
-              in
-              let open Lwt_result_syntax in
-              match commands with
-              | [] -> tzfail (No_manual_entry keywords)
-              | _ ->
-                  let state = setup_formatter ppf format verbosity in
-                  let commands = List.map (fun c -> Ex c) commands in
-                  usage_internal
-                    ppf
-                    ~executable_name
-                    ~global_options
-                    ~highlights:keywords
-                    commands ;
-                  restore_formatter ppf state ;
-                  return_unit);
-        ])
+      (command
+         ~group:manual_group
+         ~desc:
+           "Print documentation of commands.\n\
+            Add search keywords to narrow list.\n\
+            Will display only the commands by default, unless [-verbosity \
+            <2|3>] is passed or the list of matching commands if less than 3."
+         (args2
+            (arg
+               ~doc:
+                 "level of details\n\
+                  0. Only shows command mnemonics, without documentation.\n\
+                  1. Shows command mnemonics with short descriptions.\n\
+                  2. Show commands and arguments with short descriptions\n\
+                  3. Show everything"
+               ~long:"verbosity"
+               ~short:'v'
+               ~placeholder:"0|1|2|3"
+               (parameter
+                  ~autocomplete:(fun _ -> Lwt.return_ok ["0"; "1"; "2"; "3"])
+                  (fun _ arg ->
+                    let open Lwt_result_syntax in
+                    match arg with
+                    | "0" -> return Terse
+                    | "1" -> return Short
+                    | "2" -> return Details
+                    | "3" -> return Full
+                    | _ -> failwith "Level of details out of range")))
+            (default_arg
+               ~doc:"the manual's output format"
+               ~placeholder:"plain|colors|html"
+               ~long:"format"
+               ~default:
+                 (match format with
+                 | Ansi -> "colors"
+                 | Plain -> "plain"
+                 | Html -> "html")
+               (parameter
+                  ~autocomplete:(fun _ ->
+                    Lwt.return_ok ["colors"; "plain"; "html"])
+                  (fun _ arg ->
+                    let open Lwt_result_syntax in
+                    match arg with
+                    | "colors" -> return Ansi
+                    | "plain" -> return Plain
+                    | "html" -> return Html
+                    | _ -> failwith "Unknown manual format"))))
+         (prefix
+            "man"
+            (seq_of_param
+               (string
+                  ~name:"keyword"
+                  ~desc:
+                    "keyword to search for\n\
+                     If several are given they must all appear in the command.")))
+         (fun (verbosity, format) keywords _ ->
+           let commands =
+             List.fold_left
+               (fun commands keyword ->
+                 List.filter (search_command keyword) commands)
+               (Lazy.force with_manual)
+               keywords
+           in
+           let verbosity =
+             match verbosity with
+             | Some verbosity -> verbosity
+             | None when Compare.List_length_with.(commands <= 1) -> Full
+             | None when Compare.List_length_with.(commands <= 3) -> Details
+             | None -> Short
+           in
+           let open Lwt_result_syntax in
+           match commands with
+           | [] -> tzfail (No_manual_entry keywords)
+           | _ ->
+               let state = internal_setup_formatter ppf format verbosity None in
+               let commands = List.map (fun c -> Ex c) commands in
+               usage_internal
+                 ppf
+                 ~prefix_executable:(format = Html)
+                 ~executable_name
+                 ~global_options
+                 ~highlights:keywords
+                 commands ;
+               restore_formatter ppf state ;
+               return_unit)
+      :: commands)
   in
   Lazy.force with_manual
 
 let pp_cli_errors ppf ~executable_name ~global_options ~default errs =
-  let pp_one = function
+  let pp_one ppf = function
     | Bad_argument (i, v) ->
-        Format.fprintf ppf "Erroneous command line argument %d (%s)." i v ;
-        Some []
-    | Option_expected_argument (arg, command) ->
+        Format.fprintf ppf "Erroneous command line argument %d (%s)." i v
+    | Option_expected_argument (arg, _) ->
         Format.fprintf
           ppf
           "Command line option @{<opt>%s@} expects an argument."
-          arg ;
-        Some (Option.fold ~some:(fun command -> [Ex command]) ~none:[] command)
-    | Bad_option_argument (arg, command) ->
+          arg
+    | Bad_option_argument (arg, _) ->
         Format.fprintf
           ppf
           "Wrong value for command line option @{<opt>%s@}."
-          arg ;
-        Some (Option.fold ~some:(fun command -> [Ex command]) ~none:[] command)
-    | Multiple_occurrences (arg, command) ->
+          arg
+    | Bad_env_argument (env, _) ->
+        Format.fprintf
+          ppf
+          "Wrong value for environment variable argument @{<opt>%s@}."
+          env
+    | Multiple_occurrences (arg, _) ->
         Format.fprintf
           ppf
           "Command line option @{<opt>%s@} appears multiple times."
-          arg ;
-        Some (Option.fold ~some:(fun command -> [Ex command]) ~none:[] command)
+          arg
     | No_manual_entry [keyword] ->
-        Format.fprintf ppf "No manual entry that match @{<hilight>%s@}." keyword ;
-        Some []
+        Format.fprintf ppf "No manual entry that match @{<hilight>%s@}." keyword
     | No_manual_entry (keyword :: keywords) ->
         Format.fprintf
           ppf
@@ -1697,33 +2185,28 @@ let pp_cli_errors ppf ~executable_name ~global_options ~default errs =
              ~pp_sep:(fun ppf () -> Format.fprintf ppf ", ")
              (fun ppf keyword -> Format.fprintf ppf "@{<hilight>%s@}" keyword))
           keywords
-          keyword ;
-        Some []
-    | Unknown_option (option, command) ->
-        Format.fprintf ppf "Unexpected command line option @{<opt>%s@}." option ;
-        Some (Option.fold ~some:(fun command -> [Ex command]) ~none:[] command)
-    | Extra_arguments (extra, command) ->
+          keyword
+    | Unknown_option (option, _) ->
+        Format.fprintf ppf "Unexpected command line option @{<opt>%s@}." option
+    | Extra_arguments (extra, _) ->
         Format.(
           fprintf
             ppf
             "Extra command line arguments:@, @[<h>%a@]."
             (pp_print_list ~pp_sep:pp_print_space pp_print_string)
-            extra) ;
-        Some [Ex command]
+            extra)
     | Unterminated_command (_, commands) ->
         Format.fprintf
           ppf
           "@[<v 2>Unterminated command, here are possible completions.@,%a@]"
           (Format.pp_print_list (fun ppf (Command {params; options; _}) ->
                print_commandline ppf ([], options, params)))
-          commands ;
-        Some (List.map (fun c -> Ex c) commands)
+          commands
     | Command_not_found ([], _all_commands) ->
         Format.fprintf
           ppf
           "@[<v 0>Unrecognized command.@,\
-           Try using the @{<kwd>man@} command to get more information.@]" ;
-        Some []
+           Try using the @{<kwd>man@} command to get more information.@]"
     | Command_not_found (_, commands) ->
         Format.fprintf
           ppf
@@ -1732,43 +2215,56 @@ let pp_cli_errors ppf ~executable_name ~global_options ~default errs =
           \  @[<v 0>%a@]@]"
           (Format.pp_print_list (fun ppf (Command {params; options; _}) ->
                print_commandline ppf ([], options, params)))
-          commands ;
-        Some (List.map (fun c -> Ex c) commands)
-    | err ->
-        default ppf err ;
-        None
+          commands
+    | err -> default ppf err
   in
-  let rec pp acc errs =
-    let return command =
-      match (command, acc) with
-      | None, _ -> acc
-      | Some command, Some commands -> Some (command @ commands)
-      | Some command, None -> Some command
-    in
+  let err_commands = function
+    | Option_expected_argument (_, Some command) -> [Ex command]
+    | Bad_option_argument (_, Some command) -> [Ex command]
+    | Bad_env_argument (_, Some command) -> [Ex command]
+    | Multiple_occurrences (_, Some command) -> [Ex command]
+    | Unknown_option (_, Some command) -> [Ex command]
+    | Extra_arguments (_, command) -> [Ex command]
+    | _ -> []
+  in
+  let rec errs_commands acc errs =
     match errs with
-    | [] -> None
-    | [last] -> return (pp_one last)
+    | [] -> List.rev acc
     | err :: errs ->
-        let acc = return (pp_one err) in
-        Format.fprintf ppf "@," ;
-        pp acc errs
+        let acc = List.rev_append (err_commands err) acc in
+        errs_commands acc errs
   in
-  Format.fprintf ppf "@[<v 2>@{<error>@{<title>Error@}@}@," ;
-  match pp None errs with
-  | None -> Format.fprintf ppf "@]@\n"
-  | Some commands ->
+  (match errs_commands [] errs with
+  | [] -> ()
+  | commands ->
       Format.fprintf
         ppf
-        "@]@\n@\n@[<v 0>%a@]"
+        "@[<v 0>%a@]@."
         (fun ppf commands ->
-          usage_internal ppf ~executable_name ~global_options commands)
-        commands
+          usage_internal
+            ppf
+            ~prefix_executable:false
+            ~executable_name
+            ~global_options
+            commands)
+        commands) ;
+  Format.fprintf
+    ppf
+    "@[<v 2>@{<error>@{<title>Error@}@}@,%a@]@."
+    (Format.pp_print_list pp_one)
+    errs
 
 let usage ppf ~executable_name ~global_options commands =
   usage_internal
     ppf
+    ~prefix_executable:false
     ~executable_name
     ~global_options
     (List.map (fun c -> Ex c) commands)
 
 let map_command f (Command c) = Command {c with conv = (fun x -> c.conv (f x))}
+
+let setup_formatter ~isatty ppf verbosity =
+  let format = if isatty then Ansi else Plain in
+  let cols = if isatty then Terminal.Size.get_columns () else Some 95 in
+  internal_setup_formatter ppf format verbosity cols

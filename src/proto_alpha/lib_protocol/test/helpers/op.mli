@@ -2,6 +2,7 @@
 (*                                                                           *)
 (* Open Source License                                                       *)
 (* Copyright (c) 2018 Dynamic Ledger Solutions, Inc. <contact@tezos.com>     *)
+(* Copyright (c) 2023 Marigold, <contact@marigold.dev>                       *)
 (*                                                                           *)
 (* Permission is hereby granted, free of charge, to any person obtaining a   *)
 (* copy of this software and associated documentation files (the "Software"),*)
@@ -26,6 +27,9 @@
 open Protocol
 open Alpha_context
 
+(** The operation representation handled most often in test helpers. *)
+type t = Alpha_context.packed_operation
+
 (* TODO: https://gitlab.com/tezos/tezos/-/issues/3181
    Improve documentation of the operation helpers *)
 
@@ -46,50 +50,158 @@ val pack_operation :
 
 val sign :
   ?watermark:Signature.watermark ->
+  Context.t ->
   Signature.secret_key ->
   Block_hash.t ->
   packed_contents_list ->
-  packed_operation
+  (packed_operation, tztrace) result Environment.Lwt.t
 
-(** Create an unpacked endorsement that is expected for given [Block.t].
+val create_proof : Signature.secret_key -> Signature.Bls.t option
 
-    Optional parameters allow to specify the endorsed values: [level],
-    [round] and/or [block_payload_hash].
+(** Information needed on the author of a (pre)attestation: slot
+    (written into the (pre)attestation) and consensus key (required
+    for signing). *)
+type attesting_slot = {slot : Slot.t; consensus_pkh : Signature.public_key_hash}
 
-    They also allow to specify the endorser ([delegate]), and/or the
-    [slot]. These default to the first slot and its delegate.
+(** Builds an {!attesting_slot} with the attester's consensus key and
+    canonical slot, that is, its first slot. *)
+val attesting_slot_of_attester : Context.attester -> attesting_slot
+
+(** Returns the canonical {!attesting_slot} of the first attester
+    returned by {!Plugin.RPC.Validators.S.validators}. *)
+val get_attesting_slot : attested_block:Block.t -> attesting_slot tzresult Lwt.t
+
+(** Returns the canonical {!attesting_slot} of delegate [manager_pkh]
+    for [attested_block]. Fails if it doesn't have any attesting
+    rights for this block. *)
+val get_attesting_slot_of_delegate :
+  manager_pkh:Implicit_account_repr.t ->
+  attested_block:Block.t ->
+  attesting_slot tzresult Lwt.t
+
+(** Returns the canonical {!attesting_slot} of the first attester
+    returned by {!Plugin.RPC.Validators.S.validators} whose consensus
+    key is different from [consensus_pkh_to_avoid]. *)
+val get_different_attesting_slot :
+  consensus_pkh_to_avoid:Signature.public_key_hash ->
+  attested_block:Block.t ->
+  attesting_slot tzresult Lwt.t
+
+(** Builds an {!attesting_slot} with the attester's consensus key and
+    its second-smallest slot (that is, a non-canonical slot that still
+    belongs to the attester). *)
+val non_canonical_attesting_slot_of_attester :
+  Context.attester -> attesting_slot tzresult Lwt.t
+
+(** Retrieves the first attester returned by
+    {!Plugin.RPC.Validators.S.validators} and builds a non-canonical
+    {!attesting_slot} for it, where {!field-slot} is its
+    second-smallest slot. *)
+val get_non_canonical_attesting_slot :
+  attested_block:Block.t -> attesting_slot tzresult Lwt.t
+
+(** Default committee for a (pre)attestations aggregate, that is, the
+    canonical attesting slots of all delegates with attesting rights
+    on [attested_block] whose consensus keys are BLS keys. *)
+val default_committee :
+  attested_block:Block.t -> attesting_slot list tzresult Lwt.t
+
+(** Returns the canonical {!attesting_slot} of the first attester
+    returned by {!Plugin.RPC.Validators.S.validators} whose consensus
+    key is a BLS key. *)
+val get_attesting_slot_with_bls_key :
+  attested_block:Block.t -> attesting_slot tzresult Lwt.t
+
+(** Returns the canonical {!attesting_slot} of the first attester
+    returned by {!Plugin.RPC.Validators.S.validators} whose consensus
+    key is a non-BLS key. *)
+val get_attesting_slot_with_non_bls_key :
+  attested_block:Block.t -> attesting_slot tzresult Lwt.t
+
+(** Returns the canonical {!attesting_slot} corresponding to a
+    {!RPC.Attestation_rights.delegate_rights}. *)
+val attesting_slot_of_delegate_rights :
+  RPC.Attestation_rights.delegate_rights -> attesting_slot
+
+(** Create an unpacked attestation that is expected for given [Block.t].
+
+    Optional parameters allow to specify the attested values: [level],
+    [round], [block_payload_hash], and/or [dal_content].
+
+    The consensus slot and signer are the ones from [attesting_slot]
+    if provided, otherwise the canonical ones for the delegate with
+    [manager_pkh] if provided (and the function fails if [manager_pkh]
+    is not the manager key of a delegate with attesting rights at the
+    given [Block.t]'s level); otherwise, they default to the attesting
+    slot returned by {!get_attesting_slot}. The function fails if both
+    [attesting_slot] and [manager_pkh] are provided.
 
     Finally, the operation [branch] can be specified. It defaults to the
-    predecessor of the endorsed block. *)
-val raw_endorsement :
-  ?delegate:public_key_hash ->
-  ?slot:Slot.t ->
+    predecessor of the attested block. *)
+val raw_attestation :
+  ?attesting_slot:attesting_slot ->
+  ?manager_pkh:Implicit_account_repr.t ->
   ?level:Raw_level.t ->
   ?round:Round.t ->
   ?block_payload_hash:Block_payload_hash.t ->
+  ?dal_content:dal_content ->
   ?branch:Block_hash.t ->
   Block.t ->
-  Kind.endorsement Operation.t tzresult Lwt.t
+  Kind.attestation Operation.t tzresult Lwt.t
 
-(** Create an unpacked preendorsement that is expected for a given
+(** Create an unpacked preattestation that is expected for a given
     [Block.t].
 
-    Optional parameters are the same than {!raw_endorsement}. *)
-val raw_preendorsement :
-  ?delegate:public_key_hash ->
-  ?slot:Slot.t ->
+    Optional parameters are the same than {!raw_attestation}. *)
+val raw_preattestation :
+  ?attesting_slot:attesting_slot ->
+  ?manager_pkh:Implicit_account_repr.t ->
   ?level:Raw_level.t ->
   ?round:Round.t ->
   ?block_payload_hash:Block_payload_hash.t ->
   ?branch:Block_hash.t ->
   Block.t ->
-  Kind.preendorsement Operation.t tzresult Lwt.t
+  Kind.preattestation Operation.t tzresult Lwt.t
 
-(** Create a packed endorsement that is expected for a given
-    [Block.t] by packing the result of {!raw_endorsement}. *)
-val endorsement :
-  ?delegate:public_key_hash ->
-  ?slot:Slot.t ->
+(** Create a packed attestation that is expected for a given
+    [Block.t] by packing the result of {!raw_attestation}. *)
+val attestation :
+  ?attesting_slot:attesting_slot ->
+  ?manager_pkh:Implicit_account_repr.t ->
+  ?level:Raw_level.t ->
+  ?round:Round.t ->
+  ?block_payload_hash:Block_payload_hash.t ->
+  ?dal_content:dal_content ->
+  ?branch:Block_hash.t ->
+  Block.t ->
+  Operation.packed tzresult Lwt.t
+
+(** Crafts an {!Attestations_aggregate} operation pointing to the
+    given {!Block.t}. Block context is expected to include at least
+    one delegate with a BLS consensus key, otherwise this function
+    will return an error.
+
+    The committee consists of the concatenation of [committee] with
+    [dal_content = None] for each member, and of
+    [committee_with_dal]. If neither is provided, it defaults to
+    {!default_committee} with no DAL contents.
+
+    Other parameters are the same as in {!raw_attestation}. *)
+val raw_attestations_aggregate :
+  ?committee:attesting_slot list ->
+  ?committee_with_dal:(attesting_slot * dal_content option) list ->
+  ?level:Raw_level.t ->
+  ?round:Round.t ->
+  ?block_payload_hash:Block_payload_hash.t ->
+  ?branch:Block_hash.t ->
+  Block.t ->
+  Kind.attestations_aggregate Operation.t tzresult Lwt.t
+
+(** Same as {!raw_preattestations_aggregate} but returns the packed
+    operation. *)
+val attestations_aggregate :
+  ?committee:attesting_slot list ->
+  ?committee_with_dal:(attesting_slot * dal_content option) list ->
   ?level:Raw_level.t ->
   ?round:Round.t ->
   ?block_payload_hash:Block_payload_hash.t ->
@@ -97,11 +209,39 @@ val endorsement :
   Block.t ->
   Operation.packed tzresult Lwt.t
 
-(** Create a packed preendorsement that is expected for a given
-    [Block.t] by packing the result of {!raw_preendorsement}. *)
-val preendorsement :
-  ?delegate:public_key_hash ->
-  ?slot:Slot.t ->
+(** Create a packed preattestation that is expected for a given
+    [Block.t] by packing the result of {!raw_preattestation}. *)
+val preattestation :
+  ?attesting_slot:attesting_slot ->
+  ?manager_pkh:Implicit_account_repr.t ->
+  ?level:Raw_level.t ->
+  ?round:Round.t ->
+  ?block_payload_hash:Block_payload_hash.t ->
+  ?branch:Block_hash.t ->
+  Block.t ->
+  Operation.packed tzresult Lwt.t
+
+(** Crafts a {!Preattestations_aggregate} operation pointing to the
+    given {!Block.t}. Block context is expected to include at least
+    one delegate with a BLS consensus key, otherwise this function
+    will return an error.
+
+    [committee] defaults to {!default_committee}.
+
+    Other parameters are the same as in {!raw_attestation}. *)
+val raw_preattestations_aggregate :
+  ?committee:attesting_slot list ->
+  ?level:Raw_level.t ->
+  ?round:Round.t ->
+  ?block_payload_hash:Block_payload_hash.t ->
+  ?branch:Block_hash.t ->
+  Block.t ->
+  Kind.preattestations_aggregate operation tzresult Lwt.t
+
+(** Same as {!raw_preattestations_aggregate} but returns the packed
+    operation. *)
+val preattestations_aggregate :
+  ?committee:attesting_slot list ->
   ?level:Raw_level.t ->
   ?round:Round.t ->
   ?block_payload_hash:Block_payload_hash.t ->
@@ -122,10 +262,47 @@ type gas_limit =
 (** Pretty printer for gas_limit type. *)
 val pp_gas_limit : Format.formatter -> gas_limit -> unit
 
+(** Packs a manager operation into a contents list.
+
+    @param force_reveal Prepends the operation to reveal [source]'s
+      public key if the latter has not been revealed yet. Disabled
+      by default (i.e., set to [false]).
+
+    @param counter Specifies the expected current counter, meaning
+      that the operation's counter will actually be [counter + 1].
+      Defaults to the correct current counter for [source] in the
+      context.
+
+    @param fee Specifies the fee. Defaults to [Tez.zero].
+
+    @param gas_limit Specifies the gas limit. Defaults to a high
+      limit of around 50_000 gas units.
+
+    @param storage_limit Specifies the storage limit. Defaults to
+      [Z.of_int 60_000].
+
+    @param public_key The actual [source] written in the operation
+      will be the hash of [public_key]. Defaults to the public key
+      that corresponds to the [source] argument.
+
+    @param source Used to retrieve defaults values of [counter] and
+      [public_key]. *)
+val manager_operation :
+  ?force_reveal:bool ->
+  ?counter:Manager_counter.t ->
+  ?fee:Tez.t ->
+  ?gas_limit:gas_limit ->
+  ?storage_limit:Z.t ->
+  ?public_key:public_key ->
+  source:Contract.t ->
+  Context.t ->
+  'a manager_operation ->
+  packed_contents_list tzresult Lwt.t
+
 val transaction :
   ?force_reveal:bool ->
   ?counter:Manager_counter.t ->
-  ?fee:Tez.tez ->
+  ?fee:Tez.t ->
   ?gas_limit:gas_limit ->
   ?storage_limit:Z.t ->
   ?parameters:Script.lazy_expr ->
@@ -165,30 +342,30 @@ val unsafe_transaction :
 
 val delegation :
   ?force_reveal:bool ->
-  ?fee:Tez.tez ->
+  ?fee:Tez.t ->
   ?gas_limit:gas_limit ->
   ?counter:Manager_counter.t ->
   ?storage_limit:Z.t ->
   Context.t ->
   Contract.t ->
-  public_key_hash option ->
+  Implicit_account_repr.t option ->
   Operation.packed tzresult Lwt.t
 
 val set_deposits_limit :
   ?force_reveal:bool ->
-  ?fee:Tez.tez ->
+  ?fee:Tez.t ->
   ?gas_limit:gas_limit ->
   ?storage_limit:Z.t ->
   ?counter:Manager_counter.t ->
   Context.t ->
   Contract.t ->
-  Tez.tez option ->
+  Tez.t option ->
   Operation.packed tzresult Lwt.t
 
 val increase_paid_storage :
   ?force_reveal:bool ->
   ?counter:Manager_counter.t ->
-  ?fee:Tez.tez ->
+  ?fee:Tez.t ->
   ?gas_limit:gas_limit ->
   ?storage_limit:Z.t ->
   Context.t ->
@@ -197,13 +374,13 @@ val increase_paid_storage :
   Z.t ->
   Operation.packed tzresult Lwt.t
 
-(** [revelation ?fee ?gas_limit ?forge_pkh ctxt pkh] Creates a new
-    [Reveal] {!manager_operation} to reveal a public key [pkh]
-    applying to current context [ctxt].
+(** [revelation ?fee ?gas_limit ?forge_pkh ?forge_proof ctxt pkh]
+    Creates a new [Reveal] {!manager_operation} to reveal a public key
+    [pkh] applying to current context [ctxt].
 
     Optional arguments allow to override defaults:
 
-    {ul {li [?fee:Tez.tez]: specify a fee, otherwise set to
+    {ul {li [?fee:Tez.t]: specify a fee, otherwise set to
     [Tez.zero].}
 
     {li [?gas_limit:Gas.Arith.integral]: force a gas limit, otherwise
@@ -211,6 +388,10 @@ val increase_paid_storage :
 
     {li [?forge_pkh]: use a provided [pkh] as source, instead of
     hashing [pkh]. Useful for forging non-honest reveal operations}
+
+    {li [?forge_proof]: use a provided [proof] instead of creating a
+    correct proof for [pkh]. Useful for forging non-honest reveal
+    operations}
 
     {li [?storage_limit:Z.t]: forces a storage limit, otherwise
     set to [Z.zero]}}
@@ -220,13 +401,17 @@ val revelation :
   ?gas_limit:gas_limit ->
   ?storage_limit:Z.t ->
   ?counter:Manager_counter.t ->
-  ?forge_pkh:public_key_hash option ->
+  ?forge_pkh:Implicit_account_repr.t option ->
+  ?forge_proof:Signature.Bls.t option ->
   Context.t ->
   public_key ->
   (packed_operation, tztrace) result Lwt.t
 
 val failing_noop :
-  Context.t -> public_key_hash -> string -> Operation.packed tzresult Lwt.t
+  Context.t ->
+  Implicit_account_repr.t ->
+  string ->
+  Operation.packed tzresult Lwt.t
 
 (** [contract_origination ctxt source] Create a new contract origination
     operation, sign it with [source] and returns it alongside the contract
@@ -243,11 +428,11 @@ val failing_noop :
 val contract_origination :
   ?force_reveal:bool ->
   ?counter:Manager_counter.t ->
-  ?delegate:public_key_hash ->
-  script:Script.t ->
+  ?delegate:Implicit_account_repr.t ->
+  script:Script.michelson_with_storage ->
   ?public_key:public_key ->
-  ?credit:Tez.tez ->
-  ?fee:Tez.tez ->
+  ?credit:Tez.t ->
+  ?fee:Tez.t ->
   ?gas_limit:gas_limit ->
   ?storage_limit:Z.t ->
   Context.t ->
@@ -257,11 +442,11 @@ val contract_origination :
 val contract_origination_hash :
   ?force_reveal:bool ->
   ?counter:Manager_counter.t ->
-  ?delegate:public_key_hash ->
-  script:Script.t ->
+  ?delegate:Implicit_account_repr.t ->
+  script:Script.michelson_with_storage ->
   ?public_key:public_key ->
-  ?credit:Tez.tez ->
-  ?fee:Tez.tez ->
+  ?credit:Tez.t ->
+  ?fee:Tez.t ->
   ?gas_limit:gas_limit ->
   ?storage_limit:Z.t ->
   Context.t ->
@@ -274,7 +459,7 @@ val register_global_constant :
   ?force_reveal:bool ->
   ?counter:Manager_counter.t ->
   ?public_key:Signature.public_key ->
-  ?fee:Tez.tez ->
+  ?fee:Tez.t ->
   ?gas_limit:gas_limit ->
   ?storage_limit:Z.t ->
   Context.t ->
@@ -284,22 +469,31 @@ val register_global_constant :
   value:Protocol.Alpha_context.Script.lazy_expr ->
   (Protocol.operation, tztrace) result Lwt.t
 
-val double_endorsement :
+val double_attestation :
   Context.t ->
-  Kind.endorsement Operation.t ->
-  Kind.endorsement Operation.t ->
+  Kind.attestation Operation.t ->
+  Kind.attestation Operation.t ->
   Operation.packed
 
-val double_preendorsement :
+val double_preattestation :
   Context.t ->
-  Kind.preendorsement Operation.t ->
-  Kind.preendorsement Operation.t ->
+  Kind.preattestation Operation.t ->
+  Kind.preattestation Operation.t ->
   Operation.packed
 
 val double_baking :
   Context.t ->
   Block_header.block_header ->
   Block_header.block_header ->
+  Operation.packed
+
+val dal_entrapment :
+  Context.t ->
+  'a Kind.consensus operation ->
+  consensus_slot:Slot.t ->
+  Dal.Slot_index.t ->
+  lag_index:int ->
+  Dal.Shard_with_proof.t ->
   Operation.packed
 
 val activation :
@@ -388,7 +582,7 @@ val ballot :
   Vote.ballot ->
   Operation.packed tzresult Lwt.t
 
-val dummy_script : Script.t
+val dummy_script : Script.michelson_with_storage
 
 val dummy_script_cost : Tez.t
 
@@ -447,7 +641,7 @@ val sc_rollup_origination :
   ?fee:Tez.t ->
   ?gas_limit:gas_limit ->
   ?storage_limit:Z.t ->
-  origination_proof:Sc_rollup.Proof.serialized ->
+  ?whitelist:Sc_rollup.Whitelist.t ->
   Context.t ->
   Contract.t ->
   Sc_rollup.Kind.t ->
@@ -467,7 +661,7 @@ val sc_rollup_origination :
 val sc_rollup_publish :
   ?force_reveal:bool ->
   ?counter:Manager_counter.t ->
-  ?fee:Tez.tez ->
+  ?fee:Tez.t ->
   ?gas_limit:gas_limit ->
   ?storage_limit:Z.t ->
   Context.t ->
@@ -476,8 +670,7 @@ val sc_rollup_publish :
   Sc_rollup.Commitment.t ->
   Operation.packed tzresult Lwt.t
 
-(** [sc_rollup_cement ctxt source rollup commitment] tries to cement
-    the specified commitment.
+(** [sc_rollup_cement ctxt source rollup] tries to cement a commitment.
 
     Optional arguments allow to override defaults:
 
@@ -487,13 +680,12 @@ val sc_rollup_publish :
 val sc_rollup_cement :
   ?force_reveal:bool ->
   ?counter:Manager_counter.t ->
-  ?fee:Tez.tez ->
+  ?fee:Tez.t ->
   ?gas_limit:gas_limit ->
   ?storage_limit:Z.t ->
   Context.t ->
   Contract.t ->
   Sc_rollup.t ->
-  Sc_rollup.Commitment.Hash.t ->
   Operation.packed tzresult Lwt.t
 
 val sc_rollup_execute_outbox_message :
@@ -513,20 +705,20 @@ val sc_rollup_execute_outbox_message :
     commitment bond of [staker]. *)
 val sc_rollup_recover_bond :
   ?counter:Manager_counter.t ->
-  ?fee:Tez.tez ->
+  ?fee:Tez.t ->
   ?gas_limit:gas_limit ->
   ?storage_limit:Z.t ->
   ?force_reveal:bool ->
   Context.t ->
   Contract.t ->
   Sc_rollup.t ->
-  public_key_hash ->
+  Implicit_account_repr.t ->
   Operation.packed tzresult Lwt.t
 
 val sc_rollup_add_messages :
   ?force_reveal:bool ->
   ?counter:Manager_counter.t ->
-  ?fee:Tez.tez ->
+  ?fee:Tez.t ->
   ?gas_limit:gas_limit ->
   ?storage_limit:Z.t ->
   Context.t ->
@@ -537,20 +729,20 @@ val sc_rollup_add_messages :
 val sc_rollup_refute :
   ?force_reveal:bool ->
   ?counter:Manager_counter.t ->
-  ?fee:Tez.tez ->
+  ?fee:Tez.t ->
   ?gas_limit:gas_limit ->
   ?storage_limit:Z.t ->
   Context.t ->
   Contract.t ->
   Sc_rollup.t ->
-  public_key_hash ->
+  Implicit_account_repr.t ->
   Sc_rollup.Game.refutation ->
   Operation.packed tzresult Lwt.t
 
 val sc_rollup_timeout :
   ?force_reveal:bool ->
   ?counter:Manager_counter.t ->
-  ?fee:Tez.tez ->
+  ?fee:Tez.t ->
   ?gas_limit:gas_limit ->
   ?storage_limit:Z.t ->
   Context.t ->
@@ -559,7 +751,7 @@ val sc_rollup_timeout :
   Sc_rollup.Game.Index.t ->
   Operation.packed tzresult Lwt.t
 
-val dal_publish_slot_header :
+val dal_publish_commitment :
   ?force_reveal:bool ->
   ?counter:Manager_counter.t ->
   ?fee:Tez.t ->
@@ -567,7 +759,7 @@ val dal_publish_slot_header :
   ?storage_limit:Z.t ->
   Context.t ->
   Contract.t ->
-  Dal.Operations.Publish_slot_header.t ->
+  Dal.Operations.Publish_commitment.t ->
   (packed_operation, tztrace) result Lwt.t
 
 (** [zk_rollup_origination ctxt source ~public_parameters ~circuits_info
@@ -586,12 +778,32 @@ val zk_rollup_origination :
   nb_ops:int ->
   (Operation.packed * Zk_rollup.t) tzresult Lwt.t
 
+(* [update_consensus_key ?proof_signer ctxt source public_key] tries to update
+   the consensus key of [source] to [public_key]. If a [proof_signer] is given,
+   we create a signature of the [public_key] using the [proof_signer] secret
+   key. This signature is then given as a [proof] in the update_consensus_key
+   operation. *)
 val update_consensus_key :
   ?force_reveal:bool ->
   ?counter:Manager_counter.t ->
   ?fee:Tez.t ->
   ?gas_limit:gas_limit ->
   ?storage_limit:Z.t ->
+  ?proof_signer:Contract.t ->
+  ?forge_proof:Signature.Bls.t option ->
+  Context.t ->
+  Contract.t ->
+  public_key ->
+  (packed_operation, tztrace) result Lwt.t
+
+val update_companion_key :
+  ?force_reveal:bool ->
+  ?counter:Manager_counter.t ->
+  ?fee:Tez.t ->
+  ?gas_limit:gas_limit ->
+  ?storage_limit:Z.t ->
+  ?proof_signer:Contract.t ->
+  ?forge_proof:Signature.Bls.t option ->
   Context.t ->
   Contract.t ->
   public_key ->
@@ -600,8 +812,8 @@ val update_consensus_key :
 val drain_delegate :
   Context.t ->
   consensus_key:Signature.Public_key_hash.t ->
-  delegate:Signature.Public_key_hash.t ->
-  destination:Signature.Public_key_hash.t ->
+  delegate:Implicit_account_repr.t ->
+  destination:Implicit_account_repr.t ->
   packed_operation tzresult Lwt.t
 
 (** [zk_rollup_publish ctxt source ~zk_rollup ~op] tries to add an operation
@@ -630,4 +842,268 @@ val zk_rollup_update :
   Contract.t ->
   zk_rollup:Zk_rollup.t ->
   update:Zk_rollup.Update.t ->
+  Operation.packed tzresult Lwt.t
+
+module Micheline = Micheline
+
+(** {!Protocol.type-mode}-related helpers *)
+
+(** Which {!Protocol.type-mode} to test. *)
+type tested_mode = Application | Construction | Mempool
+
+(** [check_validation_and_application ~loc ?error ~predecessor
+    tested_mode operation] tests the validation and application of
+    [operation] in [tested_mode].
+
+    - When [tested_mode] is [Application] or [Construction], a block
+      containing [operation] is baked on top of [predecessor] in the
+      specified mode.
+
+    - When [tested_mode] is [Mempool], a mempool is initialized using
+      [predecessor] as head, then {!Incremental.add_operation} is called
+      on [operation], then {!Incremental.finalize_block_with_metadata}.
+
+    When [check_after] is provided, it is called on the resulting
+    block. When [error] is provided, we check that an error identified
+    by [error] is returned. When neither is provided, we return unit
+    if there the validation and application returned [Ok], or the
+    unchanged error. When both are provided, the function fails.
+*)
+val check_validation_and_application :
+  loc:string ->
+  ?check_after:(Block.block_with_metadata -> unit tzresult Lwt.t) ->
+  ?error:(Environment.Error_monad.error -> bool) ->
+  predecessor:Block.t ->
+  tested_mode ->
+  t ->
+  unit tzresult Lwt.t
+
+(** Calls {!check_validation_and_application} on all {!tested_mode}s
+    successively, with respective checks or errors. *)
+val check_validation_and_application_all_modes_different_outcomes :
+  loc:string ->
+  ?check_after_application:(Block.block_with_metadata -> unit tzresult Lwt.t) ->
+  ?check_after_construction:(Block.block_with_metadata -> unit tzresult Lwt.t) ->
+  ?check_after_mempool:(Block.block_with_metadata -> unit tzresult Lwt.t) ->
+  ?application_error:(Environment.Error_monad.error -> bool) ->
+  ?construction_error:(Environment.Error_monad.error -> bool) ->
+  ?mempool_error:(Environment.Error_monad.error -> bool) ->
+  predecessor:Block.t ->
+  t ->
+  unit tzresult Lwt.t
+
+(** Calls {!check_validation_and_application} on all {!tested_mode}s
+    successively, with the same [check_after] or [error] provided for
+    each mode. *)
+val check_validation_and_application_all_modes :
+  loc:string ->
+  ?check_after:(Block.block_with_metadata -> unit tzresult Lwt.t) ->
+  ?error:(Environment.Error_monad.error -> bool) ->
+  predecessor:Block.t ->
+  t ->
+  unit tzresult Lwt.t
+
+val get_op_signature : t -> signature option
+
+val set_op_signature : t -> signature option -> t
+
+val copy_op_signature : src:t -> dst:t -> t
+
+(** [clst_deposit ctxt src amount] returns a deposit operation of [amount] tez
+    on the CLST contract. *)
+val clst_deposit :
+  ?force_reveal:bool ->
+  ?counter:Manager_counter.t ->
+  ?fee:Tez.t ->
+  ?gas_limit:gas_limit ->
+  ?storage_limit:Z.t ->
+  Context.t ->
+  Contract.t ->
+  Tez.t ->
+  Operation.packed tzresult Lwt.t
+
+(** [clst_redeem ctxt src amount] returns a withdraw operation of
+    [amount] clst tokens on the CLST contract.
+
+    [amount] is given in mutez, as the current internal exchange rate
+    between clst and mutez set at 1. This rate will be adjusted
+    soon. *)
+val clst_redeem :
+  ?force_reveal:bool ->
+  ?counter:Manager_counter.t ->
+  ?fee:Tez.t ->
+  ?gas_limit:gas_limit ->
+  ?storage_limit:Z.t ->
+  Context.t ->
+  Contract.t ->
+  int64 ->
+  Operation.packed tzresult Lwt.t
+
+(** [clst_finalize_redeem ctxt sender redeemer] returns a finalize redeem
+    operation on the CLST contract for the given [redeemer]. *)
+val clst_finalize_redeem :
+  ?force_reveal:bool ->
+  ?counter:Manager_counter.t ->
+  ?fee:Tez.t ->
+  ?gas_limit:gas_limit ->
+  ?storage_limit:Z.t ->
+  Context.t ->
+  sender:Contract.t ->
+  redeemer:Implicit_account_repr.t ->
+  Operation.packed tzresult Lwt.t
+
+(** [clst_approve ctxt sender batch] increases or decreases allowances
+    for the given [(owner, spender, amount)] batch.
+
+    The operation is signed and sent by [sender]. *)
+val clst_approve :
+  ?force_reveal:bool ->
+  ?counter:Manager_counter.t ->
+  ?fee:Tez.t ->
+  ?gas_limit:gas_limit ->
+  ?storage_limit:Z.t ->
+  Context.t ->
+  sender:Contract.t ->
+  (Contract.t * Contract.t * int64) list ->
+  Operation.packed tzresult Lwt.t
+
+(** [clst_update_operator ctxt sender batch] approves or revokes an
+    infinite allowance of clst tokens set to [operator] regarding a
+    token [owner] for the given [(owner, operator, action)] batch.
+
+    The operation is signed and sent by [sender]. *)
+val clst_update_operator :
+  ?force_reveal:bool ->
+  ?counter:Manager_counter.t ->
+  ?fee:Tez.t ->
+  ?gas_limit:gas_limit ->
+  ?storage_limit:Z.t ->
+  Context.t ->
+  sender:Contract.t ->
+  (Contract.t * Contract.t * [< `Add | `Remove]) list ->
+  Operation.packed tzresult Lwt.t
+
+(** [clst_transfer ctxt sender batch] performs a batch transfer with
+    the given [(src, [(dst, amount)])] batch.
+
+    The operation is signed and sent by [sender]. *)
+val clst_transfer :
+  ?force_reveal:bool ->
+  ?counter:Manager_counter.t ->
+  ?fee:Tez.t ->
+  ?gas_limit:gas_limit ->
+  ?storage_limit:Z.t ->
+  Context.t ->
+  sender:Contract.t ->
+  (Contract.t * (Contract.t * int64) list) list ->
+  Operation.packed tzresult Lwt.t
+
+(** [clst_export_ticket ?destination_contract ctxt sender batch]
+    exports [amount] clst tokens as a clst ticket from [src] to [dst]
+    if [destination_contract] is [None]. Otherwise, emits the internal
+    transaction to the [destination_contract] entrypoint of [list
+    (pair dst_address (list ticket))] type. The batch consists of
+    [(dst, [(src, amount)])] elements.
+
+    The operation is signed and sent by [sender]. *)
+val clst_export_ticket :
+  ?force_reveal:bool ->
+  ?counter:Manager_counter.t ->
+  ?fee:Tez.t ->
+  ?gas_limit:gas_limit ->
+  ?storage_limit:Z.t ->
+  ?destination_contract:string option ->
+  Context.t ->
+  sender:Contract.t ->
+  (Contract.t * (Contract.t * int64) list) list ->
+  Operation.packed tzresult Lwt.t
+
+(** [clst_lambda_export ctxt src amount lambda_action] exports
+    [amount] clst tokens as a clst ticket from [src] and passes them
+    to [lambda_action], a Michelson lambda of type [list ticket ->
+    list operation]. *)
+val clst_lambda_export :
+  ?force_reveal:bool ->
+  ?counter:Manager_counter.t ->
+  ?fee:Tez.t ->
+  ?gas_limit:gas_limit ->
+  ?storage_limit:Z.t ->
+  Context.t ->
+  src:Contract.t ->
+  lambda_action:Script.expr ->
+  int64 ->
+  Operation.packed tzresult Lwt.t
+
+(** [clst_import_ticket_from_implicit ctxt src amount] imports
+    [amount] clst tickets from an implicit account [src] to CLST as
+    [amount] clst tokens for [src]. *)
+val clst_import_ticket_from_implicit :
+  ?force_reveal:bool ->
+  ?counter:Manager_counter.t ->
+  ?fee:Tez.t ->
+  ?gas_limit:gas_limit ->
+  ?storage_limit:Z.t ->
+  Context.t ->
+  src:Contract.t ->
+  int64 ->
+  Operation.packed tzresult Lwt.t
+
+(** [clst_register_delegate ctxt src
+    ~edge_of_clst_staking_over_baking_millionth
+    ~ratio_of_clst_staking_over_direct_staking_billionth] returns a
+    register_delegate on the CLST contract. *)
+val clst_register_delegate :
+  ?force_reveal:bool ->
+  ?counter:Manager_counter.t ->
+  ?fee:Tez.t ->
+  ?gas_limit:gas_limit ->
+  ?storage_limit:Z.t ->
+  Context.t ->
+  Contract.t ->
+  edge_of_clst_staking_over_baking_millionth:Z.t ->
+  ratio_of_clst_staking_over_direct_staking_billionth:Z.t ->
+  Operation.packed tzresult Lwt.t
+
+(** [clst_update_delegate_parameters ctxt src
+    ~edge_of_clst_staking_over_baking_millionth
+    ~ratio_of_clst_staking_over_direct_staking_billionth] returns a
+    update_delegate_parameters operation on the CLST contract. *)
+val clst_update_delegate_parameters :
+  ?force_reveal:bool ->
+  ?counter:Manager_counter.t ->
+  ?fee:Tez.t ->
+  ?gas_limit:gas_limit ->
+  ?storage_limit:Z.t ->
+  Context.t ->
+  Contract.t ->
+  edge_of_clst_staking_over_baking_millionth:Z.t ->
+  ratio_of_clst_staking_over_direct_staking_billionth:Z.t ->
+  Operation.packed tzresult Lwt.t
+
+(** [clst_unregister_delegate ctxt src] returns a unregister_delegate operation
+    on the CLST contract. *)
+val clst_unregister_delegate :
+  ?force_reveal:bool ->
+  ?counter:Manager_counter.t ->
+  ?fee:Tez.t ->
+  ?gas_limit:gas_limit ->
+  ?storage_limit:Z.t ->
+  Context.t ->
+  Contract.t ->
+  Operation.packed tzresult Lwt.t
+
+(** [set_delegate_parameters ctxt delegate
+    ~limit_of_staking_over_baking_millionth
+    ~edge_of_baking_over_staking_billionth] returns a `set_delegate_parameters`
+    operation. *)
+val set_delegate_parameters :
+  ?force_reveal:bool ->
+  ?counter:Manager_counter.t ->
+  ?fee:Tez.t ->
+  ?gas_limit:gas_limit ->
+  ?storage_limit:Z.t ->
+  Context.t ->
+  Contract.t ->
+  limit_of_staking_over_baking_millionth:Z.t ->
+  edge_of_baking_over_staking_billionth:Z.t ->
   Operation.packed tzresult Lwt.t

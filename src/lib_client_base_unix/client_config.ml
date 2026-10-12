@@ -37,6 +37,8 @@ type cli_args = {
   log_requests : bool;
   better_errors : bool;
   client_mode : client_mode;
+  log_coloring : bool option;
+  allow_fixed_random_seed : bool;
 }
 
 and client_mode = [`Mode_client | `Mode_light | `Mode_mockup | `Mode_proxy]
@@ -58,6 +60,8 @@ type error += Suppressed_arg of {args : string list; by : string}
 type error += Invalid_chain_argument of string
 
 type error += Invalid_block_argument of string
+
+type error += Invalid_log_coloring_argument of string
 
 type error += Invalid_protocol_argument of string
 
@@ -101,8 +105,8 @@ let () =
       Format.fprintf
         ppf
         (if List.compare_length_with args 1 = 0 then
-         "Option %s is in conflict with %s"
-        else "Options %s are in conflict with %s")
+           "Option %s is in conflict with %s"
+         else "Options %s are in conflict with %s")
         (String.concat " and " args)
         by)
     Data_encoding.(obj2 (req "suppressed" (list string)) (req "by" string))
@@ -138,6 +142,15 @@ let () =
     Data_encoding.(obj1 (req "value" string))
     (function Invalid_protocol_argument s -> Some s | _ -> None)
     (fun s -> Invalid_protocol_argument s) ;
+  register_error_kind
+    `Branch
+    ~id:"badLogColoringArgument"
+    ~title:"Bad Log Coloring Argument"
+    ~description:"Log coloring argument could not be parsed"
+    ~pp:(fun ppf s -> Format.fprintf ppf "Value %s is not a boolean." s)
+    Data_encoding.(obj1 (req "value" string))
+    (function Invalid_log_coloring_argument s -> Some s | _ -> None)
+    (fun s -> Invalid_log_coloring_argument s) ;
   register_error_kind
     `Branch
     ~id:"invalidPortArgument"
@@ -203,6 +216,17 @@ let default_endpoint = Uri.of_string "http://localhost:8732"
 
 let default_media_type = Media_type.Command_line.Any
 
+let default_daily_logs_path = None
+
+let signing_version_for_test =
+  Option.map
+    (function
+      | "0" -> Signature.Version_0
+      | "1" -> Signature.Version_1
+      | "2" -> Signature.Version_2
+      | _ -> Signature.V_latest.version)
+    (Sys.getenv_opt "TEZOS_SIGNER_SIGNING_VERSION")
+
 open Filename.Infix
 
 module Cfg_file = struct
@@ -218,8 +242,12 @@ module Cfg_file = struct
     endpoint : Uri.t option;
     web_port : int;
     remote_signer : Uri.t option;
+    signing_version : Signature.version option;
     confirmations : int option;
     password_filename : string option;
+    internal_events : Tezos_base.Internal_event_config.t option;
+    log : Tezos_base_unix.Logs_simple_config.cfg option;
+    profiling : Tezos_profiler.Profiler.profiling_config option;
   }
 
   let default =
@@ -232,8 +260,12 @@ module Cfg_file = struct
       tls = None;
       web_port = 8080;
       remote_signer = None;
+      signing_version = None;
       confirmations = Some 0;
       password_filename = None;
+      internal_events = None;
+      log = None;
+      profiling = None;
     }
 
   open Data_encoding
@@ -249,29 +281,37 @@ module Cfg_file = struct
              endpoint;
              web_port;
              remote_signer;
+             signing_version;
              confirmations;
              password_filename;
-           } ->
-        ( base_dir,
-          node_addr,
-          node_port,
-          tls,
-          media_type,
-          endpoint,
-          Some web_port,
-          remote_signer,
-          confirmations,
-          password_filename ))
-      (fun ( base_dir,
-             node_addr,
-             node_port,
-             tls,
-             media_type,
-             endpoint,
-             web_port,
-             remote_signer,
-             confirmations,
-             password_filename ) ->
+             internal_events;
+             log;
+             profiling;
+           }
+         ->
+        ( ( base_dir,
+            node_addr,
+            node_port,
+            tls,
+            media_type,
+            endpoint,
+            Some web_port,
+            remote_signer,
+            signing_version,
+            confirmations ),
+          (password_filename, internal_events, log, profiling) ))
+      (fun ( ( base_dir,
+               node_addr,
+               node_port,
+               tls,
+               media_type,
+               endpoint,
+               web_port,
+               remote_signer,
+               signing_version,
+               confirmations ),
+             (password_filename, internal_events, log, profiling) )
+         ->
         let web_port = Option.value ~default:default.web_port web_port in
         {
           base_dir;
@@ -282,20 +322,38 @@ module Cfg_file = struct
           endpoint;
           web_port;
           remote_signer;
+          signing_version;
           confirmations;
           password_filename;
+          internal_events;
+          log;
+          profiling;
         })
-      (obj10
-         (req "base_dir" string)
-         (opt "node_addr" string)
-         (opt "node_port" uint16)
-         (opt "tls" bool)
-         (opt "media_type" Media_type.Command_line.encoding)
-         (opt "endpoint" Tezos_rpc.Encoding.uri_encoding)
-         (opt "web_port" uint16)
-         (opt "remote_signer" Tezos_rpc.Encoding.uri_encoding)
-         (opt "confirmations" int8)
-         (opt "password_filename" string))
+      (merge_objs
+         (obj10
+            (req "base_dir" string)
+            (opt "node_addr" string)
+            (opt "node_port" uint16)
+            (opt "tls" bool)
+            (opt "media_type" Media_type.Command_line.encoding)
+            (opt "endpoint" Tezos_rpc.Encoding.uri_encoding)
+            (opt "web_port" uint16)
+            (opt "remote_signer" Tezos_rpc.Encoding.uri_encoding)
+            (opt "signing_version" Signature.version_encoding)
+            (opt "confirmations" int8))
+         (obj4
+            (opt "password_filename" string)
+            (opt "internal_events" Tezos_base.Internal_event_config.encoding)
+            (opt
+               "log"
+               ~description:
+                 "Configuration of the Lwt-log sink (part of the logging \
+                  framework)"
+               Tezos_base_unix.Logs_simple_config.cfg_encoding)
+            (opt
+               "profiling"
+               ~description:"Configuration of profiling output"
+               Tezos_profiler.Profiler.profiling_config_encoding)))
 
   let from_json json = Data_encoding.Json.destruct encoding json
 
@@ -322,10 +380,19 @@ let default_cli_args =
     log_requests = false;
     better_errors = false;
     client_mode = `Mode_client;
+    log_coloring = Some true;
+    allow_fixed_random_seed = false;
   }
 
-let string_parameter () : (string, #Client_context.full) Tezos_clic.parameter =
-  Tezos_clic.parameter (fun _ x -> Lwt.return_ok x)
+let string_parameter () = Tezos_clic.parameter (fun _ x -> Lwt.return_ok x)
+
+let bool_parameter () =
+  Tezos_clic.parameter (fun _ bool ->
+      let open Lwt_result_syntax in
+      match bool with
+      | "true" -> return true
+      | "false" -> return false
+      | _ -> tzfail (Invalid_log_coloring_argument bool))
 
 let media_type_parameter () :
     (Media_type.Command_line.t, #Client_context.full) Tezos_clic.parameter =
@@ -341,7 +408,7 @@ let endpoint_parameter () =
       let parsed = Uri.of_string x in
       let* _ =
         match Uri.scheme parsed with
-        | Some "http" | Some "https" -> return ()
+        | Some "http" | Some "https" -> return_unit
         | _ ->
             tzfail
               (Invalid_endpoint_arg
@@ -510,6 +577,15 @@ let better_errors () =
        the RPC calls take more time however."
     ()
 
+let log_coloring () =
+  Tezos_clic.arg
+    ~long:"log-coloring"
+    ~placeholder:"true|false"
+    ~doc:
+      "Enable or disable light coloring in default stdout logs. Coloring is \
+       enabled by default."
+    (bool_parameter ())
+
 (* Command-line args which can be set in config file as well *)
 let addr_confdesc = "-A/--addr ('node_addr' in config file)"
 
@@ -621,6 +697,18 @@ let client_mode_arg () =
     (Tezos_clic.parameter
        ~autocomplete:(fun _ -> Lwt.return_ok mode_strings)
        (fun _ param -> Lwt.return (parse_client_mode param)))
+
+let client_fixed_random_seed_env_var = "TEZOS_CLIENT_FIXED_RANDOM_SEED"
+
+let allow_fixed_random_seed () =
+  Tezos_clic.switch
+    ~long:"allow-fixed-random-seed"
+    ~doc:
+      (Format.sprintf
+         "Allow the use of a fixed random seed specified with %s for testing \
+          purposes. This is insecure and should never be used in production."
+         client_fixed_random_seed_env_var)
+    ()
 
 let read_config_file config_file =
   let open Lwt_result_syntax in
@@ -852,7 +940,9 @@ let commands config_file cfg (client_mode : client_mode)
             ~default:((cfg.base_dir // mockup_protocol_constants) ^ ".json")
             (parameter (fun _ctx str -> Lwt.return_ok str))))
       (fixed ["config"; "init"])
-      (fun (config_file, bootstrap_accounts_file, protocol_constants_file) cctxt ->
+      (fun (config_file, bootstrap_accounts_file, protocol_constants_file)
+           cctxt
+         ->
         match client_mode with
         | `Mode_client | `Mode_light | `Mode_proxy ->
             config_init_client config_file cfg
@@ -866,7 +956,7 @@ let commands config_file cfg (client_mode : client_mode)
   ]
 
 let global_options () =
-  Tezos_clic.args19
+  Tezos_clic.args21
     (base_dir_arg ())
     (no_base_dir_warnings_switch ())
     (config_file_arg ())
@@ -886,6 +976,8 @@ let global_options () =
     (remote_signer_arg ())
     (password_filename_arg ())
     (client_mode_arg ())
+    (log_coloring ())
+    (allow_fixed_random_seed ())
 
 type parsed_config_args = {
   parsed_config_file : Cfg_file.t option;
@@ -1059,7 +1151,9 @@ let parse_config_args (ctx : #Client_context.full) argv =
            sources,
            remote_signer,
            password_filename,
-           client_mode ),
+           client_mode,
+           log_coloring,
+           allow_fixed_random_seed ),
          remaining ) =
     Tezos_clic.parse_global_options (global_options ()) ctx argv
   in
@@ -1138,7 +1232,7 @@ let parse_config_args (ctx : #Client_context.full) argv =
     in
     if superr <> [] then
       tzfail (Suppressed_arg {args = superr; by = endpoint_confdesc})
-    else return ()
+    else return_unit
   in
   let tls = if tls then Some true else None in
   let* endpoint =
@@ -1176,6 +1270,9 @@ let parse_config_args (ctx : #Client_context.full) argv =
     Option.either remote_signer
     @@ Option.either remote_signer_env cfg.remote_signer
   in
+  let signing_version =
+    Option.either signing_version_for_test cfg.signing_version
+  in
   let confirmations = Option.value ~default:cfg.confirmations confirmations in
   (* --password-filename has precedence over --config-file's
      "password-filename" json field *)
@@ -1192,6 +1289,7 @@ let parse_config_args (ctx : #Client_context.full) argv =
       media_type;
       endpoint = Some endpoint;
       remote_signer;
+      signing_version;
       confirmations;
       password_filename;
     }
@@ -1219,6 +1317,8 @@ let parse_config_args (ctx : #Client_context.full) argv =
       password_filename;
       protocol;
       client_mode;
+      log_coloring;
+      allow_fixed_random_seed;
     }
   in
   return
@@ -1251,6 +1351,8 @@ type t =
   * Uri.t option
   * string option
   * client_mode
+  * bool option
+  * bool
 
 module type Remote_params = sig
   val authenticate :
@@ -1280,3 +1382,7 @@ let clic_commands ~base_dir:_ ~config_commands ~builtin_commands ~other_commands
   config_commands @ builtin_commands @ other_commands
 
 let logger = None
+
+let advertise_log_levels = None
+
+let version = None

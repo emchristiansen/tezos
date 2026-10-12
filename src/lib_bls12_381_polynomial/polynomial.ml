@@ -40,8 +40,8 @@ module Stubs = struct
   - [size res = degree p + 1]
   - [size p = n] *)
   external of_sparse : fr_array -> (fr * int) array -> int -> unit
-    = "caml_bls12_381_polynomial_internal_polynomial_of_sparse_stubs"
-    [@@noalloc]
+    = "caml_bls12_381_polynomial_polynomial_of_sparse_stubs"
+  [@@noalloc]
 
   (** [add res a b size_a size_b] writes the result of polynomial addition of [a] and [b]
   in [res]
@@ -52,8 +52,8 @@ module Stubs = struct
   - [size res = max (size_a, size_b)]
   - [res], [a] and [b] are either pairwise disjoint or equal *)
   external add : fr_array -> fr_array -> fr_array -> int -> int -> unit
-    = "caml_bls12_381_polynomial_internal_polynomial_add_stubs"
-    [@@noalloc]
+    = "caml_bls12_381_polynomial_polynomial_add_stubs"
+  [@@noalloc]
 
   (** [sub res a b size_a size_b] writes the result of polynomial subtraction of [b] from [a]
   in [res]
@@ -64,8 +64,8 @@ module Stubs = struct
   - [size res = max (size_a, size_b)]
   - [res], [a] and [b] are either pairwise disjoint or equal *)
   external sub : fr_array -> fr_array -> fr_array -> int -> int -> unit
-    = "caml_bls12_381_polynomial_internal_polynomial_sub_stubs"
-    [@@noalloc]
+    = "caml_bls12_381_polynomial_polynomial_sub_stubs"
+  [@@noalloc]
 
   (** [mul res a b size_a size_b] writes the result of polynomial multiplication of [a] by [b]
   in [res]
@@ -76,8 +76,8 @@ module Stubs = struct
   - [size b = size_b]
   - [size res = size_a + size_b - 1] *)
   external mul : fr_array -> fr_array -> fr_array -> int -> int -> unit
-    = "caml_bls12_381_polynomial_internal_polynomial_mul_stubs"
-    [@@noalloc]
+    = "caml_bls12_381_polynomial_polynomial_mul_stubs"
+  [@@noalloc]
 
   (** [mul_by_scalar res b a size_a] writes the result of multiplying a polynomial [a]
   by a blst_fr element [b] in [res]
@@ -87,8 +87,8 @@ module Stubs = struct
   - [size res = size_a]
   - [res] and [a] either disjoint or equal *)
   external mul_by_scalar : fr_array -> fr -> fr_array -> int -> unit
-    = "caml_bls12_381_polynomial_internal_polynomial_mul_by_scalar_stubs"
-    [@@noalloc]
+    = "caml_bls12_381_polynomial_polynomial_mul_by_scalar_stubs"
+  [@@noalloc]
 
   (** [linear res poly_polylen_coeff nb_polys] writes the result of
       computing [λ₁·p₁(x) + λ₂·p₂(x) + … + λₖ·pₖ(x)] in [res], where
@@ -101,8 +101,8 @@ module Stubs = struct
    - [size poly_polylen_coeff = nb_polys]
    - [size p_i = size_p_i] *)
   external linear : fr_array -> (fr_array * int * fr) array -> int -> unit
-    = "caml_bls12_381_polynomial_internal_polynomial_linear_stubs"
-    [@@noalloc]
+    = "caml_bls12_381_polynomial_polynomial_linear_stubs"
+  [@@noalloc]
 
   (** [linear_with_powers res c poly_polylen nb_polys] writes the result of
       computing [c⁰·p₀(x) + c¹·p₁(x) + … + cᵏ·pₖ(x)] in [res], where
@@ -116,8 +116,8 @@ module Stubs = struct
    - [size p_i = size_p_i] *)
   external linear_with_powers :
     fr_array -> fr -> (fr_array * int) array -> int -> unit
-    = "caml_bls12_381_polynomial_internal_polynomial_linear_with_powers_stubs"
-    [@@noalloc]
+    = "caml_bls12_381_polynomial_polynomial_linear_with_powers_stubs"
+  [@@noalloc]
 
   (** [negate res p n] writes the result of negating a polynomial [p] in [res]
 
@@ -126,16 +126,16 @@ module Stubs = struct
   - [size res = n]
   - [res] and [p] either disjoint or equal *)
   external negate : fr_array -> fr_array -> int -> unit
-    = "caml_bls12_381_polynomial_internal_polynomial_negate_stubs"
-    [@@noalloc]
+    = "caml_bls12_381_polynomial_polynomial_negate_stubs"
+  [@@noalloc]
 
   (** [evaluate res p n x] writes the result of evaluating a polynomial [p] at [x]
   in [res]
 
   - requires: [size p = n] and [n > 0] *)
   external evaluate : fr -> fr_array -> int -> fr -> unit
-    = "caml_bls12_381_polynomial_internal_polynomial_evaluate_stubs"
-    [@@noalloc]
+    = "caml_bls12_381_polynomial_polynomial_evaluate_stubs"
+  [@@noalloc]
 
   (** [division_xn res_q res_r p size_p (n, c)] writes the quotient and remainder of
       the division of a polynomial [p] by [(X^n + c)] in [res]
@@ -146,8 +146,8 @@ module Stubs = struct
   - [size res_r = n] *)
   external division_xn :
     fr_array -> fr_array -> fr_array -> int -> int * fr -> unit
-    = "caml_bls12_381_polynomial_internal_polynomial_division_xn_stubs"
-    [@@noalloc]
+    = "caml_bls12_381_polynomial_polynomial_division_xn_stubs"
+  [@@noalloc]
 
   (** [mul_xn res p size_p n c] writes the result of multiplying a polynomial [p]
       by [(X^n + c)] in [res]
@@ -157,12 +157,12 @@ module Stubs = struct
   - [size p = size_p]
   - [size res = size_p + n] *)
   external mul_xn : fr_array -> fr_array -> int -> int -> fr -> unit
-    = "caml_bls12_381_polynomial_internal_polynomial_mul_xn_stubs"
-    [@@noalloc]
+    = "caml_bls12_381_polynomial_polynomial_mul_xn_stubs"
+  [@@noalloc]
 
   external derivative : fr_array -> fr_array -> int -> unit
-    = "caml_bls12_381_polynomial_internal_polynomial_derivative_stubs"
-    [@@noalloc]
+    = "caml_bls12_381_polynomial_polynomial_derivative_stubs"
+  [@@noalloc]
 end
 
 module Polynomial_impl = struct
@@ -180,15 +180,15 @@ module Polynomial_impl = struct
 
   let allocate = Fr_carray.allocate
 
-  let copy = Fr_carray.copy
+  let copy p = Fr_carray.copy ~offset:0 ~len:(length p) p
+
+  let copy_carray = Fr_carray.copy
 
   let get = Fr_carray.get
 
-  let degree p =
-    let rec aux i =
-      if i = -1 then -1 else if Fr.eq (get p i) Fr.zero then aux (i - 1) else i
-    in
-    aux (length p - 1)
+  let degree = Fr_carray.degree
+
+  let init = Fr_carray.init
 
   let equal p1 p2 =
     let n1 = length p1 in
@@ -196,7 +196,7 @@ module Polynomial_impl = struct
     let short_n, long_p, long_n =
       if n1 <= n2 then (n1, p2, n2) else (n2, p1, n1)
     in
-    if Bigstringaf.(memcmp p1 0 p2 0 (short_n * Fr.size_in_bytes)) = 0 then
+    if Fr_carray.equal p1 ~offset1:0 p2 ~offset2:0 ~len:short_n then
       let rec stop_at_first_non_zero i =
         if i = long_n then true
         else if Fr.eq (get long_p i) Fr.zero then stop_at_first_non_zero (i + 1)
@@ -347,6 +347,20 @@ module Polynomial_impl = struct
 
   let is_zero p = if degree p = -1 then true else false
 
+  let truncate ~len p =
+    if len < 0 then
+      raise (Invalid_argument "truncate: expected positive length.")
+    else
+      (* [min_len_capacity p] returns the minimum of [len] and [degree p + 1].
+         Here, [degree p + 1] is the minimal length of the {!type:Carray.t}
+         representing the polynomial [p].
+         When [p] is the zero polynomial its degree is -1, so we return 1 for
+         one coefficient holding the value. *)
+      let min_len_capacity p =
+        if is_zero p then 1 else min len (degree p + 1)
+      in
+      Fr_carray.copy ~len:(min_len_capacity p) p
+
   let evaluate p scalar =
     let n = length p in
     let res = Fr.copy scalar in
@@ -390,10 +404,10 @@ module Polynomial_impl = struct
     else
       List.init nb_chunks (fun i ->
           if (i + 1) * size_chunks <= nb_coeff_P then
-            if i = nb_chunks - 1 then copy ~offset:(i * size_chunks) p
-            else copy ~offset:(i * size_chunks) ~len:size_chunks p
+            if i = nb_chunks - 1 then Fr_carray.copy ~offset:(i * size_chunks) p
+            else Fr_carray.copy ~offset:(i * size_chunks) ~len:size_chunks p
           else if i * size_chunks < nb_coeff_P then
-            copy
+            Fr_carray.copy
               ~offset:(i * size_chunks)
               ~len:(nb_coeff_P - (i * size_chunks))
               p
@@ -412,6 +426,8 @@ module Polynomial_impl = struct
   let ( * ) = mul
 
   let constant c = of_coefficients [(c, 0)]
+
+  let fold_left_map = Fr_carray.fold_left_map
 end
 
 module type Polynomial_sig = sig
@@ -429,6 +445,10 @@ module type Polynomial_sig = sig
   type scalar
 
   type t [@@deriving repr]
+
+  (** [init n f] returns a fresh polynomial of length [n], with element number [i]
+      initialized to the result of [f i]. *)
+  val init : int -> (int -> scalar) -> t
 
   (** [allocate len] creates a zero polynomial of size [len] *)
   val allocate : int -> t
@@ -459,7 +479,14 @@ module type Polynomial_sig = sig
   val to_string : t -> string
 
   (** [copy p] returns a copy of a polynomial [p] *)
-  val copy : ?offset:int -> ?len:int -> t -> t
+  val copy : t -> t
+
+  (** [truncate ~len p] returns a new polynomial made of the first [len]
+      coefficients of [p]. If [degree p + 1] is less than [len] then
+      [copy p] is returned.
+
+      @raise [Invalid_argument] if [len] is negative. *)
+  val truncate : len:int -> t -> t
 
   (** [to_dense_coefficients p] returns the dense representation of
   a polynomial [p], i.e., it converts a C array to an OCaml array *)
@@ -568,20 +595,38 @@ module type Polynomial_sig = sig
 
   (** [constant s] creates a value of type [t] from a blst_fr element [s] *)
   val constant : scalar -> t
+
+  (** [fold_left_map] is a combination of fold_left and map that threads an
+    accumulator through calls to [f]. *)
+  val fold_left_map : ('acc -> scalar -> 'acc * scalar) -> 'acc -> t -> 'acc * t
 end
 
 module type Polynomial_unsafe_sig = sig
-  include Polynomial_sig
+  include Polynomial_sig with type t = Fr_carray.t
 
-  (** [to_carray p] converts [p] from type {!t} to type {!Fr_carray.t}
+  (** [to_carray p] converts [p] from type {!type:t} to type {!type:Fr_carray.t}
 
       Note: [to_carray p] doesn't create a copy of [p] *)
   val to_carray : t -> Fr_carray.t
 
-  (** [of_carray p] converts [p] from type {!Fr_carray.t} to type {!t}
+  (** [of_carray p] converts [p] from type {!type:Fr_carray.t} to type {!type:t}
 
       Note: [of_carray p] doesn't create a copy of [p] *)
   val of_carray : Fr_carray.t -> t
+
+  (** [copy_carray ?offset ?len p] returns a polynomial made of [len] contiguous
+      coefficients starting from the coefficient of index [offset].
+      By default, [offset = 0] and [len = length p - offset].
+
+      @raise [Invalid_argument] if [offset] is not in the range 0 to [(length p - 1)],
+      or if [len] is not positive, or if [offset + length] is not in the range 0 to
+      [(length p - 1)]. *)
+  val copy_carray : ?offset:int -> ?len:int -> t -> t
+
+  (** [length p] returns the length of the underlying {!type:Fr_carray.t}. *)
+  val length : t -> int
+
+  val to_sparse_coefficients : t -> (scalar * int) list
 end
 
 module Polynomial_unsafe :

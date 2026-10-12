@@ -26,8 +26,24 @@
 open Tezos_scoru_wasm
 open Tezos_webassembly_interpreter
 
-(** [compute durable buffers] applies one call to [kernel_run]. *)
+(** [preload_kernel ~hooks durable] can be used to parse and load in the module
+    cache the kernel from [durable], as a way to speed-up further executions
+    involving this kernel. *)
+val preload_kernel : hooks:Hooks.t -> Durable.t -> unit Lwt.t
+
+(** [compute ~nds ~nds_host_functions_enabled durable buffers] executes
+    [wasm_entrypoint] once. Defaults to {!Constants.wasm_entrypoint} when
+    omitted.  [nds] is the NDS handle of a [Dual] storage ([None] on
+    [Durable_only]); the [nds_*] host functions mutate it in place, so
+    only the new [durable] is returned.  [nds_host_functions_enabled] is
+    [true] when NDS is activated on chain at the level of this
+    [kernel_run]. *)
 val compute :
+  ?wasm_entrypoint:string ->
+  hooks:Hooks.t ->
+  version:Wasm_pvm_state.version ->
+  nds:Octez_riscv_nds_common.Nds.t option ->
+  nds_host_functions_enabled:bool ->
   reveal_builtins:Builtins.reveals ->
   write_debug:Builtins.write_debug ->
   Durable.t ->

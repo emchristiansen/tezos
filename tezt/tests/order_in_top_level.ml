@@ -48,6 +48,7 @@ let test_order_in_top_level =
     ~__FILE__
     ~title:"Order in top level of the script does not matter."
     ~tags:["client"; "script"]
+    ~uses_node:false
   @@ fun protocol ->
   let* client = Client.init_mockup ~protocol () in
   let top_level_elements =
@@ -56,7 +57,7 @@ let test_order_in_top_level =
   permutations top_level_elements
   |> Lwt_list.iter_s @@ fun elements ->
      let script = String.concat ";\n" elements in
-     let* () = Client.typecheck_script client ~script in
+     let* () = Client.typecheck_script client ~scripts:[script] in
      unit
 
 let register ~protocols = test_order_in_top_level protocols

@@ -40,13 +40,7 @@ struct
 
   let length_field = req "length" (conv Int64.of_int Int64.to_int int64)
 
-  let step_encoding : step Data_encoding.t =
-    (* Context path name.  [bytes] must be used for JSON since we have no
-       charset specificaiton. *)
-    conv
-      Bytes.unsafe_of_string
-      Bytes.unsafe_to_string
-      (Bounded.bytes 255 (* 1 byte for the length *))
+  let step_encoding : step Data_encoding.t = Bounded.string' Hex 255
 
   let hash_encoding = Context_hash.encoding
 
@@ -492,7 +486,7 @@ end) =
 struct
   open Tezos_context_sigs.Context.Proof_types
   module V1 = Make_V1 (Conf)
-  open Data_encoding
+  open Data_encoding.V1
 
   let entries = Conf.entries
 
@@ -538,7 +532,7 @@ struct
     let open Compact in
     req "length" @@ conv Int64.of_int Int64.to_int int64
 
-  let step_encoding : step Data_encoding.t = V1.step_encoding
+  let step_encoding : step Data_encoding.V1.t = V1.step_encoding
 
   let hash_encoding = Compact.payload V1.hash_encoding
 
@@ -990,9 +984,11 @@ struct
          (req "after" kinded_hash_encoding)
          (req "state" a)
 
-  let tree_proof_encoding =
+  let tree_proof_compact =
     let open Compact in
-    make ~tag_size:`Uint8 @@ encoding (payload tree_encoding)
+    encoding (payload tree_encoding)
+
+  let tree_proof_encoding = Compact.make ~tag_size:`Uint8 tree_proof_compact
 
   let stream_proof_encoding =
     let open Compact in
@@ -1010,6 +1006,15 @@ module V1 = struct
 end
 
 module V2 = struct
+  module type PROOF_ENCODING_COMPACT = sig
+    include Tezos_context_sigs.Context.PROOF_ENCODING
+
+    val tree_proof_compact :
+      Tezos_context_sigs.Context.Proof_types.tree
+      Tezos_context_sigs.Context.Proof_types.t
+      Data_encoding.Compact.t
+  end
+
   module Tree32 = Make_V2 (struct
     let entries = 32
   end)

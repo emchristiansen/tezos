@@ -26,8 +26,8 @@
 (** Testing
     -------
     Component:    Protocol Library
-    Invocation:   dune exec \
-                  src/proto_alpha/lib_protocol/test/pbt/test_zk_rollup_encoding.exe
+    Invocation:   dune exec src/proto_alpha/lib_protocol/test/pbt/main.exe \
+                  -- --file test_zk_rollup_encoding.ml
     Subject:      Zk rollup encodings
 *)
 
@@ -65,8 +65,8 @@ let gen_zkr_account =
   let open Gen in
   let open Zk_rollup_account_repr in
   let* state = gen_l2_state in
-  let public_parameters = Operator.public_parameters in
-  let circuits_info = SMap.of_seq (Plonk.SMap.to_seq Operator.circuits) in
+  let _prover_pp, public_parameters = Lazy.force Operator.lazy_pp in
+  let circuits_info = SMap.of_seq (Kzg.SMap.to_seq Operator.circuits) in
   let* nb_ops = nat in
   let static =
     {
@@ -96,8 +96,9 @@ let gen_ticket_hash =
   Ticket_hash_repr.of_bytes_exn bytes
 
 let gen_pkh =
-  let pkh, _, _ = Signature.generate_key ~algo:Ed25519 () in
-  Gen.return pkh
+  let pkh_sig, _, _ = Signature.generate_key ~algo:Ed25519 () in
+  (* FIXME-PA *)
+  Gen.return (Implicit_account_repr.Forbidden.of_pkh pkh_sig)
 
 let gen_z =
   let open Gen in
@@ -222,8 +223,9 @@ let tests_to_scalar = [test_address_to_scalar; test_operation_to_scalar]
 
 let () =
   Alcotest.run
-    "ZK rollup encoding"
+    ~__FILE__
+    (Protocol.name ^ ": ZK rollup encoding")
     [
-      (Protocol.name ^ ": roundtrip", qcheck_wrap tests_roundtrip);
-      (Protocol.name ^ ": to_scalar", qcheck_wrap tests_to_scalar);
+      (": roundtrip", qcheck_wrap tests_roundtrip);
+      (": to_scalar", qcheck_wrap tests_to_scalar);
     ]

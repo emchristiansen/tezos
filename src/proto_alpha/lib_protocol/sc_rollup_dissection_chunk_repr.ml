@@ -156,7 +156,7 @@ let default_check ~section_maximum_size ~check_sections_number
           if Z.(leq incr section_maximum_size) then traverse (next :: others)
           else tzfail (Dissection_invalid_distribution section_maximum_size)
         else tzfail Dissection_ticks_not_increasing
-    | _ -> return ()
+    | _ -> return_unit
   in
   traverse dissection
 
@@ -241,12 +241,13 @@ let () =
     ~id:"smart_rollup_dissection_edge_ticks_mismatch"
     ~title:description
     ~description
-    ~pp:
-      (fun ppf
-           ( dissection_start_tick,
-             dissection_stop_tick,
-             chunk_start_tick,
-             chunk_stop_tick ) ->
+    ~pp:(fun
+        ppf
+        ( dissection_start_tick,
+          dissection_stop_tick,
+          chunk_start_tick,
+          chunk_stop_tick )
+      ->
       Sc_rollup_tick_repr.(
         Format.fprintf
           ppf
@@ -277,7 +278,8 @@ let () =
     (fun ( dissection_start_tick,
            dissection_stop_tick,
            chunk_start_tick,
-           chunk_stop_tick ) ->
+           chunk_stop_tick )
+       ->
       Dissection_edge_ticks_mismatch
         {
           dissection_start_tick;

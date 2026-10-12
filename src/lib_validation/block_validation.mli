@@ -29,13 +29,27 @@
     part). The main function of this module is [apply] whichs calls the one of
     the protocol. *)
 
+(** This type is used to represent an operation contained in a block
+    that we want to validate and/or apply. *)
+type operation
+
+(** Create an [operation] from the [Operation.t] by hashing it and by checking
+    whether the protocol should check the operation's signature. The signature
+    should always be checked unless the operation hash is already known in the
+    [known_valid_operations_set] *)
+val mk_operation :
+  ?known_valid_operation_set:Operation_hash.Set.t -> Operation.t -> operation
+
+val operation_encoding : operation Data_encoding.t
+
 type validation_store = {
   resulting_context_hash : Context_hash.t;
   timestamp : Time.Protocol.t;
   message : string option;
   max_operations_ttl : int;
-  last_allowed_fork_level : Int32.t;
+  last_finalized_block_level : Int32.t;
       (** Oldest block for which reorganizations can happen *)
+  last_preserved_block_level : Int32.t;
 }
 
 val may_patch_protocol :
@@ -79,7 +93,8 @@ module Shell_header_hash : Tezos_crypto.Intfs.HASH
 
 type result = {
   shell_header_hash : Shell_header_hash.t;
-      (** This field is used as a (local) unique identifier for blocks
+  protocol_data : Bytes.t;
+      (** These two fields are used as a (local) unique identifier for blocks
           in order to implement the preapply cache mechanism. *)
   validation_store : validation_store;
   block_metadata : bytes * Block_metadata_hash.t option;
@@ -102,7 +117,7 @@ val check_liveness :
   live_blocks:Block_hash.Set.t ->
   live_operations:Operation_hash.Set.t ->
   Block_hash.t ->
-  Operation.t list list ->
+  operation list list ->
   unit tzresult
 
 type apply_environment = {
@@ -132,9 +147,9 @@ type apply_environment = {
     2. [P.apply]
     3. [P.finalize_block]
 
-    [should_precheck] when set (default), triggers the block prechecking before
-    applying it, see [precheck]. If it is set to [false] the given block must
-    have been prechecked.
+    [should_validate] when set (default), triggers the block validation before
+    applying it, see [validate]. If it is set to [false] the given block must
+    have been validated.
 
     If [simulate] is true, the context resulting from the application
     is not committed to disk using `Context.commit`, only the commit
@@ -142,14 +157,14 @@ type apply_environment = {
 val apply :
   ?simulate:bool ->
   ?cached_result:apply_result * Tezos_protocol_environment.Context.t ->
-  ?should_precheck:bool ->
+  ?should_validate:bool ->
   apply_environment ->
   cache:Tezos_protocol_environment.Context.source_of_cache ->
   Block_header.t ->
-  Operation.t list list ->
+  operation list list ->
   apply_result tzresult Lwt.t
 
-(** [precheck chain_id ~predecessor_block_header
+(** [validate chain_id ~predecessor_block_header
     ~predecessor_block_hash ~predecessor_context
     ~predecessor_resulting_context_hash ~cache header ops] gets the
     protocol [P] of the context of the predecessor block and calls
@@ -157,7 +172,7 @@ val apply :
    1. [P.begin_validate]
    2. [P.validate_operation]
    3. [P.finalize_validation] *)
-val precheck :
+val validate :
   chain_id:Chain_id.t ->
   predecessor_block_header:Block_header.t ->
   predecessor_block_hash:Block_hash.t ->
@@ -165,7 +180,7 @@ val precheck :
   predecessor_resulting_context_hash:Context_hash.t ->
   cache:Tezos_protocol_environment.Context.source_of_cache ->
   Block_header.t ->
-  Operation.t list list ->
+  operation list list ->
   unit tzresult Lwt.t
 
 val preapply :
@@ -184,14 +199,15 @@ val preapply :
   predecessor_max_operations_ttl:int ->
   predecessor_block_metadata_hash:Block_metadata_hash.t option ->
   predecessor_ops_metadata_hash:Operation_metadata_list_list_hash.t option ->
-  Operation.t list list ->
+  cache:Tezos_protocol_environment.Context.source_of_cache ->
+  operation list list ->
   ((Block_header.shell_header * error Preapply_result.t list)
   * (apply_result * Tezos_protocol_environment.Context.t))
   tzresult
   Lwt.t
 
 (** Hypothesis: we assume that the given block has already been
-                validated -- E.g. by calling [precheck]. *)
+                validated -- E.g. by calling [validate]. *)
 val recompute_metadata :
   chain_id:Chain_id.t ->
   predecessor_block_header:Block_header.t ->
@@ -199,6 +215,6 @@ val recompute_metadata :
   predecessor_block_metadata_hash:Block_metadata_hash.t option ->
   predecessor_ops_metadata_hash:Operation_metadata_list_list_hash.t option ->
   block_header:Block_header.t ->
-  operations:Operation.t trace trace ->
+  operations:operation trace trace ->
   cache:Tezos_protocol_environment.Context.source_of_cache ->
   ((bytes * Block_metadata_hash.t option) * ops_metadata) tzresult Lwt.t

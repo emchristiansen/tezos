@@ -84,7 +84,7 @@ previous runs, and send an alert if the difference is too large.
 The ``Long_test`` module also provides function
 ``update_grafana_dashboard`` called in
 :src:`tezt/long_tests/main.ml` with a specification to create/overwrite a dashboard
-in `Nomadic Labs' Grafana <https://grafana.nomadic-labs.cloud/d/longtezts>`_.
+in `Nomadic Labs' Grafana <https://grafana.nomadic-labs.cloud/d/longtezts>`__ (restricted access).
 Default is named ``Long Tezts`` but you can add additional dashboards using the
 ``Long_test.update_grafana_dashboard`` function. To add a dashboard for your tests, define
 it next to your test (in the same file), and declare it in the call to
@@ -101,7 +101,7 @@ needs. And of course you can contribute to improve them.
 
 Automated long tezts logs are available in `Nomadic Labs' public S3 bucket browser
 <https://logs.nomadic-labs.cloud/#PRT/master/>`_. In case of InfluxDB issues, you can inspect
-metrics in the `InfluxDB dashboard <https://grafana.nomadic-labs.cloud/d/influxdb/>`_.
+metrics in the `InfluxDB dashboard <https://grafana.nomadic-labs.cloud/d/influxdb/>`__ (restricted access).
 InfluxDB itself is private and direct access via CLI is restricted to administrators.
 
 Example
@@ -114,14 +114,6 @@ that measures how long it takes for ``octez-client`` to load.  It uses
 significantly higher than usual. It also defines a graph of this time.
 This test and its graph are registered in
 :src:`tezt/long_tests/main.ml`.
-
-One-Shot Tests
---------------
-
-You may be interested in running some long tests using this framework
-on your own branch instead of ``master``.
-
-Check the documentation of the `PRT one-shot repository <https://gitlab.com/nomadic-labs/iac/terraform/tf-aws-performance-regression-oneshot-instance>`_
 
 Providing Large Data
 --------------------
@@ -227,7 +219,7 @@ Configuring and Running Tezt Long Tests
 ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
 
 For more information about how to use the configuration file, please refer
-to the `Long test module API <https://tezos.gitlab.io/api/odoc/_html/tezt-performance-regression/Tezt_performance_regression/>`__.
+to the :package-api:`Long test module API <tezt-tezos/Tezt_tezos_tezt_performance_regression/index.html>`.
 
 A predefined configuration has already been shipped in :src:`tezt/lib_performance_regression/local-sandbox/tezt_config.json`.
 It allows to use the InfluxDB and Grafana instances set up by the

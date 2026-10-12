@@ -63,13 +63,13 @@ let commands () =
       ~default:"0.05"
   in
   let source_arg =
-    ContractAlias.destination_arg
+    Contract_alias.destination_arg
       ~name:"source"
       ~doc:"name of the source (i.e. SENDER) contract for the transaction"
       ()
   in
   let payer_arg =
-    ContractAlias.destination_arg
+    Contract_alias.destination_arg
       ~name:"payer"
       ~doc:"name of the payer (i.e. SOURCE) contract for the transaction"
       ()
@@ -166,7 +166,8 @@ let commands () =
            program
            storage
            input
-           cctxt ->
+           cctxt
+         ->
         let source = Option.map snd source in
         let payer = Option.map snd payer in
         Lwt.return @@ Micheline_parser.no_parsing_error program
@@ -210,7 +211,10 @@ let commands () =
          no_print_source_flag
          custom_gas_flag)
       (prefixes ["typecheck"; "script"] @@ Program.source_param @@ stop)
-      (fun (show_types, emacs_mode, no_print_source, original_gas) program cctxt ->
+      (fun (show_types, emacs_mode, no_print_source, original_gas)
+           program
+           cctxt
+         ->
         match program with
         | program, [] ->
             resolve_max_gas cctxt cctxt#block original_gas
@@ -351,9 +355,9 @@ let commands () =
       @@ stop)
       (fun () bytes cctxt ->
         (if Bytes.get bytes 0 != '\005' then
-         failwith
-           "Not a piece of packed Michelson data (must start with `0x05`)"
-        else return_unit)
+           failwith
+             "Not a piece of packed Michelson data (must start with `0x05`)"
+         else return_unit)
         >>=? fun () ->
         (* Remove first byte *)
         let bytes = Bytes.sub bytes 1 (Bytes.length bytes - 1) in
@@ -399,7 +403,8 @@ let commands () =
            bytes
            (_, (key_locator, _))
            signature
-           (cctxt : #Alpha_client_context.full) ->
+           (cctxt : #Alpha_client_context.full)
+         ->
         Client_keys_v0.check key_locator signature bytes >>=? function
         | false -> cctxt#error "invalid signature"
         | true ->

@@ -31,11 +31,15 @@ type t = {
   expected_commitment : bool;
 }
 
-include Compare.Make (struct
+module Ordered = struct
   type nonrec t = t
 
   let compare {level = l1; _} {level = l2; _} = Raw_level_repr.compare l1 l2
-end)
+end
+
+include Compare.Make (Ordered)
+module Map = Map.Make (Ordered)
+module Set = Set.Make (Ordered)
 
 type level = t
 
@@ -127,8 +131,9 @@ let () =
     (fun () -> Invalid_cycle_eras)
 
 let create_cycle_eras cycle_eras =
+  let open Result_syntax in
   match cycle_eras with
-  | [] -> error Invalid_cycle_eras
+  | [] -> tzfail Invalid_cycle_eras
   | newest_era :: older_eras ->
       let rec aux {first_level; first_cycle; _} older_eras =
         match older_eras with
@@ -142,12 +147,42 @@ let create_cycle_eras cycle_eras =
               Raw_level_repr.(first_level > first_level_of_previous_era)
               && Cycle_repr.(first_cycle > first_cycle_of_previous_era)
             then aux previous_era even_older_eras
-            else error Invalid_cycle_eras
-        | [] -> ok ()
+            else tzfail Invalid_cycle_eras
+        | [] -> return_unit
       in
-      aux newest_era older_eras >>? fun () -> ok cycle_eras
+      let* () = aux newest_era older_eras in
+      return cycle_eras
 
 let add_cycle_era new_era cycle_eras = create_cycle_eras (new_era :: cycle_eras)
+
+let current_era = function [] -> assert false | cycle_era :: _ -> cycle_era
+
+let update_cycle_eras cycle_eras ~(level : int32) ~prev_blocks_per_cycle
+    ~new_blocks_per_cycle ~prev_blocks_per_commitment ~new_blocks_per_commitment
+    =
+  let previous_era = current_era cycle_eras in
+  (* making sure that previous protocol's constants match the last cycle era *)
+  assert (Compare.Int32.(prev_blocks_per_cycle = previous_era.blocks_per_cycle)) ;
+  assert (
+    Compare.Int32.(
+      prev_blocks_per_commitment = previous_era.blocks_per_commitment)) ;
+  let current_cycle =
+    let level_position =
+      Int32.sub level (Raw_level_repr.to_int32 previous_era.first_level)
+    in
+    Cycle_repr.add
+      previous_era.first_cycle
+      (Int32.to_int (Int32.div level_position prev_blocks_per_cycle))
+  in
+  let new_cycle_era =
+    {
+      first_level = Raw_level_repr.of_int32_exn (Int32.succ level);
+      first_cycle = Cycle_repr.succ current_cycle;
+      blocks_per_cycle = new_blocks_per_cycle;
+      blocks_per_commitment = new_blocks_per_commitment;
+    }
+  in
+  add_cycle_era new_cycle_era cycle_eras
 
 let cycle_era_encoding =
   let open Data_encoding in
@@ -187,8 +222,6 @@ let cycle_eras_encoding =
       | Error _ -> Error "Invalid cycle eras")
     (Data_encoding.list cycle_era_encoding)
 
-let current_era = function [] -> assert false | cycle_era :: _ -> cycle_era
-
 let root_level cycle_eras =
   let first_era = List.last_opt cycle_eras in
   let first_era =
@@ -202,6 +235,15 @@ let root_level cycle_eras =
   in
   {
     level = first_era.first_level;
+    level_position = 0l;
+    cycle = Cycle_repr.root;
+    cycle_position = 0l;
+    expected_commitment = false;
+  }
+
+let level_zero_use_with_care =
+  {
+    level = Raw_level_repr.root;
     level_position = 0l;
     cycle = Cycle_repr.root;
     cycle_position = 0l;
@@ -227,10 +269,8 @@ let era_of_cycle ~cycle_eras cycle =
   aux cycle_eras
 
 (* precondition: [level] belongs to [era] *)
-let level_from_raw_with_era era ~first_level_in_alpha_family level =
-  let {first_level; first_cycle; blocks_per_cycle; blocks_per_commitment} =
-    era
-  in
+let cycle_from_raw_with_era era level =
+  let {first_level; first_cycle; blocks_per_cycle; _} = era in
   let level_position_in_era = Raw_level_repr.diff level first_level in
   assert (Compare.Int32.(level_position_in_era >= 0l)) ;
   let cycles_since_era_start =
@@ -239,14 +279,23 @@ let level_from_raw_with_era era ~first_level_in_alpha_family level =
   let cycle =
     Cycle_repr.add first_cycle (Int32.to_int cycles_since_era_start)
   in
-  let cycle_position = Int32.rem level_position_in_era blocks_per_cycle in
+  (cycle, level_position_in_era)
+
+(* precondition: [level] belongs to [era] *)
+let level_from_raw_with_era era ~first_level_in_alpha_family level =
+  let cycle, level_position_in_era = cycle_from_raw_with_era era level in
+  let cycle_position = Int32.rem level_position_in_era era.blocks_per_cycle in
   let level_position = Raw_level_repr.diff level first_level_in_alpha_family in
   let expected_commitment =
     Compare.Int32.(
-      Int32.rem cycle_position blocks_per_commitment
-      = Int32.pred blocks_per_commitment)
+      Int32.rem cycle_position era.blocks_per_commitment
+      = Int32.pred era.blocks_per_commitment)
   in
   {level; level_position; cycle; cycle_position; expected_commitment}
+
+let cycle_from_raw ~cycle_eras l =
+  let era = era_of_level ~cycle_eras l in
+  fst @@ cycle_from_raw_with_era era l
 
 let level_from_raw_aux_exn ~cycle_eras level =
   let first_level_in_alpha_family =
@@ -278,15 +327,17 @@ let () =
     (fun level -> Level_not_in_alpha level)
 
 let level_from_raw_aux ~cycle_eras level =
+  let open Result_syntax in
   let first_level_in_alpha_family =
     match List.rev cycle_eras with
     | [] -> assert false
     | {first_level; _} :: _ -> first_level
   in
-  error_when
-    Raw_level_repr.(level < first_level_in_alpha_family)
-    (Level_not_in_alpha level)
-  >|? fun () ->
+  let+ () =
+    error_when
+      Raw_level_repr.(level < first_level_in_alpha_family)
+      (Level_not_in_alpha level)
+  in
   let era = era_of_level ~cycle_eras level in
   level_from_raw_with_era era ~first_level_in_alpha_family level
 
@@ -315,7 +366,7 @@ let level_from_raw_with_offset ~cycle_eras ~offset raw_level =
   match res with
   | Ok level -> level_from_raw_aux ~cycle_eras level
   | Error _ ->
-      error
+      Result_syntax.tzfail
         (Negative_level_and_offset_sum
            (Raw_level_repr.to_int32 raw_level, offset))
 
@@ -351,4 +402,29 @@ module Internal_for_tests = struct
       level_position =
         Int32.add level.level_position (Int32.of_int (n * blocks_per_cycle));
     }
+
+  let root =
+    {
+      level = Raw_level_repr.root;
+      level_position = 0l;
+      cycle = Cycle_repr.root;
+      cycle_position = 0l;
+      expected_commitment = false;
+    }
+
+  let make_cycle_eras ~blocks_per_cycle ~blocks_per_commitment =
+    let cycle_era =
+      {
+        first_level = Raw_level_repr.root;
+        first_cycle = Cycle_repr.root;
+        blocks_per_cycle;
+        blocks_per_commitment;
+      }
+    in
+    create_cycle_eras [cycle_era]
+
+  let level_from_int32 ~cycle_eras l =
+    let open Result_syntax in
+    let* raw_level = Raw_level_repr.of_int32 l in
+    return @@ level_from_raw ~cycle_eras raw_level
 end

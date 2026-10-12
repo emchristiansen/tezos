@@ -23,8 +23,8 @@
 (*                                                                           *)
 (*****************************************************************************)
 
-(** Functor for the common parts of all Tezos daemons: node, baker,
-    endorser and accuser. Handles event handling in particular. *)
+(** Functor for the common parts of all Tezos daemons: node, baker and accuser.
+    Handles event handling in particular. *)
 
 module type PARAMETERS = sig
   type persistent_state
@@ -73,6 +73,7 @@ module Make (X : PARAMETERS) = struct
 
   type session_status = {
     process : Process.t;
+    stdin : Lwt_io.output_channel;
     session_state : X.session_state;
     mutable event_loop_promise : unit Lwt.t option;
   }
@@ -96,11 +97,19 @@ module Make (X : PARAMETERS) = struct
     mutable status : status;
     event_pipe : string;
     mutable stdout_handlers : (string -> unit) list;
+    mutable stderr_handlers : (string -> unit) list;
     mutable persistent_event_handlers : (event -> unit) list;
     mutable one_shot_event_handlers : event_handler list String_map.t;
   }
 
   let name daemon = daemon.name
+
+  let pid daemon =
+    match daemon.status with
+    | Running status -> Process.pid status.process |> Option.some
+    | Not_running -> None
+
+  let path daemon = daemon.path
 
   (* Having to wait more that 3 seconds after hitting Ctrl+C is already unreasonable.
      We choose a timeout one order of magnitude larger to reduce flakiness in case
@@ -113,6 +122,26 @@ module Make (X : PARAMETERS) = struct
     | Running {process; event_loop_promise = Some event_loop_promise; _} ->
         Process.terminate ~timeout process ;
         event_loop_promise
+
+  let stop daemon =
+    match daemon.status with
+    | Not_running -> unit
+    | Running {event_loop_promise = None; _} ->
+        invalid_arg "you cannot call Daemon.stop before Daemon.run returns"
+    | Running {process; _} ->
+        let pid = Process.pid process in
+        Unix.kill pid Sys.sigstop ;
+        unit
+
+  let continue daemon =
+    match daemon.status with
+    | Not_running -> unit
+    | Running {event_loop_promise = None; _} ->
+        invalid_arg "you cannot call Daemon.continue before Daemon.run returns"
+    | Running {process; _} ->
+        let pid = Process.pid process in
+        Unix.kill pid Sys.sigcont ;
+        unit
 
   let kill daemon =
     match daemon.status with
@@ -162,6 +191,7 @@ module Make (X : PARAMETERS) = struct
       status = Not_running;
       event_pipe;
       stdout_handlers = [];
+      stderr_handlers = [];
       persistent_event_handlers = [];
       one_shot_event_handlers = String_map.empty;
     }
@@ -191,25 +221,50 @@ module Make (X : PARAMETERS) = struct
     | None | Some ([] | _ :: _ :: _) -> None
     | Some [(name, value)] -> Some {name; value; timestamp}
 
-  let read_json_event daemon even_input =
-    let max_event_size = 1024 * 1024 (* 1MB *) in
+  let read_json_event daemon event_input =
+    let max_event_size =
+      1024 * 1024
+      (* 1MB *)
+    in
     let origin = "event from " ^ daemon.name in
     let buff = Buffer.create 256 in
     let rec loop () =
-      let* line = Lwt_io.read_line_opt even_input in
+      let* line = Lwt_io.read_line_opt event_input in
       match line with
-      | None -> return None
+      | None -> return []
       | Some line -> (
-          Buffer.add_string buff line ;
-          match JSON.parse_opt ~origin (Buffer.contents buff) with
-          | None when Buffer.length buff >= max_event_size ->
-              Format.ksprintf
-                failwith
-                "Could not parse daemon %s event after %d bytes."
-                daemon.name
-                max_event_size
-          | None -> loop ()
-          | Some json -> return (Some json))
+          (* If a line alone is a valid JSON, then it is not stacked in the
+              buffer and rather treated as an event.
+              This is great to get rid of concurrency issue due to a small event
+              being nested in a very big one, but it is not an ideal solution
+              since it suffers several drawbacks:
+              - It does not work if a several line event is nested into another one.
+              - Many subterms of a valid json are valid json, hence if we are
+                unlucky and cut a big json at unexpected position, we might parse
+                a subterm and not stake it, preventing definitely the whole term
+                to be seen as a valid json.
+          *)
+          match JSON.parse_opt ~origin line with
+          | Some json ->
+              if Buffer.length buff = 0 then return [json]
+              else
+                let* l = loop () in
+                return (json :: l)
+          | None -> (
+              Buffer.add_string buff line ;
+              match JSON.parse_opt ~origin (Buffer.contents buff) with
+              | None when Buffer.length buff >= max_event_size ->
+                  Format.ksprintf
+                    failwith
+                    "Could not parse daemon %s event after %d bytes.\n\
+                     buffer: %s\n\
+                     line:%s"
+                    daemon.name
+                    max_event_size
+                    (Buffer.contents buff)
+                    line
+              | None -> loop ()
+              | Some json -> return [json]))
     in
     loop ()
 
@@ -253,8 +308,8 @@ module Make (X : PARAMETERS) = struct
             loop [] events)
 
   let run ?(env = String_map.empty) ?runner ?(on_terminate = fun _ -> unit)
-      ?(event_level = `Info) ?(event_sections_levels = []) daemon session_state
-      arguments =
+      ?(event_level = `Info) ?(event_sections_levels = [])
+      ?(capture_stderr = false) daemon session_state arguments =
     (match daemon.status with
     | Not_running -> ()
     | Running _ -> Test.fail "daemon %s is already running" daemon.name) ;
@@ -271,6 +326,14 @@ module Make (X : PARAMETERS) = struct
       match runner with
       | None -> None
       | Some runner ->
+          (* If the daemon shuts down, the command will fail. A proposition is
+             to use "tail --retry --follow" instead.
+
+             However, it seems that "tail" can be blocking.
+
+             Probably a solution is to catch the error when the daemons shuts
+             down and to rerun it once it is restarted.
+          *)
           let cmd = "cat" in
           let arguments = [daemon.event_pipe] in
           let name = Filename.basename daemon.event_pipe in
@@ -299,8 +362,8 @@ module Make (X : PARAMETERS) = struct
         ("file-descriptor-path://" ^ daemon.event_pipe ^ args_str)
         env
     in
-    let process =
-      Process.spawn
+    let process, stdin =
+      Process.spawn_with_stdin
         ?runner
         ~name:daemon.name
         ~color:daemon.color
@@ -311,16 +374,18 @@ module Make (X : PARAMETERS) = struct
     (* Make sure the daemon status is [Running], otherwise
        [event_loop_promise] would stop immediately thinking the daemon
        has been terminated. *)
-    let running_status = {process; session_state; event_loop_promise = None} in
+    let running_status =
+      {process; session_state; stdin; event_loop_promise = None}
+    in
     daemon.status <- Running running_status ;
     let event_loop_promise =
       let rec event_loop () =
         let* json = read_json_event daemon event_input in
         match json with
-        | Some json ->
-            handle_raw_event daemon json ;
+        | _ :: _ as json_list ->
+            List.iter (handle_raw_event daemon) json_list ;
             event_loop ()
-        | None -> (
+        | [] -> (
             match daemon.status with
             | Not_running -> (
                 match event_process with
@@ -332,23 +397,28 @@ module Make (X : PARAMETERS) = struct
                 let* () = Lwt_unix.sleep 0.01 in
                 event_loop ())
       in
-      let rec stdout_loop () =
-        let* stdout_line = Lwt_io.read_line_opt (Process.stdout process) in
-        match stdout_line with
+      let rec channel_loop get_channel get_handlers () =
+        let* channel_line = Lwt_io.read_line_opt (get_channel process) in
+        match channel_line with
         | Some line ->
-            List.iter (fun handler -> handler line) daemon.stdout_handlers ;
-            stdout_loop ()
+            List.iter (fun handler -> handler line) (get_handlers daemon) ;
+            channel_loop get_channel get_handlers ()
         | None -> (
             match daemon.status with
             | Not_running -> Lwt.return_unit
             | Running _ ->
                 (* TODO: is the sleep necessary here? *)
                 let* () = Lwt_unix.sleep 0.01 in
-                stdout_loop ())
+                channel_loop get_channel get_handlers ())
       in
       let ( and*!! ) = lwt_both_fail_early in
       let* () = event_loop ()
-      and*!! () = stdout_loop ()
+      and*!! () =
+        channel_loop Process.stdout (fun daemon -> daemon.stdout_handlers) ()
+      and*!! () =
+        if capture_stderr then
+          channel_loop Process.stderr (fun daemon -> daemon.stderr_handlers) ()
+        else unit
       and*!! () =
         let* process_status = Process.wait process in
         (* Setting [daemon.status] to [Not_running] stops the event loop cleanly. *)
@@ -369,13 +439,29 @@ module Make (X : PARAMETERS) = struct
     Background.register event_loop_promise ;
     unit
 
-  let wait_for_full ?where daemon name filter =
+  let wait_for_full ?timeout ?where daemon name filter =
     let promise, resolver = Lwt.task () in
+    let promise = Lwt.map Result.ok promise in
+    let promise =
+      match timeout with
+      | None -> promise
+      | Some timeout ->
+          Lwt.pick
+            [
+              promise;
+              (let* () = Lwt_unix.sleep timeout in
+               Lwt.return_error ());
+            ]
+    in
     let current_events =
       String_map.find_opt name daemon.one_shot_event_handlers
       |> Option.value ~default:[]
     in
-    Log.debug "Waiting for event [%s]" name ;
+    Log.debug
+      "Waiting for event [%s]%s on daemon %s"
+      name
+      (match where with None -> "" | Some where -> " where " ^ where)
+      daemon.name ;
     daemon.one_shot_event_handlers <-
       String_map.add
         name
@@ -383,10 +469,16 @@ module Make (X : PARAMETERS) = struct
         daemon.one_shot_event_handlers ;
     let* result = promise in
     match result with
-    | None ->
+    | Ok (Some x) -> return x
+    | Ok None ->
         raise
           (Terminated_before_event {daemon = daemon.name; event = name; where})
-    | Some x -> return x
+    | Error () ->
+        Format.ksprintf
+          failwith
+          "Timeout waiting for event %s of %s"
+          name
+          daemon.name
 
   let event_from_full_event_filter filter json =
     let raw = get_event_from_full_event json in
@@ -396,8 +488,13 @@ module Make (X : PARAMETERS) = struct
        @see raw_event_from_event *)
     Option.bind raw (fun {value; _} -> filter value)
 
-  let wait_for ?where daemon name filter =
-    wait_for_full ?where daemon name (event_from_full_event_filter filter)
+  let wait_for ?timeout ?where daemon name filter =
+    wait_for_full
+      ?timeout
+      ?where
+      daemon
+      name
+      (event_from_full_event_filter filter)
 
   let on_event daemon handler =
     daemon.persistent_event_handlers <-
@@ -406,9 +503,23 @@ module Make (X : PARAMETERS) = struct
   let on_stdout daemon handler =
     daemon.stdout_handlers <- handler :: daemon.stdout_handlers
 
-  let log_events daemon =
+  let on_stderr daemon handler =
+    daemon.stderr_handlers <- handler :: daemon.stderr_handlers
+
+  let log_events ?max_length daemon =
+    let truncate s max_length =
+      match max_length with
+      | Some max_length when String.length s > max_length ->
+          String.sub s 0 max_length ^ "[...]"
+      | _ -> s
+    in
     on_event daemon @@ fun event ->
-    Log.info "Received event: %s = %s" event.name (JSON.encode event.value)
+    Log.info
+      ~color:daemon.color
+      "[%s] Received event: %s = %s"
+      daemon.name
+      event.name
+      (truncate (JSON.encode event.value) max_length)
 
   type observe_memory_consumption = Observe of (unit -> int option Lwt.t)
 

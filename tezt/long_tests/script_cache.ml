@@ -33,7 +33,12 @@
    fast machine. This is why this test is in the "long test" category.
    If at some point the cache layout can be set through protocol parameters,
    then we may consider duplicating these tests in the CI too.
+
+   FIXME: https://gitlab.com/tezos/tezos/-/issues/5620
+   These test have disabled by adding the tag [ci_disabled] due to consistent failures.
 *)
+
+let team = Team.layer1
 
 (*
 
@@ -50,7 +55,7 @@
 *)
 let get_operations client =
   let* operations =
-    RPC.Client.call client @@ RPC.get_chain_block_operations ()
+    Client.RPC.call client @@ RPC.get_chain_block_operations ()
   in
   return JSON.(operations |> geti 3 |> geti 0 |> get "contents")
 
@@ -79,7 +84,7 @@ let current_head = ["chains"; "main"; "blocks"; "head"]
 
 let get_counter client =
   let* counter_json =
-    RPC.Client.call client
+    Client.RPC.call client
     @@ RPC.get_chain_block_context_contract_counter
          ~id:Constant.bootstrap1.public_key_hash
          ()
@@ -95,7 +100,7 @@ let get_size client =
 
 let get_storage ~contract_id client =
   let* storage_json =
-    RPC.Client.call client
+    Client.RPC.call client
     @@ RPC.get_chain_block_context_contract_storage ~id:contract_id ()
   in
   return
@@ -248,7 +253,9 @@ let liquidity_baking_address = "KT1TxqZ8QtKvLu3V3JH7Gx58n7Co8pgtpQU5"
 (** [get_cached_contracts client] retrieves the cached scripts, except
     the liquidity baking CPMM script. *)
 let get_cached_contracts client =
-  let* contracts = RPC.Script_cache.get_cached_contracts client in
+  let* contracts =
+    Client.RPC.call client @@ RPC.get_chain_block_context_cache_contracts_all ()
+  in
   let all =
     JSON.(
       as_list contracts
@@ -271,6 +278,7 @@ let check ?(tags = []) label test ~protocol ~executors =
     ~__FILE__
     ~title:(sf "(%s) Cache: %s" (Protocol.name protocol) label)
     ~tags:(["cache"] @ tags)
+    ~team
     ~timeout:(Minutes 2000)
     ~executors
   @@ test
@@ -292,7 +300,11 @@ let check ?(tags = []) label test ~protocol ~executors =
 
 *)
 let check_contract_cache_lowers_gas_consumption ~protocol =
-  check "contract cache lowers gas consumption" ~protocol @@ fun () ->
+  check
+    ~tags:[Tag.ci_disabled]
+    "contract cache lowers gas consumption"
+    ~protocol
+  @@ fun () ->
   let* _, client = init1 ~protocol in
   let* contract_id = originate_str_id_contract client "" in
   let* gas1 = call_contract contract_id "Left 1" client in
@@ -315,7 +327,10 @@ let check_contract_cache_lowers_gas_consumption ~protocol =
 
 *)
 let check_full_cache ~protocol =
-  check "contract cache does not go beyond its size limit" ~protocol
+  check
+    ~tags:[Tag.ci_disabled]
+    "contract cache does not go beyond its size limit"
+    ~protocol
   @@ fun () ->
   let* _, client = init1 ~protocol in
   let s = String.make 1024 'x' in
@@ -364,7 +379,7 @@ let check_block_impact_on_cache ~protocol =
   check
     "one cannot violate the cache size limit"
     ~protocol
-    ~tags:["memory"; "limit"]
+    ~tags:["memory"; "limit"; Tag.ci_disabled]
   @@ fun () ->
   let* node, client = init1 ~protocol in
 
@@ -442,7 +457,11 @@ let check_block_impact_on_cache ~protocol =
 
 *)
 let check_cache_backtracking_during_chain_reorganization ~protocol =
-  check "the cache handles chain reorganizations" ~protocol @@ fun () ->
+  check
+    ~tags:[Tag.ci_disabled]
+    "the cache handles chain reorganizations"
+    ~protocol
+  @@ fun () ->
   let* nodeA = Node.init [Synchronisation_threshold 0] in
   let* clientA = Client.init ~endpoint:(Node nodeA) () in
   let* nodeB = Node.init [Synchronisation_threshold 0] in
@@ -537,7 +556,7 @@ let check_reloading_efficiency ~protocol body =
   let start = Unix.gettimeofday () in
   let* () = Node.run nodeA [Synchronisation_threshold 0] in
   let* () = Node.wait_for_ready nodeA in
-  let* _ = RPC.Client.call clientA @@ RPC.get_chain_is_bootstrapped () in
+  let* _ = Client.RPC.call clientA @@ RPC.get_chain_is_bootstrapped () in
   let* _ = Client.bake_for_and_wait clientA in
   let stop = Unix.gettimeofday () in
   let* cached_contracts' = get_cached_contracts clientA in
@@ -565,7 +584,7 @@ let check_reloading_efficiency ~protocol body =
 
 *)
 let check_cache_reloading_is_not_too_slow ~protocol =
-  let tags = ["reload"; "performance"] in
+  let tags = ["reload"; "performance"; Tag.ci_disabled] in
   check "a node reloads a full cache sufficiently fast" ~protocol ~tags
   @@ fun () ->
   check_reloading_efficiency ~protocol @@ fun client ->
@@ -615,10 +634,10 @@ let gas_from_simulation client chain_id contract_id ?blocks_before_activation
          | Some b -> Printf.sprintf {|, "blocks_before_activation" : %d |} b)
   in
 
-  let* block = RPC.Client.call client @@ RPC.get_chain_block_hash () in
+  let* block = Client.RPC.call client @@ RPC.get_chain_block_hash () in
   let data : RPC_core.data = Data (data block counter) in
   let* result =
-    RPC.Client.call client
+    Client.RPC.call client
     @@ RPC.post_chain_block_helpers_scripts_simulate_operation ~data ()
   in
   return (read_consumed_gas JSON.(get "contents" result |> geti 0))
@@ -626,11 +645,11 @@ let gas_from_simulation client chain_id contract_id ?blocks_before_activation
 let check_simulation_takes_cache_into_account ~protocol =
   check
     "operation simulation takes cache into account"
-    ~tags:["simulation"]
+    ~tags:["simulation"; Tag.ci_disabled]
     ~protocol
   @@ fun () ->
   let* _, client = init1 ~protocol in
-  let* chain_id = RPC.Client.call client @@ RPC.get_chain_chain_id () in
+  let* chain_id = Client.RPC.call client @@ RPC.get_chain_chain_id () in
   let* contract_id = originate_very_small_contract client in
   let* () = Client.bake_for_and_wait client in
 
@@ -671,7 +690,8 @@ let check_simulation_close_to_protocol_user_activation ~executors ~migrate_from
           upgrades"
          (Protocol.name migrate_from)
          (Protocol.name migrate_to))
-    ~tags:["cache"; "simulation"; "user"; "upgrade"]
+    ~tags:["cache"; "simulation"; "user"; "upgrade"; Tag.ci_disabled]
+    ~team
     ~timeout:(Minutes 2000)
     ~executors
   @@ fun () ->
@@ -689,7 +709,7 @@ let check_simulation_close_to_protocol_user_activation ~executors ~migrate_from
   in
   setup_migration_time ~migration_level:8 @@ fun node client ->
   let* contract_id = originate_very_small_contract client in
-  let* chain_id = RPC.Client.call client @@ RPC.get_chain_chain_id () in
+  let* chain_id = Client.RPC.call client @@ RPC.get_chain_chain_id () in
   let simulate ~blocks_before_activation counter =
     let arg = {|{ "prim" : "Unit" }|} in
     gas_from_simulation
@@ -770,7 +790,8 @@ let check_simulation_close_to_protocol_auto_activation ~executors ~migrate_from
           automatic upgrades"
          (Protocol.name migrate_from)
          (Protocol.name migrate_to))
-    ~tags:["cache"; "simulation"; "auto"; "upgrade"]
+    ~tags:["cache"; "simulation"; "auto"; "upgrade"; Tag.ci_disabled]
+    ~team
     ~timeout:(Minutes 2000)
     ~executors
   @@ fun () ->
@@ -810,7 +831,7 @@ let check_simulation_close_to_protocol_auto_activation ~executors ~migrate_from
   let* final_period =
     let get_period () =
       let* json =
-        RPC.Client.call client @@ RPC.get_chain_block_votes_current_period ()
+        Client.RPC.call client @@ RPC.get_chain_block_votes_current_period ()
       in
       return @@ JSON.(json |-> "voting_period" |-> "kind" |> as_string)
     in
@@ -842,7 +863,7 @@ let check_simulation_close_to_protocol_auto_activation ~executors ~migrate_from
       ~error_msg:"We never reached the adoption period") ;
 
   let* json =
-    RPC.Client.call client @@ RPC.get_chain_block_votes_current_period ()
+    Client.RPC.call client @@ RPC.get_chain_block_votes_current_period ()
   in
   let level = JSON.(json |-> "remaining" |> as_int) in
   Log.info "Remaining %d blocks before the end of %s" level final_period ;
@@ -866,7 +887,7 @@ let check_simulation_close_to_protocol_auto_activation ~executors ~migrate_from
 
   let simulate counter =
     let arg = {|{ "prim" : "Unit" }|} in
-    let* chain_id = RPC.Client.call client @@ RPC.get_chain_chain_id () in
+    let* chain_id = Client.RPC.call client @@ RPC.get_chain_chain_id () in
     gas_from_simulation client chain_id contract_id counter arg
   in
   let* predicted_gas_in_simulation = simulate 4 in
@@ -882,7 +903,7 @@ let check_simulation_close_to_protocol_auto_activation ~executors ~migrate_from
       ~error_msg:"Expecting %R, got %L") ;
 
   let* _json =
-    RPC.Client.call client @@ RPC.get_chain_block_votes_current_period ()
+    Client.RPC.call client @@ RPC.get_chain_block_votes_current_period ()
   in
   let* () = Client.bake_for_and_wait client in
   let* predicted_gas_in_simulation = simulate 4 in

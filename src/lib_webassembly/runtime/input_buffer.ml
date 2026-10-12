@@ -16,7 +16,7 @@ exception Dequeue_from_empty_queue
 let reraise = function
   | Lazy_vector.Bounds -> raise Bounds
   | Lazy_vector.SizeOverflow -> raise SizeOverflow
-  | exn -> raise exn
+  | exn -> Lwt.reraise exn
 
 module Vector = Lazy_vector.Mutable.ZVector
 
@@ -58,3 +58,5 @@ let enqueue (input : t) r =
     let* first = get_input (Z.pred num_elements) input in
     if is_successor r first then enqueue ()
     else raise Cannot_store_an_earlier_message
+
+let snapshot v = Vector.of_immutable @@ Vector.snapshot v

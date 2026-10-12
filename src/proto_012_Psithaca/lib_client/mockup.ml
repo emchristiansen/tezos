@@ -147,7 +147,8 @@ module Protocol_constants_overrides = struct
                    double_baking_punishment,
                    ratio_of_frozen_deposits_slashed_per_double_endorsement,
                    chain_id,
-                   timestamp ) ) ) ) ->
+                   timestamp ) ) ) )
+         ->
         {
           preserved_cycles;
           blocks_per_cycle;
@@ -559,11 +560,11 @@ module Protocol_constants_overrides = struct
              Option.is_some override_value)
     in
     (if fields_with_override <> [] then
-     cctxt#message
-       "@[<v>mockup client uses protocol overrides:@,%a@]@?"
-       (pp_print_list field_pp)
-       fields_with_override
-    else Lwt.return_unit)
+       cctxt#message
+         "@[<v>mockup client uses protocol overrides:@,%a@]@?"
+         (pp_print_list field_pp)
+         fields_with_override
+     else Lwt.return_unit)
     >>= fun () ->
     return
       ({
@@ -804,7 +805,8 @@ module Protocol_parameters = struct
       (fun ( initial_timestamp,
              bootstrap_accounts,
              bootstrap_contracts,
-             constants ) ->
+             constants )
+         ->
         {initial_timestamp; bootstrap_accounts; bootstrap_contracts; constants})
       (obj4
          (req "initial_timestamp" Time.Protocol.encoding)
@@ -985,8 +987,8 @@ let mem_init :
   let default = parameters.initial_timestamp in
   let timestamp = Option.value ~default protocol_overrides.timestamp in
   (if not @@ Time.Protocol.equal default timestamp then
-   cctxt#message "@[<h>initial_timestamp: %a@]" Time.Protocol.pp_hum timestamp
-  else Lwt.return_unit)
+     cctxt#message "@[<h>initial_timestamp: %a@]" Time.Protocol.pp_hum timestamp
+   else Lwt.return_unit)
   >>= fun () ->
   let fitness =
     Protocol.Alpha_context.(

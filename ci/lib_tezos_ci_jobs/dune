@@ -1,0 +1,19 @@
+; This file was automatically generated, do not edit.
+; Edit file manifest/main.ml instead.
+
+(library
+ (name tezos_ci_jobs)
+ (libraries
+  gitlab_ci
+  tezos_ci
+  cacio
+  tezos_ci_pipelines
+  sdk_bindings_ci
+  tezt.core
+  release_site_ci
+  grafazos_ci
+  teztale_ci
+  rollup_node_ci)
+ (flags
+  (:standard)
+  -open Gitlab_ci.Base))

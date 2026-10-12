@@ -1,0 +1,15 @@
+[package]
+name = "tezos-protocol"
+version = "0.1.0"
+edition = "2021"
+
+[dependencies]
+tezos_data_encoding.workspace = true
+tezos_crypto_rs.workspace = true
+nom.workspace = true
+thiserror = "1.0"
+hex = "0.4"
+proptest = { version = "1.0", optional = true }
+
+[features]
+testing = ["proptest"]

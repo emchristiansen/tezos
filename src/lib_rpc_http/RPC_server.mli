@@ -27,36 +27,44 @@
 
 type cors = {allowed_headers : string list; allowed_origins : string list}
 
-(** A handle on the server worker. *)
-type server
+module RPC_logging : Resto_cohttp_server.Server.LOGGING
 
-type callback =
-  Cohttp_lwt_unix.Server.conn ->
-  Cohttp.Request.t ->
-  Cohttp_lwt.Body.t ->
-  Cohttp_lwt_unix.Server.response_action Lwt.t
+include module type of
+    Resto_cohttp_server.Server.Make (Tezos_rpc.Encoding) (RPC_logging)
 
-val resto_callback : server -> callback
+(** Limits (or not) the number of maximum allowed RPC connections at any given time *)
+module Max_active_rpc_connections : sig
+  type t = Unlimited | Limited of int
 
-(** Initializes a RPC server *)
-val init_server :
-  ?cors:cors ->
-  ?agent:string ->
-  ?acl:Resto_acl.Acl.t ->
-  media_types:Media_type.t list ->
-  unit Tezos_rpc.Directory.t ->
-  server
+  val default : t
 
-(** Promise [server].*)
+  val encoding : t Data_encoding.t
+
+  val pp_parameter : Format.formatter -> t -> unit
+end
+
+(** [launch ?host server ?conn_closed ?callback
+    ?max_active_connections listening_protocol] starts the given resto
+    [server] initiating the listening loop using the
+
+    @param [callback] overwrites (if given) the default handler of
+    each resto http query will be treated by.
+
+    @param [conn_closed] is an optional function that is called when
+    a connection is closed.
+
+    @param [max_active_connections] limits the number of active
+    connections. When this limit is reached, the server will not
+    process new requests until existing ones are
+    completed. Defaults to 100. *)
 val launch :
   ?host:string ->
   server ->
+  ?conn_closed:(Cohttp_lwt_unix.Server.conn -> unit) ->
   ?callback:callback ->
+  ?max_active_connections:Max_active_rpc_connections.t ->
   Conduit_lwt_unix.server ->
   unit Lwt.t
-
-(** Kill an RPC server. *)
-val shutdown : server -> unit Lwt.t
 
 module Acl : sig
   include module type of Resto_acl.Acl

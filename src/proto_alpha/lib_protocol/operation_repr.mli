@@ -3,6 +3,7 @@
 (* Open Source License                                                       *)
 (* Copyright (c) 2018 Dynamic Ledger Solutions, Inc. <contact@tezos.com>     *)
 (* Copyright (c) 2022 Nomadic Labs <contact@nomadic-labs.com>                *)
+(* Copyright (c) 2023 Marigold, <contact@marigold.dev>                       *)
 (*                                                                           *)
 (* Permission is hereby granted, free of charge, to any person obtaining a   *)
 (* copy of this software and associated documentation files (the "Software"),*)
@@ -27,11 +28,13 @@
 (** Tezos Protocol Implementation - Low level Repr. of Operations
 
     Defines kinds of operations that can be performed on chain:
-    - preendorsement
-    - endorsement
+    - preattestation
+    - attestation
+    - attestations_aggregate
     - double baking evidence
-    - double preendorsing evidence
-    - double endorsing evidence
+    - double preattestation evidence
+    - double attestation evidence
+    - DAL entrapment evidence
     - seed nonce revelation
     - account activation
     - proposal (see: [Voting_repr])
@@ -43,11 +46,6 @@
       - origination
       - delegation
       - set deposits limitation
-      - tx rollup origination
-      - tx rollup batch submission
-      - tx rollup commit
-      - tx rollup withdraw
-      - tx rollup reveal withdrawals
       - smart rollup origination
       - smart rollup add messages
       - smart rollup publish
@@ -66,34 +64,43 @@
     list. *)
 
 module Kind : sig
-  type preendorsement_consensus_kind = Preendorsement_consensus_kind
+  type preattestation_consensus_kind = Preattestation_consensus_kind
 
-  type endorsement_consensus_kind = Endorsement_consensus_kind
+  type attestation_consensus_kind = Attestation_consensus_kind
+
+  type preattestations_aggregate_consensus_kind =
+    | Preattestations_aggregate_consensus_kind
+
+  type attestations_aggregate_consensus_kind =
+    | Attestations_aggregate_consensus_kind
 
   type 'a consensus =
-    | Preendorsement_kind : preendorsement_consensus_kind consensus
-    | Endorsement_kind : endorsement_consensus_kind consensus
+    | Preattestation_kind : preattestation_consensus_kind consensus
+    | Attestation_kind : attestation_consensus_kind consensus
+    | Preattestations_aggregate_kind :
+        preattestations_aggregate_consensus_kind consensus
+    | Attestations_aggregate_kind :
+        attestations_aggregate_consensus_kind consensus
 
-  type preendorsement = preendorsement_consensus_kind consensus
+  type preattestation = preattestation_consensus_kind consensus
 
-  type endorsement = endorsement_consensus_kind consensus
+  type attestation = attestation_consensus_kind consensus
 
-  type dal_attestation = Dal_attestation_kind
+  type preattestations_aggregate =
+    preattestations_aggregate_consensus_kind consensus
+
+  type attestations_aggregate = attestations_aggregate_consensus_kind consensus
 
   type seed_nonce_revelation = Seed_nonce_revelation_kind
 
   type vdf_revelation = Vdf_revelation_kind
 
-  type 'a double_consensus_operation_evidence =
+  type double_consensus_operation_evidence =
     | Double_consensus_operation_evidence
 
-  type double_endorsement_evidence =
-    endorsement_consensus_kind double_consensus_operation_evidence
-
-  type double_preendorsement_evidence =
-    preendorsement_consensus_kind double_consensus_operation_evidence
-
   type double_baking_evidence = Double_baking_evidence_kind
+
+  type dal_entrapment_evidence = Dal_entrapment_evidence_kind
 
   type activate_account = Activate_account_kind
 
@@ -123,25 +130,9 @@ module Kind : sig
 
   type register_global_constant = Register_global_constant_kind
 
-  type tx_rollup_origination = Tx_rollup_origination_kind
-
-  type tx_rollup_submit_batch = Tx_rollup_submit_batch_kind
-
-  type tx_rollup_commit = Tx_rollup_commit_kind
-
-  type tx_rollup_return_bond = Tx_rollup_return_bond_kind
-
-  type tx_rollup_finalize_commitment = Tx_rollup_finalize_commitment_kind
-
-  type tx_rollup_remove_commitment = Tx_rollup_remove_commitment_kind
-
-  type tx_rollup_rejection = Tx_rollup_rejection_kind
-
-  type tx_rollup_dispatch_tickets = Tx_rollup_dispatch_tickets_kind
-
   type transfer_ticket = Transfer_ticket_kind
 
-  type dal_publish_slot_header = Dal_publish_slot_header_kind
+  type dal_publish_commitment = Dal_publish_commitment_kind
 
   type sc_rollup_originate = Sc_rollup_originate_kind
 
@@ -176,27 +167,16 @@ module Kind : sig
     | Set_deposits_limit_manager_kind : set_deposits_limit manager
     | Increase_paid_storage_manager_kind : increase_paid_storage manager
     | Update_consensus_key_manager_kind : update_consensus_key manager
-    | Tx_rollup_origination_manager_kind : tx_rollup_origination manager
-    | Tx_rollup_submit_batch_manager_kind : tx_rollup_submit_batch manager
-    | Tx_rollup_commit_manager_kind : tx_rollup_commit manager
-    | Tx_rollup_return_bond_manager_kind : tx_rollup_return_bond manager
-    | Tx_rollup_finalize_commitment_manager_kind
-        : tx_rollup_finalize_commitment manager
-    | Tx_rollup_remove_commitment_manager_kind
-        : tx_rollup_remove_commitment manager
-    | Tx_rollup_rejection_manager_kind : tx_rollup_rejection manager
-    | Tx_rollup_dispatch_tickets_manager_kind
-        : tx_rollup_dispatch_tickets manager
     | Transfer_ticket_manager_kind : transfer_ticket manager
-    | Dal_publish_slot_header_manager_kind : dal_publish_slot_header manager
+    | Dal_publish_commitment_manager_kind : dal_publish_commitment manager
     | Sc_rollup_originate_manager_kind : sc_rollup_originate manager
     | Sc_rollup_add_messages_manager_kind : sc_rollup_add_messages manager
     | Sc_rollup_cement_manager_kind : sc_rollup_cement manager
     | Sc_rollup_publish_manager_kind : sc_rollup_publish manager
     | Sc_rollup_refute_manager_kind : sc_rollup_refute manager
     | Sc_rollup_timeout_manager_kind : sc_rollup_timeout manager
-    | Sc_rollup_execute_outbox_message_manager_kind
-        : sc_rollup_execute_outbox_message manager
+    | Sc_rollup_execute_outbox_message_manager_kind :
+        sc_rollup_execute_outbox_message manager
     | Sc_rollup_recover_bond_manager_kind : sc_rollup_recover_bond manager
     | Zk_rollup_origination_manager_kind : zk_rollup_origination manager
     | Zk_rollup_publish_manager_kind : zk_rollup_publish manager
@@ -204,35 +184,63 @@ module Kind : sig
 end
 
 type 'a consensus_operation_type =
-  | Endorsement : Kind.endorsement consensus_operation_type
-  | Preendorsement : Kind.preendorsement consensus_operation_type
+  | Attestation : Kind.attestation consensus_operation_type
+  | Preattestation : Kind.preattestation consensus_operation_type
+  | Preattestations_aggregate :
+      Kind.preattestations_aggregate consensus_operation_type
+  | Attestations_aggregate :
+      Kind.attestations_aggregate consensus_operation_type
 
-val pp_operation_kind :
-  Format.formatter -> 'kind consensus_operation_type -> unit
+type consensus_aggregate_content = {
+  level : Raw_level_repr.t;
+  round : Round_repr.t;
+  block_payload_hash : Block_payload_hash.t;
+}
 
 type consensus_content = {
   slot : Slot_repr.t;
   (* By convention, this is the validator's first slot. *)
   level : Raw_level_repr.t;
-  (* The level of (pre)endorsed block. *)
+  (* The level of (pre)attested block. *)
   round : Round_repr.t;
-  (* The round of (pre)endorsed block. *)
+  (* The round of (pre)attested block. *)
   block_payload_hash : Block_payload_hash.t;
-      (* The payload hash of (pre)endorsed block. *)
+      (* The payload hash of (pre)attested block. *)
 }
 
 val consensus_content_encoding : consensus_content Data_encoding.t
 
 val pp_consensus_content : Format.formatter -> consensus_content -> unit
 
+(** The DAL content in an attestation operation having some level [l] refers to
+    slots published at levels [l + 1 - lag], where [lag] is an element of the
+    protocol parameter [attestation_lags]. Whenever there is a need to
+    disambiguate, one should use "attestation level" for the level inside the
+    operation and "attested level" for the level of the block including the
+    operation. We have [attestation_level + 1 = attested_level]. *)
+type dal_content = {attestations : Dal_attestations_repr.t}
+
 type consensus_watermark =
-  | Endorsement of Chain_id.t
-  | Preendorsement of Chain_id.t
-  | Dal_attestation of Chain_id.t
+  | Attestation of Chain_id.t
+  | Preattestation of Chain_id.t
 
 val to_watermark : consensus_watermark -> Signature.watermark
 
 val of_watermark : Signature.watermark -> consensus_watermark option
+
+type consensus_key_kind = Consensus | Companion
+
+val consensus_key_kind_encoding : consensus_key_kind Data_encoding.t
+
+val pp_consensus_key_kind : Format.formatter -> consensus_key_kind -> unit
+
+type public_key_kind = Manager_pk | Consensus_pk | Companion_pk
+
+val public_key_kind_encoding : public_key_kind Data_encoding.t
+
+val pp_public_key_kind : Format.formatter -> public_key_kind -> unit
+
+val consensus_to_public_key_kind : consensus_key_kind -> public_key_kind
 
 type raw = Operation.t = {shell : Operation.shell_header; proto : bytes}
 
@@ -266,18 +274,28 @@ and _ contents_list =
 (** A value of type [contents] an operation related to whether
     consensus, governance or contract management. *)
 and _ contents =
-  (* Preendorsement: About consensus, preendorsement of a block held by a
+  (* Preattestation: About consensus, preattestation of a block held by a
      validator (specific to Tenderbake). *)
-  | Preendorsement : consensus_content -> Kind.preendorsement contents
-  (* Endorsement: About consensus, endorsement of a block held by a
+  | Preattestation : consensus_content -> Kind.preattestation contents
+  (* Attestation: About consensus, attestation of a block held by a
      validator. *)
-  | Endorsement : consensus_content -> Kind.endorsement contents
-  (* DAL/FIXME https://gitlab.com/tezos/tezos/-/issues/3115
-
-     Temporary operation to avoid modifying endorsement encoding. *)
-  | Dal_attestation :
-      Dal_attestation_repr.operation
-      -> Kind.dal_attestation contents
+  | Attestation : {
+      consensus_content : consensus_content;
+      dal_content : dal_content option;
+    }
+      -> Kind.attestation contents
+  (* Aggregate of preattestations. *)
+  | Preattestations_aggregate : {
+      consensus_content : consensus_aggregate_content;
+      committee : Slot_repr.t list;
+    }
+      -> Kind.preattestations_aggregate contents
+  (* Aggregate of attestations. *)
+  | Attestations_aggregate : {
+      consensus_content : consensus_aggregate_content;
+      committee : (Slot_repr.t * dal_content option) list;
+    }
+      -> Kind.attestations_aggregate contents
   (* Seed_nonce_revelation: Nonces are created by bakers and are
      combined to create pseudo-random seeds. Bakers are urged to reveal their
      nonces after a given number of cycles to keep their block rewards
@@ -293,32 +311,36 @@ and _ contents =
       solution : Seed_repr.vdf_solution;
     }
       -> Kind.vdf_revelation contents
-  (* Double_preendorsement_evidence: Double-preendorsement is a
-     kind of malicious attack where a byzantine attempts to fork
-     the chain by preendorsing blocks with different
-     contents (at the same level and same round)
-     twice. This behavior may be reported and the byzantine will have
-     its security deposit forfeited. *)
-  | Double_preendorsement_evidence : {
-      op1 : Kind.preendorsement operation;
-      op2 : Kind.preendorsement operation;
+  (* Double_consensus_operation_evidence: Double-consensus-operation
+     is a kind of malicious attack where a byzantine attempts to fork
+     the chain by preattesting or attesting two blocks at the same
+     level and round with different payloads. This behavior may be
+     reported and the byzantine will have its security deposit
+     forfeited. *)
+  | Double_consensus_operation_evidence : {
+      slot : Slot_repr.t;
+      op1 : 'a Kind.consensus operation;
+      op2 : 'b Kind.consensus operation;
     }
-      -> Kind.double_preendorsement_evidence contents
-  (* Double_endorsement_evidence: Similar to double-preendorsement but
-     for endorsements. *)
-  | Double_endorsement_evidence : {
-      op1 : Kind.endorsement operation;
-      op2 : Kind.endorsement operation;
-    }
-      -> Kind.double_endorsement_evidence contents
-  (* Double_baking_evidence: Similarly to double-endorsement but the
-     byzantine attempts to fork by signing two different blocks at the
-     same level. *)
+      -> Kind.double_consensus_operation_evidence contents
+  (* Double_baking_evidence: Similarly to
+     Double_consensus_operation_evidence but the byzantine attempts to
+     fork by signing two different blocks at the same level. *)
   | Double_baking_evidence : {
       bh1 : Block_header_repr.t;
       bh2 : Block_header_repr.t;
     }
       -> Kind.double_baking_evidence contents
+  (* The attester failed to correctly identify a trap when attesting DAL
+     slots. *)
+  | Dal_entrapment_evidence : {
+      attestation : 'a Kind.consensus operation;
+      consensus_slot : Slot_repr.t;
+      slot_index : Dal_slot_index_repr.t;
+      lag_index_opt : int option;
+      shard_with_proof : Dal_slot_repr.Shard_with_proof.t;
+    }
+      -> Kind.dal_entrapment_evidence contents
   (* Activate_account: Account activation allows to register a public
      key hash on the blockchain. *)
   | Activate_account : {
@@ -328,14 +350,14 @@ and _ contents =
       -> Kind.activate_account contents
   (* Proposals: A candidate protocol can be proposed for voting. *)
   | Proposals : {
-      source : Signature.Public_key_hash.t;
+      source : Implicit_account_repr.t;
       period : int32;
       proposals : Protocol_hash.t list;
     }
       -> Kind.proposals contents
   (* Ballot: The validators of the chain will then vote on proposals. *)
   | Ballot : {
-      source : Signature.Public_key_hash.t;
+      source : Implicit_account_repr.t;
       period : int32;
       proposal : Protocol_hash.t;
       ballot : Vote_repr.ballot;
@@ -346,8 +368,8 @@ and _ contents =
      when [consensus_key] is the active consensus key of [delegate].. *)
   | Drain_delegate : {
       consensus_key : Signature.Public_key_hash.t;
-      delegate : Signature.Public_key_hash.t;
-      destination : Signature.Public_key_hash.t;
+      delegate : Implicit_account_repr.t;
+      destination : Implicit_account_repr.t;
     }
       -> Kind.drain_delegate contents
   (* Failing_noop: An operation never considered by the state machine
@@ -359,8 +381,8 @@ and _ contents =
      interactions between contracts (whether implicit or
      smart). *)
   | Manager_operation : {
-      source : Signature.Public_key_hash.t;
-      fee : Tez_repr.tez;
+      source : Implicit_account_repr.t;
+      fee : Tez_repr.t;
       counter : Manager_counter_repr.t;
       operation : 'kind manager_operation;
       gas_limit : Gas_limit_repr.Arith.integral;
@@ -371,14 +393,23 @@ and _ contents =
 (** A [manager_operation] describes management and interactions
     between contracts (whether implicit or smart). *)
 and _ manager_operation =
-  (* [Reveal] for the revelation of a public key, a one-time
-     prerequisite to any signed operation, in order to be able to
-     check the sender’s signature. *)
-  | Reveal : Signature.Public_key.t -> Kind.reveal manager_operation
+  (* [Reveal {public_key; proof}] for the revelation of a public key
+     [public_key], a one-time prerequisite to any signed operation, in
+     order to be able to check the sender’s signature. To prevent
+     rogue key attacks, a proof of possession [proof] must be provided
+     if and only if the new key is a BLS key. The [proof] is a
+     signature over the public key itself (cf. the IETF BLS Signature
+     V4 standard
+     https://datatracker.ietf.org/doc/html/draft-irtf-cfrg-bls-signature-04#section-3.3 *)
+  | Reveal : {
+      public_key : Signature.Public_key.t;
+      proof : Bls.t option;
+    }
+      -> Kind.reveal manager_operation
   (* [Transaction] of some amount to some destination contract. It can
      also be used to execute/call smart-contracts. *)
   | Transaction : {
-      amount : Tez_repr.tez;
+      amount : Tez_repr.t;
       parameters : Script_repr.lazy_expr;
       entrypoint : Entrypoint_repr.t;
       destination : Contract_repr.t;
@@ -387,16 +418,16 @@ and _ manager_operation =
   (* [Origination] of a contract using a smart-contract [script] and
      initially credited with the amount [credit]. *)
   | Origination : {
-      delegate : Signature.Public_key_hash.t option;
+      delegate : Implicit_account_repr.t option;
       script : Script_repr.t;
-      credit : Tez_repr.tez;
+      credit : Tez_repr.t;
     }
       -> Kind.origination manager_operation
   (* [Delegation] to some staking contract (designated by its public
      key hash). When this value is None, delegation is reverted as it
      is set to nobody. *)
   | Delegation :
-      Signature.Public_key_hash.t option
+      Implicit_account_repr.t option
       -> Kind.delegation manager_operation
   (* [Register_global_constant] allows registration and substitution
      of a global constant available from any contract and registered in
@@ -418,75 +449,24 @@ and _ manager_operation =
       destination : Contract_hash.t;
     }
       -> Kind.increase_paid_storage manager_operation
-  (* [Update_consensus_key pk] updates the consensus key of
-     the signing delegate to [pk]. *)
-  | Update_consensus_key :
-      Signature.Public_key.t
+  (* [Update_consensus_key {public_key; proof}] updates the consensus key of the
+     signing delegate to [public_key]. To prevent rogue key attacks, a proof of
+     possession must be provided if and only if the new key is a BLS key. The
+     [proof] is a signature over the public key itself. *)
+  | Update_consensus_key : {
+      public_key : Signature.Public_key.t;
+      proof : Bls.t option;
+      kind : consensus_key_kind;
+    }
       -> Kind.update_consensus_key manager_operation
-  (* [Tx_rollup_origination] allows an implicit contract to originate
-     a new transactional rollup. *)
-  | Tx_rollup_origination : Kind.tx_rollup_origination manager_operation
-  (* [Tx_rollup_submit_batch] allows to submit batches of L2 operations on a
-     transactional rollup. The content is a string, but stands for an immutable
-     byte sequence. *)
-  | Tx_rollup_submit_batch : {
-      tx_rollup : Tx_rollup_repr.t;
-      content : string;
-      burn_limit : Tez_repr.t option;
-    }
-      -> Kind.tx_rollup_submit_batch manager_operation
-  | Tx_rollup_commit : {
-      tx_rollup : Tx_rollup_repr.t;
-      commitment : Tx_rollup_commitment_repr.Full.t;
-    }
-      -> Kind.tx_rollup_commit manager_operation
-  | Tx_rollup_return_bond : {
-      tx_rollup : Tx_rollup_repr.t;
-    }
-      -> Kind.tx_rollup_return_bond manager_operation
-  | Tx_rollup_finalize_commitment : {
-      tx_rollup : Tx_rollup_repr.t;
-    }
-      -> Kind.tx_rollup_finalize_commitment manager_operation
-  | Tx_rollup_remove_commitment : {
-      tx_rollup : Tx_rollup_repr.t;
-    }
-      -> Kind.tx_rollup_remove_commitment manager_operation
-  | Tx_rollup_rejection : {
-      tx_rollup : Tx_rollup_repr.t;
-      level : Tx_rollup_level_repr.t;
-      message : Tx_rollup_message_repr.t;
-      message_position : int;
-      message_path : Tx_rollup_inbox_repr.Merkle.path;
-      message_result_hash : Tx_rollup_message_result_hash_repr.t;
-      message_result_path : Tx_rollup_commitment_repr.Merkle.path;
-      previous_message_result : Tx_rollup_message_result_repr.t;
-      previous_message_result_path : Tx_rollup_commitment_repr.Merkle.path;
-      proof : Tx_rollup_l2_proof.serialized;
-    }
-      -> Kind.tx_rollup_rejection manager_operation
-  | Tx_rollup_dispatch_tickets : {
-      tx_rollup : Tx_rollup_repr.t;
-          (** The rollup from where the tickets are retrieved *)
-      level : Tx_rollup_level_repr.t;
-          (** The level at which the withdrawal was enabled *)
-      context_hash : Context_hash.t;
-          (** The hash of the l2 context resulting from the execution of the
-          inbox from where this withdrawal was enabled. *)
-      message_index : int;
-          (** Index of the message in the inbox at [level] where this withdrawal was enabled. *)
-      message_result_path : Tx_rollup_commitment_repr.Merkle.path;
-      tickets_info : Tx_rollup_reveal_repr.t list;
-    }
-      -> Kind.tx_rollup_dispatch_tickets manager_operation
-      (** [Transfer_ticket] allows an implicit account (the "claimer") to
-      receive [amount] tickets, pulled out of [tx_rollup], to the
-      [entrypoint] of the smart contract [destination].
+      (** [Transfer_ticket] allows an implicit account (the "claimer") to receive
+     [amount] tickets, pulled out of [tx_rollup], to the [entrypoint] of the
+     smart contract [destination].
 
-      The ticket must have been addressed to the
-      claimer, who must be the source of this operation. It must have been
-      pulled out at [level] and from the message at [message_index]. The ticket
-      is composed of [ticketer; ty; contents]. *)
+     The ticket must have been addressed to the claimer, who must be the source
+     of this operation. It must have been pulled out at [level] and from the
+     message at [message_index]. The ticket is composed of [ticketer; ty;
+     contents]. *)
   | Transfer_ticket : {
       contents : Script_repr.lazy_expr;  (** Contents of the withdrawn ticket *)
       ty : Script_repr.lazy_expr;
@@ -501,9 +481,9 @@ and _ manager_operation =
           (** The entrypoint of the smart contract address that should receive the tickets. *)
     }
       -> Kind.transfer_ticket manager_operation
-  | Dal_publish_slot_header :
-      Dal_operations_repr.Publish_slot_header.t
-      -> Kind.dal_publish_slot_header manager_operation
+  | Dal_publish_commitment :
+      Dal_operations_repr.Publish_commitment.t
+      -> Kind.dal_publish_commitment manager_operation
       (** [Sc_rollup_originate] allows an implicit account to originate a new
           smart contract rollup (initialized with a given boot sector).
           The [parameters_ty] field allows to provide the expected interface
@@ -513,8 +493,8 @@ and _ manager_operation =
   | Sc_rollup_originate : {
       kind : Sc_rollups.Kind.t;
       boot_sector : string;
-      origination_proof : Sc_rollup_proof_repr.serialized;
       parameters_ty : Script_repr.lazy_expr;
+      whitelist : Sc_rollup_whitelist_repr.t option;
     }
       -> Kind.sc_rollup_originate manager_operation
   (* [Sc_rollup_add_messages] adds messages to the smart rollups' inbox. *)
@@ -524,7 +504,6 @@ and _ manager_operation =
       -> Kind.sc_rollup_add_messages manager_operation
   | Sc_rollup_cement : {
       rollup : Sc_rollup_repr.t;
-      commitment : Sc_rollup_commitment_repr.Hash.t;
     }
       -> Kind.sc_rollup_cement manager_operation
   | Sc_rollup_publish : {
@@ -564,7 +543,7 @@ and _ manager_operation =
       -> Kind.sc_rollup_execute_outbox_message manager_operation
   | Sc_rollup_recover_bond : {
       sc_rollup : Sc_rollup_repr.t;
-      staker : Signature.Public_key_hash.t;
+      staker : Implicit_account_repr.t;
     }
       -> Kind.sc_rollup_recover_bond manager_operation
   | Zk_rollup_origination : {
@@ -611,6 +590,11 @@ val pack : 'kind operation -> packed_operation
 
 val manager_kind : 'kind manager_operation -> 'kind Kind.manager
 
+(** Extracts the slots from a
+    {!constructor:contents.Attestations_aggregate} committee. *)
+val committee_slots :
+  (Slot_repr.t * dal_content option) list -> Slot_repr.t list
+
 val encoding : packed_operation Data_encoding.t
 
 val contents_encoding : packed_contents Data_encoding.t
@@ -620,6 +604,12 @@ val contents_list_encoding : packed_contents_list Data_encoding.t
 val protocol_data_encoding : packed_protocol_data Data_encoding.t
 
 val unsigned_operation_encoding :
+  (Operation.shell_header * packed_contents_list) Data_encoding.t
+
+(* Encoding to sign and verify attestations signatures with BLS keys. In this
+   encoding, the signed payload is omitting slots to enable BLS proof of
+   possession aggregation. *)
+val bls_mode_unsigned_operation_encoding :
   (Operation.shell_header * packed_contents_list) Data_encoding.t
 
 val raw : _ operation -> raw
@@ -674,25 +664,28 @@ val compare_by_passes : packed_operation -> packed_operation -> int
 
    The global order is as follows:
 
-   {!Endorsement} and {!Preendorsement} > {!Dal_attestation} >
-   {!Proposals} > {!Ballot} > {!Double_preendorsement_evidence} >
-   {!Double_endorsement_evidence} > {!Double_baking_evidence} >
-   {!Vdf_revelation} > {!Seed_nonce_revelation} > {!Activate_account}
-   > {!Drain_delegate} > {!Manager_operation}.
+   {!Attestations_aggregate}, {!Preattestations_aggregate}, {!Attestation} and
+   {!Preattestation} > {!Proposals} > {!Ballot} >
+   {!Double_preattestation_evidence} > {!Double_attestation_evidence} >
+   {!Double_baking_evidence} > {!Dal_entrapment_evidence} > {!Vdf_revelation} >
+   {!Seed_nonce_revelation} > {!Activate_account} > {!Drain_delegate} >
+   {!Manager_operation}.
 
-   {!Endorsement} and {!Preendorsement} are compared by the pair of
-   their [level] and [round] such as the farther to the current state
-   [level] and [round] is greater; e.g. the greater pair in
-   lexicographic order being the better. When equal and both
-   operations being of the same kind, we compare their [slot]: the
-   The smaller being the better, assuming that the more slots an endorser
-   has, the smaller is its smallest [slot]. When the pair is equal
-   and comparing an {!Endorsement] to a {!Preendorsement}, the
-   {!Endorsement} is better.
+   {!Attestation} and {!Preattestation} are compared by the pair of their
+   [level] and [round] such as the farther to the current state [level] and
+   [round] is greater; e.g. the greater pair in lexicographic order being the
+   better. When equal and both operations being of the same kind, we compare
+   their [slot], the smaller being the better (assuming that the more slots an
+   attester has, the smaller is its smallest [slot]), and then the number of the
+   DAL attested slots, the more the better. When the pair is equal and comparing
+   an {!Attestation} to a {!Preattestation}, the {!Attestation} is better.
 
-   Two {!Dal_attestation} ops are compared in the lexicographic
-   order of the pair of their number of endorsed slots as available
-   and their endorsers.
+   {!Attestations_aggregate} are compared to {!Attestations} and
+   {!Preattestations} by the pair of their [level] and [round] as well. If the
+   pairs are equal, an {!Attestation_aggregate} is preferred over an
+   {!Attestation} or a {!Preattestation}. For equal pairs, two
+   {!Attestations_aggregate} are compared by their [committee] in lexicographic
+   order.
 
    Two voting operations are compared in the lexicographic order of
    the pair of their [period] and [source]. A {!Proposals} is better
@@ -702,6 +695,9 @@ val compare_by_passes : packed_operation -> packed_operation -> int
    to the current state the better. For {!Double_baking_evidence}
    in the case of equality, they are compared by the hashes of their first
    denounced block_header.
+
+   Two {!Dal_entrapment_evidence} ops are compared by their level and the number
+   of slots they attest.
 
    Two {!Vdf_revelation} ops are compared by their [solution].
 
@@ -722,8 +718,30 @@ type error += Missing_signature (* `Permanent *)
 
 type error += Invalid_signature (* `Permanent *)
 
+(** Measuring the length of an operation, ignoring its signature.
+    This is useful to define a gas model for the check of the
+    signature. *)
+val unsigned_operation_length : _ operation -> int
+
+(** Measuring the length of an operation in bls_mode, ignoring its
+    signature. *)
+val bls_mode_unsigned_operation_length : _ operation -> int
+
+(** Check the signature of an operation. This function serializes the operation
+    using the provided encoding before calling the [Signature.check] function
+    with the appropriate watermark. *)
 val check_signature :
-  Signature.Public_key.t -> Chain_id.t -> _ operation -> unit tzresult
+  (Operation.shell_header * packed_contents_list) Data_encoding.t ->
+  Signature.Public_key.t ->
+  Chain_id.t ->
+  _ operation ->
+  unit tzresult
+
+(* Serializes the operation using the provided encoding. *)
+val serialize_unsigned_operation :
+  (Operation.shell_header * packed_contents_list) Data_encoding.t ->
+  _ operation ->
+  bytes
 
 type ('a, 'b) eq = Eq : ('a, 'a) eq
 
@@ -741,22 +759,26 @@ module Encoding : sig
       }
         -> 'b case
 
-  val preendorsement_case : Kind.preendorsement case
+  val preattestation_case : Kind.preattestation case
 
-  val endorsement_case : Kind.endorsement case
+  val attestation_case : Kind.attestation case
 
-  val dal_attestation_case : Kind.dal_attestation case
+  val attestation_with_dal_case : Kind.attestation case
+
+  val attestations_aggregate_case : Kind.attestations_aggregate case
+
+  val preattestations_aggregate_case : Kind.preattestations_aggregate case
 
   val seed_nonce_revelation_case : Kind.seed_nonce_revelation case
 
   val vdf_revelation_case : Kind.vdf_revelation case
 
-  val double_preendorsement_evidence_case :
-    Kind.double_preendorsement_evidence case
-
-  val double_endorsement_evidence_case : Kind.double_endorsement_evidence case
+  val double_consensus_operation_evidence_case :
+    Kind.double_consensus_operation_evidence case
 
   val double_baking_evidence_case : Kind.double_baking_evidence case
+
+  val dal_entrapment_evidence_case : Kind.dal_entrapment_evidence case
 
   val activate_account_case : Kind.activate_account case
 
@@ -778,6 +800,8 @@ module Encoding : sig
 
   val update_consensus_key_case : Kind.update_consensus_key Kind.manager case
 
+  val update_companion_key_case : Kind.update_consensus_key Kind.manager case
+
   val register_global_constant_case :
     Kind.register_global_constant Kind.manager case
 
@@ -785,30 +809,10 @@ module Encoding : sig
 
   val increase_paid_storage_case : Kind.increase_paid_storage Kind.manager case
 
-  val tx_rollup_origination_case : Kind.tx_rollup_origination Kind.manager case
-
-  val tx_rollup_submit_batch_case :
-    Kind.tx_rollup_submit_batch Kind.manager case
-
-  val tx_rollup_commit_case : Kind.tx_rollup_commit Kind.manager case
-
-  val tx_rollup_return_bond_case : Kind.tx_rollup_return_bond Kind.manager case
-
-  val tx_rollup_finalize_commitment_case :
-    Kind.tx_rollup_finalize_commitment Kind.manager case
-
-  val tx_rollup_remove_commitment_case :
-    Kind.tx_rollup_remove_commitment Kind.manager case
-
-  val tx_rollup_rejection_case : Kind.tx_rollup_rejection Kind.manager case
-
-  val tx_rollup_dispatch_tickets_case :
-    Kind.tx_rollup_dispatch_tickets Kind.manager case
-
   val transfer_ticket_case : Kind.transfer_ticket Kind.manager case
 
-  val dal_publish_slot_header_case :
-    Kind.dal_publish_slot_header Kind.manager case
+  val dal_publish_commitment_case :
+    Kind.dal_publish_commitment Kind.manager case
 
   val sc_rollup_originate_case : Kind.sc_rollup_originate Kind.manager case
 
@@ -859,32 +863,17 @@ module Encoding : sig
 
     val update_consensus_key_case : Kind.update_consensus_key case
 
+    val update_companion_key_case : Kind.update_consensus_key case
+
     val register_global_constant_case : Kind.register_global_constant case
 
     val set_deposits_limit_case : Kind.set_deposits_limit case
 
     val increase_paid_storage_case : Kind.increase_paid_storage case
 
-    val tx_rollup_origination_case : Kind.tx_rollup_origination case
-
-    val tx_rollup_submit_batch_case : Kind.tx_rollup_submit_batch case
-
-    val tx_rollup_commit_case : Kind.tx_rollup_commit case
-
-    val tx_rollup_return_bond_case : Kind.tx_rollup_return_bond case
-
-    val tx_rollup_finalize_commitment_case :
-      Kind.tx_rollup_finalize_commitment case
-
-    val tx_rollup_remove_commitment_case : Kind.tx_rollup_remove_commitment case
-
-    val tx_rollup_rejection_case : Kind.tx_rollup_rejection case
-
-    val tx_rollup_dispatch_tickets_case : Kind.tx_rollup_dispatch_tickets case
-
     val transfer_ticket_case : Kind.transfer_ticket case
 
-    val dal_publish_slot_header_case : Kind.dal_publish_slot_header case
+    val dal_publish_commitment_case : Kind.dal_publish_commitment case
 
     val sc_rollup_originate_case : Kind.sc_rollup_originate case
 
@@ -909,4 +898,9 @@ module Encoding : sig
 
     val zk_rollup_update_case : Kind.zk_rollup_update case
   end
+end
+
+module Internal_for_benchmarking : sig
+  (* Serialize an operation, ignoring its signature. *)
+  val serialize_unsigned_operation : _ operation -> bytes
 end

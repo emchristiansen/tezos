@@ -2,7 +2,7 @@
 (*                                                                           *)
 (* Open Source License                                                       *)
 (* Copyright (c) 2021 Nomadic Labs <contact@nomadic-labs.com>                *)
-(* Copyright (c) 2022 Trili Tech, <contact@trili.tech>                       *)
+(* Copyright (c) 2022-2024 TriliTech <contact@trili.tech>                    *)
 (*                                                                           *)
 (* Permission is hereby granted, free of charge, to any person obtaining a   *)
 (* copy of this software and associated documentation files (the "Software"),*)
@@ -27,16 +27,18 @@
 module PVM = struct
   type boot_sector = string
 
+  module type PROTO_ORIGINATION = Sc_rollup_PVM_sig.PROTO_ORIGINATION
+
+  module type PROTO_VERIFICATION = Sc_rollup_PVM_sig.PROTO_VERIFICATION
+
   module type S = sig
-    val parse_boot_sector : string -> boot_sector option
+    include Sc_rollup_PVM_sig.S
 
     val pp_boot_sector : Format.formatter -> boot_sector -> unit
-
-    include Sc_rollup_PVM_sig.S
   end
 
   type ('state, 'proof, 'output) implementation =
-    (module S
+    (module PROTO_VERIFICATION
        with type state = 'state
         and type proof = 'proof
         and type output_proof = 'output)
@@ -48,21 +50,23 @@ module Kind = struct
   (*
       Each time we add a data constructor to [t], we also need:
       - to extend [Sc_rollups.all] with this new constructor ;
-      - to update [Sc_rollups.of_name] and [encoding] ;
+      - to update [Sc_rollups.of_string] and [encoding] ;
       - to update [Sc_rollups.wrapped_proof] and [wrapped_proof_encoding].
 
   *)
-  type t = Example_arith | Wasm_2_0_0
+  type t = Example_arith | Wasm_2_0_0 | Riscv
 
-  let all = [Example_arith; Wasm_2_0_0]
+  let all = [Example_arith; Wasm_2_0_0; Riscv]
 
   let to_string = function
     | Example_arith -> "arith"
     | Wasm_2_0_0 -> "wasm_2_0_0"
+    | Riscv -> "riscv"
 
   let of_string = function
     | "arith" -> Some Example_arith
     | "wasm_2_0_0" -> Some Wasm_2_0_0
+    | "riscv" -> Some Riscv
     | _ -> None
 
   let encoding =
@@ -71,20 +75,40 @@ module Kind = struct
   let pp fmt = function
     | Example_arith -> Format.pp_print_string fmt "arith"
     | Wasm_2_0_0 -> Format.pp_print_string fmt "wasm_2_0_0"
+    | Riscv -> Format.pp_print_string fmt "riscv"
 
   let equal x y =
     match (x, y) with
     | Example_arith, Example_arith -> true
     | Wasm_2_0_0, Wasm_2_0_0 -> true
+    | Riscv, Riscv -> true
     | _ -> false
 
   let example_arith_pvm =
     PVM.Packed (module Sc_rollup_arith.Protocol_implementation)
 
-  let wasm_2_0_0_pvm =
-    PVM.Packed (module Sc_rollup_wasm.V2_0_0.Protocol_implementation)
+  let wasm_2_0_0_pvm ~config =
+    let (module Wasm) = Sc_rollup_wasm.V2_0_0.protocol_implementation ~config in
+    PVM.Packed (module Wasm)
 
-  let pvm_of = function
+  let riscv_pvm = PVM.Packed (module Sc_rollup_riscv.Protocol_implementation)
+
+  let pvm_of ~config = function
     | Example_arith -> example_arith_pvm
-    | Wasm_2_0_0 -> wasm_2_0_0_pvm
+    | Wasm_2_0_0 -> wasm_2_0_0_pvm ~config
+    | Riscv -> riscv_pvm
+
+  let no_proof_machine_of ~config :
+      t -> (module Sc_rollup_origination_machine.S) = function
+    | Example_arith -> (module Sc_rollup_origination_machine.Arith)
+    | Wasm_2_0_0 -> Sc_rollup_origination_machine.wasm ~config
+    | Riscv -> (module Sc_rollup_origination_machine.Riscv)
 end
+
+let genesis_state_hash_of ~boot_sector kind =
+  let open Lwt_syntax in
+  let (module Machine) = Kind.no_proof_machine_of ~config:[] kind in
+  let empty = Machine.empty_state () in
+  let* tree = Machine.initial_state ~empty in
+  let* tree = Machine.install_boot_sector tree boot_sector in
+  Machine.state_hash tree

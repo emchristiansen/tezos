@@ -1,0 +1,14804 @@
+// SPDX-FileCopyrightText: 2025-2026 Functori <contact@functori.com>
+// SPDX-License-Identifier: MIT
+
+use account_storage::Code;
+use account_storage::Manager;
+use account_storage::TezosAccount;
+use enshrined_contracts::charge_internal_receipt_bodies;
+use enshrined_contracts::charge_persisted_error;
+use enshrined_contracts::get_enshrined_contract_entrypoint;
+use enshrined_contracts::CracError;
+use mir::ast::big_map::LazyStorageError;
+use mir::ast::BinWriter;
+use mir::ast::BorrowedUnparseError;
+use mir::ast::IntoMicheline;
+use mir::ast::Micheline;
+use mir::ast::{
+    AddressHash, Entrypoint, OperationInfo, PublicKeyHash, RcTypedValue, TransferTokens,
+    TypedValue,
+};
+use mir::context::CtxTrait;
+use mir::context::LookupViewError;
+use mir::context::TypecheckingCtx;
+use mir::{
+    gas::{Gas, OutOfGas},
+    interpreter::{compute_contract_address, ContractInterpretError, InterpretError},
+    parser::Parser,
+    serializer::DecodeError,
+    typechecker::{
+        type_props::TypeProperty, AllowForgedLazyStorageId, TcError, TypecheckViews,
+    },
+};
+use mir_ctx::clear_temporary_big_maps;
+use num_bigint::{BigInt, BigUint};
+use num_traits::ops::checked::CheckedSub;
+use num_traits::{ToPrimitive, Zero};
+use primitive_types::U256;
+use std::collections::{BTreeMap, BTreeSet, HashMap};
+use tezos_crypto_rs::{
+    hash::{ContractKt1Hash, ContractTz1Hash},
+    PublicKeyWithHash,
+};
+use tezos_data_encoding::types::Narith;
+use tezos_ethereum::wei::michelson_gas_to_mutez;
+use tezos_evm_logging::{log, Level::*};
+use tezos_evm_runtime::runtime_keyspaces::RuntimeKeyspaces;
+use tezos_evm_runtime::safe_storage::SafeStorage;
+use tezos_protocol::contract::Contract;
+use tezos_smart_rollup::types::PublicKey;
+use tezos_smart_rollup_host::storage::StorageV1;
+use tezos_smart_rollup_keyspace::KeySpaceLoader;
+use tezos_storage::error::Error as StorageError;
+use tezos_tezlink::lazy_storage_diff::LazyStorageDiffList;
+use tezos_tezlink::operation::{
+    ManagerOperationContentConv, ManagerOperationField as _, Operation,
+    OriginationContent, Script,
+};
+use tezos_tezlink::operation_result::{
+    produce_skipped_receipt, AddressRegistry, BacktrackedResult, ContentResult,
+    InternalContentWithMetadata, InternalOperationSum, OperationKind, OperationResult,
+    OperationWithMetadata, Originated, OriginationSuccess, TransferTarget,
+};
+use tezos_tezlink::{
+    operation::{OperationContent, Parameters, RevealContent, TransferContent},
+    operation_result::{
+        ApplyOperationError, Balance, BalanceTooLow, BalanceUpdate, EventContent,
+        EventSuccess, OperationError, OperationResultSum, OriginationError, RevealError,
+        RevealSuccess, TransferError, TransferSuccess, UpdateOrigin,
+    },
+};
+use tezosx_interfaces::Milligas;
+use tezosx_interfaces::{Origin, Registry};
+use tezosx_journal::TemporaryBigMapIdAllocator;
+use tezosx_journal::TezosXJournal;
+
+use crate::account_storage::{
+    OriginatedContractInfo, StorageSpace, TezosImplicitAccount,
+};
+use crate::gas::Cost;
+pub use crate::gas::TezlinkOperationGas;
+pub use crate::mir_ctx::address_from_contract;
+use crate::mir_ctx::{
+    convert_big_map_diff, BlockCtx, Ctx, ExecCtx, InterpretContext, OperationCtx, TcCtx,
+};
+
+/// Result of applying a single operation within a batch.
+///
+/// Wraps the serializable [`OperationWithMetadata`] together with
+/// the amount of gas that was consumed during the execution of the operation.
+/// This struct is internal, it is never serialized nor deserialized.
+#[derive(Debug, PartialEq)]
+pub struct ProcessedOperation {
+    pub operation_with_metadata: OperationWithMetadata,
+    /// Total gas consumed by this operation (including internal operations),
+    /// in milligas.
+    ///
+    /// - For Applied/BackTracked/Failed: total gas consumed since the start
+    ///   of the operation, computed from the gas tracker's initial limit and
+    ///   remaining gas. This includes gas from all internal sub-operations.
+    ///   For BackTracked operations, this reflects gas actually burned during
+    ///   execution, even though the operation's effects were reverted (because
+    ///   a later operation in the batch failed).
+    /// - For Skipped: 0.
+    pub operation_consumed_milligas: u32,
+}
+
+impl ProcessedOperation {
+    /// Total milligas consumed across a batch of processed operations.
+    /// In practice, individual operation gas is bounded by
+    /// `hard_gas_limit_per_operation` (3_000_000 gas = 3_000_000_000 milligas
+    /// in Tezos X, raised from the L1 default of 1_040_000 gas to match the
+    /// EVM per-transaction cap of 30M gas), so neither per-operation values
+    /// nor batch totals will overflow `u64`.
+    pub fn total_consumed_milligas(ops: &[ProcessedOperation]) -> u64 {
+        ops.iter()
+            .map(|p| u64::from(p.operation_consumed_milligas))
+            .sum()
+    }
+
+    /// Extract the operation-with-metadata from each processed operation,
+    /// discarding the per-operation consumed milligas.
+    pub fn into_receipts(ops: Vec<Self>) -> Vec<OperationWithMetadata> {
+        ops.into_iter().map(|p| p.operation_with_metadata).collect()
+    }
+}
+
+/// Fee pricing parameters for computing refunds inside
+/// `validate_and_apply_operation`.
+pub struct FeeRefundConfig {
+    pub da_fees: u64,
+    pub base_fee_per_gas: U256,
+    pub michelson_to_evm_gas_multiplier: u64,
+}
+
+/// Compute the fee refund: surplus of declared fees beyond actual costs.
+///
+/// fee_refund = total_operation_fees - da_fees - consumed_gas_fees
+/// where consumed_gas_fees = michelson_gas_to_mutez(base_fee, multiplier, consumed_gas)
+/// and consumed_gas = ceil(total_consumed_milligas / 1000).
+fn compute_fee_refund(
+    total_operation_fees: u64,
+    processed_operations: &[ProcessedOperation],
+    config: &FeeRefundConfig,
+) -> u64 {
+    let consumed_milligas =
+        ProcessedOperation::total_consumed_milligas(processed_operations);
+    // Safe: consumed_milligas <= gas_limit * 1000, so ceil never exceeds gas_limit.
+    let consumed_gas = consumed_milligas.div_ceil(1000);
+    let consumed_gas_fees = michelson_gas_to_mutez(
+        config.base_fee_per_gas,
+        config.michelson_to_evm_gas_multiplier,
+        consumed_gas,
+    );
+
+    // saturating_sub ensures the refund is non-negative and smaller than the fees
+    // paid by the source account at the beginning of the application.
+    total_operation_fees.saturating_sub(config.da_fees.saturating_add(consumed_gas_fees))
+}
+
+extern crate alloc;
+
+/// Base58Check of the null implicit account
+/// `tz1Ke2h7sDdakHJQh8WX4Z372du1KChsksyU`.
+///
+/// Used as the kernel-stamped `SOURCE` field for cross-runtime requests
+/// (entrypoint calls and view calls) and as the `sender` of the
+/// synthetic CRAC-ID event prepended to CRAC receipts.  Michelson
+/// requires `SOURCE` to be an implicit account (tz1/tz2/tz3); CRACs
+/// have no natural implicit source, so this placeholder fills the
+/// role.  User-issued Michelson `EMIT` ops cannot carry this sender
+/// because `execute_internal_operations` stamps them with the
+/// executing contract's originated (KT1) address.
+pub const NULL_PKH: &str = "tz1Ke2h7sDdakHJQh8WX4Z372du1KChsksyU";
+
+pub mod account_storage;
+// Test-only oracle for KT1 derivation: production claims indices from
+// the Michelson journal and derives addresses with
+// `mir::interpreter::compute_contract_address` directly.
+#[cfg(test)]
+mod address;
+pub mod context;
+pub mod enshrined_contracts;
+mod gas;
+pub mod mir_ctx;
+pub mod storage_fees;
+mod validate;
+
+/// Where an internal operation entered the current frame's tree.
+enum InternalOpOrigin {
+    /// Operation directly emitted by the current frame.
+    Own {
+        /// Storage cost delegated to the operation.
+        delegated_storage_cost: u64,
+    },
+    /// Operation surfaced by the CRAC drain mechanism.
+    Crac,
+}
+
+/// An internal operation accumulated during the execution of a manager
+/// operation, paired with the origin that produced it within the current
+/// frame's tree.
+struct TaggedInternalOp {
+    op: InternalOperationSum,
+    origin: InternalOpOrigin,
+}
+
+impl TaggedInternalOp {
+    fn own(op: InternalOperationSum, delegated_storage_cost: u64) -> Self {
+        Self {
+            op,
+            origin: InternalOpOrigin::Own {
+                delegated_storage_cost,
+            },
+        }
+    }
+
+    fn from_crac(op: InternalOperationSum) -> Self {
+        Self {
+            op,
+            origin: InternalOpOrigin::Crac,
+        }
+    }
+
+    #[inline]
+    fn is_own(&self) -> bool {
+        matches!(self.origin, InternalOpOrigin::Own { .. })
+    }
+}
+
+/// Whether the last [`InternalOpOrigin::Own`] receipt of `receipts` is
+/// applied (vacuously true when there is none). Paired with the frame's
+/// [`SubtreeStatus`] by every parent verdict. CRAC receipts are ignored: EVM
+/// can catch their failures and let the parent succeed, and an uncaught one
+/// already fails the gateway transfer that made the call.
+fn last_own_receipt_applied(receipts: &[TaggedInternalOp]) -> bool {
+    receipts
+        .iter()
+        .rev()
+        .find(|t| t.is_own())
+        .is_none_or(|t| t.op.is_applied())
+}
+
+/// Drop the origin tags and return the underlying internal operations
+/// in their original order.
+fn untag_internals(tagged: Vec<TaggedInternalOp>) -> Vec<InternalOperationSum> {
+    tagged.into_iter().map(|t| t.op).collect()
+}
+
+/// Build the final [`ContentResult`] for the parent operation,
+/// cascading any exec failure into the internals (mutated in place).
+///
+/// - Parent `Err` → parent becomes `Failed`; every Applied
+///   internal is demoted to `BackTracked`.
+/// - Parent `Ok` but an internal failed → parent demoted to
+///   `BackTracked`; every Applied internal demoted to `BackTracked`.
+/// - Otherwise → parent stays `Applied`; internals untouched.
+fn finalize_statuses<M: OperationKind>(
+    result: Result<M::Success, ApplyOperationError>,
+    internal_operation_results: &mut [TaggedInternalOp],
+    internals: SubtreeStatus,
+) -> ContentResult<M> {
+    match result {
+        Ok(success) => {
+            // Keep the parent Applied if its own internal operations succeeded.
+            // Check `internals` because some failures leave no receipt (L2-1863).
+            // Also check the last Own receipt. Ignore CRAC receipts here:
+            // EVM can catch their failures and let the parent succeed.
+            let all_internal_succeeded = internals.all_applied()
+                && last_own_receipt_applied(internal_operation_results);
+            if all_internal_succeeded {
+                ContentResult::Applied(success)
+            } else {
+                internal_operation_results
+                    .iter_mut()
+                    .for_each(|t| t.op.transform_result_backtrack());
+                ContentResult::BackTracked(BacktrackedResult {
+                    errors: None,
+                    result: success,
+                })
+            }
+        }
+        Err(operation_error) => {
+            internal_operation_results
+                .iter_mut()
+                .for_each(|t| t.op.transform_result_backtrack());
+            ContentResult::Failed(vec![operation_error].into())
+        }
+    }
+}
+
+/// Charge the payer for the storage that `content` and each Own
+/// internal allocated.
+///
+/// Entries tagged [`InternalOpOrigin::Crac`] pass through unchanged
+/// — their storage cost belongs to a foreign-runtime caller.
+///
+/// On a per-entry burn failure, the receipt entries
+/// (clone-then-rebuild) carry the pre-burn internals — no stray
+/// balance_updates survive. Host-side debits applied by `burn_tez`
+/// are rolled back out-of-band by the caller's `SafeStorage`
+/// transaction.
+fn burn_pass<Host, M, A>(
+    host: &mut Host,
+    payer: &A,
+    storage_limit_remaining: &mut BigUint,
+    content: &mut ContentResult<M>,
+    internal_operation_results: Vec<TaggedInternalOp>,
+) -> (Vec<InternalOperationSum>, Result<(), ApplyOperationError>)
+where
+    Host: StorageV1,
+    M: storage_fees::OperationStorageFees,
+    A: TezosAccount,
+{
+    let parent_outcome = storage_fees::burn_content_storage_fees::<_, M>(
+        host,
+        payer,
+        storage_limit_remaining,
+        content,
+    );
+    if parent_outcome.is_err() {
+        return (untag_internals(internal_operation_results), parent_outcome);
+    }
+
+    let burned: Result<Vec<InternalOperationSum>, ApplyOperationError> =
+        internal_operation_results
+            .iter()
+            .map(|tagged_op| {
+                let mut op = tagged_op.op.clone();
+                match &tagged_op.origin {
+                    InternalOpOrigin::Own {
+                        delegated_storage_cost,
+                    } => {
+                        storage_fees::burn_internal_op_storage_fees(
+                            host,
+                            payer,
+                            storage_limit_remaining,
+                            &mut op,
+                        )?;
+                        storage_fees::add_delegated_storage_fee_balance_updates(
+                            payer,
+                            &mut op,
+                            *delegated_storage_cost,
+                        )?;
+                    }
+                    InternalOpOrigin::Crac => {}
+                }
+                Ok(op)
+            })
+            .collect();
+
+    match burned {
+        Ok(burned) => (burned, Ok(())),
+        Err(e) => (untag_internals(internal_operation_results), Err(e)),
+    }
+}
+
+/// Build the wire [`OperationResult`] for a manager operation:
+/// cascade statuses, burn storage fees, then assemble the receipt
+/// (never mutated afterwards).
+///
+/// A burn-level failure demotes the parent (and every Applied
+/// internal) to `BackTracked`, with the burn errors attached to
+/// the parent.
+#[allow(clippy::too_many_arguments)]
+fn finalize_and_burn<Host, M, A>(
+    host: &mut Host,
+    payer: &A,
+    storage_limit: &Narith,
+    balance_updates: Vec<BalanceUpdate>,
+    delegated_storage_cost: u64,
+    top_level_delegated_delta: u64,
+    result: Result<M::Success, ApplyOperationError>,
+    mut internal_operation_results: Vec<TaggedInternalOp>,
+    internals: SubtreeStatus,
+) -> OperationResult<M>
+where
+    Host: StorageV1,
+    M: storage_fees::OperationStorageFees,
+    A: TezosAccount,
+{
+    let mut content =
+        finalize_statuses::<M>(result, &mut internal_operation_results, internals);
+    let mut storage_limit_remaining: BigUint = storage_limit.0.clone();
+    let (mut internals, burn_outcome) = burn_pass(
+        host,
+        payer,
+        &mut storage_limit_remaining,
+        &mut content,
+        internal_operation_results,
+    );
+    let burn_outcome = burn_outcome.and_then(|()| {
+        storage_fees::burn_storage_cost(
+            host,
+            payer,
+            &mut storage_limit_remaining,
+            delegated_storage_cost,
+        )?;
+        storage_fees::add_delegated_storage_fee_balance_updates_to_content(
+            payer,
+            &mut content,
+            top_level_delegated_delta,
+        )
+    });
+    if let Err(errors) = burn_outcome {
+        log!(Debug, "Storage burn failed: {errors:?}");
+        content.backtrack_if_applied_with_errors(errors.into());
+        internals
+            .iter_mut()
+            .for_each(InternalOperationSum::transform_result_backtrack);
+    }
+    OperationResult {
+        balance_updates,
+        result: content,
+        internal_operation_results: internals,
+    }
+}
+
+/// Cost of a single durable-store write of `payload_bytes`, in
+/// milligas. Public counterpart of [`consume_storage_write_milligas`]
+/// for callers outside `tezos_execution` that maintain their own gas
+/// counter.
+pub fn storage_write_cost_milligas(count: u64, payload_bytes: u64) -> u64 {
+    gas::STORAGE_WRITE_BASE_MILLIGAS
+        .saturating_mul(count)
+        .saturating_add(
+            gas::STORAGE_WRITE_PER_BYTE_MILLIGAS.saturating_mul(payload_bytes),
+        )
+}
+
+/// Charge gas for a sequence of `count` durable-store writes whose
+/// combined payload is `payload_bytes`.
+pub(crate) fn consume_storage_write_milligas(
+    operation_gas: &mut TezlinkOperationGas,
+    count: u64,
+    payload_bytes: u64,
+) -> Result<(), mir::gas::OutOfGas> {
+    let cost = storage_write_cost_milligas(count, payload_bytes);
+    operation_gas.cast_and_consume_milligas(Milligas::new(cost))
+}
+
+/// Cost of a single durable-store read of `payload_bytes`, in
+/// milligas. Public counterpart of [`consume_storage_read_milligas`]
+/// for callers outside `tezos_execution` that maintain their own gas
+/// counter.
+pub fn storage_read_cost_milligas(count: u64, payload_bytes: u64) -> u64 {
+    gas::STORAGE_READ_BASE_MILLIGAS
+        .saturating_mul(count)
+        .saturating_add(gas::STORAGE_READ_PER_BYTE_MILLIGAS.saturating_mul(payload_bytes))
+}
+
+/// Charge gas for a sequence of `count` durable-store reads whose
+/// combined payload is `payload_bytes`.
+pub(crate) fn consume_storage_read_milligas(
+    operation_gas: &mut TezlinkOperationGas,
+    count: u64,
+    payload_bytes: u64,
+) -> Result<(), mir::gas::OutOfGas> {
+    let cost = storage_read_cost_milligas(count, payload_bytes);
+    operation_gas.cast_and_consume_milligas(Milligas::new(cost))
+}
+
+/// Counters are often being read and updated (code size, paid bytes, etc.). When
+/// charging gas for these operations, we use an upper-bound of their size.
+const COUNTER_SIZE: u64 = 32;
+
+fn reveal<Host>(
+    tc_ctx: &mut TcCtx<'_, '_, Host>,
+    source_account: &TezosImplicitAccount,
+    public_key: &PublicKey,
+) -> Result<RevealSuccess, RevealError>
+where
+    Host: KeySpaceLoader + StorageV1,
+{
+    log!(Debug, "Applying a reveal operation");
+    let manager = source_account
+        .manager(tc_ctx.rk.tez_accounts())
+        .map_err(|_| RevealError::UnretrievableManager)?;
+
+    let expected_hash = match manager {
+        Manager::Revealed(_) => {
+            return Err(RevealError::PreviouslyRevealedKey(Contract::Implicit(
+                source_account.pkh().clone(),
+            )))
+        }
+        Manager::NotRevealed(pkh) => pkh,
+    };
+
+    // Ensure that the source of the operation is equal to the retrieved hash.
+    if &expected_hash != source_account.pkh() {
+        return Err(RevealError::InconsistentHash {
+            public_key: public_key.clone(),
+            expected_hash,
+            source_hash: source_account.pkh().clone(),
+        });
+    }
+
+    // Check the public key
+    let pkh_from_pk = public_key.pk_hash();
+    if expected_hash != pkh_from_pk {
+        return Err(RevealError::InconsistentPublicKey {
+            public_key: public_key.clone(),
+            expected_hash,
+            computed_hash: pkh_from_pk,
+        });
+    }
+
+    // Set the public key as the manager
+    source_account
+        .set_manager_public_key(tc_ctx.rk.tez_accounts_mut(), public_key)
+        .map_err(|_| RevealError::FailedToWriteManager)?;
+
+    log!(Debug, "Reveal operation succeed");
+
+    Ok(RevealSuccess {
+        consumed_milligas: tc_ctx
+            .operation_gas
+            .get_and_reset_milligas_consumed()
+            .map_err(|_| RevealError::OutOfGas)?,
+    })
+}
+
+fn contract_from_address(address: AddressHash) -> Result<Contract, TransferError> {
+    match address {
+        AddressHash::Kt1(kt1) => Ok(Contract::Originated(kt1)),
+        AddressHash::Implicit(pkh) => Ok(Contract::Implicit(pkh)),
+        AddressHash::Sr1(_) => Err(TransferError::MirAddressUnsupportedError),
+    }
+}
+
+fn transfer_tez<Host>(
+    host: &mut Host,
+    giver_account: &impl TezosAccount,
+    amount: &Narith,
+    receiver_account: &impl TezosAccount,
+) -> Result<TransferSuccess, TransferError>
+where
+    Host: StorageV1,
+{
+    let balance_updates =
+        compute_balance_updates(giver_account, receiver_account, amount)
+            .map_err(|e| TransferError::FailedToComputeBalanceUpdate(e.to_string()))?;
+
+    apply_balance_changes(host, giver_account, receiver_account, &amount.0)?;
+    Ok(TransferSuccess {
+        storage: None,
+        lazy_storage_diff: None,
+        balance_updates,
+        ticket_receipt: vec![],
+        originated_contracts: vec![],
+        consumed_milligas: 0_u64.into(),
+        storage_size: 0_u64.into(),
+        paid_storage_size_diff: 0_u64.into(),
+        allocated_destination_contract: false,
+        address_registry_diff: vec![],
+    })
+}
+
+/// Credit the receiver without debiting any sender.
+/// Used for cross-runtime calls where the sender's balance was already
+/// debited on the EVM side.
+///
+/// Assumption: this path is enabled from a foreign calling runtime,
+/// and the sender was already debited in that runtime.
+fn credit_destination_without_debiting_sender(
+    host: &mut impl StorageV1,
+    amount: &Narith,
+    receiver_account: &impl TezosAccount,
+) -> Result<TransferSuccess, TransferError> {
+    if amount.eq(&0_u64.into()) {
+        return Ok(TransferSuccess {
+            storage: None,
+            lazy_storage_diff: None,
+            balance_updates: vec![],
+            ticket_receipt: vec![],
+            originated_contracts: vec![],
+            consumed_milligas: 0_u64.into(),
+            storage_size: 0_u64.into(),
+            paid_storage_size_diff: 0_u64.into(),
+            allocated_destination_contract: false,
+            address_registry_diff: vec![],
+        });
+    }
+    let receiver_balance = receiver_account
+        .balance(host)
+        .map_err(|_| TransferError::FailedToFetchDestinationBalance)?
+        .0;
+    let new_receiver_balance = (&receiver_balance + &amount.0).into();
+    receiver_account
+        .set_balance(host, &new_receiver_balance)
+        .map_err(|_| TransferError::FailedToUpdateDestinationBalance)?;
+    let receiver_delta = BigInt::from_biguint(num_bigint::Sign::Plus, amount.into());
+    Ok(TransferSuccess {
+        storage: None,
+        lazy_storage_diff: None,
+        // TODO: L2-882 design CRAC receipts
+        balance_updates: vec![BalanceUpdate {
+            balance: Balance::Account(receiver_account.contract()),
+            changes: receiver_delta.try_into().map_err(
+                |e: num_bigint::TryFromBigIntError<num_bigint::BigInt>| {
+                    TransferError::FailedToComputeBalanceUpdate(e.to_string())
+                },
+            )?,
+            update_origin: UpdateOrigin::BlockApplication,
+        }],
+        ticket_receipt: vec![],
+        originated_contracts: vec![],
+        consumed_milligas: 0_u64.into(),
+        storage_size: 0_u64.into(),
+        paid_storage_size_diff: 0_u64.into(),
+        allocated_destination_contract: false,
+        address_registry_diff: vec![],
+    })
+}
+
+fn burn_tez(
+    host: &mut impl StorageV1,
+    account: &impl TezosAccount,
+    amount: &num_bigint::BigUint,
+) -> Result<Narith, TransferError> {
+    let balance = account
+        .balance(host)
+        .map_err(|_| TransferError::FailedToFetchSenderBalance)?;
+    let new_balance = match balance.0.checked_sub(amount) {
+        None => {
+            return Err(TransferError::BalanceTooLow(BalanceTooLow {
+                contract: account.contract(),
+                balance: balance.clone(),
+                amount: amount.into(),
+            }));
+        }
+        Some(new_balance) => new_balance.into(),
+    };
+    account
+        .set_balance(host, &new_balance)
+        .map_err(|_| TransferError::FailedToApplyBalanceChanges)?;
+    Ok(new_balance)
+}
+
+/// How a queued internal operation should be turned into a receipt.
+///
+/// The decision is the same for every operation kind, so it is taken
+/// once per operation — before the per-kind `match` — rather than
+/// re-derived inside each arm:
+/// - [`Disposition::Skip`]: a previous internal operation in the same
+///   top-level operation already failed, so this one is not executed
+///   and is reported as `Skipped`.
+/// - [`Disposition::Replay`]: this operation shares its MIR counter
+///   with an already-applied one (a `DUP`ed `operation` value); it is
+///   rejected as an internal-operation replay (matching L1's
+///   `Internal_operation_replay`) instead of being applied again.
+/// - [`Disposition::Apply`]: execute the operation normally.
+#[derive(Clone, Copy)]
+enum Disposition {
+    Skip,
+    Replay,
+    Apply,
+}
+
+/// One suspended batch of sibling internal operations, plus the bookkeeping
+/// needed to finalize the operation that emitted it.
+///
+/// This is the heap-allocated stand-in for what used to be a native stack
+/// frame of [`execute_internal_operations`]. A Michelson call chain (`KT1_a`
+/// calls `KT1_b` calls `KT1_c` ...) used to recurse through
+/// `execute_internal_operations` -> `transfer` -> `execute_internal_operations`,
+/// so its depth grew the wasm shadow stack — a fixed 1 MiB that cannot grow,
+/// and good for only a few hundred levels once the MIR interpreter frames are
+/// counted, while the per-operation gas limit affords well over a thousand.
+/// Nesting now grows this `Vec` on the heap instead, leaving gas as the only
+/// bound — as in L1, where `Apply.apply_internal_operations` loops over a queue
+/// rather than recursing.
+struct InternalOpFrame<'a> {
+    /// Operations still to execute at this nesting level, in emission order.
+    pending: std::vec::IntoIter<OperationInfo<'a>>,
+    /// The contract that emitted `pending`; the `sender` of their receipts.
+    sender: crate::account_storage::TezosOriginatedAccount,
+    /// Set once any sibling at this level has failed; every remaining sibling
+    /// is then reported as `Skipped`.
+    failed: bool,
+}
+
+/// The transfer a nested [`InternalOpFrame`] is the subtree of: its receipt is
+/// built, but whether it reads `Applied`, `BackTracked` or `Failed` depends on
+/// how that subtree ends. Built pre-order, placed post-order by
+/// [`settle_parent_transfer`].
+struct PendingParent {
+    receipt: InternalContentWithMetadata<TransferContent>,
+    /// Where `receipt` goes in `all_internal_receipts`: the length the list had
+    /// when the transfer ran, so the receipt lands ahead of everything its
+    /// subtree contributes and the flat list stays in DFS order.
+    ///
+    /// What DFS order needs is that relative position, not a fixed absolute
+    /// offset — the receipt has to precede its own subtree, nothing more. So
+    /// the load-bearing property is that no insertion lands *before* a live
+    /// parent's `receipt_at`, and every insertion satisfies it:
+    ///
+    /// - an operation's own receipt is appended, at the end of the list;
+    /// - [`splice_reentrant_crac_ops`] splices just after an operation of the
+    ///   innermost frame, itself appended;
+    /// - [`settle_parent_transfer`] inserts at the `receipt_at` of the
+    ///   innermost pending parent, and `receipt_at` never decreases with
+    ///   nesting depth (the list only grows), so that index is at or after
+    ///   every enclosing one.
+    ///
+    /// The last case is routinely an *equality*, not a corner: a linear call
+    /// chain appends nothing on the way down, so every level captures the same
+    /// index — 0 for a chain hanging off the first operation — and settles
+    /// insert there in turn, innermost first. Each ancestor then still lands
+    /// ahead of the whole subtree it is inserting in front of, which is all
+    /// that is required. Anything that inserts further up the list breaks this
+    /// and has to place these receipts differently.
+    receipt_at: usize,
+    /// Storage cost the transfer delegated, dropped if the subtree raises.
+    delegated_storage_cost: u64,
+    /// `(pending, failed, backtracked)` CRAC list lengths, and the number of
+    /// pending alias originations, captured before the subtree ran; see
+    /// [`splice_reentrant_crac_ops`].
+    crac_watermarks: (usize, usize, usize, usize),
+}
+
+/// Drain the re-entrant CRAC ops accumulated while the operation whose receipt
+/// sits at `receipt_at` executed (a gateway leg that re-entered the Michelson
+/// runtime) and splice the synthetic frame in at `receipt_at + 1` — right after
+/// that operation and ahead of its inline children (e.g. the `%on_result`
+/// callback). The leg runs before the callback that consumes its payload, so
+/// the frame must precede it. Empty drain → no-op.
+fn splice_reentrant_crac_ops(
+    journal: &mut TezosXJournal,
+    all_internal_receipts: &mut Vec<TaggedInternalOp>,
+    receipt_at: usize,
+    (pending, failed, backtracked, alias_originations): (usize, usize, usize, usize),
+) {
+    // Aliases the operation materialized itself, e.g. through the gateway's
+    // `%materialize_alias`, come first: they were materialized before
+    // anything the operation emitted ran.
+    let alias_originations = journal
+        .michelson
+        .take_pending_alias_origination_internals_from(alias_originations);
+    let reentrant_ops = crate::enshrined_contracts::drain_reentrant_crac_ops(
+        journal,
+        pending,
+        failed,
+        backtracked,
+    );
+    let frame_at = receipt_at + 1;
+    all_internal_receipts.splice(
+        frame_at..frame_at,
+        alias_originations
+            .into_iter()
+            .chain(reentrant_ops)
+            .map(TaggedInternalOp::from_crac),
+    );
+}
+
+/// Whether anything in an internal-operation subtree failed.
+///
+/// This has to be carried out of the subtree rather than read back off its
+/// receipts, because a receipt list can end on an `Applied` entry even though
+/// the subtree failed: an operation that *raises* contributes no receipt at all
+/// — an unsupported `SET_DELEGATE` and an out-of-gas on the per-operation cost
+/// both do — and it abandons its batch, so no `Skipped` sibling is recorded
+/// after it either. `[EMIT ; SET_DELEGATE]` therefore leaves the applied event
+/// as the last receipt, and reading the tail reports success for a subtree that
+/// failed (L2-1863).
+#[must_use]
+#[derive(Clone, Copy)]
+enum SubtreeStatus {
+    AllApplied,
+    SomeFailed,
+}
+
+impl SubtreeStatus {
+    fn from_failed(failed: bool) -> Self {
+        if failed {
+            Self::SomeFailed
+        } else {
+            Self::AllApplied
+        }
+    }
+
+    fn all_applied(self) -> bool {
+        matches!(self, Self::AllApplied)
+    }
+}
+
+/// How the internal-operation subtree of a [`PendingParent`] ended.
+enum SubtreeEnd {
+    /// Every operation in it was dequeued, carrying the batch's own verdict.
+    Drained(SubtreeStatus),
+    /// Executing it raised, which the recursive version surfaced out of
+    /// `transfer` as `FailedToExecuteInternalOperation`.
+    Raised(ApplyOperationError),
+}
+
+/// Place the receipt of the transfer whose subtree just ended, resolved against
+/// how it ended, and fail `enclosing` — the batch that transfer belongs to — if
+/// it did not stay `Applied`, so its siblings are `Skipped`.
+fn settle_parent_transfer(
+    journal: &mut TezosXJournal,
+    all_internal_receipts: &mut Vec<TaggedInternalOp>,
+    enclosing: &mut InternalOpFrame<'_>,
+    parent: PendingParent,
+    end: SubtreeEnd,
+) {
+    let PendingParent {
+        mut receipt,
+        receipt_at,
+        delegated_storage_cost,
+        crac_watermarks,
+    } = parent;
+    let (applied, delegated_storage_cost) = match end {
+        SubtreeEnd::Drained(status) => {
+            // Both signals are needed. The subtree's own verdict covers what no
+            // receipt records (see [`SubtreeStatus`]); its last own receipt
+            // covers the rest. A re-entrant CRAC receipt spliced at the tail
+            // does not count, as in [`finalize_statuses`]. Read before the
+            // CRAC splice below, exactly where and when the recursive version
+            // read it.
+            let applied = status.all_applied()
+                && all_internal_receipts
+                    .get(receipt_at..)
+                    .is_none_or(last_own_receipt_applied);
+            if !applied {
+                receipt.result.backtrack_if_applied();
+            }
+            (applied, delegated_storage_cost)
+        }
+        SubtreeEnd::Raised(err) => {
+            let err = TransferError::FailedToExecuteInternalOperation(err.to_string());
+            log!(Error, "Internal transfer failed: {err:?}");
+            receipt.result = ContentResult::Failed(ApplyOperationError::from(err).into());
+            // The transfer's own `TransferSuccess` and delegated storage cost
+            // are dropped on this path, exactly as they were when the error
+            // travelled out of `transfer` instead.
+            (false, 0)
+        }
+    };
+    if !applied {
+        enclosing.failed = true;
+    }
+    // Insert the receipt BEFORE the subtree's own so the flat list follows DFS
+    // order: parent op, then its sub-ops. See [`PendingParent::receipt_at`].
+    all_internal_receipts.insert(
+        receipt_at,
+        TaggedInternalOp::own(
+            InternalOperationSum::Transfer(receipt),
+            delegated_storage_cost,
+        ),
+    );
+    splice_reentrant_crac_ops(
+        journal,
+        all_internal_receipts,
+        receipt_at,
+        crac_watermarks,
+    );
+}
+
+/// Execute `internal_operations` and everything they transitively emit,
+/// appending their receipts to `all_internal_receipts` in DFS order.
+///
+/// Iterative by design: `nested` is the explicit DFS worklist that replaces what
+/// used to be native recursion through [`transfer`] — see [`InternalOpFrame`].
+/// Only [`transfer_step`] is reached from here, never [`transfer`], so the cycle
+/// is gone.
+///
+/// Every nested frame is paired with the transfer it is the subtree of, and the
+/// batch handed in by the caller is held apart as `root`, so "the frame below
+/// this one" is always a frame and "the outermost batch" is always the one
+/// without a [`PendingParent`].
+///
+/// Returns whether anything in the whole subtree failed — `root`'s own verdict,
+/// which the caller needs to decide the enclosing operation's status and cannot
+/// rederive from the receipts. See [`SubtreeStatus`].
+#[allow(clippy::too_many_arguments)]
+fn execute_internal_operations<'a, Host>(
+    tc_ctx: &mut TcCtx<'a, '_, Host>,
+    operation_ctx: &mut OperationCtx<'a>,
+    registry: &impl Registry<Journal = tezosx_journal::TezosXJournal>,
+    journal: &mut TezosXJournal,
+    internal_operations: Vec<OperationInfo<'a>>,
+    sender_account: &crate::account_storage::TezosOriginatedAccount,
+    parser: &'a Parser<'a>,
+    all_internal_receipts: &mut Vec<TaggedInternalOp>,
+    nonce_counter: &mut u16,
+) -> Result<SubtreeStatus, ApplyOperationError>
+where
+    Host: KeySpaceLoader + StorageV1,
+{
+    let mut root = InternalOpFrame {
+        pending: internal_operations.into_iter(),
+        sender: sender_account.clone(),
+        failed: false,
+    };
+    let mut nested: Vec<(PendingParent, InternalOpFrame<'a>)> = vec![];
+    loop {
+        let frame = nested.last_mut().map_or(&mut root, |(_, frame)| frame);
+        let raised = match execute_pending_operations(
+            tc_ctx,
+            operation_ctx,
+            registry,
+            journal,
+            frame,
+            parser,
+            all_internal_receipts,
+            nonce_counter,
+        ) {
+            // One of the operations emitted a batch of its own: run that first.
+            // The transfer that emitted it is settled when this frame comes
+            // back on top and drains.
+            Ok(Some(child)) => {
+                nested.push(child);
+                continue;
+            }
+            Ok(None) => None,
+            // A block abort is never contained: it aborts everything.
+            Err(err @ ApplyOperationError::BlockAbort(_)) => return Err(err),
+            // Containment, one nesting level at a time, as in the recursive
+            // version: an error abandons the batch it was raised in, the
+            // transfer that emitted that batch is reported as `Failed`, and
+            // *its* siblings carry on (as `Skipped`).
+            Err(err) => Some(err),
+        };
+        let Some((parent, drained)) = nested.pop() else {
+            // `root` ended, so everything has: there is no transfer left to
+            // settle, and nobody here to contain an error raised in it. Its
+            // verdict is the caller's answer.
+            return match raised {
+                None => Ok(SubtreeStatus::from_failed(root.failed)),
+                Some(err) => Err(err),
+            };
+        };
+        let end = match raised {
+            // The batch that just drained is the authority on whether its own
+            // operations failed; its receipts are not.
+            None => SubtreeEnd::Drained(SubtreeStatus::from_failed(drained.failed)),
+            Some(err) => SubtreeEnd::Raised(err),
+        };
+        let enclosing = nested.last_mut().map_or(&mut root, |(_, frame)| frame);
+        settle_parent_transfer(journal, all_internal_receipts, enclosing, parent, end);
+    }
+}
+
+/// Execute the operations still pending in `frame`, appending a receipt per
+/// operation to `all_internal_receipts`, until either the batch drains
+/// (`Ok(None)`) or one of them is a transfer whose callee emitted internal
+/// operations of its own (`Ok(Some(..))`, that transfer and the batch it
+/// emitted).
+///
+/// Returning that batch instead of executing it here is what keeps a Michelson
+/// call chain off the native stack. The transfer's own receipt travels with it
+/// as a [`PendingParent`], to be placed by [`settle_parent_transfer`] once the
+/// returned frame has drained. `frame` keeps its iterator, so a later call
+/// resumes this batch where it left off.
+#[allow(clippy::too_many_arguments)]
+fn execute_pending_operations<'a, Host>(
+    tc_ctx: &mut TcCtx<'a, '_, Host>,
+    operation_ctx: &mut OperationCtx<'a>,
+    registry: &impl Registry<Journal = tezosx_journal::TezosXJournal>,
+    journal: &mut TezosXJournal,
+    // The batch to execute: supplies each operation's `sender` and carries the
+    // `failed` short-circuit shared by its siblings.
+    frame: &mut InternalOpFrame<'a>,
+    parser: &'a Parser<'a>,
+    all_internal_receipts: &mut Vec<TaggedInternalOp>,
+    nonce_counter: &mut u16,
+) -> Result<Option<(PendingParent, InternalOpFrame<'a>)>, ApplyOperationError>
+where
+    Host: KeySpaceLoader + StorageV1,
+{
+    for OperationInfo { operation, counter } in frame.pending.by_ref() {
+        // Where this operation's own receipt, appended below, lands.
+        let receipt_at = all_internal_receipts.len();
+        // Watermarks for the CRAC drain. Everything pushed to the three CRAC
+        // lists between here and the drain belongs to this op's own re-entrant
+        // subtree. Splicing it at the parent site keeps DFS order rather than
+        // letting it reach the top-level merge with a smaller seq than its
+        // outer parent (would invert DFS — L2-1300).
+        let crac_watermarks = (
+            journal.michelson.pending_crac_receipts.len(),
+            journal.michelson.failed_crac_receipts.len(),
+            journal.michelson.backtracked_crac_receipts.len(),
+            journal.michelson.pending_alias_origination_count(),
+        );
+        tc_ctx
+            .operation_gas
+            .consume(Cost::manager_operation())
+            .map_err(TransferError::OutOfGas)?;
+        log!(
+            Debug,
+            "Executing internal operation {operation:?} with counter {counter:?}"
+        );
+        // Assign operation-local nonces; block-sequential nonces are
+        // assigned at block finalization by renumber_nonces().
+        let nonce = *nonce_counter;
+        *nonce_counter = nonce_counter.saturating_add(1);
+        // Internal-operation replay detection. `operation` is
+        // `Duplicable`, so a contract may `DUP` an `operation` value and
+        // emit both copies. They share the MIR `counter`, the identity
+        // L1 uses to enforce internal-operation linearity. Record each
+        // counter as it is dequeued; a counter already seen within this
+        // top-level operation is a replay, and the duplicated operation
+        // is rejected (matching L1 `Internal_operation_replay`) instead
+        // of being applied a second time under a fresh display nonce.
+        let is_replay = !operation_ctx.applied_counters.insert(counter);
+        // Resolve the disposition once: a prior failure short-circuits
+        // every kind to `Skip`, a replayed counter to `Replay`, and a
+        // replay also fails the enclosing operation. Only `Apply` needs
+        // the per-kind logic below.
+        let disposition = if frame.failed {
+            Disposition::Skip
+        } else if is_replay {
+            frame.failed = true;
+            Disposition::Replay
+        } else {
+            Disposition::Apply
+        };
+        match operation {
+            mir::ast::Operation::TransferTokens(TransferTokens {
+                param,
+                destination_address,
+                amount,
+            }) => {
+                let amount = Narith(amount.try_into().map_err(
+                    |err: num_bigint::TryFromBigIntError<()>| {
+                        TransferError::MirAmountToNarithError(err.to_string())
+                    },
+                )?);
+                let dest_contract = contract_from_address(destination_address.hash)?;
+                // Unparsed through the borrowed walk, which reads through the
+                // `Rc` and clones only leaf payloads, charging before it
+                // allocates. Taking the parameter by value here instead would
+                // copy it whenever it is still shared — with the other
+                // occurrences of a `DUP`ed operation, or with the returned
+                // storage — and that copy would land before any unparsing gas
+                // is charged, so the heap would run out before the gas did.
+                //
+                // A transfer parameter is `Passable`, and `operation` is not,
+                // so the walk's refusal of `operation` is unreachable here.
+                let value = param
+                    .clone_into_micheline_optimized_legacy(
+                        &parser.arena,
+                        tc_ctx.gas(),
+                        Some(TypeProperty::Passable),
+                    )
+                    .map_err(TransferError::from)?;
+                let encoded_value = value.encode(tc_ctx.gas())?.map_err(|e| {
+                    TransferError::MichelineSerializationError(e.to_string())
+                })?;
+                let content = TransferContent {
+                    amount,
+                    destination: dest_contract,
+                    parameters: Parameters {
+                        entrypoint: destination_address.entrypoint,
+                        value: encoded_value,
+                    },
+                };
+                let (result, delegated_storage_cost_delta, subtree) = match disposition {
+                    Disposition::Skip => (ContentResult::Skipped, 0, None),
+                    Disposition::Replay => (
+                        ContentResult::Failed(
+                            ApplyOperationError::InternalOperationReplay.into(),
+                        ),
+                        0,
+                        None,
+                    ),
+                    Disposition::Apply => {
+                        // Internal-operation parameters were produced and
+                        // validated by the emitting contract during its own
+                        // execution, so they may legitimately reference
+                        // big_maps it owns.
+                        let allow_forged_lazy_storage_id = AllowForgedLazyStorageId::Yes;
+                        // `transfer_step`, not `transfer`: the callee's own
+                        // internal operations come back to the driver as a
+                        // new frame instead of recursing through here.
+                        let step = transfer_step(
+                            tc_ctx,
+                            operation_ctx,
+                            registry,
+                            journal,
+                            &frame.sender,
+                            &content.amount,
+                            &content.destination,
+                            &content.parameters.entrypoint,
+                            value,
+                            parser,
+                            false,
+                            allow_forged_lazy_storage_id,
+                        );
+                        match step {
+                            Ok(TransferStep {
+                                success,
+                                delegated_storage_cost,
+                                emitted,
+                            }) => (
+                                // Provisional: `settle_parent_transfer` demotes it
+                                // to `BackTracked` should `emitted` end in a
+                                // failure.
+                                ContentResult::Applied(success.into()),
+                                delegated_storage_cost,
+                                emitted,
+                            ),
+                            Err(CracError::BlockAbort(msg)) => {
+                                return Err(ApplyOperationError::BlockAbort(msg));
+                            }
+                            Err(CracError::Operation(err)) => {
+                                frame.failed = true;
+                                log!(Error, "Internal transfer failed: {err:?}");
+                                (
+                                    ContentResult::Failed(
+                                        ApplyOperationError::from(err).into(),
+                                    ),
+                                    0,
+                                    None,
+                                )
+                            }
+                        }
+                    }
+                };
+                let receipt = InternalContentWithMetadata {
+                    content,
+                    sender: frame.sender.contract(),
+                    nonce,
+                    result,
+                };
+                if let Some((callee, ops)) = subtree {
+                    // Hand the callee's batch back to the driver rather than
+                    // running it here, and let the receipt ride along: where it
+                    // ends up in `all_internal_receipts` is settled with it.
+                    return Ok(Some((
+                        PendingParent {
+                            receipt,
+                            receipt_at,
+                            delegated_storage_cost: delegated_storage_cost_delta,
+                            crac_watermarks,
+                        },
+                        InternalOpFrame {
+                            pending: ops.into_iter(),
+                            sender: callee,
+                            failed: false,
+                        },
+                    )));
+                }
+                all_internal_receipts.push(TaggedInternalOp::own(
+                    InternalOperationSum::Transfer(receipt),
+                    delegated_storage_cost_delta,
+                ));
+            }
+            mir::ast::Operation::CreateContract(mir::ast::CreateContract {
+                delegate,
+                amount,
+                storage,
+                code: _,
+                micheline_code,
+                address,
+            }) => {
+                let amount = Narith(amount.try_into().unwrap_or(BigUint::ZERO));
+                let encode_err = |e: tezos_data_encoding::enc::BinError| {
+                    ApplyOperationError::Origination(
+                        OriginationError::MichelineSerializationError(e.to_string()),
+                    )
+                };
+                let script = Script {
+                    code: micheline_code.encode(tc_ctx.gas())?.map_err(encode_err)?,
+                    // Borrowed, so the receipt's copy of the storage costs
+                    // nothing and the origination below still gets the payload
+                    // behind its `Rc`. Taking it by value here would copy it,
+                    // with the original still live.
+                    storage: storage
+                        .clone_into_micheline_optimized_legacy(
+                            &parser.arena,
+                            tc_ctx.gas(),
+                            Some(TypeProperty::Storable),
+                        )
+                        .map_err(OriginationError::from)?
+                        .encode(tc_ctx.gas())?
+                        .map_err(encode_err)?,
+                };
+                let result = match disposition {
+                    Disposition::Skip => ContentResult::Skipped,
+                    Disposition::Replay => ContentResult::Failed(
+                        ApplyOperationError::InternalOperationReplay.into(),
+                    ),
+                    Disposition::Apply => {
+                        let receipt = originate_contract(
+                            tc_ctx,
+                            address,
+                            &frame.sender,
+                            &amount,
+                            Some(&script.code),
+                            // Shared, not unwrapped: the other occurrences of
+                            // a `DUP`ed operation hold the same payload, so
+                            // `unwrap_or_clone` here would deep-copy it, unmetered
+                            // and before anything charges for it (L2-1836).
+                            storage,
+                            &Origin::Native,
+                        );
+                        match receipt {
+                            Ok(success) => ContentResult::Applied(success),
+                            Err(err) => {
+                                frame.failed = true;
+                                log!(Error, "Internal origination failed: {err:?}");
+                                ContentResult::Failed(
+                                    ApplyOperationError::from(err).into(),
+                                )
+                            }
+                        }
+                    }
+                };
+                all_internal_receipts.push(TaggedInternalOp::own(
+                    InternalOperationSum::Origination(InternalContentWithMetadata {
+                        content: OriginationContent {
+                            balance: amount,
+                            delegate,
+                            script,
+                        },
+                        sender: frame.sender.contract(),
+                        nonce,
+                        result,
+                    }),
+                    0,
+                ));
+            }
+            mir::ast::Operation::SetDelegate(set_delegate) => {
+                return Err(ApplyOperationError::UnSupportedSetDelegate(format!(
+                    "{set_delegate:?}"
+                )));
+            }
+
+            mir::ast::Operation::Emit(mir::ast::Emit { tag, value, arg_ty }) => {
+                let tag: Option<Entrypoint> = tag
+                    .map(|t| {
+                        t.try_into().map_err(|e: mir::ast::ByteReprError| {
+                            ApplyOperationError::UnSupportedEmit(format!(
+                                "Invalid emit tag: {e:?}"
+                            ))
+                        })
+                    })
+                    .transpose()?;
+                let emit_err = |e: tezos_data_encoding::enc::BinError| {
+                    ApplyOperationError::EmitMichelineSerializationError(e.to_string())
+                };
+                // Borrowed, like the transfer parameter above: an `EMIT`ted
+                // value shared with the stack copy that produced it must not be
+                // copied before the unparser has charged for it.
+                let payload = Some(
+                    value
+                        .clone_into_micheline_optimized_legacy(
+                            &parser.arena,
+                            tc_ctx.gas(),
+                            Some(TypeProperty::Pushable),
+                        )
+                        .map_err(|e| match e {
+                            mir::ast::BorrowedUnparseError::OutOfGas => {
+                                ApplyOperationError::OutOfGas(mir::gas::OutOfGas)
+                            }
+                            mir::ast::BorrowedUnparseError::UnsupportedUnparsing => {
+                                ApplyOperationError::EmitMichelineSerializationError(
+                                    "value carries an operation, which is not pushable"
+                                        .to_string(),
+                                )
+                            }
+                            mir::ast::BorrowedUnparseError::UnsatisfiedProperty(prop) => {
+                                ApplyOperationError::EmitMichelineSerializationError(
+                                    format!(
+                                        "value carries a sub-value that is not {prop}"
+                                    ),
+                                )
+                            }
+                        })?
+                        .encode(tc_ctx.gas())?
+                        .map_err(emit_err)?
+                        .into(),
+                );
+                let ty = match arg_ty {
+                    mir::ast::Or::Left(typ) => typ
+                        .into_micheline_optimized_legacy(&parser.arena, tc_ctx.gas())?
+                        .encode(tc_ctx.gas())?
+                        .map_err(emit_err)?,
+                    mir::ast::Or::Right(mic) => {
+                        mic.encode(tc_ctx.gas())?.map_err(emit_err)?
+                    }
+                }
+                .into();
+                let result = match disposition {
+                    Disposition::Skip => ContentResult::Skipped,
+                    Disposition::Replay => ContentResult::Failed(
+                        ApplyOperationError::InternalOperationReplay.into(),
+                    ),
+                    Disposition::Apply => {
+                        // Same semantics as OCaml:
+                        // Gas.consumed ~since:ctxt_before_op ~until:ctxt
+                        let consumed_milligas = tc_ctx
+                            .operation_gas
+                            .get_and_reset_milligas_consumed()
+                            .map_err(TransferError::OutOfGas)?;
+                        ContentResult::Applied(EventSuccess { consumed_milligas })
+                    }
+                };
+                all_internal_receipts.push(TaggedInternalOp::own(
+                    InternalOperationSum::Event(InternalContentWithMetadata {
+                        content: EventContent { tag, payload, ty },
+                        sender: frame.sender.contract(),
+                        nonce,
+                        result,
+                    }),
+                    0,
+                ));
+            }
+        }
+        log!(Debug, "Internal operation executed successfully");
+        splice_reentrant_crac_ops(
+            journal,
+            all_internal_receipts,
+            receipt_at,
+            crac_watermarks,
+        );
+    }
+    Ok(None)
+}
+
+/// The internal operations a transfer's callee emitted, together with that
+/// callee — their `sender`. `None` when no code ran (implicit destination) or
+/// when the transfer was not applied at all, in which case there is no subtree.
+type Subtree<'a> = Option<(
+    crate::account_storage::TezosOriginatedAccount,
+    Vec<OperationInfo<'a>>,
+)>;
+
+/// Outcome of [`transfer_step`]: everything the transfer's own receipt needs,
+/// plus the internal operations its callee emitted, left for the caller to
+/// execute.
+struct TransferStep<'a> {
+    success: TransferSuccess,
+    delegated_storage_cost: u64,
+    emitted: Subtree<'a>,
+}
+
+/// Outcome of [`transfer`]: the transfer's own receipt data, plus the verdict of
+/// the internal-operation subtree it drove — which its caller needs to decide
+/// the enclosing operation's status, see [`SubtreeStatus`].
+struct TransferOutcome {
+    success: TransferSuccess,
+    delegated_storage_cost: u64,
+    subtree: SubtreeStatus,
+}
+
+/// Handles manager transfer operations for both implicit and originated
+/// contracts but with a MIR context, including the internal operations the
+/// callee emits.
+///
+/// Only for the outermost transfer of an operation. Internal transfers go
+/// through [`transfer_step`] driven by [`execute_internal_operations`], so
+/// that a Michelson call chain does not recurse on the native stack.
+#[allow(clippy::too_many_arguments)]
+fn transfer<'a, Host>(
+    tc_ctx: &mut TcCtx<'a, '_, Host>,
+    operation_ctx: &mut OperationCtx<'a>,
+    registry: &impl Registry<Journal = tezosx_journal::TezosXJournal>,
+    journal: &mut TezosXJournal,
+    sender_account: &impl TezosAccount,
+    amount: &Narith,
+    dest_contract: &Contract,
+    entrypoint: &Entrypoint,
+    param: Micheline<'a>,
+    parser: &'a Parser<'a>,
+    all_internal_receipts: &mut Vec<TaggedInternalOp>,
+    skip_sender_debit: bool,
+    // Whether a forged big_map id (a bare lazy-storage reference) is allowed in
+    // `param`. See [`mir::typechecker::AllowForgedLazyStorageId`].
+    allow_forged_lazy_storage_id: AllowForgedLazyStorageId,
+    nonce_counter: &mut u16,
+) -> Result<TransferOutcome, CracError>
+where
+    Host: KeySpaceLoader + StorageV1,
+{
+    let pending_crac_receipts_before = journal.michelson.pending_crac_receipts.len();
+    let failed_crac_receipts_before = journal.michelson.failed_crac_receipts.len();
+    let backtracked_crac_receipts_before =
+        journal.michelson.backtracked_crac_receipts.len();
+    let alias_originations_before = journal.michelson.pending_alias_origination_count();
+
+    let step_result = transfer_step(
+        tc_ctx,
+        operation_ctx,
+        registry,
+        journal,
+        sender_account,
+        amount,
+        dest_contract,
+        entrypoint,
+        param,
+        parser,
+        skip_sender_debit,
+        allow_forged_lazy_storage_id,
+    );
+    // Aliases the gateway materialized itself, through `%materialize_alias`,
+    // were materialized before anything it emitted ran: they come first.
+    let alias_originations = journal
+        .michelson
+        .take_pending_alias_origination_internals_from(alias_originations_before);
+    // A direct gateway call may re-enter Michelson even without emitting a
+    // callback. Nest its CRAC frames before callbacks, including on failure.
+    let reentrant_ops = crate::enshrined_contracts::drain_reentrant_crac_ops(
+        journal,
+        pending_crac_receipts_before,
+        failed_crac_receipts_before,
+        backtracked_crac_receipts_before,
+    );
+    all_internal_receipts.extend(
+        alias_originations
+            .into_iter()
+            .chain(reentrant_ops)
+            .map(TaggedInternalOp::from_crac),
+    );
+    let TransferStep {
+        success,
+        delegated_storage_cost,
+        emitted,
+    } = step_result?;
+    let subtree = match emitted {
+        // No emitted operations to execute; CRAC status is combined below.
+        None => SubtreeStatus::AllApplied,
+        Some((callee, internal_operations)) => match execute_internal_operations(
+            tc_ctx,
+            operation_ctx,
+            registry,
+            journal,
+            internal_operations,
+            &callee,
+            parser,
+            all_internal_receipts,
+            nonce_counter,
+        ) {
+            Ok(subtree) => subtree,
+            Err(ApplyOperationError::BlockAbort(msg)) => {
+                return Err(CracError::BlockAbort(msg))
+            }
+            Err(other) => {
+                return Err(CracError::Operation(
+                    TransferError::FailedToExecuteInternalOperation(other.to_string()),
+                ))
+            }
+        },
+    };
+    Ok(TransferOutcome {
+        success,
+        delegated_storage_cost,
+        subtree,
+    })
+}
+
+/// Executes a transfer up to — but not including — the internal operations the
+/// callee emitted, which are returned in [`TransferStep::emitted`] instead.
+///
+/// The split is what makes internal-operation execution iterative: the
+/// transfer's own receipt is fully determined at this point (its
+/// `consumed_milligas` is even reset here, so children's gas is not attributed
+/// to it, matching L1's `Gas.consumed ~since:ctxt_before_op`), so nothing needs
+/// to stay on the native stack while the subtree runs.
+///
+/// When `skip_sender_debit` is true, only the receiver is credited without
+/// debiting the sender. This is used for cross-runtime calls (e.g. EVM gateway)
+/// where the sender's balance was already debited by the calling runtime.
+#[allow(clippy::too_many_arguments)]
+fn transfer_step<'a, Host>(
+    tc_ctx: &mut TcCtx<'a, '_, Host>,
+    operation_ctx: &mut OperationCtx<'a>,
+    registry: &impl Registry<Journal = tezosx_journal::TezosXJournal>,
+    journal: &mut TezosXJournal,
+    sender_account: &impl TezosAccount,
+    amount: &Narith,
+    dest_contract: &Contract,
+    entrypoint: &Entrypoint,
+    param: Micheline<'a>,
+    parser: &'a Parser<'a>,
+    skip_sender_debit: bool,
+    // Whether a forged big_map id (a bare lazy-storage reference) is allowed in
+    // `param`. See [`mir::typechecker::AllowForgedLazyStorageId`].
+    allow_forged_lazy_storage_id: AllowForgedLazyStorageId,
+) -> Result<TransferStep<'a>, CracError>
+where
+    Host: KeySpaceLoader + StorageV1,
+{
+    match dest_contract {
+        Contract::Implicit(pkh) => {
+            tc_ctx
+                .operation_gas
+                .consume(Cost::transaction())
+                .map_err(TransferError::OutOfGas)?;
+
+            // Safety coupling: `Operation::touches_only_accounts` (tezos crate)
+            // treats implicit-destination transfers as account-only and lets the
+            // caller narrow the per-operation SafeStorage snapshot to the accounts
+            // root. That relies on this guard rejecting any implicit transfer that
+            // could execute code or touch another root (non-default entrypoint /
+            // non-Unit parameter). Do not relax it without revisiting that
+            // classifier.
+            if !entrypoint.is_default() {
+                return Err(TransferError::NoSuchEntrypoint(entrypoint.clone()).into());
+            }
+            if param != Micheline::from(()) {
+                return Err(TransferError::BadContractParameter(
+                    sender_account.contract(),
+                )
+                .into());
+            }
+            // Transfers of 0 tez to an implicit contract are rejected.
+            if amount.eq(&0_u64.into()) {
+                return Err(
+                    TransferError::EmptyImplicitTransfer(dest_contract.clone()).into()
+                );
+            };
+
+            let dest_account = context::implicit_from_public_key_hash(pkh)
+                .map_err(|_| TransferError::FailedToFetchDestinationAccount)?;
+            let already_allocated =
+                dest_account
+                    .allocate(tc_ctx.rk.tez_accounts_mut())
+                    .map_err(|_| TransferError::FailedToAllocateDestination)?;
+            let receipt = if skip_sender_debit {
+                credit_destination_without_debiting_sender(
+                    tc_ctx.rk.host_mut(),
+                    amount,
+                    &dest_account,
+                )?
+            } else {
+                transfer_tez(tc_ctx.rk.host_mut(), sender_account, amount, &dest_account)?
+            };
+            Ok(TransferStep {
+                success: TransferSuccess {
+                    allocated_destination_contract: !already_allocated,
+                    consumed_milligas: tc_ctx
+                        .operation_gas
+                        .get_and_reset_milligas_consumed()
+                        .map_err(TransferError::OutOfGas)?,
+                    ..receipt
+                },
+                delegated_storage_cost: 0,
+                // No code runs for an implicit destination, so there is
+                // nothing to emit.
+                emitted: None,
+            })
+        }
+        Contract::Originated(kt1) => {
+            let dest_account = context::originated_from_kt1(kt1)
+                .map_err(|_| TransferError::FailedToFetchDestinationAccount)?;
+            // Reject transfers to a never-originated KT1 before any state
+            // write. Without this check, `transfer_tez` would create a
+            // balance entry under the bogus contract path and the failure
+            // would only surface at `code()` as RuntimeError::PathNotFound,
+            // wrapped as FailedToFetchContractCode → CracError::BlockAbort
+            // — a user-controllable block-abort handle. Mirrors Tezos's
+            // `Contract.Non_existing_contract`.
+            if !dest_account
+                .exists(tc_ctx.rk.host())
+                .map_err(|_| TransferError::FailedToFetchDestinationAccount)?
+            {
+                return Err(TransferError::ContractDoesNotExist(Contract::Originated(
+                    kt1.clone(),
+                ))
+                .into());
+            }
+            let receipt = if skip_sender_debit {
+                credit_destination_without_debiting_sender(
+                    tc_ctx.rk.host_mut(),
+                    amount,
+                    &dest_account,
+                )?
+            } else {
+                transfer_tez(tc_ctx.rk.host_mut(), sender_account, amount, &dest_account)?
+            };
+            let code = dest_account
+                .code(tc_ctx.rk.host())
+                .map_err(|_| TransferError::FailedToFetchContractCode)?;
+            let (code_read_count, code_size) = match &code {
+                Code::Code(code_bytes) => (1, code_bytes.len() as u64),
+                Code::Enshrined(_) => (0, 0),
+            };
+            consume_storage_read_milligas(
+                tc_ctx.operation_gas,
+                code_read_count,
+                code_size,
+            )
+            .map_err(TransferError::OutOfGas)?;
+            let storage = dest_account
+                .storage(tc_ctx.rk.host())
+                .map_err(|_| TransferError::FailedToFetchContractStorage)?;
+            consume_storage_read_milligas(tc_ctx.operation_gas, 1, storage.len() as u64)
+                .map_err(TransferError::OutOfGas)?;
+            let exec_ctx = ExecCtx::create(
+                tc_ctx.rk.host_mut(),
+                sender_account,
+                &dest_account,
+                amount,
+            )?;
+
+            let delegated_storage_cost_before = operation_ctx.delegated_storage_cost;
+            let (internal_operations, new_storage, address_registry_diff): (
+                Vec<OperationInfo<'a>>,
+                Vec<u8>,
+                Vec<AddressRegistry>,
+            ) = {
+                let mut ctx = Ctx {
+                    tc_ctx: &mut *tc_ctx,
+                    exec_ctx,
+                    operation_ctx: &mut *operation_ctx,
+                    journal: &mut *journal,
+                    registry,
+                    address_registry_diff: Vec::new(),
+                };
+                let (internal_operations, new_storage) = match code {
+                    Code::Code(code_bytes) => {
+                        let (iter, new_storage) = interpret_encoded_script(
+                            &code_bytes,
+                            &storage,
+                            entrypoint,
+                            param,
+                            parser,
+                            &mut ctx,
+                            allow_forged_lazy_storage_id,
+                        )
+                        .map_err(TransferError::from)?;
+                        (iter.collect::<Vec<_>>(), new_storage)
+                    }
+                    Code::Enshrined(contract) => {
+                        let ops = enshrined_contracts::execute_enshrined_contract(
+                            contract, entrypoint, param, &mut ctx,
+                        )?;
+                        (ops, vec![])
+                    }
+                };
+                let address_registry_diff = ctx.address_registry_diff;
+                (internal_operations, new_storage, address_registry_diff)
+            };
+            let delegated_storage_cost =
+                operation_ctx.delegated_storage_cost - delegated_storage_cost_before;
+
+            // `interpret_context` holds this operation's lazy-storage size
+            // delta, accumulated by the `LazyStorage` hooks during execution.
+            // Like `big_map_diff`, it is a per-operation value carried on the
+            // batch-lifetime `TcCtx` and drained at each operation boundary;
+            // the drain also resets it, so every frame (this transfer, and the
+            // origination path) starts empty and no separate reset is needed.
+            // TODO(L2-1481): make this draining structurally safe so a hook
+            // firing without a matching drain cannot be silently mispriced.
+            let lazy_storage_size_diff =
+                tc_ctx.interpret_context.take_lazy_storage_size_diff();
+
+            // Read the contract's current accounting record and compute the
+            // post-update record, folding the storage-size delta and the
+            // lazy-storage delta into `used_bytes`. Then charge gas for the
+            // durable-storage operations this transfer performs — the storage
+            // blob write plus the single read-modify-write of the aggregated
+            // `/info` record, each at the exact number of bytes moved. The
+            // record is only persisted (further below) once its cost has been
+            // charged. Enshrined contracts have synthetic storage that is not
+            // accounted: they read, charge, and write nothing here.
+            let (storage_space, info_to_write) =
+                if enshrined_contracts::is_enshrined(dest_account.kt1()) {
+                    (
+                        StorageSpace {
+                            used_bytes: 0.into(),
+                            allocated_bytes: 0.into(),
+                        },
+                        None,
+                    )
+                } else {
+                    let (prev_info, info_bytes_read) = dest_account
+                        .read_info_with_len(tc_ctx.rk.host())
+                        .map_err(|_| TransferError::FailedToUpdateContractStorage)?;
+                    let (new_info, space) = prev_info.with_storage_size(
+                        new_storage.len() as u64,
+                        lazy_storage_size_diff,
+                    );
+                    let info_bytes_written = new_info
+                        .encoded_len()
+                        .map_err(|_| TransferError::FailedToUpdateContractStorage)?;
+
+                    consume_storage_write_milligas(
+                        tc_ctx.operation_gas,
+                        1,
+                        new_storage.len() as u64,
+                    )
+                    .map_err(TransferError::OutOfGas)?;
+                    consume_storage_read_milligas(
+                        tc_ctx.operation_gas,
+                        1,
+                        info_bytes_read,
+                    )
+                    .map_err(TransferError::OutOfGas)?;
+                    consume_storage_write_milligas(
+                        tc_ctx.operation_gas,
+                        1,
+                        info_bytes_written,
+                    )
+                    .map_err(TransferError::OutOfGas)?;
+
+                    (space, Some(new_info))
+                };
+
+            // In L1, the receipt of an operation only shows its own gas
+            // consumption, i.e. it does not include that of its internal
+            // operations.
+            let consumed_milligas = tc_ctx
+                .operation_gas
+                .get_and_reset_milligas_consumed()
+                .map_err(TransferError::OutOfGas)?;
+            let big_map_diff_order = tc_ctx.interpret_context.take_big_map_diff_order();
+            let lazy_storage_diff = convert_big_map_diff(
+                std::mem::take(&mut tc_ctx.big_map_diff),
+                big_map_diff_order,
+            );
+
+            // Persist the storage blob and the accounting record now that
+            // their gas has been charged (no-op for enshrined contracts).
+            if let Some(info) = &info_to_write {
+                dest_account
+                    .write_storage_and_info(tc_ctx.rk.host_mut(), &new_storage, info)
+                    .map_err(|_| TransferError::FailedToUpdateContractStorage)?;
+            }
+            let StorageSpace {
+                used_bytes,
+                allocated_bytes: paid_storage_size_diff,
+            } = storage_space;
+
+            log!(Debug, "Transfer operation succeeded");
+            Ok(TransferStep {
+                success: TransferSuccess {
+                    storage: if new_storage.is_empty() {
+                        None
+                    } else {
+                        Some(new_storage.into())
+                    },
+                    lazy_storage_diff,
+                    consumed_milligas,
+                    storage_size: used_bytes,
+                    paid_storage_size_diff,
+                    address_registry_diff,
+                    ..receipt
+                },
+                delegated_storage_cost,
+                // The operations the callee emitted are deliberately NOT run
+                // here: doing so is what made a Michelson call chain recurse
+                // on the native stack. The caller drives them iteratively —
+                // see `execute_internal_operations`.
+                emitted: Some((dest_account, internal_operations)),
+            })
+        }
+    }
+}
+
+/// Typecheck originated-contract `code`, returning its exposed entrypoints
+/// (annotation → type) together with its declared storage type. `None` if
+/// `code` is not a well-formed, typeable script (or gas is exhausted).
+fn typecheck_originated_script(
+    code: &[u8],
+    gas: &mut Gas,
+) -> Option<(HashMap<Entrypoint, mir::ast::Type>, mir::ast::Type)> {
+    let parser = Parser::new();
+    let micheline = Micheline::decode_raw(&parser.arena, code, gas).ok()?.ok()?;
+    let typechecked = micheline
+        .split_script()
+        .ok()?
+        .typecheck_script(gas, true, false)
+        .ok()?;
+    // `typechecked` is only used afterwards via `.annotations`, so the
+    // (recursive, non-trivial) storage type can be moved out instead of cloned.
+    let storage_ty = typechecked.storage;
+    let entrypoints = typechecked
+        .annotations
+        .into_iter()
+        .filter_map(|(field_annotation, (_, ty))| {
+            mir::ast::Entrypoint::try_from(field_annotation)
+                .ok()
+                .map(|entrypoint| (entrypoint, ty.clone()))
+        })
+        .collect();
+    Some((entrypoints, storage_ty))
+}
+
+fn get_originated_contract_entrypoint(
+    code: Vec<u8>,
+    gas: &mut Gas,
+) -> Option<HashMap<Entrypoint, mir::ast::Type>> {
+    typecheck_originated_script(&code, gas).map(|(entrypoints, _)| entrypoints)
+}
+
+pub fn get_contract_entrypoint(
+    host: &impl StorageV1,
+    address: &AddressHash,
+    gas: &mut Gas,
+) -> Option<HashMap<mir::ast::Entrypoint, mir::ast::Type>> {
+    let contract = contract_from_address(address.clone()).ok()?;
+    let contract_account = context::originated_from_contract(&contract).ok()?;
+    let code = contract_account.code(host).ok()?;
+    match code {
+        Code::Code(code) => get_originated_contract_entrypoint(code, gas),
+        Code::Enshrined(contract) => get_enshrined_contract_entrypoint(contract),
+    }
+}
+
+/// Errors returned by [`upgrade_alias_implementation`].
+#[derive(Debug, PartialEq, Eq)]
+pub enum AliasUpgradeError {
+    /// `new_code` is not a well-formed, typeable Michelson script.
+    InvalidScript,
+    /// The currently-installed implementation no longer typechecks. Should
+    /// never happen; indicates a corrupted slot.
+    CurrentImplementationInvalid,
+    /// `new_code` removes (or renames) an entrypoint exposed by the current
+    /// implementation. Downstream Michelson contracts may hardcode entrypoint
+    /// annotations, so an exposed entrypoint may never disappear.
+    EntrypointRemoved(String),
+    /// `new_code` changes the type of an already-exposed entrypoint.
+    EntrypointTypeChanged(String),
+    /// `new_code` changes the contract's storage type. Every alias keeps its
+    /// own storage typed against the shared code; a storage-type change would
+    /// brick every alias at its next execution.
+    StorageTypeChanged,
+    /// Durable-storage failure while reading or writing the slot.
+    Storage(StorageError),
+}
+
+impl From<StorageError> for AliasUpgradeError {
+    fn from(e: StorageError) -> Self {
+        Self::Storage(e)
+    }
+}
+
+/// Atomically upgrade the single shared Michelson alias implementation (see
+/// [`account_storage::ALIAS_IMPLEMENTATION_PATH`]). A single durable-storage
+/// write here changes the behaviour of **every** existing and future alias at
+/// once — O(1) in the number of aliases.
+///
+/// `new_code` must be a typeable Michelson script. To protect downstream
+/// callers, the upgrade enforces two invariants against the currently-installed
+/// implementation:
+///
+/// - **Entrypoint monotonicity:** every entrypoint exposed today must still be
+///   present, with the same type, in `new_code` (new entrypoints may be added).
+///   This protects callers that hardcode entrypoint annotations.
+/// - **Storage-type invariance:** the storage type must not change. Each alias
+///   keeps its own `/data/storage` typed against the shared code, so a
+///   storage-type change would brick every alias at its next execution.
+///
+/// Note on widening the parameter while keeping the implicit `default`
+/// entrypoint: in Michelson the `default` entrypoint's type is the *whole* root
+/// parameter unless a branch is annotated `%default`. So to add an entrypoint
+/// via an `or` while preserving `default`, the old default branch must be
+/// annotated `%default` in `new_code` — otherwise `default`'s type changes and
+/// the upgrade is (correctly) rejected.
+///
+/// This is the upgrade primitive only.
+// TODO: https://linear.app/tezos/issue/L2-1530
+// Wire this to the Tezos X governance trigger that authorises an upgrade.
+// Until then it has no caller outside tests; the mechanism by which a
+// governance decision reaches the kernel is out of scope for L2-1528. When a
+// metered caller is wired, revisit gas accounting and distinguishing
+// out-of-gas from a genuinely invalid script.
+pub fn upgrade_alias_implementation<Host: StorageV1>(
+    host: &mut Host,
+    new_code: &[u8],
+    gas: &mut Gas,
+) -> Result<(), AliasUpgradeError> {
+    // `new_code` (untrusted) must be a well-formed, typeable script.
+    let (new_entrypoints, new_storage_ty) = typecheck_originated_script(new_code, gas)
+        .ok_or(AliasUpgradeError::InvalidScript)?;
+
+    // Check invariants against the currently-installed implementation. An
+    // absent slot (not seeded yet) means there is nothing to preserve.
+    if let Some(current_code) = account_storage::read_alias_implementation(host)? {
+        // The current implementation is already installed and trusted; typecheck
+        // it with a fresh budget (it is small and known-good) so `new_code`'s
+        // gas consumption cannot starve this check and misreport it as corrupt.
+        let (current_entrypoints, current_storage_ty) =
+            typecheck_originated_script(&current_code, &mut Gas::default())
+                .ok_or(AliasUpgradeError::CurrentImplementationInvalid)?;
+
+        if new_storage_ty != current_storage_ty {
+            return Err(AliasUpgradeError::StorageTypeChanged);
+        }
+
+        for (entrypoint, ty) in current_entrypoints.iter() {
+            match new_entrypoints.get(entrypoint) {
+                Some(new_ty) if new_ty == ty => {}
+                Some(_) => {
+                    return Err(AliasUpgradeError::EntrypointTypeChanged(format!(
+                        "{entrypoint}"
+                    )))
+                }
+                None => {
+                    return Err(AliasUpgradeError::EntrypointRemoved(format!(
+                        "{entrypoint}"
+                    )))
+                }
+            }
+        }
+    }
+
+    // One write upgrades every alias.
+    account_storage::write_alias_implementation(host, new_code)?;
+    Ok(())
+}
+
+/// Look up the synthetic views declared by an enshrined contract.
+///
+/// Returns `Some(views)` (possibly empty) for enshrined contracts,
+/// `None` for unknown addresses or for originated contracts — the
+/// latter already expose their views inside their on-chain Michelson
+/// code, so off-chain tooling discovers them through `/script`
+/// directly. See
+/// [`crate::mir_ctx::enshrined_synthetic_views`] for the source of
+/// truth.
+pub fn get_enshrined_contract_views(
+    host: &impl StorageV1,
+    address: &AddressHash,
+) -> Option<Vec<(&'static str, mir::ast::Type, mir::ast::Type)>> {
+    let contract = contract_from_address(address.clone()).ok()?;
+    let contract_account = context::originated_from_contract(&contract).ok()?;
+    let code = contract_account.code(host).ok()?;
+    match code {
+        Code::Code(_) => None,
+        Code::Enshrined(contract) => {
+            Some(crate::mir_ctx::enshrined_synthetic_views(contract))
+        }
+    }
+}
+
+/// Debug-render a MIR error (or value) under the runtime's byte cap: a
+/// `DUP; PAIR` DAG built for `O(K)` gas renders as `2^K` nodes (see
+/// [`mir::bounded_fmt`]), and this backs a free, unauthenticated RPC, so
+/// an uncapped render is an OOM vector.
+fn bounded_render<T: std::fmt::Debug + ?Sized>(value: &T) -> String {
+    mir::bounded_fmt::debug_bounded(
+        value,
+        mir::bounded_fmt::MAX_INTERPRET_ERROR_RENDER_BYTES,
+    )
+}
+
+/// Inputs of [`run_code`]: run an arbitrary Michelson script against the
+/// current state, without originating it. Can be used by the node
+/// to implement RPCs such as `run_script_view`, `run_code`,
+/// `trace_code` and TZIP-4 `run_view`.
+#[derive(Debug)]
+pub struct RunCodeParams {
+    /// Micheline-encoded toplevel script (`parameter` / `storage` / `code`).
+    pub script: Vec<u8>,
+    /// Micheline-encoded initial storage.
+    pub storage: Vec<u8>,
+    /// Micheline-encoded parameter.
+    pub input: Vec<u8>,
+    /// Entrypoint to call.
+    pub entrypoint: Entrypoint,
+    /// Value of `SELF_ADDRESS`, and the account whose balance backs
+    /// `BALANCE` when [`balance`](Self::balance) is absent. Mandatory,
+    /// unlike L1's `opt "self"`: L1 answers an absent `self` by
+    /// originating a 4,000,000-ꜩ dummy in its in-memory simulation
+    /// context, which here would mean minting into durable storage.
+    // TODO: https://linear.app/tezos/issue/L2-1875
+    // The `run_code` RPC lets the caller omit `self`; synthesise the KT1
+    // node-side rather than teaching the kernel to mint.
+    pub self_address: ContractKt1Hash,
+    /// Value of `SENDER`. Defaults to [`payer`](Self::payer) when that is
+    /// given, and to `self_address` otherwise — L1 resolves the pair
+    /// together, see `sender_and_payer` in `proto_alpha/lib_plugin/RPC.ml`.
+    pub sender: Option<AddressHash>,
+    /// Value of `SOURCE`. Defaults to the null implicit account (the
+    /// all-zero `tz1`, L1's `Implicit_account_repr.zero`).
+    pub payer: Option<PublicKeyHash>,
+    /// Value of `AMOUNT`, in mutez.
+    pub amount: u64,
+    /// Value of `BALANCE`, in mutez. Defaults to `self_address`'s own
+    /// balance, which is zero if that account does not exist.
+    pub balance: Option<u64>,
+    /// Gas budget, in milligas.
+    pub milligas: u64,
+    /// Value of `CHAIN_ID`.
+    pub chain_id: tezos_crypto_rs::hash::ChainId,
+    /// Value of `LEVEL`.
+    pub level: tezos_tezlink::enc_wrappers::BlockNumber,
+    /// Value of `NOW`.
+    pub now: tezos_smart_rollup::types::Timestamp,
+}
+
+/// Output of [`run_code`].
+pub struct RunCodeOutput {
+    /// The resulting storage, Micheline-encoded in the optimized-legacy
+    /// representation.
+    pub storage: Vec<u8>,
+}
+
+/// Why a [`run_code`] call did not produce a result.
+#[derive(Debug, thiserror::Error)]
+pub enum RunCodeError {
+    /// The script, storage or parameter is ill-typed, or execution
+    /// failed (`FAILWITH`, out of gas, ...). A user-level error.
+    #[error("{0}")]
+    Execution(String),
+    /// Durable-storage failure. Infrastructure, not a script failure.
+    #[error("{0}")]
+    Host(String),
+}
+
+const GAS_EXHAUSTED: &str = "Gas exhausted";
+
+/// A durable-storage fault is infrastructure, not the caller's script
+/// being wrong. The other `LazyStorageError` variants are the caller's:
+/// gas, a forged id that does not resolve, an ill-typed stored value.
+fn is_host_fault(err: &LazyStorageError) -> bool {
+    matches!(
+        err,
+        LazyStorageError::PathError(_)
+            | LazyStorageError::RuntimeError(_)
+            | LazyStorageError::NomReadError(_)
+            | LazyStorageError::BinWriteError(_)
+    )
+}
+
+impl From<ScriptError<'_>> for RunCodeError {
+    fn from(err: ScriptError) -> Self {
+        match err {
+            ScriptError::OutOfGas(_) => Self::Execution(GAS_EXHAUSTED.to_string()),
+            // Host faults surface from big-map finalization directly, or
+            // nested in `InterpretError`: big-map access and `VIEW` lookup
+            // mid-interpretation.
+            ScriptError::Interpret(e) => match &e {
+                ContractInterpretError::LazyStorageError(err)
+                | ContractInterpretError::InterpretError(
+                    InterpretError::LazyStorageError(err),
+                ) if is_host_fault(err) => Self::Host(bounded_render(&e)),
+                ContractInterpretError::InterpretError(
+                    InterpretError::ViewLookupError(LookupViewError::HostError(_)),
+                ) => Self::Host(bounded_render(&e)),
+                _ => Self::Execution(bounded_render(&e)),
+            },
+            ScriptError::Decode(e) => Self::Execution(bounded_render(&e)),
+            ScriptError::Typecheck(e) => Self::Execution(bounded_render(&e)),
+            ScriptError::Unparse(e) => Self::Execution(match e {
+                // Folded into [ScriptError::OutOfGas] upstream; kept for
+                // exhaustiveness.
+                BorrowedUnparseError::OutOfGas => GAS_EXHAUSTED.to_string(),
+                BorrowedUnparseError::UnsupportedUnparsing => {
+                    "the resulting storage carries an operation, which cannot \
+                     be unparsed"
+                        .to_string()
+                }
+                BorrowedUnparseError::UnsatisfiedProperty(prop) => format!(
+                    "the resulting storage carries a sub-value that is not {prop}"
+                ),
+            }),
+            ScriptError::Encode(e) => Self::Execution(bounded_render(&e)),
+        }
+    }
+}
+
+/// Run a Michelson script against the current state without originating
+/// it, and return its resulting storage. The operations it emits are
+/// discarded.
+///
+/// # Precondition
+///
+/// **Callers must run this against a state they discard.** Interpreting a
+/// script writes through to durable storage — big-map contents and
+/// metadata, the global big-map id counter, the address registry — and a
+/// caller-supplied storage that drops an existing big-map id makes
+/// `interpret` *delete* that big map. Nothing in this crate enforces
+/// this; `tezosx_run_code_fn` does, with a reverted `SafeStorage`.
+pub fn run_code<Host, R>(
+    rk: &mut RuntimeKeyspaces<'_, Host, Host::KeySpace>,
+    registry: &R,
+    journal: &mut TezosXJournal,
+    params: &RunCodeParams,
+) -> Result<RunCodeOutput, RunCodeError>
+where
+    Host: KeySpaceLoader + StorageV1,
+    R: Registry<Journal = tezosx_journal::TezosXJournal>,
+{
+    // Declared first so it outlives every `Micheline` borrowed from its
+    // arena, including the ones held by `ctx` below.
+    let parser = Parser::new();
+    let arena = &parser.arena;
+
+    let host_err = |e: tezos_storage::error::Error| RunCodeError::Host(e.to_string());
+
+    let account = context::originated_from_kt1(&params.self_address).map_err(host_err)?;
+
+    let mut operation_gas = TezlinkOperationGas::start_milligas(params.milligas)
+        .map_err(|e| RunCodeError::Execution(e.to_string()))?;
+
+    let balance = match params.balance {
+        Some(balance) => balance,
+        None => account
+            .balance(rk.host())
+            .map_err(host_err)?
+            .0
+            .try_into()
+            .map_err(|_| {
+                RunCodeError::Execution("Contract balance overflows u64".to_string())
+            })?,
+    };
+    let balance: i64 = balance
+        .try_into()
+        .map_err(|_| RunCodeError::Execution("Balance overflows i64".to_string()))?;
+    let amount: i64 = params
+        .amount
+        .try_into()
+        .map_err(|_| RunCodeError::Execution("Amount overflows i64".to_string()))?;
+
+    // L1 defaults `SOURCE` to `Implicit_account_repr.zero` — the all-zero
+    // `tz1`, which is what `ContractTz1Hash::default()` yields.
+    let payer_pkh = params
+        .payer
+        .clone()
+        .unwrap_or_else(|| PublicKeyHash::Ed25519(ContractTz1Hash::default()));
+    let payer_account =
+        context::implicit_from_public_key_hash(&payer_pkh).map_err(host_err)?;
+
+    let self_address = AddressHash::Kt1(params.self_address.clone());
+    // L1 resolves `sender` and `payer` together: a `payer` given without a
+    // `sender` becomes the sender too. `SENDER` falls back to `self` only
+    // when neither is given (`sender_and_payer`, `lib_plugin/RPC.ml`).
+    let sender = params.sender.clone().unwrap_or_else(|| {
+        params
+            .payer
+            .clone()
+            .map_or_else(|| self_address.clone(), AddressHash::Implicit)
+    });
+    let contract_account = account.clone();
+
+    let mut counter = 0u128;
+
+    let mut tc_ctx = TcCtx {
+        rk,
+        operation_gas: &mut operation_gas,
+        big_map_diff: BTreeMap::new(),
+        interpret_context: InterpretContext::new(),
+        temporary_big_map_id_allocator: TemporaryBigMapIdAllocator::new(),
+    };
+    let mut operation_ctx = OperationCtx {
+        source: &payer_account,
+        counter: &mut counter,
+        applied_counters: BTreeSet::new(),
+        level: &params.level,
+        now: &params.now,
+        chain_id: &params.chain_id,
+        source_public_key: &[],
+        crac_chain_depth: 0,
+        crac_origin: None,
+        delegated_storage_cost: 0,
+    };
+    let mut ctx = Ctx {
+        tc_ctx: &mut tc_ctx,
+        exec_ctx: ExecCtx {
+            sender,
+            amount,
+            self_address,
+            balance,
+            contract_account,
+        },
+        operation_ctx: &mut operation_ctx,
+        journal,
+        registry,
+        address_registry_diff: Vec::new(),
+    };
+
+    // Wrapped so the temporary big_maps this run allocated are cleared on
+    // the failure paths too, not only on the way out.
+    let result: Result<Vec<u8>, RunCodeError> = (|| {
+        let parameter = Micheline::decode_raw(arena, &params.input, ctx.gas())
+            .map_err(|_: OutOfGas| RunCodeError::Execution(GAS_EXHAUSTED.to_string()))?
+            .map_err(|e| RunCodeError::Execution(bounded_render(&e)))?;
+
+        // Forged big-map ids are allowed, as on L1 (`~internal:true`, and
+        // the storage side has no knob anyway); rejecting them in the
+        // parameter would not contain anything — the storage can name the
+        // same id — and would break legitimate dry runs. Views are not
+        // typechecked either, as on L1, which validates them at
+        // origination and `CREATE_CONTRACT` instead. Both are covered by
+        // this function's precondition.
+        let (_operations, storage) = interpret_encoded_script(
+            &params.script,
+            &params.storage,
+            &params.entrypoint,
+            parameter,
+            &parser,
+            &mut ctx,
+            AllowForgedLazyStorageId::Yes,
+        )
+        .map_err(RunCodeError::from)?;
+        Ok(storage)
+    })();
+
+    // Release the `&mut` borrow on `tc_ctx` before clearing through it.
+    drop(ctx);
+
+    // Clear the temporary range so a second run against the same state
+    // does not restart allocation at -1 and collide. It does *not* make
+    // the run clean — see the precondition.
+    if let Err(err) = clear_temporary_big_maps(
+        tc_ctx.rk.host_mut(),
+        &tc_ctx.temporary_big_map_id_allocator,
+    ) {
+        log!(
+            Error,
+            "Cleaning the temporary big_map in the storage failed: {err}"
+        );
+    }
+
+    Ok(RunCodeOutput { storage: result? })
+}
+
+// Handles manager transfer operations.
+#[allow(clippy::too_many_arguments)]
+fn transfer_external<'a, Host>(
+    tc_ctx: &mut TcCtx<'a, '_, Host>,
+    operation_ctx: &mut OperationCtx<'a>,
+    registry: &impl Registry<Journal = tezosx_journal::TezosXJournal>,
+    journal: &mut TezosXJournal,
+    amount: &Narith,
+    dest: &Contract,
+    parameters: &Parameters,
+    all_internal_receipts: &mut Vec<TaggedInternalOp>,
+    parser: &'a Parser<'a>,
+    nonce_counter: &mut u16,
+) -> Result<(TransferTarget, u64, SubtreeStatus), CracError>
+where
+    Host: KeySpaceLoader + StorageV1,
+{
+    log!(Debug,
+        "Applying an external transfer operation from {} to {dest:?} of {amount:?} mutez with parameters {parameters:?}",
+        operation_ctx.source.contract()
+    );
+    let entrypoint = &parameters.entrypoint;
+    let value = Micheline::decode_raw(&parser.arena, &parameters.value, tc_ctx.gas())
+        .map_err(|oog: OutOfGas| CracError::Operation(oog.into()))?
+        .map_err(|e| CracError::Operation(TransferError::from(e)))?;
+
+    transfer(
+        tc_ctx,
+        operation_ctx,
+        registry,
+        journal,
+        operation_ctx.source,
+        amount,
+        dest,
+        entrypoint,
+        value,
+        parser,
+        all_internal_receipts,
+        false, // external operations always debit the sender
+        // external operations are not allowed to forge big_map ids
+        AllowForgedLazyStorageId::No,
+        nonce_counter,
+    )
+    .map(
+        |TransferOutcome {
+             success,
+             delegated_storage_cost,
+             subtree,
+         }| (success.into(), delegated_storage_cost, subtree),
+    )
+}
+
+fn gw<E: ToString>(e: E) -> TransferError {
+    TransferError::GatewayError(e.to_string())
+}
+
+/// Result of a cross-runtime transfer, carrying both the transfer
+/// outcome and any internal operation receipts produced during
+/// Michelson execution (e.g. sub-transfers, originations, events).
+pub struct CrossRuntimeTransferResult {
+    pub target: TransferTarget,
+    pub internal_receipts: Vec<InternalOperationSum>,
+    /// Standalone storage cost — in mutez — of the internal
+    /// operations the sub-execution emitted directly. Excludes
+    /// operations surfaced from inner CRAC sub-executions (their
+    /// cost is reported upward by those sub-executions through
+    /// their own `X-Tezos-Storage-Cost` header, accumulated on the
+    /// caller frame's [`OperationCtx::delegated_storage_cost`]).
+    pub own_storage_cost: BigUint,
+}
+
+/// Error from [`cross_runtime_transfer`], carrying both the transfer
+/// error and any partial internal operation receipts that were
+/// collected before the failure (RFC Example 4: backtracked / failed /
+/// skipped statuses).
+pub struct CracTransferError {
+    pub error: CracError,
+    pub internal_receipts: Vec<InternalOperationSum>,
+    /// `true` when the target's own call succeeded but one of its
+    /// internal operations subsequently failed (a "deep failure").
+    /// In that case the real error is already present as a `Failed`
+    /// entry in `internal_receipts`, so the `alias→target` synthetic
+    /// op should be marked `BackTracked` rather than `Failed`.
+    /// `false` for every other error path (decode/checkpoint errors,
+    /// direct target failure, structural failures).
+    pub deep_failure: bool,
+}
+
+impl From<CracError> for CracTransferError {
+    fn from(error: CracError) -> Self {
+        Self {
+            error,
+            internal_receipts: vec![],
+            deep_failure: false,
+        }
+    }
+}
+
+impl From<TransferError> for CracTransferError {
+    fn from(error: TransferError) -> Self {
+        Self::from(CracError::Operation(error))
+    }
+}
+
+/// Execute a cross-runtime transfer with automatic rollback on failure.
+///
+/// Snapshots the world state before executing the transfer.  On success
+/// the snapshot is discarded; on failure it is restored, undoing any
+/// balance credits or storage writes that occurred before the error
+/// (e.g. Michelson `FAILWITH`).
+// TODO: L2-888 replace the low level revert mechanism by more general one
+#[allow(clippy::too_many_arguments)]
+pub fn cross_runtime_transfer<'a, Host>(
+    tc_ctx: &mut TcCtx<'a, '_, Host>,
+    operation_ctx: &mut OperationCtx<'a>,
+    registry: &impl Registry<Journal = tezosx_journal::TezosXJournal>,
+    journal: &mut TezosXJournal,
+    sender: &impl TezosAccount,
+    amount: &Narith,
+    dest: &Contract,
+    parameters: &Parameters,
+    parser: &'a Parser<'a>,
+    nonce_counter: &mut u16,
+) -> Result<CrossRuntimeTransferResult, CracTransferError>
+where
+    Host: KeySpaceLoader + StorageV1,
+{
+    let entrypoint = &parameters.entrypoint;
+    let value = Micheline::decode_raw(&parser.arena, &parameters.value, tc_ctx.gas())
+        .map_err(|oog: OutOfGas| CracTransferError::from(TransferError::from(oog)))?
+        .map_err(|e| CracTransferError::from(TransferError::from(e)))?;
+
+    let world_state = tezos_smart_rollup_host::path::OwnedPath::from(
+        &tezos_evm_runtime::runtime_keyspaces::TEZ_ACCOUNTS_ROOT_PATH,
+    );
+    let checkpoint_index = journal
+        .michelson
+        .checkpoint(tc_ctx.rk.host_mut(), &world_state)
+        .map_err(|e| CracTransferError::from(gw(e)))?;
+
+    let mut internal_receipts = Vec::new();
+    match transfer(
+        tc_ctx,
+        operation_ctx,
+        registry,
+        journal,
+        sender,
+        amount,
+        dest,
+        entrypoint,
+        value,
+        parser,
+        &mut internal_receipts,
+        true, // skip_sender_debit: the calling runtime already debited the sender
+        // big maps cannot be sent across runtimes
+        AllowForgedLazyStorageId::No,
+        nonce_counter,
+    ) {
+        Ok(TransferOutcome {
+            success, subtree, ..
+        }) => {
+            // transfer() returns Ok even when internal operations failed: the
+            // failure is contained and only reported. `subtree` carries the
+            // verdict of the ops it drove, and the last own receipt catches a
+            // failure no frame saw — the same pair [`finalize_statuses`] uses
+            // in the normal Tezos operation path. Deciding on the receipts
+            // alone would commit the snapshot of a failed sub-execution
+            // (L2-1863). The CRAC frames drained by `transfer` are ignored: a
+            // failure the EVM side caught must not revert this crossing.
+            let all_internal_succeeded =
+                subtree.all_applied() && last_own_receipt_applied(&internal_receipts);
+            if all_internal_succeeded {
+                // promote: discard the snapshot, keep changes
+                journal
+                    .michelson
+                    .checkpoint_commit(tc_ctx.rk.host_mut(), checkpoint_index)
+                    .map_err(|e| CracTransferError::from(gw(e)))?;
+
+                let target: TransferTarget = success.into();
+                let own_storage_cost =
+                    storage_fees::compute_storage_fees::<TransferContent>(&target)?;
+                let own_storage_cost: BigUint = internal_receipts
+                    .iter()
+                    .filter(|t| t.is_own())
+                    .try_fold(own_storage_cost, |acc, t| {
+                        let fee = storage_fees::compute_internal_op_storage_fees(&t.op)?;
+                        Ok::<BigUint, TransferError>(acc + fee)
+                    })?;
+
+                Ok(CrossRuntimeTransferResult {
+                    target,
+                    internal_receipts: untag_internals(internal_receipts),
+                    own_storage_cost,
+                })
+            } else {
+                // revert: restore the snapshot
+                journal
+                    .michelson
+                    .checkpoint_revert(tc_ctx.rk.host_mut(), checkpoint_index)
+                    .map_err(|e| CracTransferError::from(gw(e)))?;
+                internal_receipts
+                    .iter_mut()
+                    .for_each(|t| t.op.transform_result_backtrack());
+                // Meter the persisted error bodies of internal-op failures
+                // before recording the failed CRAC receipt.  Each
+                // `ContentResult::Failed` entry carries the FAILWITH body;
+                // charging here closes the bypass by which an attacker
+                // whose KT1 issues an internal TRANSFER_TOKENS to a
+                // FAILWITHing contract would otherwise route a large body
+                // into the receipt unmetered.  On OOG the oversized body is
+                // replaced with `OutOfGas` while the entry is preserved so
+                // the failed CRAC receipt always carries its internal-op list.
+                let mut internal_receipts = untag_internals(internal_receipts);
+                charge_internal_receipt_bodies(
+                    tc_ctx.operation_gas,
+                    &mut internal_receipts,
+                );
+                // Return the internal receipts so the failed CRAC
+                // receipt can include backtracked/failed/skipped ops.
+                // deep_failure=true: the target's own call returned Ok
+                // but one of its internal ops recorded a Failed receipt.
+                // The real error is already present in internal_receipts;
+                // the alias→target synthetic op should be BackTracked.
+                Err(CracTransferError {
+                    error: CracError::Operation(
+                        TransferError::FailedToExecuteInternalOperation(
+                            "internal operation failed during cross-runtime call".into(),
+                        ),
+                    ),
+                    internal_receipts,
+                    deep_failure: true,
+                })
+            }
+        }
+        Err(e) => {
+            journal
+                .michelson
+                .checkpoint_revert(tc_ctx.rk.host_mut(), checkpoint_index)
+                .map_err(|e| CracTransferError::from(gw(e)))?;
+            internal_receipts
+                .iter_mut()
+                .for_each(|t| t.op.transform_result_backtrack());
+            // Meter the persisted error bodies of any internal-op failures
+            // accumulated before the top-level error, then meter the
+            // top-level error itself.  Only `CracError::Operation` errors
+            // are stored in the BSON sink; `CracError::BlockAbort` aborts
+            // the block so no receipt is produced and no per-byte charge
+            // applies.
+            let mut internal_receipts = untag_internals(internal_receipts);
+            charge_internal_receipt_bodies(tc_ctx.operation_gas, &mut internal_receipts);
+            let metered_error = match e {
+                CracError::Operation(te) => {
+                    charge_persisted_error(tc_ctx.operation_gas, te)
+                }
+                CracError::BlockAbort(_) => e,
+            };
+            Err(CracTransferError {
+                error: metered_error,
+                internal_receipts,
+                deep_failure: false,
+            })
+        }
+    }
+}
+
+/// Maximum size, in bytes, of an originated Michelson script (code + storage).
+/// Mirrors L1's `max_operation_data_length`; bounds `decode_raw` at origination
+/// time (defense-in-depth on top of the per-type cap, L2-1706).
+pub const MICHELSON_MAXIMUM_SCRIPT_SIZE: usize = 32 * 1024;
+
+/// Render a typechecking error, capped at
+/// [`mir::bounded_fmt::MAX_INTERPRET_ERROR_RENDER_BYTES`]. Origination
+/// typechecks attacker-supplied code, which can synthesise a
+/// structurally-shared `Type` DAG whose render is far larger than its node
+/// count; the per-type parse cap does not bound instruction-synthesised
+/// types. Building such a type is gas-bounded (the typechecker's `DUP` walks
+/// the unfolded type in its `Duplicable` check), so the render is `O(gas)`
+/// rather than unbounded, but that ceiling is still large, so the error text
+/// is capped here as on the transfer and view sinks.
+fn bounded_tc_error(e: &mir::typechecker::TcError) -> String {
+    mir::bounded_fmt::display_bounded(
+        e,
+        mir::bounded_fmt::MAX_INTERPRET_ERROR_RENDER_BYTES,
+    )
+}
+
+/// Typechecking failure of an originated script, part `what` of it. Running
+/// out of gas is reported as such, like on L1.
+fn origination_tc_error(what: &str, e: &mir::typechecker::TcError) -> OriginationError {
+    if e.is_out_of_gas() {
+        OriginationError::OutOfGas(mir::gas::OutOfGas)
+    } else {
+        OriginationError::MirTypecheckingError(format!(
+            "{what} : {}",
+            bounded_tc_error(e)
+        ))
+    }
+}
+
+/// This function typechecks both fields of a &Script: the code and the storage.
+/// It returns the typechecked storage.
+pub fn typecheck_code_and_storage<'a, Host: KeySpaceLoader + StorageV1>(
+    ctx: &mut TcCtx<'a, '_, Host>,
+    parser: &'a Parser<'a>,
+    script: &Script,
+) -> Result<TypedValue<'a>, OriginationError> {
+    let script_size = script.code.len() + script.storage.len();
+    if script_size > MICHELSON_MAXIMUM_SCRIPT_SIZE {
+        return Err(OriginationError::ScriptTooLarge(format!(
+            "{script_size} bytes exceeds the maximum of {MICHELSON_MAXIMUM_SCRIPT_SIZE}"
+        )));
+    }
+    let contract_micheline =
+        Micheline::decode_raw(&parser.arena, &script.code, ctx.gas())
+            .map_err(OriginationError::from)?
+            .map_err(|e| OriginationError::MichelineSerializationError(e.to_string()))?;
+    let allow_lazy_storage_in_storage = true;
+    let contract_typechecked = contract_micheline
+        .split_script()
+        .map_err(|e| origination_tc_error("Splitting script", &e))?
+        .typecheck_script(ctx.gas(), allow_lazy_storage_in_storage, true)
+        .map_err(|e| origination_tc_error("Script", &e))?;
+    let storage_micheline =
+        Micheline::decode_raw(&parser.arena, &script.storage, ctx.gas())
+            .map_err(OriginationError::from)?
+            .map_err(|e| OriginationError::MichelineSerializationError(e.to_string()))?;
+    // The initial storage comes from the (external) origination operation, so
+    // it must not reference a `big_map` by a forged id — a contract cannot own
+    // a lazy-storage id before it exists. Internal `CREATE_CONTRACT`
+    // originations do not go through here: they carry an already-typechecked
+    // `TypedValue` storage straight to `originate_contract`, which legitimately
+    // references the emitting contract's big_maps. Mirrors L1's
+    // `allow_forged_lazy_storage_id_in_storage:false` at origination.
+    contract_typechecked
+        // Origination: validate storage-value lambda child views (L2-1635).
+        .typecheck_storage_with_views(
+            ctx,
+            &storage_micheline,
+            TypecheckViews::Enabled,
+            AllowForgedLazyStorageId::No,
+        )
+        .map_err(|e| origination_tc_error("Storage", &e))
+}
+
+/// Dump the initial storage's big maps and serialize it.
+///
+/// The storage is only ever read here, so it is taken behind its `Rc`. An
+/// internal `CREATE_CONTRACT` reached through a `DUP`ed operation shares its
+/// storage with the other occurrences, so taking it by value would deep-copy
+/// it — unmetered, and before either the walk or the unparser charges
+/// anything (L2-1836).
+fn handle_storage_with_big_maps<'a, Host: KeySpaceLoader + StorageV1>(
+    ctx: &mut TcCtx<'a, '_, Host>,
+    storage: RcTypedValue<'a>,
+) -> Result<(Vec<u8>, Option<LazyStorageDiffList>), OriginationError> {
+    let parser = Parser::new();
+
+    // Dump big_map allocation, starting with empty big_maps. The walk rebuilds
+    // only the spine down to a big map, and returns `None` — leaving `storage`
+    // untouched and still shared — when there is none.
+    let dumped =
+        mir::ast::big_map::dump_big_map_updates_shared(ctx, &[], &storage, false)
+            .map_err(|err| OriginationError::MirBigMapAllocation(err.to_string()))?;
+    // Drain the diff before the fallible encode below: otherwise an
+    // encode failure leaves `ctx.big_map_diff` half-populated and the
+    // next operation in the same batch inherits stale entries.
+    let big_map_diff_order = ctx.interpret_context.take_big_map_diff_order();
+    let lazy_storage_diff =
+        convert_big_map_diff(std::mem::take(&mut ctx.big_map_diff), big_map_diff_order);
+    // Borrowed unparse, for the same reason: it reads through the `Rc` and
+    // clones only leaf payloads, through constructors that charge first.
+    let storage = dumped
+        .as_ref()
+        .unwrap_or(&storage)
+        .clone_into_micheline_optimized_legacy(
+            &parser.arena,
+            ctx.gas(),
+            Some(TypeProperty::Storable),
+        )
+        .map_err(OriginationError::from)?
+        .encode(ctx.gas())?
+        .map_err(|e| OriginationError::MichelineSerializationError(e.to_string()))?;
+    Ok((storage, lazy_storage_diff))
+}
+
+/// Originate a contract: install its code and initial storage, run
+/// the initial-balance transfer from the sender, record the
+/// classification of the new contract under `origin`, and return the
+/// success body that the post-execution burn pass will charge. User-
+/// issued and internal MIR originations pass [`Origin::Native`]; the
+/// alias-forwarder materialization path passes [`Origin::Alias`].
+pub fn originate_contract<'a, Host>(
+    ctx: &mut TcCtx<'a, '_, Host>,
+    contract: ContractKt1Hash,
+    sender_account: &impl TezosAccount,
+    initial_balance: &Narith,
+    script_code: Option<&[u8]>,
+    script_storage: RcTypedValue<'a>,
+    origin: &Origin,
+) -> Result<OriginationSuccess, OriginationError>
+where
+    Host: KeySpaceLoader + StorageV1,
+{
+    // If the origination is internal the big map are handled by the first transfer
+    // The big_maps vector will be filled only if the origination is "external"
+
+    let (new_storage, lazy_storage_diff) =
+        handle_storage_with_big_maps(ctx, script_storage)?;
+
+    // Drain the lazy-storage size delta accumulated by the big-map hooks in
+    // `handle_storage_with_big_maps`, on the same footing as the transfer path
+    // (and as `big_map_diff`): every frame drains its per-operation accumulator
+    // so the next one starts empty. The delta is the contribution of the
+    // big-maps present in the initial storage; it is folded into the contract's
+    // initial `used_bytes` by `init` below.
+    // TODO(L2-1481): make this draining structurally safe so a hook firing
+    // without a matching drain cannot be silently mispriced.
+    let lazy_storage_size_diff = ctx.interpret_context.take_lazy_storage_size_diff();
+
+    // Set the storage of the contract
+    let smart_contract = context::originated_from_kt1(&contract)
+        .map_err(|_| OriginationError::FailedToFetchOriginated)?;
+
+    // Charge gas for the durable writes `smart_contract.init` performs: the
+    // code and storage blobs (their own size), plus a single write of the
+    // aggregated `/info` accounting record, charged at the exact number of
+    // bytes written. `init` builds the record from the blob lengths without
+    // reading it back — origination always targets a fresh KT1 — so no read is
+    // charged. The charge precedes the write inside `init`.
+    //
+    // `init` writes the code and storage blobs as two separate durable
+    // writes (`store_write_all` each), so a code-bearing origination is
+    // billed two write bases over the combined blob payload — one base per
+    // physical write, matching the transfer path. A code-less origination
+    // (`script_code = None`, Tezos X alias) writes no `/data/code`, so only
+    // the storage blob is written and a single base is billed.
+    let code_size = script_code.map_or(0, |c| c.len()) as u64;
+    let storage_size = new_storage.len() as u64;
+    let blob_writes = if script_code.is_some() { 2 } else { 1 };
+    let init_payload_bytes = code_size.saturating_add(storage_size);
+    let info_bytes_written = OriginatedContractInfo::for_new_contract(
+        code_size,
+        storage_size,
+        lazy_storage_size_diff.clone(),
+    )
+    .encoded_len()
+    .map_err(|_| OriginationError::CantInitContract)?;
+    consume_storage_write_milligas(ctx.operation_gas, blob_writes, init_payload_bytes)
+        .map_err(OriginationError::OutOfGas)?;
+    consume_storage_write_milligas(ctx.operation_gas, 1, info_bytes_written)
+        .map_err(OriginationError::OutOfGas)?;
+
+    let StorageSpace {
+        used_bytes: total_size,
+        allocated_bytes: paid_storage_size_diff,
+    } = smart_contract
+        .init(
+            ctx.rk.host_mut(),
+            script_code,
+            &new_storage,
+            lazy_storage_size_diff,
+        )
+        .map_err(|_| OriginationError::CantInitContract)?;
+
+    // There's this line in the origination `assert (Compare.Z.(total_size >= Z.zero)) ;`
+    //
+    // A code-less Tezos X alias (`script_code = None`) resolves to the shared
+    // implementation and carries no own code, so its total size is just its
+    // storage — and re-materializing an already-materialized alias sees a zero
+    // storage delta. Neither is an "empty contract" in the sense this guard
+    // rejects, so it only applies to contracts that ship their own code.
+    if script_code.is_some() {
+        match BigUint::try_from(total_size.0.clone()) {
+            Ok(b) if !b.is_zero() => b,
+            _ => return Err(OriginationError::CantOriginateEmptyContract),
+        };
+    }
+
+    // Compute the initial_balance setup of the smart contract as a balance update for the origination.
+    let balance_updates =
+        compute_balance_updates(sender_account, &smart_contract, initial_balance)
+            .map_err(|e| OriginationError::FailedToComputeBalanceUpdate(e.to_string()))?;
+
+    // `apply_balance_changes` writes and reads the giver and receiver balances,
+    // two reads and writes each for an amount, so 4 reads and 4 writes in total.
+    consume_storage_write_milligas(ctx.operation_gas, 4, COUNTER_SIZE)
+        .map_err(OriginationError::OutOfGas)?;
+    consume_storage_read_milligas(ctx.operation_gas, 4, COUNTER_SIZE)
+        .map_err(OriginationError::OutOfGas)?;
+
+    // Apply the initial-balance transfer (sender → smart_contract).
+    apply_balance_changes(
+        ctx.rk.host_mut(),
+        sender_account,
+        &smart_contract,
+        &initial_balance.0,
+    )
+    .map_err(|err| match err {
+        TransferError::BalanceTooLow(btl) => OriginationError::BalanceTooLow(btl),
+        _ => OriginationError::FailedToApplyBalanceUpdate,
+    })?;
+
+    // Record the classification of the new contract. Origination is the only
+    // writer of the origin path for a freshly created KT1, so write it
+    // unconditionally.
+    smart_contract
+        .set_origin(ctx.rk.host_mut(), origin)
+        .map_err(|_| OriginationError::CantInitContract)?;
+
+    let origination_success = OriginationSuccess {
+        balance_updates,
+        originated_contracts: vec![Originated { contract }],
+        consumed_milligas: ctx.operation_gas.get_and_reset_milligas_consumed()?,
+        storage_size: total_size,
+        paid_storage_size_diff,
+        lazy_storage_diff,
+    };
+    Ok(origination_success)
+}
+
+/// Prepares balance updates in the format expected by the Tezos operation.
+fn compute_balance_updates(
+    giver: &impl TezosAccount,
+    receiver: &impl TezosAccount,
+    amount: &Narith,
+) -> Result<Vec<BalanceUpdate>, num_bigint::TryFromBigIntError<num_bigint::BigInt>> {
+    if amount.eq(&0_u64.into()) {
+        return Ok(vec![]);
+    };
+
+    let giver_delta = BigInt::from_biguint(num_bigint::Sign::Minus, amount.into());
+    let receiver_delta = BigInt::from_biguint(num_bigint::Sign::Plus, amount.into());
+
+    let giver_update = BalanceUpdate {
+        balance: Balance::Account(giver.contract()),
+        changes: giver_delta.try_into()?,
+        update_origin: UpdateOrigin::BlockApplication,
+    };
+
+    let receiver_update = BalanceUpdate {
+        balance: Balance::Account(receiver.contract()),
+        changes: receiver_delta.try_into()?,
+        update_origin: UpdateOrigin::BlockApplication,
+    };
+
+    Ok(vec![giver_update, receiver_update])
+}
+
+/// Applies balance changes by updating both source and destination accounts.
+fn apply_balance_changes<Host>(
+    host: &mut Host,
+    giver_account: &impl TezosAccount,
+    receiver_account: &impl TezosAccount,
+    amount: &num_bigint::BigUint,
+) -> Result<(), TransferError>
+where
+    Host: StorageV1,
+{
+    let giver_balance = giver_account
+        .balance(host)
+        .map_err(|_| TransferError::FailedToFetchSenderBalance)?;
+    let new_giver_balance = match giver_balance.0.checked_sub(amount) {
+        None => {
+            return Err(TransferError::BalanceTooLow(BalanceTooLow {
+                contract: giver_account.contract(),
+                balance: giver_balance,
+                amount: amount.into(),
+            }));
+        }
+        Some(new_source_balance) => new_source_balance.into(),
+    };
+    giver_account
+        .set_balance(host, &new_giver_balance)
+        .map_err(|_| TransferError::FailedToApplyBalanceChanges)?;
+    let receiver_balance = receiver_account
+        .balance(host)
+        .map_err(|_| TransferError::FailedToFetchDestinationBalance)?
+        .0;
+    let new_receiver_balance = (&receiver_balance + amount).into();
+    receiver_account
+        .set_balance(host, &new_receiver_balance)
+        .map_err(|_| TransferError::FailedToUpdateDestinationBalance)?;
+
+    log!(Debug,
+        "Transfer: OK - the new balance of the giver is {new_giver_balance:?} and the new balance of the receiver is {new_receiver_balance:?}"
+    );
+
+    Ok(())
+}
+
+/// Why [interpret_encoded_script] failed, with the MIR error kept
+/// structural so callers can classify it (durable-storage fault vs script
+/// failure) before rendering.
+///
+/// TODO: https://gitlab.com/tezos/tezos/-/issues/8003
+/// migrate [TransferError]'s remaining stringly sinks onto this type.
+#[derive(Debug, thiserror::Error)]
+enum ScriptError<'a> {
+    /// Gas ran out outside interpretation and unparsing, which report
+    /// their own exhaustion through [ScriptError::Interpret] and the
+    /// unparse fold in [interpret_encoded_script].
+    #[error("gas exhausted")]
+    OutOfGas(#[from] OutOfGas),
+    /// The script or storage bytes are not valid Micheline.
+    #[error("script or storage bytes are not valid Micheline")]
+    Decode(#[from] DecodeError),
+    /// No `parameter`/`storage`/`code` toplevel, or ill-typed.
+    #[error("script does not typecheck")]
+    Typecheck(#[from] TcError),
+    /// Execution failed: `FAILWITH`, an ill-typed parameter or storage,
+    /// gas, or a lazy-storage fault.
+    #[error("script execution failed")]
+    Interpret(ContractInterpretError<'a>),
+    /// The resulting storage cannot be unparsed.
+    #[error("resulting storage cannot be unparsed")]
+    Unparse(BorrowedUnparseError),
+    /// The resulting storage cannot be re-encoded.
+    #[error("resulting storage cannot be re-encoded")]
+    Encode(#[from] tezos_data_encoding::enc::BinError),
+}
+
+/// Hand-written: `#[from]` refuses a non-`'static` source
+/// ([Error::source] must be `dyn Error + 'static`).
+impl<'a> From<ContractInterpretError<'a>> for ScriptError<'a> {
+    fn from(e: ContractInterpretError<'a>) -> Self {
+        Self::Interpret(e)
+    }
+}
+
+impl From<ScriptError<'_>> for TransferError {
+    fn from(err: ScriptError) -> Self {
+        match err {
+            ScriptError::OutOfGas(e) => Self::OutOfGas(e),
+            ScriptError::Decode(e) => e.into(),
+            ScriptError::Typecheck(e) => e.into(),
+            ScriptError::Interpret(e) => e.into(),
+            ScriptError::Unparse(e) => e.into(),
+            ScriptError::Encode(e) => Self::MichelineSerializationError(e.to_string()),
+        }
+    }
+}
+
+/// Decode, typecheck and interpret a binary Michelson script against a
+/// binary storage; return the emitted operations and the re-encoded
+/// resulting storage.
+fn interpret_encoded_script<'a>(
+    code: &[u8],
+    storage: &[u8],
+    entrypoint: &Entrypoint,
+    parameter: Micheline<'a>,
+    parser: &'a Parser<'a>,
+    ctx: &mut impl CtxTrait<'a>,
+    allow_forged_lazy_storage_id: AllowForgedLazyStorageId,
+) -> Result<(impl Iterator<Item = OperationInfo<'a>>, Vec<u8>), ScriptError<'a>> {
+    // Parse and typecheck the contract
+    let contract_micheline = Micheline::decode_raw(&parser.arena, code, ctx.gas())??;
+    let contract_typechecked =
+        contract_micheline
+            .split_script()?
+            .typecheck_script(ctx.gas(), true, false)?;
+    let storage_micheline = Micheline::decode_raw(&parser.arena, storage, ctx.gas())??;
+
+    // Execute the contract
+    let (internal_operations, new_storage) = contract_typechecked.interpret(
+        ctx,
+        &parser.arena,
+        parameter,
+        entrypoint,
+        &storage_micheline,
+        allow_forged_lazy_storage_id,
+    )?;
+
+    // Encode the new storage
+    // Unparse through the borrowed walk: the consuming `IntoMicheline`
+    // `unwrap_or_clone`s each child, which deep-copies one that is still shared
+    // (`DUP ; PAIR` leaves `Pair(V, V)` sharing a single allocation) *before*
+    // any gas is charged for it. The borrowed walk reads through the `Rc` and
+    // clones only leaf payloads, through constructors that charge first, so an
+    // oversized storage runs out of gas instead of exhausting the heap
+    // (L2-1840).
+    let new_storage = new_storage
+        .clone_into_micheline_optimized_legacy(
+            &parser.arena,
+            ctx.gas(),
+            Some(TypeProperty::Storable),
+        )
+        .map_err(|e| match e {
+            BorrowedUnparseError::OutOfGas => ScriptError::OutOfGas(OutOfGas),
+            e => ScriptError::Unparse(e),
+        })?
+        .encode(ctx.gas())??;
+
+    Ok((internal_operations, new_storage))
+}
+
+pub fn get_required_da_fees(
+    operation: &Operation,
+    da_fee_per_byte_mutez: u64,
+) -> anyhow::Result<u64> {
+    let op_raw_size = operation
+        .to_bytes()
+        .map(|bytes| bytes.len())
+        .map_err(|_| anyhow::anyhow!("Cannot map operation to its raw size"))?;
+    // TODO: See: L2-939.
+    // It is needed for the fees to be updated but without
+    // a proper gas system 'à-la-Ethereum' we can't use for `FeeUpdates`
+    // for now.
+    Ok(da_fee_per_byte_mutez.saturating_mul(op_raw_size as u64))
+}
+#[allow(clippy::too_many_arguments)]
+pub fn validate_and_apply_operation<Host>(
+    rk: &mut RuntimeKeyspaces<'_, Host, Host::KeySpace>,
+    registry: &impl Registry<Journal = tezosx_journal::TezosXJournal>,
+    journal: &mut TezosXJournal,
+    operation: Operation,
+    block_ctx: &BlockCtx,
+    skip_signature_check: bool,
+    required_fees: Option<u64>,
+    fee_refund_config: Option<FeeRefundConfig>,
+    safe_roots: &[tezos_smart_rollup_host::path::OwnedPath],
+) -> Result<Vec<ProcessedOperation>, OperationError>
+where
+    Host: StorageV1 + KeySpaceLoader,
+{
+    // Sum declared fees (mutez) from all operation contents before
+    // `operation` is moved into validation.
+    let fee_refund_config = if let Some(config) = fee_refund_config {
+        let total_fees: u64 = operation
+            .content
+            .iter()
+            .map(|c| &c.fee().0)
+            .sum::<BigUint>()
+            .to_u64()
+            .ok_or_else(|| {
+                OperationError::BlockAbort("total fees do not fit in u64".into())
+            })?;
+        Some((config, total_fees))
+    } else {
+        None
+    };
+
+    let mut safe_host = SafeStorage {
+        host: rk.host_mut(),
+        world_states: safe_roots.to_vec(),
+    };
+
+    safe_host.start()?;
+
+    log!(Debug, "Verifying that the batch is valid");
+
+    // The validation writes the counter and the balance of the source on `safe_host`.
+    // When the batch is invalid, `safe_host.revert()` below drops these writes.
+    let validation = {
+        let mut rk = RuntimeKeyspaces::init(&mut safe_host)?;
+        validate::execute_validation(
+            &mut rk,
+            operation,
+            skip_signature_check,
+            required_fees,
+        )
+    };
+    let validation_info = match validation {
+        Ok(validation_info) => validation_info,
+        Err(validity_err) => {
+            log!(Debug, "Reverting the changes because the batch is invalid.");
+            safe_host.revert()?;
+            return Err(OperationError::Validation(validity_err));
+        }
+    };
+
+    log!(Debug, "Batch is valid!");
+
+    safe_host.promote()?;
+
+    // Skip trace promotion (and its store_has probe) when the tracer is off:
+    // no trace data was written, so there is nothing to move out of /tmp.
+    if block_ctx.tracing_enabled {
+        safe_host.promote_trace()?;
+    }
+    if block_ctx.http_trace_enabled {
+        safe_host.promote_http_trace()?;
+    }
+    safe_host.start()?;
+
+    // Each operation uses 0-based nonces; block-sequential nonces are
+    // assigned at block finalization by renumber_nonces().
+    let mut nonce_counter: u16 = 0;
+    // The origination nonce lives on the journal.
+    // Snapshot the index so the revert branch below can put it back: unlike an EVM-driven frame,
+    // this path never opens a journal frame, so `revert_frame` does not roll it back for us — and a
+    // backtracked batch must not consume indices, since on L1 the nonce dies with the reverted
+    // context.
+    let origination_index_before = journal.michelson.origination_index();
+    // We use `mut` here because apply_batch does not handle fee refund,
+    // so we append the refund balance updates to processed_ops afterwards.
+    let (mut processed_ops, applied) = {
+        // Loaded under the mirror, so the batch's account writes follow the
+        // promote or revert below.
+        let mut rk = RuntimeKeyspaces::init(&mut safe_host)?;
+        apply_batch(
+            &mut rk,
+            registry,
+            journal,
+            validation_info,
+            block_ctx,
+            &mut nonce_counter,
+        )
+        .map_err(OperationError::BlockAbort)?
+    };
+
+    if applied {
+        log!(
+            Debug,
+            "Committing the changes because the batch was successfully applied."
+        );
+        safe_host.promote()?;
+        if block_ctx.tracing_enabled {
+            safe_host.promote_trace()?;
+        }
+        if block_ctx.http_trace_enabled {
+            safe_host.promote_http_trace()?;
+        }
+    } else {
+        log!(
+            Debug,
+            "Reverting the changes because some operation failed."
+        );
+        log!(Debug, "Processed operations: {processed_ops:#?}");
+        safe_host.revert()?;
+        // Clear the in-memory EVM journal: `safe_host.revert()` only rolls
+        // back durable storage and cannot affect the in-memory REVM
+        // JournalInner. Without this, commit_evm_journal_from_external()
+        // would persist EVM state changes from a backtracked operation.
+        journal.evm.clear();
+        // The captured cross-runtime originator now lives on the shared
+        // journal (not `evm`), so drop it here too — a backtracked
+        // operation's originator must not leak into the next one.
+        journal.reset_original_source();
+        // Give the origination-nonce indices back: none of this batch's
+        // originations survived, so none of them may consume an index.
+        journal
+            .michelson
+            .restore_origination_index(origination_index_before);
+    }
+
+    // The refund is written once the operation's mirror is promoted or
+    // reverted, on the host under it: it survives a failed operation, and
+    // stays covered by whatever rollback that host is itself under.
+    if let Some((config, total_fees)) = fee_refund_config {
+        let fee_refund = compute_fee_refund(total_fees, &processed_ops, &config);
+        apply_fee_refund(&mut *safe_host.host, &mut processed_ops, fee_refund)
+            .map_err(|e| OperationError::BlockAbort(format!("Fee refund: {e}")))?;
+    }
+
+    Ok(processed_ops)
+}
+
+/// Credit the source with a fee refund and record balance updates in the receipt.
+///
+/// Returns Ok(()) with no effect when `fee_refund == 0`.
+fn apply_fee_refund<Host>(
+    host: &mut Host,
+    processed_operations: &mut [ProcessedOperation],
+    fee_refund: u64,
+) -> Result<(), anyhow::Error>
+where
+    Host: StorageV1,
+{
+    if fee_refund == 0 {
+        return Ok(());
+    }
+
+    // Validate conversions before any storage mutation.
+    let source_delta: i64 = i64::try_from(fee_refund)?;
+    let block_fees_delta: i64 = -source_delta;
+
+    // Safe: validate_and_apply_operation rejects empty batches (ValidityError::EmptyBatch).
+    let first_op = processed_operations
+        .first_mut()
+        .ok_or_else(|| anyhow::anyhow!("Fee refund: empty processed_operations"))?;
+
+    let source_pkh = first_op.operation_with_metadata.content.source()?.clone();
+
+    // Credit source account with the refund.
+    let source_account = context::implicit_from_public_key_hash(&source_pkh)?;
+    source_account.add_balance(host, fee_refund)?;
+
+    log!(
+        Debug,
+        "Fee refund: {} mutez credited to {}",
+        fee_refund,
+        source_pkh
+    );
+
+    // Record balance updates in the receipt (same ordering as
+    // compute_fees_balance_updates: Account first, BlockFees second).
+    let contract = Contract::Implicit(source_pkh);
+    let receipt = &mut first_op.operation_with_metadata.receipt;
+    receipt.push_balance_update(BalanceUpdate {
+        balance: Balance::Account(contract),
+        changes: source_delta,
+        update_origin: UpdateOrigin::BlockApplication,
+    });
+    receipt.push_balance_update(BalanceUpdate {
+        balance: Balance::BlockFees,
+        changes: block_fees_delta,
+        update_origin: UpdateOrigin::BlockApplication,
+    });
+
+    Ok(())
+}
+
+fn apply_batch<Host>(
+    rk: &mut RuntimeKeyspaces<'_, Host, Host::KeySpace>,
+    registry: &impl Registry<Journal = tezosx_journal::TezosXJournal>,
+    journal: &mut TezosXJournal,
+    validation_info: validate::ValidatedBatch,
+    block_ctx: &BlockCtx,
+    nonce_counter: &mut u16,
+) -> Result<(Vec<ProcessedOperation>, bool), String>
+where
+    Host: KeySpaceLoader + StorageV1,
+{
+    let validate::ValidatedBatch {
+        source_account,
+        source_public_key,
+        validated_operations,
+    } = validation_info;
+    let mut first_failure: Option<usize> = None;
+    let mut processed_ops = Vec::with_capacity(validated_operations.len());
+    for (index, validated_operation) in validated_operations.into_iter().enumerate() {
+        log!(
+            Debug,
+            "Applying operation #{index} in the batch with counter {:?}.",
+            validated_operation.content.counter
+        );
+        let processed = if first_failure.is_some() {
+            log!(
+                Debug,
+                "Skipping this operation because we already failed on {first_failure:?}."
+            );
+            ProcessedOperation {
+                operation_with_metadata: produce_skipped_receipt(
+                    validated_operation.content,
+                    validated_operation.balance_updates,
+                ),
+                // Skipped operations were not executed, so consumed no gas.
+                operation_consumed_milligas: 0,
+            }
+        } else {
+            apply_operation(
+                rk,
+                registry,
+                journal,
+                &source_account,
+                &source_public_key,
+                validated_operation,
+                block_ctx,
+                nonce_counter,
+            )?
+        };
+
+        if first_failure.is_none()
+            && !processed.operation_with_metadata.receipt.is_applied()
+        {
+            first_failure = Some(index);
+        }
+
+        processed_ops.push(processed);
+    }
+
+    if let Some(failure_idx) = first_failure {
+        processed_ops[..failure_idx]
+            .iter_mut()
+            .for_each(|processed| {
+                OperationResultSum::transform_result_backtrack(
+                    &mut processed.operation_with_metadata.receipt,
+                )
+            });
+        return Ok((processed_ops, false));
+    }
+
+    Ok((processed_ops, true))
+}
+
+fn log_on_operation_failure<T, E: std::fmt::Debug>(
+    operation_name: &str,
+    result: &Result<T, E>,
+) {
+    if let Err(err) = result {
+        log!(Error, "{operation_name} failed because of: {err:?}");
+    }
+}
+
+#[allow(clippy::too_many_arguments)]
+fn apply_operation<Host>(
+    rk: &mut RuntimeKeyspaces<'_, Host, Host::KeySpace>,
+    registry: &impl Registry<Journal = tezosx_journal::TezosXJournal>,
+    journal: &mut TezosXJournal,
+    source_account: &TezosImplicitAccount,
+    source_public_key: &[u8],
+    validated_operation: validate::ValidatedOperation,
+    block_ctx: &BlockCtx,
+    nonce_counter: &mut u16,
+) -> Result<ProcessedOperation, String>
+where
+    Host: KeySpaceLoader + StorageV1,
+{
+    let mut internal_operations_receipts: Vec<TaggedInternalOp> = Vec::new();
+    let mut gas = validated_operation.gas;
+    let mut tc_ctx = TcCtx {
+        rk,
+        operation_gas: &mut gas,
+        big_map_diff: BTreeMap::new(),
+        interpret_context: InterpretContext::new(),
+        temporary_big_map_id_allocator: journal
+            .michelson
+            .temporary_big_map_id_allocator(),
+    };
+    let parser = Parser::new();
+    // Block-cumulative internal-operation counter: the block's prior count
+    // (`internal_operations_base`) plus what this batch already produced
+    // (`nonce_counter`). The MIR cap fires at L1's 65,535 limit against this.
+    let mut counter = block_ctx
+        .internal_operations_base
+        .saturating_add(u128::from(*nonce_counter));
+    let storage_limit = &validated_operation.content.storage_limit;
+    let balance_updates = validated_operation.balance_updates;
+    let receipt = match &validated_operation.content.operation {
+        OperationContent::Reveal(RevealContent { pk, .. }) => {
+            let reveal_result = reveal(&mut tc_ctx, source_account, pk);
+            log_on_operation_failure("Reveal", &reveal_result);
+            OperationResultSum::Reveal(finalize_and_burn::<_, RevealContent, _>(
+                tc_ctx.rk.host_mut(),
+                source_account,
+                storage_limit,
+                balance_updates,
+                0,
+                0,
+                reveal_result.map_err(Into::into),
+                internal_operations_receipts,
+                // A reveal emits no internal operation.
+                SubtreeStatus::AllApplied,
+            ))
+        }
+        OperationContent::Transfer(TransferContent {
+            amount,
+            destination,
+            parameters,
+        }) => {
+            let mut operation_ctx = OperationCtx {
+                source: source_account,
+                counter: &mut counter,
+                applied_counters: BTreeSet::new(),
+                level: block_ctx.level,
+                now: block_ctx.now,
+                chain_id: block_ctx.chain_id,
+                source_public_key,
+                crac_chain_depth: 0,
+                crac_origin: None,
+                delegated_storage_cost: 0,
+            };
+            let (transfer_result, top_level_delegated_delta, internals) =
+                match transfer_external(
+                    &mut tc_ctx,
+                    &mut operation_ctx,
+                    registry,
+                    journal,
+                    amount,
+                    destination,
+                    parameters,
+                    &mut internal_operations_receipts,
+                    &parser,
+                    nonce_counter,
+                ) {
+                    Ok((target, delta, internals)) => (Ok(target), delta, internals),
+                    // The verdict is unused on this path: a failed transfer
+                    // backtracks every internal receipt regardless.
+                    Err(e) => (Err(e), 0, SubtreeStatus::AllApplied),
+                };
+            let transfer_result = match transfer_result {
+                Ok(v) => Ok(v),
+                Err(CracError::BlockAbort(msg)) => {
+                    log!(
+                        Error,
+                        "Block abort was triggered by a Michelson transfer: {msg}"
+                    );
+                    return Err(msg);
+                }
+                Err(CracError::Operation(e)) => {
+                    log!(Error, "Transfer failed because of: {e:?}");
+                    Err(e)
+                }
+            };
+            OperationResultSum::Transfer(finalize_and_burn::<_, TransferContent, _>(
+                tc_ctx.rk.host_mut(),
+                source_account,
+                storage_limit,
+                balance_updates,
+                operation_ctx.delegated_storage_cost,
+                top_level_delegated_delta,
+                transfer_result.map_err(Into::into),
+                internal_operations_receipts,
+                internals,
+            ))
+        }
+        OperationContent::Origination(OriginationContent {
+            ref balance,
+            delegate: _,
+            ref script,
+        }) => {
+            // Claim from the operation's single origination nonce, held
+            // by the journal, so this top-level `Origination` and any
+            // `CREATE_CONTRACT` reached through a CRAC of the same
+            // operation can never derive the same KT1.
+            let index = journal.michelson.next_origination_index();
+            let address =
+                compute_contract_address(journal.michelson.operation_hash(), index);
+            let typechecked_storage =
+                typecheck_code_and_storage(&mut tc_ctx, &parser, script);
+            let origination_result = match typechecked_storage {
+                Ok(storage) => originate_contract(
+                    &mut tc_ctx,
+                    address,
+                    source_account,
+                    balance,
+                    Some(&script.code),
+                    RcTypedValue::new(storage),
+                    &Origin::Native,
+                ),
+                Err(err) => Err(err),
+            };
+            log_on_operation_failure("Origination", &origination_result);
+            OperationResultSum::Origination(
+                finalize_and_burn::<_, OriginationContent, _>(
+                    tc_ctx.rk.host_mut(),
+                    source_account,
+                    storage_limit,
+                    balance_updates,
+                    0,
+                    0,
+                    origination_result.map_err(|e| e.into()),
+                    internal_operations_receipts,
+                    // An origination emits no internal operation.
+                    SubtreeStatus::AllApplied,
+                ),
+            )
+        }
+    };
+
+    // Read the total gas consumed since the start of the operation, immune
+    // to baseline resets performed by per-segment measurements (e.g. via
+    // `get_and_reset_milligas_consumed` while attributing gas to internal
+    // sub-operations). Skipped operations never reach this point: they are
+    // built directly in `apply_batch` with `operation_consumed_milligas: 0`.
+    let operation_consumed_milligas = tc_ctx.operation_gas.total_milligas_consumed();
+    Ok(ProcessedOperation {
+        operation_with_metadata: OperationWithMetadata {
+            content: validated_operation.content.into_manager_operation_content(),
+            receipt,
+        },
+        operation_consumed_milligas,
+    })
+}
+
+/// Shared test utilities for gateway testing
+#[cfg(test)]
+pub(crate) mod test_utils {
+    pub use tezosx_interfaces::testing::MockRegistry;
+}
+
+#[cfg(test)]
+mod tests {
+    use tezos_evm_runtime::runtime::MockKernelHost;
+    use tezosx_journal::TezosXHashes;
+
+    use tezos_smart_rollup_keyspace::extensions::KeySpaceExtBin;
+    use tezos_smart_rollup_keyspace::{KeySpace, KeySpaceLoader};
+
+    use crate::account_storage::TezosImplicitAccount;
+    use crate::account_storage::{self, Code};
+    use crate::context;
+    use crate::{
+        account_storage::TezosOriginatedAccount, address::OriginationNonce,
+        mir_ctx::clear_temporary_big_maps, mir_ctx::BlockCtx,
+    };
+    use mir::ast::big_map::BigMapId;
+    use mir::ast::{Address, Entrypoint, IntoMicheline, Micheline, Type, TypedValue};
+    use mir::context::TypecheckingCtx;
+    use mir::gas::{self, Gas};
+    use mir::parser::Parser;
+    use mir::typechecker::{typecheck_value, AllowForgedLazyStorageId};
+    use num_traits::ops::checked::CheckedSub;
+    use num_traits::ToPrimitive;
+    use pretty_assertions::assert_eq;
+    use std::collections::BTreeMap;
+    use std::fs::read_to_string;
+    use tezos_crypto_rs::hash::{
+        ContractKt1Hash, HashTrait, OperationHash, SecretKeyEd25519,
+    };
+    use tezos_data_encoding::enc::BinWriter;
+    use tezos_data_encoding::types::{Narith, Zarith};
+    use tezos_evm_runtime::runtime_keyspaces::{MockRuntimeKeyspaces, RuntimeKeyspaces};
+    use tezos_protocol::contract::Contract;
+    use tezos_smart_rollup::types::{PublicKey, PublicKeyHash};
+    use tezos_smart_rollup_host::storage::StorageV1;
+    use tezos_tezlink::{
+        block::TezBlock,
+        operation::{
+            sign_operation, ManagerOperation, ManagerOperationContent,
+            ManagerOperationContentConv, Operation, OperationContent, OriginationContent,
+            Parameters, RevealContent, Script, TransferContent,
+        },
+        operation_result::{
+            ApplyOperationError, ApplyOperationErrors, BacktrackedResult, Balance,
+            BalanceTooLow, BalanceUpdate, ContentResult, CounterError,
+            InternalContentWithMetadata, InternalOperationSum, OperationKind,
+            OperationResult, OperationResultSum, OperationWithMetadata, Originated,
+            OriginationError, OriginationSuccess, RevealError, RevealSuccess,
+            TransferError, TransferSuccess, TransferTarget, UpdateOrigin, ValidityError,
+        },
+    };
+    use tezosx_interfaces::RuntimeId;
+    use tezosx_journal::TezosXJournal;
+    use typed_arena::Arena;
+
+    use crate::enshrined_contracts::{CracError, PERSISTED_ERROR_PER_BYTE_MILLIGAS};
+    use crate::gas::TezlinkOperationGas;
+    use crate::make_default_ctx;
+    use crate::storage_fees::{COST_PER_BYTES, ORIGINATION_SIZE};
+    use crate::storage_read_cost_milligas;
+    use crate::{
+        account_storage::{Manager, TezosAccount},
+        burn_pass, cross_runtime_transfer, validate_and_apply_operation,
+        CracTransferError, FeeRefundConfig, OperationError, ProcessedOperation,
+        TaggedInternalOp,
+    };
+    use tezos_smart_rollup::types::Timestamp;
+    use tezos_smart_rollup_host::path::OwnedPath;
+    use tezos_tezlink::enc_wrappers::BlockNumber;
+
+    /// Journal seeded with `hash`, so the operation's origination nonce
+    /// derives the same child KT1s the production path would. Tests that
+    /// do not assert on originated addresses use
+    /// [`TezosXJournal::mock`], whose seed is the zero hash.
+    fn journal_with_operation_hash(hash: OperationHash) -> TezosXJournal {
+        TezosXJournal::new(
+            tezosx_journal::CracId::mock(RuntimeId::Ethereum),
+            TezosXHashes::from_michelson_operation(hash),
+            tezos_ethereum::block::BlockConstants::dummy(),
+        )
+    }
+
+    /// A host with the `/evm/eth_accounts` root seeded, so the mirror
+    /// [`validate_and_apply_operation`] opens can copy it.
+    fn test_host() -> MockKernelHost {
+        let mut host = MockKernelHost::default();
+        host.store_write_all(
+            &tezos_evm_runtime::runtime_keyspaces::ETH_ACCOUNTS_ROOT_PATH,
+            b"seed",
+        )
+        .unwrap();
+        host
+    }
+
+    /// Test-only SafeStorage root matching the production Michelson accounts
+    /// root, used to build the account/big-map paths in tests.
+    fn test_root() -> OwnedPath {
+        OwnedPath::from(&tezos_evm_runtime::runtime_keyspaces::TEZ_ACCOUNTS_ROOT_PATH)
+    }
+
+    /// Pins [`run_code`](crate::run_code)'s step-constant semantics where
+    /// they differ from the applied path — a drift there is invisible
+    /// until an RPC consumer notices the wrong answer.
+    mod run_code {
+        use super::test_host;
+        use crate::gas::TezlinkOperationGas;
+        use crate::{run_code, RunCodeError, RunCodeParams};
+        use mir::ast::{AddressHash, Entrypoint, Micheline};
+        use mir::gas::Gas;
+        use mir::parser::Parser;
+        use tezos_crypto_rs::hash::{ChainId, ContractKt1Hash, HashTrait};
+        use tezos_evm_runtime::runtime_keyspaces::{
+            MockRuntimeKeyspaces, RuntimeKeyspaces,
+        };
+        use tezos_evm_runtime::safe_storage::SafeStorage;
+        use tezos_smart_rollup::types::Timestamp;
+        use tezos_tezlink::enc_wrappers::BlockNumber;
+        use tezosx_interfaces::testing::NotWiredRegistry;
+        use tezosx_interfaces::RuntimeId;
+        use tezosx_journal::TezosXJournal;
+
+        const KT1: &str = "KT1BRd2ka5q2cPRdXALtXD1QZ38CPam2j1ye";
+        const KT1_SENDER: &str = "KT1Lc9a9E7vqt6XYtkUbrErDGLQ55HztXV5N";
+        const TZ1: &str = "tz1Nw5nr152qddEjKT2dKBH8XcBMDAg72iLw";
+        /// L1's `Implicit_account_repr.zero`, the default `SOURCE`.
+        const TZ1_NULL: &str = "tz1Ke2h7sDdakHJQh8WX4Z372du1KChsksyU";
+
+        fn encode(micheline: Micheline<'_>) -> Vec<u8> {
+            micheline
+                .encode(&mut Gas::default())
+                .expect("encoding fits the default gas budget")
+                .expect("the value is encodable")
+        }
+
+        /// `balance` is given explicitly so the run does not depend on any
+        /// account existing in the mock host.
+        fn params(
+            script: Vec<u8>,
+            storage: Vec<u8>,
+            input: Vec<u8>,
+            sender: Option<AddressHash>,
+            payer: Option<mir::ast::PublicKeyHash>,
+        ) -> RunCodeParams {
+            RunCodeParams {
+                script,
+                storage,
+                input,
+                entrypoint: Entrypoint::default(),
+                self_address: ContractKt1Hash::from_b58check(KT1).expect("valid KT1"),
+                sender,
+                payer,
+                amount: 0,
+                balance: Some(0),
+                milligas: TezlinkOperationGas::MAX_LIMIT,
+                chain_id: ChainId::from([0u8; 4]),
+                level: BlockNumber { block_number: 1 },
+                now: Timestamp::from(0i64),
+            }
+        }
+
+        fn run(params: &RunCodeParams) -> Result<Vec<u8>, RunCodeError> {
+            let mut host = test_host();
+            let mut rk = MockRuntimeKeyspaces::init(&mut host).unwrap();
+            run_code(
+                &mut rk,
+                &NotWiredRegistry,
+                &mut TezosXJournal::mock(RuntimeId::Ethereum),
+                params,
+            )
+            .map(|output| output.storage)
+        }
+
+        /// An unoriginated `storage + 1` script with storage `41` and a
+        /// `Unit` parameter, encoded.
+        fn incr_fixture<'a>(parser: &'a Parser<'a>) -> (Vec<u8>, Vec<u8>, Vec<u8>) {
+            let script = encode(
+                parser
+                    .parse_top_level(
+                        "parameter unit; storage nat; \
+                         code { CDR; PUSH nat 1; ADD; NIL operation; PAIR }",
+                    )
+                    .expect("the script parses"),
+            );
+            let storage = encode(parser.parse("41").expect("the storage parses"));
+            let input = encode(parser.parse("Unit").expect("the parameter parses"));
+            (script, storage, input)
+        }
+
+        /// The baseline: a script that was never originated runs against
+        /// caller-supplied storage, and the storage it returns comes back.
+        #[test]
+        fn returns_the_resulting_storage() {
+            let parser = Parser::new();
+            let (script, storage, input) = incr_fixture(&parser);
+
+            let result =
+                run(&params(script, storage, input, None, None)).expect("it runs");
+
+            assert_eq!(result, encode(parser.parse("42").expect("parses")));
+        }
+
+        /// `tezosx_run_code_fn` runs this inside a [`SafeStorage`]
+        /// transaction it always reverts: reads must resolve through the
+        /// snapshot, and the state must come back untouched.
+        #[test]
+        fn runs_and_reverts_inside_a_safe_storage_transaction() {
+            use tezos_evm_runtime::safe_storage::TMP_PATH;
+            use tezos_smart_rollup_host::path::{OwnedPath, RefPath};
+            use tezos_smart_rollup_host::storage::StorageV1;
+
+            let parser = Parser::new();
+            let (script, storage, input) = incr_fixture(&parser);
+
+            let mut host = test_host();
+            let mut rk = MockRuntimeKeyspaces::init(&mut host).unwrap();
+            let probe = RefPath::assert_from(b"/tez/tez_accounts/probe");
+            rk.host_mut()
+                .store_write_all(&probe, b"before")
+                .expect("the probe is written");
+
+            {
+                let mut safe_host = SafeStorage {
+                    host: rk.host_mut(),
+                    world_states: vec![OwnedPath::from(
+                        tezos_evm_runtime::runtime_keyspaces::TEZ_ACCOUNTS_ROOT_PATH,
+                    )],
+                };
+                safe_host.start().expect("the snapshot is taken");
+                let mut inner_rk = RuntimeKeyspaces::init(&mut safe_host).unwrap();
+                run_code(
+                    &mut inner_rk,
+                    &NotWiredRegistry,
+                    &mut TezosXJournal::mock(RuntimeId::Ethereum),
+                    &params(script, storage, input, None, None),
+                )
+                .expect("it runs");
+                drop(inner_rk);
+                safe_host.revert().expect("the snapshot is dropped");
+            }
+
+            assert_eq!(
+                rk.host_mut()
+                    .store_read_all(&probe)
+                    .expect("the probe survives"),
+                b"before"
+            );
+            assert!(
+                rk.host_mut()
+                    .store_has(&TMP_PATH)
+                    .expect("/tmp is readable")
+                    .is_none(),
+                "the reverted snapshot should leave no `/tmp` behind"
+            );
+        }
+
+        /// L1 resolves `sender` and `payer` together: a `payer` given
+        /// without a `sender` is the sender too, and `SENDER` falls back to
+        /// `self` only when neither is given. Defaulting it to `self`
+        /// unconditionally — as this entrypoint first did — stores `False`.
+        #[test]
+        fn sender_falls_back_to_payer() {
+            let parser = Parser::new();
+            // `parse_top_level` borrows the source for as long as the
+            // parser, so a `format!` temporary would not live long enough.
+            let source = format!(
+                "parameter unit; storage bool; \
+                 code {{ DROP; SENDER; PUSH address \"{TZ1}\"; \
+                 COMPARE; EQ; NIL operation; PAIR }}"
+            );
+            let script =
+                encode(parser.parse_top_level(&source).expect("the script parses"));
+            let storage = encode(parser.parse("False").expect("the storage parses"));
+            let input = encode(parser.parse("Unit").expect("the parameter parses"));
+
+            let payer = match AddressHash::try_from(TZ1).expect("valid tz1") {
+                AddressHash::Implicit(pkh) => pkh,
+                other => panic!("expected an implicit account, got {other:?}"),
+            };
+
+            let result =
+                run(&params(script, storage, input, None, Some(payer))).expect("it runs");
+
+            assert_eq!(
+                result,
+                encode(parser.parse("True").expect("parses")),
+                "`SENDER` should be the payer, not `self`"
+            );
+        }
+
+        /// The other half of the pair: a `sender` given without a `payer`
+        /// is used verbatim and leaves `SOURCE` on its own default.
+        #[test]
+        fn sender_without_payer_keeps_the_null_source() {
+            let parser = Parser::new();
+            let source = format!(
+                "parameter unit; storage bool; \
+                 code {{ DROP; \
+                 SENDER; PUSH address \"{KT1_SENDER}\"; COMPARE; EQ; \
+                 SOURCE; PUSH address \"{TZ1_NULL}\"; COMPARE; EQ; \
+                 AND; NIL operation; PAIR }}"
+            );
+            let script =
+                encode(parser.parse_top_level(&source).expect("the script parses"));
+            let storage = encode(parser.parse("False").expect("the storage parses"));
+            let input = encode(parser.parse("Unit").expect("the parameter parses"));
+
+            let sender = AddressHash::try_from(KT1_SENDER).expect("valid KT1");
+
+            let result = run(&params(script, storage, input, Some(sender), None))
+                .expect("it runs");
+
+            assert_eq!(
+                result,
+                encode(parser.parse("True").expect("parses")),
+                "`SENDER` should be the given address and `SOURCE` the null tz1"
+            );
+        }
+
+        /// A `FAILWITH` is the caller's script failing, not the host
+        /// failing. The node keys on that distinction: the host kind is a
+        /// transient error clients may retry, this one is permanent.
+        #[test]
+        fn failwith_is_an_execution_error() {
+            let parser = Parser::new();
+            let script = encode(
+                parser
+                    .parse_top_level(
+                        "parameter unit; storage unit; \
+                         code { DROP; PUSH string \"boom\"; FAILWITH }",
+                    )
+                    .expect("the script parses"),
+            );
+            let storage = encode(parser.parse("Unit").expect("the storage parses"));
+            let input = encode(parser.parse("Unit").expect("the parameter parses"));
+
+            let err = run(&params(script, storage, input, None, None))
+                .expect_err("the script fails");
+
+            assert!(
+                matches!(err, RunCodeError::Execution(_)),
+                "a FAILWITH is not a host failure: {err:?}"
+            );
+            assert!(
+                err.to_string().contains("boom"),
+                "the failure value should survive into the message: {err}"
+            );
+        }
+    }
+
+    /// The roots production narrows an accounts-only operation to: the
+    /// Michelson accounts root and the EVM accounts keyspace root.
+    fn test_safe_roots() -> Vec<OwnedPath> {
+        vec![
+            test_root(),
+            OwnedPath::from(tezos_evm_runtime::runtime_keyspaces::ETH_ACCOUNTS_ROOT_PATH),
+        ]
+    }
+    use crate::{get_required_da_fees, TcCtx};
+    use primitive_types::U256;
+    use tezosx_interfaces::testing::NotWiredRegistry;
+
+    macro_rules! block_ctx {
+        () => {
+            BlockCtx {
+                level: &0u32.into(),
+                now: &0i64.into(),
+                chain_id: &HashTrait::try_from_bytes(&[0, 0, 0, 0]).unwrap(),
+                internal_operations_base: 0,
+                tracing_enabled: false,
+                http_trace_enabled: false,
+            }
+        };
+    }
+
+    #[derive(Clone)]
+    struct Bootstrap {
+        pkh: PublicKeyHash,
+        pk: PublicKey,
+        sk: SecretKeyEd25519,
+    }
+
+    fn bootstrap1() -> Bootstrap {
+        Bootstrap {
+            pkh: PublicKeyHash::from_b58check("tz1KqTpEZ7Yob7QbPE4Hy4Wo8fHG8LhKxZSx")
+                .unwrap(),
+            pk: PublicKey::from_b58check(
+                "edpkuBknW28nW72KG6RoHtYW7p12T6GKc7nAbwYX5m8Wd9sDVC9yav",
+            )
+            .unwrap(),
+            sk: SecretKeyEd25519::from_base58_check(
+                "edsk3gUfUPyBSfrS9CCgmCiQsTCHGkviBDusMxDJstFtojtc1zcpsh",
+            )
+            .unwrap(),
+        }
+    }
+
+    fn bootstrap2() -> Bootstrap {
+        Bootstrap {
+            pkh: PublicKeyHash::from_b58check("tz1gjaF81ZRRvdzjobyfVNsAeSC6PScjfQwN")
+                .unwrap(),
+            pk: PublicKey::from_b58check(
+                "edpktzNbDAUjUk697W7gYg2CRuBQjyPxbEg8dLccYYwKSKvkPvjtV9",
+            )
+            .unwrap(),
+            sk: SecretKeyEd25519::from_base58_check(
+                "edsk39qAm1fiMjgmPkw1EgQYkMzkJezLNewd7PLNHTkr6w9XA2zdfo",
+            )
+            .unwrap(),
+        }
+    }
+
+    const CONTRACT_1: &str = "KT1EFxv88KpjxzGNu1ozh9Vta4BaV3psNknp";
+    const CONTRACT_2: &str = "KT1RJ6PbjHpwc3M5rw5s2Nbmefwbuwbdxton";
+    const CONTRACT_3: &str = "KT1AEfeckNbdEYwaMKkytBwPJPycz7jdSGea";
+
+    static SCRIPT: &str = r#"
+        parameter string;
+        storage string;
+        code {
+            CAR ;
+            NIL operation ;
+            PAIR
+        }"#;
+
+    static UNIT_SCRIPT: &str = r#"
+        parameter unit;
+        storage unit;
+        code {
+            CAR ;
+            NIL operation ;
+            PAIR
+        }"#;
+
+    static FAILING_SCRIPT: &str = r#"
+        parameter unit;
+        storage unit;
+        code {
+            DROP;
+            PUSH string "This contract always fails";
+            FAILWITH
+        }"#;
+
+    // Contract whose storage is `pair (big_map string string) unit`.
+    // Used by big-map origination billing tests.
+    static BIG_MAP_UNIT_SCRIPT: &str = r#"
+        parameter unit;
+        storage (pair (big_map string string) unit);
+        code {
+            CDR;
+            NIL operation;
+            PAIR
+        }"#;
+
+    /// The entrypoints RPC (`get_contract_entrypoint`) goes through
+    /// `code()`, so a code-less alias transparently exposes the entrypoints of
+    /// the shared implementation — here the `default : unit` of `UNIT_SCRIPT`.
+    #[test]
+    fn alias_entrypoints_resolve_via_shared_implementation() {
+        use crate::account_storage::write_alias_implementation;
+        use crate::context::code::origin_path;
+        use crate::get_contract_entrypoint;
+        use mir::ast::{AddressHash, Entrypoint, Type};
+        use tezosx_interfaces::{AliasInfo, Origin, RuntimeId};
+
+        let mut host = test_host();
+        let mut rk = RuntimeKeyspaces::init(&mut host).unwrap();
+        let parser = mir::parser::Parser::new();
+
+        // Seed the shared implementation with a real Michelson script.
+        let code = parser
+            .parse_top_level(UNIT_SCRIPT)
+            .unwrap()
+            .encode(&mut Gas::default())
+            .unwrap()
+            .unwrap();
+        write_alias_implementation(rk.host_mut(), &code).unwrap();
+
+        // A code-less KT1 classified as an alias.
+        let kt1 = ContractKt1Hash::from_b58check(CONTRACT_1).unwrap();
+        let account = context::originated_from_kt1(&kt1).unwrap();
+        let origin = Origin::Alias(AliasInfo {
+            runtime: RuntimeId::Ethereum,
+            native_address: "0xabc".to_string(),
+        });
+        let mut buf = vec![];
+        origin.bin_write(&mut buf).unwrap();
+        rk.host_mut()
+            .store_write_all(&origin_path(&account).unwrap(), &buf)
+            .unwrap();
+
+        let entrypoints = get_contract_entrypoint(
+            rk.host(),
+            &AddressHash::Kt1(kt1),
+            &mut Gas::default(),
+        )
+        .expect("alias entrypoints resolve to the shared implementation");
+        assert_eq!(entrypoints.get(&Entrypoint::default()), Some(&Type::Unit));
+    }
+
+    use crate::{upgrade_alias_implementation, AliasUpgradeError};
+
+    /// Encode a Michelson script source into the Micheline bytes the alias
+    /// implementation slot holds.
+    fn encode_script(src: &str) -> Vec<u8> {
+        mir::parser::Parser::new()
+            .parse_top_level(src)
+            .unwrap()
+            .encode(&mut Gas::default())
+            .unwrap()
+            .unwrap()
+    }
+
+    // `default : unit`.
+    const UPGRADE_BASE_SCRIPT: &str =
+        "parameter unit; storage unit; code { CDR; NIL operation; PAIR }";
+    // `default : unit` plus an added `foo : string` — a valid superset.
+    const UPGRADE_SUPERSET_SCRIPT: &str = "parameter (or (unit %default) (string \
+         %foo)); storage unit; code { CDR; NIL operation; PAIR }";
+
+    #[test]
+    fn upgrade_accepts_entrypoint_superset() {
+        let mut host = test_host();
+        let mut rk = RuntimeKeyspaces::init(&mut host).unwrap();
+        account_storage::write_alias_implementation(
+            rk.host_mut(),
+            &encode_script(UPGRADE_BASE_SCRIPT),
+        )
+        .unwrap();
+
+        let superset = encode_script(UPGRADE_SUPERSET_SCRIPT);
+        upgrade_alias_implementation(rk.host_mut(), &superset, &mut Gas::default())
+            .expect("adding an entrypoint while keeping `default` must be accepted");
+        assert_eq!(
+            account_storage::read_alias_implementation(rk.host()).unwrap(),
+            Some(superset)
+        );
+    }
+
+    #[test]
+    fn upgrade_rejects_dropped_entrypoint() {
+        let mut host = test_host();
+        let mut rk = RuntimeKeyspaces::init(&mut host).unwrap();
+        // Start from the superset (default + foo)...
+        account_storage::write_alias_implementation(
+            rk.host_mut(),
+            &encode_script(UPGRADE_SUPERSET_SCRIPT),
+        )
+        .unwrap();
+
+        // ...then try to drop `foo` by going back to the bare default script.
+        let dropped = encode_script(UPGRADE_BASE_SCRIPT);
+        let err =
+            upgrade_alias_implementation(rk.host_mut(), &dropped, &mut Gas::default())
+                .expect_err("dropping an exposed entrypoint must be rejected");
+        assert!(matches!(err, AliasUpgradeError::EntrypointRemoved(_)));
+        // The slot is left untouched.
+        assert_eq!(
+            account_storage::read_alias_implementation(rk.host()).unwrap(),
+            Some(encode_script(UPGRADE_SUPERSET_SCRIPT))
+        );
+    }
+
+    #[test]
+    fn upgrade_rejects_entrypoint_type_change() {
+        let mut host = test_host();
+        let mut rk = RuntimeKeyspaces::init(&mut host).unwrap();
+        account_storage::write_alias_implementation(
+            rk.host_mut(),
+            &encode_script(UPGRADE_BASE_SCRIPT),
+        )
+        .unwrap();
+
+        // `default : string` changes the type of the existing `default` entrypoint.
+        let retyped = encode_script(
+            "parameter string; storage unit; code { CDR; NIL operation; PAIR }",
+        );
+        let err =
+            upgrade_alias_implementation(rk.host_mut(), &retyped, &mut Gas::default())
+                .expect_err("changing an entrypoint's type must be rejected");
+        assert!(matches!(err, AliasUpgradeError::EntrypointTypeChanged(_)));
+    }
+
+    #[test]
+    fn upgrade_rejects_storage_type_change() {
+        let mut host = test_host();
+        let mut rk = RuntimeKeyspaces::init(&mut host).unwrap();
+        // Base storage is `string` (like the forwarder).
+        account_storage::write_alias_implementation(
+            rk.host_mut(),
+            &encode_script(UPGRADE_SUPERSET_SCRIPT),
+        )
+        .unwrap();
+
+        // Same entrypoints, but `storage nat` — would brick every alias (whose
+        // stored storage is a `string`) at execution.
+        let retyped_storage = encode_script(
+            "parameter (or (unit %default) (string %foo)); storage nat; code { CDR; \
+             NIL operation; PAIR }",
+        );
+        let err = upgrade_alias_implementation(
+            rk.host_mut(),
+            &retyped_storage,
+            &mut Gas::default(),
+        )
+        .expect_err("changing the storage type must be rejected");
+        assert!(matches!(err, AliasUpgradeError::StorageTypeChanged));
+    }
+
+    #[test]
+    fn upgrade_rejects_widening_without_default_annotation() {
+        // Documents the `%default` requirement: widening the parameter via an
+        // `or` *without* annotating the old branch `%default` changes the
+        // implicit `default` entrypoint's type (it becomes the whole `or`), so
+        // the upgrade is correctly rejected. The safe path is to annotate
+        // `(unit %default)` — exercised by `upgrade_accepts_entrypoint_superset`.
+        let mut host = test_host();
+        let mut rk = RuntimeKeyspaces::init(&mut host).unwrap();
+        account_storage::write_alias_implementation(
+            rk.host_mut(),
+            &encode_script(UPGRADE_BASE_SCRIPT),
+        )
+        .unwrap();
+
+        let widened_no_default = encode_script(
+            "parameter (or (unit %a) (string %b)); storage unit; code { CDR; NIL \
+             operation; PAIR }",
+        );
+        let err = upgrade_alias_implementation(
+            rk.host_mut(),
+            &widened_no_default,
+            &mut Gas::default(),
+        )
+        .expect_err("widening without %default changes `default`'s type");
+        assert!(matches!(err, AliasUpgradeError::EntrypointTypeChanged(_)));
+    }
+
+    #[test]
+    fn upgrade_rejects_invalid_script() {
+        let mut host = test_host();
+        let mut rk = RuntimeKeyspaces::init(&mut host).unwrap();
+        account_storage::write_alias_implementation(
+            rk.host_mut(),
+            &encode_script(UPGRADE_BASE_SCRIPT),
+        )
+        .unwrap();
+
+        let err = upgrade_alias_implementation(
+            rk.host_mut(),
+            b"not a michelson script",
+            &mut Gas::default(),
+        )
+        .expect_err("a non-typeable script must be rejected");
+        assert!(matches!(err, AliasUpgradeError::InvalidScript));
+        // The core safety property: the slot is left untouched on rejection.
+        assert_eq!(
+            account_storage::read_alias_implementation(rk.host()).unwrap(),
+            Some(encode_script(UPGRADE_BASE_SCRIPT))
+        );
+    }
+
+    #[test]
+    fn upgrade_rejects_corrupt_current_implementation() {
+        // A non-typeable slot means the current implementation is corrupt.
+        let mut host = test_host();
+        let mut rk = RuntimeKeyspaces::init(&mut host).unwrap();
+        account_storage::write_alias_implementation(rk.host_mut(), b"garbage").unwrap();
+
+        let err = upgrade_alias_implementation(
+            rk.host_mut(),
+            &encode_script(UPGRADE_BASE_SCRIPT),
+            &mut Gas::default(),
+        )
+        .expect_err("a corrupt current implementation must be rejected");
+        assert!(matches!(
+            err,
+            AliasUpgradeError::CurrentImplementationInvalid
+        ));
+    }
+
+    #[test]
+    fn upgrade_into_empty_slot_is_accepted() {
+        // No current implementation: nothing to preserve.
+        let mut host = test_host();
+        let mut rk = RuntimeKeyspaces::init(&mut host).unwrap();
+        let code = encode_script(UPGRADE_BASE_SCRIPT);
+        upgrade_alias_implementation(rk.host_mut(), &code, &mut Gas::default())
+            .expect("seeding an empty slot has no monotonicity constraint");
+        assert_eq!(
+            account_storage::read_alias_implementation(rk.host()).unwrap(),
+            Some(code)
+        );
+    }
+
+    static SCRIPT_EMITING_INTERNAL_TRANSFER: &str = r#"
+        parameter (list address);
+        storage unit;
+        code {
+            CAR;
+            MAP {
+                CONTRACT unit;
+                IF_NONE { PUSH string "Invalid contract address"; FAILWITH } {};
+                PUSH mutez 10;
+                PUSH unit Unit;
+                TRANSFER_TOKENS
+            };
+            PUSH unit Unit;
+            SWAP;
+            PAIR
+        }"#;
+
+    /// Build the whole CREATE_CONTRACT { ... } block.
+    fn make_create_contract_block(
+        param_ty: &str,
+        storage_ty: &str,
+        code_body: &str, // inside `code { ... }`
+    ) -> String {
+        // Michelson `{ ... }` need to be doubled to escape Rust’s format! braces
+        format!(
+            "
+                parameter {param_ty} ;
+                storage {storage_ty} ;
+                code {{ {code_body} }}
+            "
+        )
+    }
+
+    /// Embed a whole contract creation block into a surrounding
+    /// script, with delegate hard-coded as `NONE key_hash`.
+    /// Also, the created script must have a storage of type `unit`.
+    fn make_script_emitting_internal_origination(create_block: &str) -> String {
+        format!(
+            r#"
+            parameter unit;
+            storage (option address);
+            code {{
+                DROP;
+                UNIT;                   # starting storage for contract
+                AMOUNT;                 # starting balance for the child
+                NONE key_hash;          # delegate is always None
+                CREATE_CONTRACT {{ {create_block} }};
+                DIP {{ SOME ; NIL operation }} ; CONS ; PAIR
+            }}"#
+        )
+    }
+
+    /// Call CREATE_CONTRACT three times:
+    /// Result of first call is dropped, result of other calls are swapped.
+    fn make_script_emitting_two_internal_originations(
+        create_block_1: &str,
+        create_block_2: &str,
+        create_block_3: &str,
+    ) -> String {
+        format!(
+            r#"
+            parameter unit;
+            storage (option (pair address address address));
+            code {{
+                DROP;
+                UNIT;                   # starting storage for contract
+                PUSH mutez 0;           # starting balance for the child
+                NONE key_hash;          # delegate is always None
+                CREATE_CONTRACT {{ {create_block_1} }}; DROP;
+
+                PUSH nat 1;             # starting storage for contract
+                PUSH mutez 0;           # starting balance for the child
+                NONE key_hash;          # delegate is always None
+                CREATE_CONTRACT {{ {create_block_2} }};
+                DIP {{ PAIR ; NIL operation }} ; CONS ;
+
+                PUSH bytes 0x;          # starting storage for contract
+                PUSH mutez 0;           # starting balance for the child
+                NONE key_hash;          # delegate is always None
+                CREATE_CONTRACT {{ {create_block_3} }};
+                DIP {{ SWAP; DIP {{ PAIR ; SOME }} }} ; CONS ; PAIR
+            }}"#
+        )
+    }
+
+    fn make_operation(
+        fee: u64,
+        first_counter: u64,
+        gas_limit: u64,
+        storage_limit: u64,
+        source: Bootstrap,
+        content: Vec<OperationContent>,
+    ) -> Operation {
+        let branch = TezBlock::genesis_block_hash();
+        let content = content
+            .into_iter()
+            .enumerate()
+            .map(|(i, c)| -> ManagerOperationContent {
+                ManagerOperation {
+                    source: source.pkh.clone(),
+                    fee: fee.into(),
+                    counter: (first_counter + i as u64).into(),
+                    operation: c,
+                    gas_limit: gas_limit.into(),
+                    storage_limit: storage_limit.into(),
+                }
+                .into_manager_operation_content()
+            })
+            .collect::<Vec<ManagerOperationContent>>();
+
+        let signature = sign_operation(&source.sk, &branch, &content).unwrap();
+
+        Operation {
+            branch,
+            content,
+            signature,
+        }
+    }
+
+    fn make_reveal_operation(
+        fee: u64,
+        counter: u64,
+        gas_limit: u64,
+        storage_limit: u64,
+        source: Bootstrap,
+    ) -> Operation {
+        make_operation(
+            fee,
+            counter,
+            gas_limit,
+            storage_limit,
+            source.clone(),
+            vec![OperationContent::Reveal(RevealContent {
+                pk: source.pk,
+                proof: None,
+            })],
+        )
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn make_transfer_operation(
+        fee: u64,
+        counter: u64,
+        gas_limit: u64,
+        storage_limit: u64,
+        source: Bootstrap,
+        amount: Narith,
+        destination: Contract,
+        parameters: Parameters,
+    ) -> Operation {
+        make_operation(
+            fee,
+            counter,
+            gas_limit,
+            storage_limit,
+            source,
+            vec![OperationContent::Transfer(TransferContent {
+                amount,
+                destination,
+                parameters,
+            })],
+        )
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn make_origination_operation(
+        fee: u64,
+        counter: u64,
+        gas_limit: u64,
+        storage_limit: u64,
+        source: Bootstrap,
+        balance: u64,
+        script: Script,
+    ) -> Operation {
+        make_operation(
+            fee,
+            counter,
+            gas_limit,
+            storage_limit,
+            source,
+            vec![OperationContent::Origination(OriginationContent {
+                balance: balance.into(),
+                script,
+                delegate: None,
+            })],
+        )
+    }
+
+    // This function setups an account that will pass the validity checks
+    fn init_account(
+        tez_accounts: &mut impl KeySpace,
+        src: &PublicKeyHash,
+        amount: u64,
+    ) -> TezosImplicitAccount {
+        // Setting the account in TezosImplicitAccount
+        let contract = Contract::from_b58check(&src.to_b58check())
+            .expect("Contract b58 conversion should have succeed");
+
+        let account = context::implicit_from_contract(&contract)
+            .expect("Account creation should have succeed");
+
+        // Allocate the account
+        account
+            .allocate(tez_accounts)
+            .expect("Account allocation should have succeed");
+
+        // Setting the balance to pass the validity check
+        let mut info = account_storage::get_tezos_account_info_or_init(tez_accounts, src)
+            .expect("Account info read should have succeed");
+        info.balance = amount.into();
+        account_storage::set_tezos_account_info(tez_accounts, src, info)
+            .expect("Set balance should have succeed");
+
+        account
+    }
+
+    fn reveal_account(tez_accounts: &mut impl KeySpace, source: &Bootstrap) {
+        let account = context::implicit_from_public_key_hash(&source.pkh)
+            .expect("Account creation should have succeed");
+        account
+            .set_manager_public_key(tez_accounts, &source.pk)
+            .unwrap()
+    }
+
+    // This function sets up an account that will pass the validity checks
+    fn init_contract<Host: StorageV1, KS: KeySpace>(
+        rk: &mut RuntimeKeyspaces<Host, KS>,
+        src: &ContractKt1Hash,
+        script: &str,
+        storage_micheline: &Micheline,
+        balance: &Narith,
+    ) -> TezosOriginatedAccount {
+        // Setting the account in TezosImplicitAccount
+        let contract = Contract::Originated(src.clone());
+
+        let account = context::originated_from_contract(&contract)
+            .expect("Account creation should have succeeded");
+
+        let parser = mir::parser::Parser::new();
+        let script_micheline = parser.parse_top_level(script).unwrap();
+
+        account
+            .init(
+                rk.host_mut(),
+                Some(
+                    &script_micheline
+                        .encode(&mut Gas::default())
+                        .unwrap()
+                        .unwrap(),
+                ),
+                &storage_micheline
+                    .encode(&mut Gas::default())
+                    .unwrap()
+                    .unwrap(),
+                0.into(),
+            )
+            .expect("Account initialisation should have succeeded");
+
+        account
+            .set_balance(rk.host_mut(), balance)
+            .expect("Set balance should have succeeded");
+
+        account
+    }
+
+    fn zip_operations(
+        operation: Operation,
+        receipt: Vec<OperationResultSum>,
+    ) -> Vec<OperationWithMetadata> {
+        operation
+            .content
+            .into_iter()
+            .zip(receipt)
+            .map(|(c, r)| OperationWithMetadata {
+                content: c,
+                receipt: r,
+            })
+            .collect::<Vec<OperationWithMetadata>>()
+    }
+
+    // Test an operation on an account that has no entry in `/context/contracts/index`
+    // This should fail as an EmptyImplicitContract
+    #[test]
+    fn apply_operation_empty_account() {
+        let mut host = test_host();
+        let mut rk = RuntimeKeyspaces::init(&mut host).unwrap();
+
+        let source = bootstrap1();
+
+        // We need to have something written in the durable storage
+        // to avoid getting an error when initializing the safe_storage
+        let other = bootstrap2();
+
+        let src_account = init_account(rk.tez_accounts_mut(), &other.pkh, 50);
+
+        let operation = make_reveal_operation(15, 1, 1000, 5, source);
+
+        let result = validate_and_apply_operation(
+            &mut rk,
+            &NotWiredRegistry,
+            &mut TezosXJournal::mock(RuntimeId::Ethereum),
+            operation,
+            &block_ctx!(),
+            false,
+            None,
+            None,
+            &test_safe_roots(),
+        );
+
+        let expected_error =
+            OperationError::Validation(ValidityError::EmptyImplicitContract);
+
+        assert_eq!(
+            src_account.counter(rk.tez_accounts()).unwrap(),
+            0.into(),
+            "Counter should not have been incremented"
+        );
+
+        assert_eq!(result, Err(expected_error));
+    }
+
+    // Test that increasing the fees makes the operation fails
+    #[test]
+    fn apply_operation_cant_pay_fees() {
+        let mut host = test_host();
+        let mut rk = RuntimeKeyspaces::init(&mut host).unwrap();
+
+        let source = bootstrap1();
+
+        let src_account = init_account(rk.tez_accounts_mut(), &source.pkh, 50);
+
+        // Fees are too high for source's balance
+        let operation = make_reveal_operation(100, 1, 1000, 5, source);
+
+        let result = validate_and_apply_operation(
+            &mut rk,
+            &NotWiredRegistry,
+            &mut TezosXJournal::mock(RuntimeId::Ethereum),
+            operation,
+            &block_ctx!(),
+            false,
+            None,
+            None,
+            &test_safe_roots(),
+        );
+
+        let expected_error =
+            OperationError::Validation(ValidityError::CantPayFees(100_u64.into()));
+
+        assert_eq!(
+            src_account.counter(rk.tez_accounts()).unwrap(),
+            0.into(),
+            "Counter should not have been incremented"
+        );
+
+        assert_eq!(result, Err(expected_error));
+    }
+
+    // Test that a wrong counter should make the operation fails
+    #[test]
+    fn apply_operation_invalid_counter() {
+        let mut host = test_host();
+        let mut rk = RuntimeKeyspaces::init(&mut host).unwrap();
+
+        let source = bootstrap1();
+
+        let src_account = init_account(rk.tez_accounts_mut(), &source.pkh, 50);
+
+        // Counter is incoherent for source's counter
+        let operation = make_reveal_operation(15, 15, 1000, 5, source);
+
+        let result = validate_and_apply_operation(
+            &mut rk,
+            &NotWiredRegistry,
+            &mut TezosXJournal::mock(RuntimeId::Ethereum),
+            operation,
+            &block_ctx!(),
+            false,
+            None,
+            None,
+            &test_safe_roots(),
+        );
+
+        let expected_error =
+            OperationError::Validation(ValidityError::CounterInTheFuture(CounterError {
+                expected: 1_u64.into(),
+                found: 15_u64.into(),
+            }));
+
+        assert_eq!(
+            src_account.counter(rk.tez_accounts()).unwrap(),
+            0.into(),
+            "Counter should not have been incremented"
+        );
+
+        assert_eq!(result, Err(expected_error));
+    }
+
+    // At this point, tests are focused on the content of the operation. We should not revert with ValidityError anymore.
+    // Test a reveal operation on an already revealed account
+    #[test]
+    fn apply_reveal_operation_on_already_revealed_account() {
+        let mut host = test_host();
+        let mut rk = RuntimeKeyspaces::init(&mut host).unwrap();
+
+        let source = bootstrap1();
+
+        let account = init_account(rk.tez_accounts_mut(), &source.pkh, 50);
+
+        // Setting the manager key of this account to its public_key, this account
+        // will be considered as revealed and the reveal operation should fail
+        let pk = PublicKey::from_b58check(
+            "edpkuBknW28nW72KG6RoHtYW7p12T6GKc7nAbwYX5m8Wd9sDVC9yav",
+        )
+        .expect("Public key creation should have succeed");
+
+        account
+            .set_manager_public_key(rk.tez_accounts_mut(), &pk)
+            .expect("Setting manager field should have succeed");
+
+        // Applying the operation
+        let operation = make_reveal_operation(15, 1, 1000, 5, source.clone());
+        let processed = validate_and_apply_operation(
+            &mut rk,
+            &NotWiredRegistry,
+            &mut TezosXJournal::mock(RuntimeId::Ethereum),
+            operation.clone(),
+            &block_ctx!(),
+            false,
+            None,
+            None,
+            &test_safe_roots(),
+        )
+        .expect(
+            "validate_and_apply_operation should not have failed with a kernel error",
+        );
+        let receipt = ProcessedOperation::into_receipts(processed);
+
+        // Reveal operation should fail
+        let expected_receipt = vec![OperationWithMetadata {
+            content: operation.content[0].clone(),
+            receipt: OperationResultSum::Reveal(OperationResult {
+                balance_updates: vec![
+                    BalanceUpdate {
+                        balance: Balance::Account(Contract::Implicit(source.pkh.clone())),
+                        changes: -15,
+                        update_origin: UpdateOrigin::BlockApplication,
+                    },
+                    BalanceUpdate {
+                        balance: Balance::BlockFees,
+                        changes: 15,
+                        update_origin: UpdateOrigin::BlockApplication,
+                    },
+                ],
+                result: ContentResult::Failed(
+                    vec![RevealError::PreviouslyRevealedKey(Contract::Implicit(
+                        source.pkh,
+                    ))
+                    .into()]
+                    .into(),
+                ),
+                internal_operation_results: vec![],
+            }),
+        }];
+
+        assert_eq!(
+            account.counter(rk.tez_accounts()).unwrap(),
+            1.into(),
+            "Counter should have been incremented"
+        );
+
+        assert_eq!(receipt, expected_receipt);
+    }
+
+    // The live RLP `TezosImplicitAccount` derives an unrevealed account's
+    // manager from the account's own public-key hash (it stores only a
+    // *revealed* public key, never a separate manager pkh). It therefore
+    // cannot represent the standalone layout's "inconsistent manager" state:
+    // `set_manager_pk_hash_internal` is a no-op, so `force_set_manager_public_key_hash`
+    // leaves the manager consistent and the reveal succeeds. This pins that
+    // invariant (the `InconsistentHash` branch of `reveal` is unreachable for
+    // the live account) rather than the standalone-only failure path.
+    #[test]
+    fn reveal_manager_is_always_consistent_on_live_account() {
+        let mut host = test_host();
+        let mut rk = RuntimeKeyspaces::init(&mut host).unwrap();
+
+        let source = bootstrap1();
+
+        let account = init_account(rk.tez_accounts_mut(), &source.pkh, 50);
+
+        // Attempting to plant an inconsistent manager pkh is a no-op on the
+        // live account: the manager stays `NotRevealed(source.pkh)`.
+        let inconsistent_pkh =
+            PublicKeyHash::from_b58check("tz1UEQcU7M43yUECMpKGJcxCVwHRaP819qhN")
+                .expect("PublicKeyHash b58 conversion should have succeed");
+
+        account
+            .force_set_manager_public_key_hash(rk.tez_accounts_mut(), &inconsistent_pkh)
+            .expect("Setting manager field should have succeed");
+
+        assert_eq!(
+            account.manager(rk.tez_accounts()).unwrap(),
+            Manager::NotRevealed(source.pkh.clone()),
+            "live account manager is derived from its own pkh, stays consistent"
+        );
+
+        let operation = make_reveal_operation(15, 1, 1000, 5, source.clone());
+
+        let processed = validate_and_apply_operation(
+            &mut rk,
+            &NotWiredRegistry,
+            &mut TezosXJournal::mock(RuntimeId::Ethereum),
+            operation.clone(),
+            &block_ctx!(),
+            false,
+            None,
+            None,
+            &test_safe_roots(),
+        )
+        .expect(
+            "validate_and_apply_operation should not have failed with a kernel error",
+        );
+        let receipt = ProcessedOperation::into_receipts(processed);
+
+        let expected_receipt = vec![OperationWithMetadata {
+            content: operation.content[0].clone(),
+            receipt: OperationResultSum::Reveal(OperationResult {
+                balance_updates: vec![
+                    BalanceUpdate {
+                        balance: Balance::Account(Contract::Implicit(source.pkh.clone())),
+                        changes: -15,
+                        update_origin: UpdateOrigin::BlockApplication,
+                    },
+                    BalanceUpdate {
+                        balance: Balance::BlockFees,
+                        changes: 15,
+                        update_origin: UpdateOrigin::BlockApplication,
+                    },
+                ],
+                result: ContentResult::Applied(RevealSuccess {
+                    consumed_milligas: 148496_u64.into(),
+                }),
+                internal_operation_results: vec![],
+            }),
+        }];
+
+        assert_eq!(receipt, expected_receipt);
+        assert_eq!(
+            account.manager(rk.tez_accounts()).unwrap(),
+            Manager::Revealed(source.pk),
+            "reveal records the source's public key as the manager"
+        );
+        assert_eq!(
+            account.counter(rk.tez_accounts()).unwrap(),
+            1.into(),
+            "Counter should have been incremented"
+        );
+    }
+
+    // Test an invalid operation where the provided public key is inconsistent for the source
+    #[test]
+    fn apply_reveal_operation_with_an_inconsistent_public_key() {
+        let mut host = test_host();
+        let mut rk = RuntimeKeyspaces::init(&mut host).unwrap();
+
+        // Wrong public key for source
+        let pk = PublicKey::from_b58check(
+            "edpkuT1qccDweCHnvgjLuNUHERpZmEaFZfbWvTzj2BxmTgQBZjaDFD",
+        )
+        .expect("Public key creation should have succeed");
+
+        let source = Bootstrap { pk, ..bootstrap1() };
+
+        // Even if we don't use it we need to init the account
+        let account = init_account(rk.tez_accounts_mut(), &source.pkh, 50);
+
+        let operation = make_reveal_operation(15, 1, 1000, 5, source.clone());
+
+        let result = validate_and_apply_operation(
+            &mut rk,
+            &NotWiredRegistry,
+            &mut TezosXJournal::mock(RuntimeId::Ethereum),
+            operation,
+            &block_ctx!(),
+            false,
+            None,
+            None,
+            &test_safe_roots(),
+        );
+
+        // The mismatch between the payload key and the source is caught in
+        // `get_revealed_key` during validation, before the signature check.
+        let expected_error = OperationError::Validation(
+            ValidityError::InconsistentPublicKey(bootstrap1().pkh),
+        );
+
+        assert_eq!(
+            account.counter(rk.tez_accounts()).unwrap(),
+            0.into(),
+            "Counter should not have been incremented"
+        );
+
+        assert_eq!(result, Err(expected_error));
+    }
+
+    // A permissionless attacker must not be able to charge a victim's
+    // fee/counter by submitting a Reveal-first batch whose source is the victim
+    // but whose payload key (and signature) are the attacker's own. Regression
+    // test for L2-1796: the mismatch is rejected during validation, before any
+    // fee is debited or counter promoted.
+    #[test]
+    fn validate_reveal_with_attacker_key_does_not_charge_source() {
+        let mut host = test_host();
+        let mut rk = RuntimeKeyspaces::init(&mut host).unwrap();
+
+        let victim = bootstrap1();
+        let attacker = bootstrap2();
+
+        let account = init_account(rk.tez_accounts_mut(), &victim.pkh, 50);
+
+        // source = victim, but the Reveal payload key is the attacker's, and the
+        // whole batch is signed by the attacker (so the signature check against
+        // that payload key would otherwise pass).
+        let branch = TezBlock::genesis_block_hash();
+        let content = vec![ManagerOperation {
+            source: victim.pkh.clone(),
+            fee: 15_u64.into(),
+            counter: 1_u64.into(),
+            operation: OperationContent::Reveal(RevealContent {
+                pk: attacker.pk.clone(),
+                proof: None,
+            }),
+            gas_limit: 1000_u64.into(),
+            storage_limit: 5_u64.into(),
+        }
+        .into_manager_operation_content()];
+        let signature = sign_operation(&attacker.sk, &branch, &content).unwrap();
+        let operation = Operation {
+            branch,
+            content,
+            signature,
+        };
+
+        let result = validate_and_apply_operation(
+            &mut rk,
+            &NotWiredRegistry,
+            &mut TezosXJournal::mock(RuntimeId::Ethereum),
+            operation,
+            &block_ctx!(),
+            false,
+            None,
+            None,
+            &test_safe_roots(),
+        );
+
+        assert_eq!(
+            result,
+            Err(OperationError::Validation(
+                ValidityError::InconsistentPublicKey(victim.pkh.clone())
+            )),
+            "attacker-signed reveal must be rejected during validation"
+        );
+
+        // The victim's fee must not be charged and its counter must not move.
+        assert_eq!(
+            account.balance(rk.host()).unwrap(),
+            50_u64.into(),
+            "Victim balance must not be debited"
+        );
+        assert_eq!(
+            account.counter(rk.tez_accounts()).unwrap(),
+            0.into(),
+            "Victim counter must not be incremented"
+        );
+    }
+
+    // Test a valid reveal operation, the manager should go from NotRevealed to Revealed
+    #[test]
+    fn apply_reveal_operation() {
+        let mut host = test_host();
+        let mut rk = RuntimeKeyspaces::init(&mut host).unwrap();
+
+        let source = bootstrap1();
+
+        let account = init_account(rk.tez_accounts_mut(), &source.pkh, 50);
+
+        let manager = account
+            .manager(rk.tez_accounts())
+            .expect("Read manager should have succeed");
+
+        assert_eq!(manager, Manager::NotRevealed(source.pkh.clone()));
+
+        let pk = PublicKey::from_b58check(
+            "edpkuBknW28nW72KG6RoHtYW7p12T6GKc7nAbwYX5m8Wd9sDVC9yav",
+        )
+        .expect("Public key creation should have succeed");
+
+        let operation = make_reveal_operation(15, 1, 1000, 5, source.clone());
+
+        let processed = validate_and_apply_operation(
+            &mut rk,
+            &NotWiredRegistry,
+            &mut TezosXJournal::mock(RuntimeId::Ethereum),
+            operation.clone(),
+            &block_ctx!(),
+            false,
+            None,
+            None,
+            &test_safe_roots(),
+        )
+        .expect(
+            "validate_and_apply_operation should not have failed with a kernel error",
+        );
+        let receipt = ProcessedOperation::into_receipts(processed);
+
+        let expected_receipt = vec![OperationWithMetadata {
+            content: operation.content[0].clone(),
+            receipt: OperationResultSum::Reveal(OperationResult {
+                balance_updates: vec![
+                    BalanceUpdate {
+                        balance: Balance::Account(Contract::Implicit(source.pkh)),
+                        changes: -15,
+                        update_origin: UpdateOrigin::BlockApplication,
+                    },
+                    BalanceUpdate {
+                        balance: Balance::BlockFees,
+                        changes: 15,
+                        update_origin: UpdateOrigin::BlockApplication,
+                    },
+                ],
+                result: ContentResult::Applied(RevealSuccess {
+                    consumed_milligas: 148496_u64.into(),
+                }),
+                internal_operation_results: vec![],
+            }),
+        }];
+
+        assert_eq!(receipt, expected_receipt);
+
+        let manager = account
+            .manager(rk.tez_accounts())
+            .expect("Read manager should have succeed");
+
+        assert_eq!(manager, Manager::Revealed(pk));
+
+        assert_eq!(
+            account.counter(rk.tez_accounts()).unwrap(),
+            1.into(),
+            "Counter should have been incremented"
+        );
+    }
+
+    // Test an invalid transfer operation, source has not enough balance to fulfill the Transfer
+    #[test]
+    fn apply_transfer_with_not_enough_balance() {
+        let mut host = test_host();
+        let mut rk = RuntimeKeyspaces::init(&mut host).unwrap();
+
+        let source = bootstrap1();
+
+        let dest = bootstrap2();
+
+        // Setup accounts with 50 mutez in their balance
+        let source_account = init_account(rk.tez_accounts_mut(), &source.pkh, 50);
+        reveal_account(rk.tez_accounts_mut(), &source);
+
+        let destination_account = init_account(rk.tez_accounts_mut(), &dest.pkh, 50);
+
+        let operation = make_transfer_operation(
+            15,
+            1,
+            21040,
+            5,
+            source.clone(),
+            100_u64.into(),
+            Contract::Implicit(dest.pkh),
+            Parameters::default(),
+        );
+
+        let processed = validate_and_apply_operation(
+            &mut rk,
+            &NotWiredRegistry,
+            &mut TezosXJournal::mock(RuntimeId::Ethereum),
+            operation.clone(),
+            &block_ctx!(),
+            false,
+            None,
+            None,
+            &test_safe_roots(),
+        )
+        .expect(
+            "validate_and_apply_operation should not have failed with a kernel error",
+        );
+        let receipt = ProcessedOperation::into_receipts(processed);
+
+        let expected_receipt = vec![OperationWithMetadata {
+            content: operation.content[0].clone(),
+            receipt: OperationResultSum::Transfer(OperationResult {
+                balance_updates: vec![
+                    BalanceUpdate {
+                        balance: Balance::Account(Contract::Implicit(source.pkh.clone())),
+                        changes: -15,
+                        update_origin: UpdateOrigin::BlockApplication,
+                    },
+                    BalanceUpdate {
+                        balance: Balance::BlockFees,
+                        changes: 15,
+                        update_origin: UpdateOrigin::BlockApplication,
+                    },
+                ],
+                result: ContentResult::Failed(
+                    vec![TransferError::BalanceTooLow(BalanceTooLow {
+                        contract: Contract::Implicit(source.pkh),
+                        balance: 35_u64.into(),
+                        amount: 100_u64.into(),
+                    })
+                    .into()]
+                    .into(),
+                ),
+                internal_operation_results: vec![],
+            }),
+        }];
+
+        assert_eq!(receipt, expected_receipt);
+
+        // Verify that source only paid the fees and the destination balance is unchanged
+        assert_eq!(source_account.balance(rk.host()).unwrap(), 35.into());
+        assert_eq!(
+            destination_account.balance(rk.host()).unwrap(),
+            50_u64.into()
+        );
+
+        assert_eq!(
+            source_account.counter(rk.tez_accounts()).unwrap(),
+            1.into(),
+            "Counter should have been incremented"
+        );
+    }
+
+    // Bootstrap 1 successfully transfer 30 mutez to Bootstrap 2
+    #[test]
+    fn apply_successful_transfer() {
+        let mut host = test_host();
+        let mut rk = RuntimeKeyspaces::init(&mut host).unwrap();
+
+        let src = bootstrap1();
+
+        let dst = bootstrap2();
+
+        // Setup accounts with 50 mutez in their balance and reveal the source
+        let source = init_account(rk.tez_accounts_mut(), &src.pkh, 50);
+        reveal_account(rk.tez_accounts_mut(), &src);
+
+        let destination = init_account(rk.tez_accounts_mut(), &dst.pkh, 50);
+
+        let operation = make_transfer_operation(
+            15,
+            1,
+            21040,
+            5,
+            src.clone(),
+            30_u64.into(),
+            Contract::Implicit(dst.pkh.clone()),
+            Parameters::default(),
+        );
+
+        let processed = validate_and_apply_operation(
+            &mut rk,
+            &NotWiredRegistry,
+            &mut TezosXJournal::mock(RuntimeId::Ethereum),
+            operation.clone(),
+            &block_ctx!(),
+            false,
+            None,
+            None,
+            &test_safe_roots(),
+        )
+        .expect(
+            "validate_and_apply_operation should not have failed with a kernel error",
+        );
+        let receipt = ProcessedOperation::into_receipts(processed);
+
+        let expected_receipt = vec![OperationWithMetadata {
+            content: operation.content[0].clone(),
+            receipt: OperationResultSum::Transfer(OperationResult {
+                balance_updates: vec![
+                    BalanceUpdate {
+                        balance: Balance::Account(Contract::Implicit(src.pkh.clone())),
+                        changes: -15,
+                        update_origin: UpdateOrigin::BlockApplication,
+                    },
+                    BalanceUpdate {
+                        balance: Balance::BlockFees,
+                        changes: 15,
+                        update_origin: UpdateOrigin::BlockApplication,
+                    },
+                ],
+                result: ContentResult::Applied(TransferTarget::ToContract(
+                    TransferSuccess {
+                        storage: None,
+                        lazy_storage_diff: None,
+                        balance_updates: vec![
+                            BalanceUpdate {
+                                balance: Balance::Account(Contract::Implicit(src.pkh)),
+                                changes: -30,
+                                update_origin: UpdateOrigin::BlockApplication,
+                            },
+                            BalanceUpdate {
+                                balance: Balance::Account(Contract::Implicit(dst.pkh)),
+                                changes: 30,
+                                update_origin: UpdateOrigin::BlockApplication,
+                            },
+                        ],
+                        ticket_receipt: vec![],
+                        originated_contracts: vec![],
+                        consumed_milligas: 2148527_u64.into(),
+                        storage_size: 0_u64.into(),
+                        paid_storage_size_diff: 0_u64.into(),
+                        allocated_destination_contract: false,
+                        address_registry_diff: vec![],
+                    },
+                )),
+                internal_operation_results: vec![],
+            }),
+        }];
+        assert_eq!(receipt, expected_receipt);
+
+        // Verify that source and destination balances changed
+        assert_eq!(source.balance(rk.host()).unwrap(), 5_u64.into());
+        assert_eq!(destination.balance(rk.host()).unwrap(), 80_u64.into());
+
+        // Verify that the source's counter has been incremented
+        assert_eq!(
+            source.counter(rk.tez_accounts()).unwrap(),
+            1.into(),
+            "Counter should have been incremented"
+        );
+    }
+
+    // Bootstrap 1 successfully transfers 30 mutez to itself
+    #[test]
+    fn apply_successful_self_transfer() {
+        let mut host = test_host();
+        let mut rk = RuntimeKeyspaces::init(&mut host).unwrap();
+
+        let src = bootstrap1();
+
+        let dest = src.clone();
+
+        // Setup account with 50 mutez in its balance
+        let source = init_account(rk.tez_accounts_mut(), &src.pkh, 50);
+        reveal_account(rk.tez_accounts_mut(), &src);
+
+        let operation = make_transfer_operation(
+            15,
+            1,
+            21000,
+            5,
+            src.clone(),
+            30_u64.into(),
+            Contract::Implicit(dest.pkh.clone()),
+            Parameters::default(),
+        );
+
+        let processed = validate_and_apply_operation(
+            &mut rk,
+            &NotWiredRegistry,
+            &mut TezosXJournal::mock(RuntimeId::Ethereum),
+            operation.clone(),
+            &block_ctx!(),
+            false,
+            None,
+            None,
+            &test_safe_roots(),
+        )
+        .expect(
+            "validate_and_apply_operation should not have failed with a kernel error",
+        );
+        let receipt = ProcessedOperation::into_receipts(processed);
+
+        let expected_receipt = vec![OperationWithMetadata {
+            content: operation.content[0].clone(),
+            receipt: OperationResultSum::Transfer(OperationResult {
+                balance_updates: vec![
+                    BalanceUpdate {
+                        balance: Balance::Account(Contract::Implicit(src.pkh.clone())),
+                        changes: -15,
+                        update_origin: UpdateOrigin::BlockApplication,
+                    },
+                    BalanceUpdate {
+                        balance: Balance::BlockFees,
+                        changes: 15,
+                        update_origin: UpdateOrigin::BlockApplication,
+                    },
+                ],
+                result: ContentResult::Applied(TransferTarget::ToContract(
+                    TransferSuccess {
+                        storage: None,
+                        lazy_storage_diff: None,
+                        balance_updates: vec![
+                            BalanceUpdate {
+                                balance: Balance::Account(Contract::Implicit(src.pkh)),
+                                changes: -30,
+                                update_origin: UpdateOrigin::BlockApplication,
+                            },
+                            BalanceUpdate {
+                                balance: Balance::Account(Contract::Implicit(dest.pkh)),
+                                changes: 30,
+                                update_origin: UpdateOrigin::BlockApplication,
+                            },
+                        ],
+                        ticket_receipt: vec![],
+                        originated_contracts: vec![],
+                        consumed_milligas: 2148527_u64.into(),
+                        storage_size: 0_u64.into(),
+                        paid_storage_size_diff: 0_u64.into(),
+                        allocated_destination_contract: false,
+                        address_registry_diff: vec![],
+                    },
+                )),
+                internal_operation_results: vec![],
+            }),
+        }];
+
+        // Verify that balance was only debited for fees
+        assert_eq!(source.balance(rk.host()).unwrap(), 35_u64.into());
+
+        assert_eq!(receipt, expected_receipt);
+
+        // Verify that the source's counter has been incremented
+        assert_eq!(
+            source.counter(rk.tez_accounts()).unwrap(),
+            1.into(),
+            "Counter should have been incremented"
+        );
+    }
+
+    #[test]
+    fn apply_transfer_to_originated_faucet_with_success_receipt() {
+        let mut host = test_host();
+        let mut rk = RuntimeKeyspaces::init(&mut host).unwrap();
+        let (requester_balance, faucet_balance, fees) = (50, 1000, 15);
+        let src = bootstrap1();
+        let desthash =
+            ContractKt1Hash::from_base58_check("KT1RJ6PbjHpwc3M5rw5s2Nbmefwbuwbdxton")
+                .expect("ContractKt1Hash b58 conversion should have succeeded");
+        // Setup accounts with 50 mutez in their balance
+        let requester = init_account(rk.tez_accounts_mut(), &src.pkh, 50);
+        reveal_account(rk.tez_accounts_mut(), &src);
+        let (code, storage) = (
+            r#"
+                        parameter (mutez %fund);
+                        storage unit;
+                        code
+                        {
+                            UNPAIR;
+                            SENDER;
+                            CONTRACT unit;
+                            IF_NONE { FAILWITH } {};
+                            SWAP;
+                            UNIT;
+                            TRANSFER_TOKENS;
+                            NIL operation;
+                            SWAP;
+                            CONS;
+                            PAIR
+                        }
+            "#,
+            &Micheline::from(()),
+        );
+        let faucet = init_contract(&mut rk, &desthash, code, storage, &1000.into());
+        let requested_amount = 100;
+        let operation = make_transfer_operation(
+            fees,
+            1,
+            22080,
+            5,
+            src.clone(),
+            0.into(),
+            Contract::Originated(desthash.clone()),
+            Parameters {
+                entrypoint: Entrypoint::try_from("fund")
+                    .expect("Entrypoint should be valid"),
+                value: Micheline::from(requested_amount as i128)
+                    .encode(&mut Gas::default())
+                    .unwrap()
+                    .unwrap(),
+            },
+        );
+        let res = validate_and_apply_operation(
+            &mut rk,
+            &NotWiredRegistry,
+            &mut TezosXJournal::mock(RuntimeId::Ethereum),
+            operation.clone(),
+            &block_ctx!(),
+            false,
+            None,
+            None,
+            &test_safe_roots(),
+        )
+        .expect("validate_and_apply_operation should not have failed with a kernel error")
+        .remove(0)
+        .operation_with_metadata;
+        assert_eq!(
+            res,
+            OperationWithMetadata {
+                content: operation.content[0].clone(),
+                receipt: OperationResultSum::Transfer(OperationResult {
+                    balance_updates: vec![
+                        BalanceUpdate {
+                            balance: Balance::Account(Contract::Implicit(
+                                src.pkh.clone()
+                            )),
+                            changes: 0 - fees as i64,
+                            update_origin: UpdateOrigin::BlockApplication,
+                        },
+                        BalanceUpdate {
+                            balance: Balance::BlockFees,
+                            changes: fees as i64,
+                            update_origin: UpdateOrigin::BlockApplication,
+                        },
+                    ],
+                    result: ContentResult::Applied(TransferTarget::ToContract(
+                        TransferSuccess {
+                            storage: Some(
+                                storage
+                                    .encode(&mut Gas::default())
+                                    .unwrap()
+                                    .unwrap()
+                                    .into()
+                            ),
+                            lazy_storage_diff: None,
+                            balance_updates: vec![],
+                            ticket_receipt: vec![],
+                            originated_contracts: vec![],
+                            consumed_milligas: 1159854_u64.into(),
+                            storage_size: 69_u64.into(), // code (67) + unit (2)
+                            paid_storage_size_diff: 0_u64.into(), // unit unchanged
+                            allocated_destination_contract: false,
+                            address_registry_diff: vec![],
+                        }
+                    )),
+                    internal_operation_results: vec![InternalOperationSum::Transfer(
+                        InternalContentWithMetadata {
+                            content: TransferContent {
+                                amount: requested_amount.into(),
+                                destination: Contract::Implicit(src.pkh.clone()),
+                                parameters: Parameters {
+                                    entrypoint: Entrypoint::default(),
+                                    value: Micheline::from(())
+                                        .encode(&mut Gas::default())
+                                        .unwrap()
+                                        .unwrap(),
+                                },
+                            },
+                            sender: Contract::Originated(desthash.clone()),
+                            nonce: 0,
+                            result: ContentResult::Applied(TransferTarget::ToContract(
+                                TransferSuccess {
+                                    storage: None,
+                                    lazy_storage_diff: None,
+                                    balance_updates: vec![
+                                        BalanceUpdate {
+                                            balance: Balance::Account(
+                                                Contract::Originated(desthash.clone())
+                                            ),
+                                            changes: 0 - (requested_amount as i64),
+                                            update_origin: UpdateOrigin::BlockApplication,
+                                        },
+                                        BalanceUpdate {
+                                            balance: Balance::Account(
+                                                Contract::Implicit(src.pkh.clone())
+                                            ),
+                                            changes: requested_amount as i64,
+                                            update_origin: UpdateOrigin::BlockApplication,
+                                        },
+                                    ],
+                                    ticket_receipt: vec![],
+                                    originated_contracts: vec![],
+                                    consumed_milligas: 2_100_250_u64.into(),
+                                    storage_size: 0_u64.into(),
+                                    paid_storage_size_diff: 0_u64.into(),
+                                    allocated_destination_contract: false,
+                                    address_registry_diff: vec![],
+                                }
+                            )),
+                        }
+                    )],
+                })
+            }
+        );
+        assert_eq!(
+            faucet.balance(rk.host()).unwrap(),
+            (faucet_balance - requested_amount).into()
+        );
+        assert_eq!(
+            requester.balance(rk.host()).unwrap(),
+            (requester_balance + requested_amount - fees).into()
+        ); // The faucet should have transferred 100 mutez to the source
+
+        assert_eq!(
+            requester.counter(rk.tez_accounts()).unwrap(),
+            1.into(),
+            "Counter should have been incremented"
+        );
+    }
+
+    /// Pin the existence-check guard introduced before `transfer_tez` in
+    /// the `Contract::Originated` branch of `transfer`. A Transaction to a
+    /// never-originated KT1 must produce a typed user-level
+    /// `ContractDoesNotExist` failure, not surface as
+    /// `FailedToFetchContractCode` (which is now routed to BlockAbort and
+    /// would discard the whole block).
+    ///
+    /// Regression for L2-1290: without this guard, a single transfer to
+    /// any unknown KT1 would be a user-controllable block-abort handle.
+    #[test]
+    fn apply_transfer_to_nonexistent_originated_contract() {
+        let mut host = test_host();
+        let mut rk = RuntimeKeyspaces::init(&mut host).unwrap();
+        let src = bootstrap1();
+        // Never-originated KT1: no `init_contract` call, no code blob, no
+        // balance entry exists at this path.
+        let desthash =
+            ContractKt1Hash::from_base58_check("KT1RJ6PbjHpwc3M5rw5s2Nbmefwbuwbdxton")
+                .expect("ContractKt1Hash b58 conversion should have succeeded");
+
+        let requester = init_account(rk.tez_accounts_mut(), &src.pkh, 50);
+        reveal_account(rk.tez_accounts_mut(), &src);
+
+        let operation = make_transfer_operation(
+            15,
+            1,
+            21040,
+            5,
+            src.clone(),
+            30_u64.into(),
+            Contract::Originated(desthash.clone()),
+            Parameters::default(),
+        );
+
+        let processed = validate_and_apply_operation(
+            &mut rk,
+            &NotWiredRegistry,
+            &mut TezosXJournal::mock(RuntimeId::Ethereum),
+            operation.clone(),
+            &block_ctx!(),
+            false,
+            None,
+            None,
+            &test_safe_roots(),
+        )
+        .expect(
+            "validate_and_apply_operation should not have failed with a kernel error",
+        );
+        let receipts = ProcessedOperation::into_receipts(processed);
+
+        assert_eq!(receipts.len(), 1, "There should be one receipt");
+        assert!(
+            matches!(
+                &receipts[0].receipt,
+                OperationResultSum::Transfer(OperationResult {
+                    result: ContentResult::Failed(ApplyOperationErrors { errors }),
+                    ..
+                }) if errors.len() == 1 && matches!(
+                    &errors[0],
+                    ApplyOperationError::Transfer(
+                        TransferError::ContractDoesNotExist(Contract::Originated(kt1))
+                    ) if kt1 == &desthash
+                )
+            ),
+            "Expected Failed Transfer with ContractDoesNotExist({desthash}), got {:?}",
+            receipts[0].receipt
+        );
+
+        // No balance entry should have been written under the bogus
+        // contract path. The guard runs before `transfer_tez`, so the
+        // never-originated KT1 must remain absent from durable storage.
+        let dest_account = context::originated_from_kt1(&desthash)
+            .expect("originated_from_kt1 should have succeeded");
+        let balance_path = context::contracts::balance_path(&dest_account)
+            .expect("balance_path should have succeeded");
+        assert_eq!(
+            rk.host_mut().store_has(&balance_path).unwrap(),
+            None,
+            "no balance entry should exist for a never-originated KT1"
+        );
+
+        // Source paid the manager fee but not the transfer amount.
+        assert_eq!(requester.balance(rk.host()).unwrap(), (50_u64 - 15).into());
+        assert_eq!(
+            requester.counter(rk.tez_accounts()).unwrap(),
+            1.into(),
+            "Counter should have been incremented"
+        );
+    }
+
+    #[test]
+    fn apply_transfer_with_execution() {
+        let mut host = test_host();
+        let mut rk = RuntimeKeyspaces::init(&mut host).unwrap();
+
+        let src = bootstrap1();
+
+        let dest = ContractKt1Hash::from_base58_check(CONTRACT_1)
+            .expect("ContractKt1Hash b58 conversion should have succeeded");
+
+        let initial_storage = Micheline::from("initial");
+
+        // Source funded with 54 mutez: 15 fee + 30 transfer + 4
+        // storage burn (4 × COST_PER_BYTES) + 5 remaining balance.
+        let source = init_account(rk.tez_accounts_mut(), &src.pkh, 54);
+        reveal_account(rk.tez_accounts_mut(), &src);
+        let destination =
+            init_contract(&mut rk, &dest, SCRIPT, &initial_storage, &50_u64.into());
+
+        let storage_value = Micheline::from("Hello world")
+            .encode(&mut Gas::default())
+            .unwrap()
+            .unwrap();
+        let operation = make_transfer_operation(
+            15,
+            1,
+            21040,
+            5,
+            src.clone(),
+            30_u64.into(),
+            Contract::Originated(dest),
+            Parameters {
+                entrypoint: mir::ast::Entrypoint::default(),
+                value: storage_value.clone(),
+            },
+        );
+
+        let processed = validate_and_apply_operation(
+            &mut rk,
+            &NotWiredRegistry,
+            &mut TezosXJournal::mock(RuntimeId::Ethereum),
+            operation.clone(),
+            &block_ctx!(),
+            false,
+            None,
+            None,
+            &test_safe_roots(),
+        )
+        .expect(
+            "validate_and_apply_operation should not have failed with a kernel error",
+        );
+        let receipt = ProcessedOperation::into_receipts(processed);
+
+        let storage = Some(storage_value.clone());
+
+        let expected_receipt = vec![OperationWithMetadata {
+            content: operation.content[0].clone(),
+            receipt: OperationResultSum::Transfer(OperationResult {
+                balance_updates: vec![
+                    BalanceUpdate {
+                        balance: Balance::Account(Contract::Implicit(src.pkh.clone())),
+                        changes: -15,
+                        update_origin: UpdateOrigin::BlockApplication,
+                    },
+                    BalanceUpdate {
+                        balance: Balance::BlockFees,
+                        changes: 15,
+                        update_origin: UpdateOrigin::BlockApplication,
+                    },
+                ],
+                result: ContentResult::Applied(TransferTarget::ToContract(
+                    TransferSuccess {
+                        storage: storage.map(Into::into),
+                        lazy_storage_diff: None,
+                        balance_updates: vec![
+                            BalanceUpdate {
+                                balance: Balance::Account(Contract::Implicit(
+                                    src.pkh.clone(),
+                                )),
+                                changes: -(4 * COST_PER_BYTES as i64),
+                                update_origin: UpdateOrigin::BlockApplication,
+                            },
+                            BalanceUpdate {
+                                balance: Balance::StorageFees,
+                                changes: (4 * COST_PER_BYTES as i64),
+                                update_origin: UpdateOrigin::BlockApplication,
+                            },
+                            // Transfer payload (sender → destination).
+                            BalanceUpdate {
+                                balance: Balance::Account(Contract::Implicit(
+                                    src.pkh.clone(),
+                                )),
+                                changes: -30,
+                                update_origin: UpdateOrigin::BlockApplication,
+                            },
+                            BalanceUpdate {
+                                balance: Balance::Account(
+                                    Contract::from_b58check(CONTRACT_1).unwrap(),
+                                ),
+                                changes: 30,
+                                update_origin: UpdateOrigin::BlockApplication,
+                            },
+                        ],
+                        ticket_receipt: vec![],
+                        originated_contracts: vec![],
+                        consumed_milligas: 1153868_u64.into(),
+                        storage_size: 44_u64.into(), // code (33) + "Hello world" (11)
+                        paid_storage_size_diff: 4_u64.into(), // "Hello world" (11) − "initial" (7)
+                        allocated_destination_contract: false,
+                        address_registry_diff: vec![],
+                    },
+                )),
+                internal_operation_results: vec![],
+            }),
+        }];
+
+        // Verify that source and destination balances changed:
+        // 54 - 15 fee - 30 transfer - 4 burn (4 × COST_PER_BYTES) = 5.
+        assert_eq!(source.balance(rk.host()).unwrap(), 5_u64.into());
+        assert_eq!(destination.balance(rk.host()).unwrap(), 80_u64.into());
+
+        assert_eq!(receipt, expected_receipt);
+
+        assert_eq!(
+            source.counter(rk.tez_accounts()).unwrap(),
+            1.into(),
+            "Counter should have been incremented"
+        );
+
+        assert_eq!(
+            destination.storage(rk.host()).unwrap(),
+            storage_value,
+            "Storage has not been updated"
+        )
+    }
+
+    /// After a transfer that grew the destination's storage,
+    /// `paid_bytes` matches `used_bytes` and both equal the post-op
+    /// `code_size + storage_size`. The watermark moved forward inside
+    /// `set_storage` during execution.
+    #[test]
+    fn apply_transfer_bumps_paid_bytes_after_storage_growth() {
+        let mut host = test_host();
+        let mut rk = RuntimeKeyspaces::init(&mut host).unwrap();
+
+        let src = bootstrap1();
+        let dest = ContractKt1Hash::from_base58_check(CONTRACT_1)
+            .expect("ContractKt1Hash b58 conversion should have succeeded");
+
+        let initial_storage = Micheline::from("initial");
+        // Source funded with 1050 mutez: 15 fee + 30 transfer + 1000
+        // storage burn (4 × COST_PER_BYTES) + 5 remaining balance.
+        init_account(rk.tez_accounts_mut(), &src.pkh, 1050);
+        reveal_account(rk.tez_accounts_mut(), &src);
+        let destination =
+            init_contract(&mut rk, &dest, SCRIPT, &initial_storage, &50_u64.into());
+
+        let storage_value = Micheline::from("Hello world")
+            .encode(&mut Gas::default())
+            .unwrap()
+            .unwrap();
+        let new_storage_size = storage_value.len() as u64;
+        let operation = make_transfer_operation(
+            15,
+            1,
+            21040,
+            5,
+            src.clone(),
+            30_u64.into(),
+            Contract::Originated(dest),
+            Parameters {
+                entrypoint: mir::ast::Entrypoint::default(),
+                value: storage_value,
+            },
+        );
+
+        let _ = validate_and_apply_operation(
+            &mut rk,
+            &NotWiredRegistry,
+            &mut TezosXJournal::mock(RuntimeId::Ethereum),
+            operation,
+            &block_ctx!(),
+            false,
+            None,
+            None,
+            &test_safe_roots(),
+        )
+        .expect(
+            "validate_and_apply_operation should not have failed with a kernel error",
+        );
+
+        // SCRIPT replaces storage by the parameter; post-op `used_bytes`
+        // is `code_size + |encoded("Hello world")|`. Read `code_size`
+        // from durable storage — the invariant under test is exactly
+        // `used == code_size + storage_size`.
+        let code_size = destination.code_size(rk.host()).unwrap();
+        let expected_used = Zarith(code_size.0 + new_storage_size);
+
+        assert_eq!(destination.used_bytes(rk.host()).unwrap(), expected_used);
+        assert_eq!(destination.paid_bytes(rk.host()).unwrap(), expected_used);
+    }
+
+    #[test]
+    fn apply_transfer_burn_failure_backtracks_with_error() {
+        let mut host = test_host();
+        let mut rk = RuntimeKeyspaces::init(&mut host).unwrap();
+        let src = bootstrap1();
+        let dest = ContractKt1Hash::from_base58_check(CONTRACT_1)
+            .expect("ContractKt1Hash b58 conversion should have succeeded");
+
+        let initial_storage = Micheline::from("initial");
+        // Fund the source with 48 mutez: 15 fee + 30 transfer + 3
+        // left.  The storage burn (4 × COST_PER_BYTES = 4 mutez)
+        // does not fit; the operation must Backtrack.
+        let source = init_account(rk.tez_accounts_mut(), &src.pkh, 48);
+        reveal_account(rk.tez_accounts_mut(), &src);
+        let destination = init_contract(
+            &mut rk,
+            &dest,
+            SCRIPT,
+            &initial_storage.clone(),
+            &50_u64.into(),
+        );
+
+        let storage_value = Micheline::from("Hello world")
+            .encode(&mut Gas::default())
+            .unwrap()
+            .unwrap();
+        let operation = make_transfer_operation(
+            15,
+            1,
+            21040,
+            5,
+            src.clone(),
+            30_u64.into(),
+            Contract::Originated(dest),
+            Parameters {
+                entrypoint: mir::ast::Entrypoint::default(),
+                value: storage_value.clone(),
+            },
+        );
+
+        let processed = validate_and_apply_operation(
+            &mut rk,
+            &NotWiredRegistry,
+            &mut TezosXJournal::mock(RuntimeId::Ethereum),
+            operation.clone(),
+            &block_ctx!(),
+            false,
+            None,
+            None,
+            &test_safe_roots(),
+        )
+        .expect("kernel error not expected — burn failure routes through Backtracked");
+        let receipts = ProcessedOperation::into_receipts(processed);
+
+        let expected_receipts = vec![OperationWithMetadata {
+            content: operation.content[0].clone(),
+            receipt: OperationResultSum::Transfer(OperationResult {
+                balance_updates: vec![
+                    BalanceUpdate {
+                        balance: Balance::Account(Contract::Implicit(src.pkh.clone())),
+                        changes: -15,
+                        update_origin: UpdateOrigin::BlockApplication,
+                    },
+                    BalanceUpdate {
+                        balance: Balance::BlockFees,
+                        changes: 15,
+                        update_origin: UpdateOrigin::BlockApplication,
+                    },
+                ],
+                result: ContentResult::BackTracked(BacktrackedResult {
+                    errors: Some(ApplyOperationErrors {
+                        errors: vec![ApplyOperationError::CannotPayStorageFee(
+                            BalanceTooLow {
+                                contract: source.contract(),
+                                balance: 3_u64.into(), // 48 - 15 fee - 30 transfer
+                                amount: (4 * COST_PER_BYTES).into(), // 4
+                            },
+                        )],
+                    }),
+                    result: TransferTarget::ToContract(TransferSuccess {
+                        storage: Some(storage_value.into()),
+                        lazy_storage_diff: None,
+                        balance_updates: vec![
+                            BalanceUpdate {
+                                balance: Balance::Account(Contract::Implicit(
+                                    src.pkh.clone(),
+                                )),
+                                changes: -30,
+                                update_origin: UpdateOrigin::BlockApplication,
+                            },
+                            BalanceUpdate {
+                                balance: Balance::Account(
+                                    Contract::from_b58check(CONTRACT_1).unwrap(),
+                                ),
+                                changes: 30,
+                                update_origin: UpdateOrigin::BlockApplication,
+                            },
+                        ],
+                        ticket_receipt: vec![],
+                        originated_contracts: vec![],
+                        consumed_milligas: 1153868_u64.into(),
+                        storage_size: 44_u64.into(), // code (33) + "Hello world" (11)
+                        paid_storage_size_diff: 4_u64.into(), // "Hello world" (11) − "initial" (7)
+                        allocated_destination_contract: false,
+                        address_registry_diff: vec![],
+                    }),
+                }),
+                internal_operation_results: vec![],
+            }),
+        }];
+
+        assert_eq!(receipts, expected_receipts);
+
+        // SafeStorage rollback: source paid the fee but neither the
+        // transfer amount nor the burn. Destination storage untouched.
+        assert_eq!(source.balance(rk.host()).unwrap(), (48_u64 - 15).into());
+        assert_eq!(
+            destination.storage(rk.host()).unwrap(),
+            initial_storage
+                .encode(&mut Gas::default())
+                .unwrap()
+                .unwrap(),
+            "destination storage must roll back to pre-op value",
+        );
+    }
+
+    #[test]
+    fn apply_transfer_to_unallocated_implicit_burns_slot() {
+        let mut host = test_host();
+        let mut rk = RuntimeKeyspaces::init(&mut host).unwrap();
+        let src = bootstrap1();
+        let dest = bootstrap2();
+        // Source funded for: 15 fee + 30 transfer + 257 slot burn
+        // (ORIGINATION_SIZE × COST_PER_BYTES) + 5 mutez change.
+        let source = init_account(rk.tez_accounts_mut(), &src.pkh, 307);
+        reveal_account(rk.tez_accounts_mut(), &src);
+        // Note: dest is NOT pre-allocated (no init_account call).
+
+        let operation = make_transfer_operation(
+            15,
+            1,
+            21010,
+            300,
+            src.clone(),
+            30_u64.into(),
+            Contract::Implicit(dest.pkh.clone()),
+            Parameters::default(),
+        );
+
+        let receipts = ProcessedOperation::into_receipts(
+            validate_and_apply_operation(
+                &mut rk,
+                &NotWiredRegistry,
+                &mut TezosXJournal::mock(RuntimeId::Ethereum),
+                operation.clone(),
+                &block_ctx!(),
+                false,
+                None,
+                None,
+                &test_safe_roots(),
+            )
+            .expect("validate_and_apply_operation should not return a kernel error"),
+        );
+
+        let expected_receipts = vec![OperationWithMetadata {
+            content: operation.content[0].clone(),
+            receipt: OperationResultSum::Transfer(OperationResult {
+                balance_updates: vec![
+                    BalanceUpdate {
+                        balance: Balance::Account(Contract::Implicit(src.pkh.clone())),
+                        changes: -15,
+                        update_origin: UpdateOrigin::BlockApplication,
+                    },
+                    BalanceUpdate {
+                        balance: Balance::BlockFees,
+                        changes: 15,
+                        update_origin: UpdateOrigin::BlockApplication,
+                    },
+                ],
+                result: ContentResult::Applied(TransferTarget::ToContract(
+                    TransferSuccess {
+                        storage: None,
+                        lazy_storage_diff: None,
+                        balance_updates: vec![
+                            // Transfer pair (source → dest implicit)
+                            BalanceUpdate {
+                                balance: Balance::Account(Contract::Implicit(
+                                    src.pkh.clone(),
+                                )),
+                                changes: -30,
+                                update_origin: UpdateOrigin::BlockApplication,
+                            },
+                            BalanceUpdate {
+                                balance: Balance::Account(Contract::Implicit(
+                                    dest.pkh.clone(),
+                                )),
+                                changes: 30,
+                                update_origin: UpdateOrigin::BlockApplication,
+                            },
+                            // Slot burn pair (ORIGINATION_SIZE × COST_PER_BYTES = 257)
+                            BalanceUpdate {
+                                balance: Balance::Account(Contract::Implicit(
+                                    src.pkh.clone(),
+                                )),
+                                changes: -257,
+                                update_origin: UpdateOrigin::BlockApplication,
+                            },
+                            BalanceUpdate {
+                                balance: Balance::StorageFees,
+                                changes: 257,
+                                update_origin: UpdateOrigin::BlockApplication,
+                            },
+                        ],
+                        ticket_receipt: vec![],
+                        originated_contracts: vec![],
+                        consumed_milligas: 2_148_528_u64.into(),
+                        storage_size: 0_u64.into(),
+                        paid_storage_size_diff: 0_u64.into(),
+                        allocated_destination_contract: true,
+                        address_registry_diff: vec![],
+                    },
+                )),
+                internal_operation_results: vec![],
+            }),
+        }];
+
+        assert_eq!(receipts, expected_receipts);
+
+        let dest_account =
+            context::implicit_from_public_key_hash(&dest.pkh).expect("dest account");
+        assert_eq!(dest_account.balance(rk.host()).unwrap(), 30_u64.into());
+        // Source: 307 - 15 fee - 30 transfer - 257 slot burn = 5.
+        assert_eq!(source.balance(rk.host()).unwrap(), 5_u64.into());
+    }
+
+    #[test]
+    fn apply_transfer_to_unallocated_implicit_cannot_pay_slot() {
+        let mut host = test_host();
+        let mut rk = RuntimeKeyspaces::init(&mut host).unwrap();
+        let src = bootstrap1();
+        let dest = bootstrap2();
+        // 50 mutez covers fee (15) + transfer (30) but NOT the slot
+        // burn (257).
+        let source = init_account(rk.tez_accounts_mut(), &src.pkh, 50);
+        reveal_account(rk.tez_accounts_mut(), &src);
+
+        let operation = make_transfer_operation(
+            15,
+            1,
+            21010,
+            300,
+            src.clone(),
+            30_u64.into(),
+            Contract::Implicit(dest.pkh.clone()),
+            Parameters::default(),
+        );
+
+        let receipts = ProcessedOperation::into_receipts(
+            validate_and_apply_operation(
+                &mut rk,
+                &NotWiredRegistry,
+                &mut TezosXJournal::mock(RuntimeId::Ethereum),
+                operation.clone(),
+                &block_ctx!(),
+                false,
+                None,
+                None,
+                &test_safe_roots(),
+            )
+            .expect("validate_and_apply_operation should not return a kernel error"),
+        );
+
+        let expected_receipts = vec![OperationWithMetadata {
+            content: operation.content[0].clone(),
+            receipt: OperationResultSum::Transfer(OperationResult {
+                balance_updates: vec![
+                    BalanceUpdate {
+                        balance: Balance::Account(Contract::Implicit(src.pkh.clone())),
+                        changes: -15,
+                        update_origin: UpdateOrigin::BlockApplication,
+                    },
+                    BalanceUpdate {
+                        balance: Balance::BlockFees,
+                        changes: 15,
+                        update_origin: UpdateOrigin::BlockApplication,
+                    },
+                ],
+                result: ContentResult::BackTracked(BacktrackedResult {
+                    errors: Some(ApplyOperationErrors {
+                        errors: vec![ApplyOperationError::CannotPayStorageFee(
+                            BalanceTooLow {
+                                contract: Contract::Implicit(src.pkh.clone()),
+                                // 50 - 15 fee - 30 transfer = 5
+                                balance: 5_u64.into(),
+                                // ORIGINATION_SIZE × COST_PER_BYTES
+                                amount: 257_u64.into(),
+                            },
+                        )],
+                    }),
+                    result: TransferTarget::ToContract(TransferSuccess {
+                        storage: None,
+                        lazy_storage_diff: None,
+                        balance_updates: vec![
+                            // Transfer pair (source → fresh implicit dest).
+                            BalanceUpdate {
+                                balance: Balance::Account(Contract::Implicit(
+                                    src.pkh.clone(),
+                                )),
+                                changes: -30,
+                                update_origin: UpdateOrigin::BlockApplication,
+                            },
+                            BalanceUpdate {
+                                balance: Balance::Account(Contract::Implicit(
+                                    dest.pkh.clone(),
+                                )),
+                                changes: 30,
+                                update_origin: UpdateOrigin::BlockApplication,
+                            },
+                        ],
+                        ticket_receipt: vec![],
+                        originated_contracts: vec![],
+                        consumed_milligas: 2_148_528_u64.into(),
+                        storage_size: 0_u64.into(),
+                        paid_storage_size_diff: 0_u64.into(),
+                        allocated_destination_contract: true,
+                        address_registry_diff: vec![],
+                    }),
+                }),
+                internal_operation_results: vec![],
+            }),
+        }];
+
+        assert_eq!(receipts, expected_receipts);
+
+        // SafeStorage rolled back the allocation: the destination
+        // account is gone again, and the source paid only the fee.
+        assert_eq!(source.balance(rk.host()).unwrap(), (50_u64 - 15).into());
+        let dest_account =
+            context::implicit_from_public_key_hash(&dest.pkh).expect("dest account");
+        assert!(
+            !dest_account.allocated(rk.tez_accounts()).unwrap(),
+            "implicit allocation must be rolled back"
+        );
+    }
+
+    #[test]
+    fn apply_transfer_with_failed_execution() {
+        let mut host = test_host();
+        let mut rk = RuntimeKeyspaces::init(&mut host).unwrap();
+
+        let src = bootstrap1();
+
+        let dest = ContractKt1Hash::from_base58_check(CONTRACT_1)
+            .expect("ContractKt1Hash b58 conversion should have succeed");
+
+        let initial_storage = Micheline::from(());
+
+        let source = init_account(rk.tez_accounts_mut(), &src.pkh, 50);
+        reveal_account(rk.tez_accounts_mut(), &src);
+
+        let destination = init_contract(
+            &mut rk,
+            &dest,
+            FAILING_SCRIPT,
+            &initial_storage,
+            &50_u64.into(),
+        );
+
+        let operation = make_transfer_operation(
+            15,
+            1,
+            1040,
+            5,
+            src.clone(),
+            30_u64.into(),
+            Contract::Originated(dest),
+            Parameters {
+                entrypoint: mir::ast::Entrypoint::default(),
+                value: Micheline::from(())
+                    .encode(&mut Gas::default())
+                    .unwrap()
+                    .unwrap(),
+            },
+        );
+
+        let processed = validate_and_apply_operation(
+            &mut rk,
+            &NotWiredRegistry,
+            &mut TezosXJournal::mock(RuntimeId::Ethereum),
+            operation.clone(),
+            &block_ctx!(),
+            false,
+            None,
+            None,
+            &test_safe_roots(),
+        )
+        .expect(
+            "validate_and_apply_operation should not have failed with a kernel error",
+        );
+        let receipt = ProcessedOperation::into_receipts(processed);
+
+        let expected_receipt = vec![OperationWithMetadata {
+            content: operation.content[0].clone(),
+            receipt: OperationResultSum::Transfer(OperationResult {
+            balance_updates: vec![
+                BalanceUpdate {
+                    balance: Balance::Account(Contract::Implicit(src.pkh)),
+                    changes: -15,
+                    update_origin: UpdateOrigin::BlockApplication,
+                },
+                BalanceUpdate {
+                    balance: Balance::BlockFees,
+                    changes: 15,
+                    update_origin: UpdateOrigin::BlockApplication,
+                },
+            ],
+            result:  ContentResult::Failed(vec![
+                ApplyOperationError::Transfer(
+            TransferError::MichelsonContractInterpretError(
+                "runtime failure while running the script: failed with: String(\"This contract always fails\") of type String".into()
+            )
+        )].into()),
+            internal_operation_results: vec![],
+            })}];
+
+        // Verify that source and destination balances changed
+        // Transfer should be free as it got reverted + 15 for fees, 5 should be left
+        assert_eq!(source.balance(rk.host()).unwrap(), 35_u64.into());
+        assert_eq!(destination.balance(rk.host()).unwrap(), 50_u64.into());
+
+        assert_eq!(receipt, expected_receipt);
+
+        assert_eq!(
+            source.counter(rk.tez_accounts()).unwrap(),
+            1.into(),
+            "Counter should have been incremented"
+        );
+
+        assert_eq!(
+            destination.storage(rk.host()).unwrap(),
+            initial_storage
+                .encode(&mut Gas::default())
+                .unwrap()
+                .unwrap(),
+            "Storage should not have been updated"
+        )
+    }
+
+    #[test]
+    fn apply_transfer_with_argument_to_implicit_fails() {
+        let mut host = test_host();
+        let mut rk = RuntimeKeyspaces::init(&mut host).unwrap();
+
+        let src = bootstrap1();
+
+        let dest = bootstrap2();
+
+        init_account(rk.tez_accounts_mut(), &src.pkh, 50);
+        reveal_account(rk.tez_accounts_mut(), &src);
+
+        let operation = make_transfer_operation(
+            15,
+            1,
+            21040,
+            5,
+            src.clone(),
+            30_u64.into(),
+            Contract::Implicit(dest.pkh),
+            Parameters {
+                entrypoint: mir::ast::Entrypoint::default(),
+                value: Micheline::from(0)
+                    .encode(&mut Gas::default())
+                    .unwrap()
+                    .unwrap(),
+            },
+        );
+
+        let processed = validate_and_apply_operation(
+            &mut rk,
+            &NotWiredRegistry,
+            &mut TezosXJournal::mock(RuntimeId::Ethereum),
+            operation.clone(),
+            &block_ctx!(),
+            false,
+            None,
+            None,
+            &test_safe_roots(),
+        )
+        .expect(
+            "validate_and_apply_operation should not have failed with a kernel error",
+        );
+        let receipt = ProcessedOperation::into_receipts(processed);
+
+        let expected_receipt = vec![OperationWithMetadata {
+            content: operation.content[0].clone(),
+            receipt: OperationResultSum::Transfer(OperationResult {
+                balance_updates: vec![
+                    BalanceUpdate {
+                        balance: Balance::Account(Contract::Implicit(src.pkh.clone())),
+                        changes: -15,
+                        update_origin: UpdateOrigin::BlockApplication,
+                    },
+                    BalanceUpdate {
+                        balance: Balance::BlockFees,
+                        changes: 15,
+                        update_origin: UpdateOrigin::BlockApplication,
+                    },
+                ],
+                result: ContentResult::Failed(
+                    vec![ApplyOperationError::Transfer(
+                        TransferError::BadContractParameter(Contract::Implicit(src.pkh)),
+                    )]
+                    .into(),
+                ),
+                internal_operation_results: vec![],
+            }),
+        }];
+
+        assert_eq!(receipt, expected_receipt);
+    }
+
+    #[test]
+    fn apply_transfer_with_non_default_entrypoint_to_implicit_fails() {
+        let mut host = test_host();
+        let mut rk = RuntimeKeyspaces::init(&mut host).unwrap();
+
+        let src = bootstrap1();
+
+        let dest = bootstrap2();
+
+        init_account(rk.tez_accounts_mut(), &src.pkh, 50);
+        reveal_account(rk.tez_accounts_mut(), &src);
+
+        let operation = make_transfer_operation(
+            15,
+            1,
+            21000,
+            5,
+            src.clone(),
+            30_u64.into(),
+            Contract::Implicit(dest.pkh),
+            Parameters {
+                entrypoint: mir::ast::Entrypoint::try_from("non_default")
+                    .expect("Entrypoint should be valid"),
+                value: Micheline::from(())
+                    .encode(&mut Gas::default())
+                    .unwrap()
+                    .unwrap(),
+            },
+        );
+
+        let processed = validate_and_apply_operation(
+            &mut rk,
+            &NotWiredRegistry,
+            &mut TezosXJournal::mock(RuntimeId::Ethereum),
+            operation.clone(),
+            &block_ctx!(),
+            false,
+            None,
+            None,
+            &test_safe_roots(),
+        )
+        .expect(
+            "validate_and_apply_operation should not have failed with a kernel error",
+        );
+        let receipt = ProcessedOperation::into_receipts(processed);
+
+        let expected_receipt = vec![OperationWithMetadata {
+            content: operation.content[0].clone(),
+            receipt: OperationResultSum::Transfer(OperationResult {
+                balance_updates: vec![
+                    BalanceUpdate {
+                        balance: Balance::Account(Contract::Implicit(src.pkh)),
+                        changes: -15,
+                        update_origin: UpdateOrigin::BlockApplication,
+                    },
+                    BalanceUpdate {
+                        balance: Balance::BlockFees,
+                        changes: 15,
+                        update_origin: UpdateOrigin::BlockApplication,
+                    },
+                ],
+                result: ContentResult::Failed(
+                    vec![ApplyOperationError::Transfer(
+                        TransferError::NoSuchEntrypoint(
+                            mir::ast::Entrypoint::try_from("non_default")
+                                .expect("Entrypoint should be valid"),
+                        ),
+                    )]
+                    .into(),
+                ),
+                internal_operation_results: vec![],
+            }),
+        }];
+
+        assert_eq!(receipt, expected_receipt);
+    }
+
+    #[test]
+    fn apply_three_valid_operations() {
+        let mut host = test_host();
+        let mut rk = RuntimeKeyspaces::init(&mut host).unwrap();
+
+        let src = bootstrap1();
+        let dest = bootstrap2();
+
+        // src & dest each credited with 50ꜩ
+        let src_acc = init_account(rk.tez_accounts_mut(), &src.pkh, 50);
+        let dest_acc = init_account(rk.tez_accounts_mut(), &dest.pkh, 50);
+
+        // op‑1: reveal
+        let reveal_content = OperationContent::Reveal(RevealContent {
+            pk: src.pk.clone(),
+            proof: None,
+        });
+
+        println!("Balance: {:?}", src_acc.balance(rk.host()).unwrap());
+
+        // op‑2: transfer 10ꜩ to dest
+        let transfer_content_1 = OperationContent::Transfer(TransferContent {
+            amount: 10.into(),
+            destination: Contract::Implicit(dest.pkh.clone()),
+            parameters: Parameters::default(),
+        });
+
+        // op‑3: transfer 20ꜩ to dest
+        let transfer_content_2 = OperationContent::Transfer(TransferContent {
+            amount: 20.into(),
+            destination: Contract::Implicit(dest.pkh.clone()),
+            parameters: Parameters::default(),
+        });
+
+        let batch = make_operation(
+            5,
+            1,
+            21000,
+            0,
+            src.clone(),
+            vec![reveal_content, transfer_content_1, transfer_content_2],
+        );
+
+        let receipts = ProcessedOperation::into_receipts(
+            validate_and_apply_operation(
+                &mut rk,
+                &NotWiredRegistry,
+                &mut TezosXJournal::mock(RuntimeId::Ethereum),
+                batch.clone(),
+                &block_ctx!(),
+                false,
+                None,
+                None,
+                &test_safe_roots(),
+            )
+            .unwrap(),
+        );
+
+        let expected_receipts = zip_operations(
+            batch,
+            vec![
+                OperationResultSum::Reveal(OperationResult {
+                    balance_updates: vec![
+                        BalanceUpdate {
+                            balance: Balance::Account(Contract::Implicit(
+                                src.pkh.clone(),
+                            )),
+                            changes: -5,
+                            update_origin: UpdateOrigin::BlockApplication,
+                        },
+                        BalanceUpdate {
+                            balance: Balance::BlockFees,
+                            changes: 5,
+                            update_origin: UpdateOrigin::BlockApplication,
+                        },
+                    ],
+                    result: ContentResult::Applied(RevealSuccess {
+                        consumed_milligas: 148612_u64.into(),
+                    }),
+                    internal_operation_results: vec![],
+                }),
+                OperationResultSum::Transfer(OperationResult {
+                    balance_updates: vec![
+                        BalanceUpdate {
+                            balance: Balance::Account(Contract::Implicit(
+                                src.pkh.clone(),
+                            )),
+                            changes: -5,
+                            update_origin: UpdateOrigin::BlockApplication,
+                        },
+                        BalanceUpdate {
+                            balance: Balance::BlockFees,
+                            changes: 5,
+                            update_origin: UpdateOrigin::BlockApplication,
+                        },
+                    ],
+                    result: ContentResult::Applied(TransferTarget::ToContract(
+                        TransferSuccess {
+                            storage: None,
+                            lazy_storage_diff: None,
+                            balance_updates: vec![
+                                BalanceUpdate {
+                                    balance: Balance::Account(Contract::Implicit(
+                                        src.pkh.clone(),
+                                    )),
+                                    changes: -10,
+                                    update_origin: UpdateOrigin::BlockApplication,
+                                },
+                                BalanceUpdate {
+                                    balance: Balance::Account(Contract::Implicit(
+                                        dest.pkh.clone(),
+                                    )),
+                                    changes: 10,
+                                    update_origin: UpdateOrigin::BlockApplication,
+                                },
+                            ],
+                            ticket_receipt: vec![],
+                            originated_contracts: vec![],
+                            consumed_milligas: 2100040_u64.into(),
+                            storage_size: 0_u64.into(),
+                            paid_storage_size_diff: 0_u64.into(),
+                            allocated_destination_contract: false,
+                            address_registry_diff: vec![],
+                        },
+                    )),
+                    internal_operation_results: vec![],
+                }),
+                OperationResultSum::Transfer(OperationResult {
+                    balance_updates: vec![
+                        BalanceUpdate {
+                            balance: Balance::Account(Contract::Implicit(
+                                src.pkh.clone(),
+                            )),
+                            changes: -5,
+                            update_origin: UpdateOrigin::BlockApplication,
+                        },
+                        BalanceUpdate {
+                            balance: Balance::BlockFees,
+                            changes: 5,
+                            update_origin: UpdateOrigin::BlockApplication,
+                        },
+                    ],
+                    result: ContentResult::Applied(TransferTarget::ToContract(
+                        TransferSuccess {
+                            storage: None,
+                            lazy_storage_diff: None,
+                            balance_updates: vec![
+                                BalanceUpdate {
+                                    balance: Balance::Account(Contract::Implicit(
+                                        src.pkh,
+                                    )),
+                                    changes: -20,
+                                    update_origin: UpdateOrigin::BlockApplication,
+                                },
+                                BalanceUpdate {
+                                    balance: Balance::Account(Contract::Implicit(
+                                        dest.pkh,
+                                    )),
+                                    changes: 20,
+                                    update_origin: UpdateOrigin::BlockApplication,
+                                },
+                            ],
+                            ticket_receipt: vec![],
+                            originated_contracts: vec![],
+                            consumed_milligas: 2100040_u64.into(),
+                            storage_size: 0_u64.into(),
+                            paid_storage_size_diff: 0_u64.into(),
+                            allocated_destination_contract: false,
+                            address_registry_diff: vec![],
+                        },
+                    )),
+                    internal_operation_results: vec![],
+                }),
+            ],
+        );
+
+        assert_eq!(receipts, expected_receipts);
+
+        // counter updated, balances moved
+        // initial_balance: 50 tez, fee amount: (3*5)tez, transfer amount: (10 + 20)tez
+        assert_eq!(
+            src_acc.balance(rk.host()).unwrap(),
+            5u64.into(),
+            "Source account should have 5ꜩ left after fees and transfers."
+        );
+        assert_eq!(
+            dest_acc.balance(rk.host()).unwrap(),
+            80u64.into(),
+            "Destination account should have 80ꜩ after transfers."
+        );
+
+        assert_eq!(
+            src_acc.counter(rk.tez_accounts()).unwrap(),
+            3.into(),
+            "Counter should have been incremented three times."
+        );
+    }
+
+    #[test]
+    fn apply_valid_then_invalid_operation_is_atomic() {
+        let mut host = test_host();
+        let mut rk = RuntimeKeyspaces::init(&mut host).unwrap();
+
+        let src = bootstrap1();
+        let dest = bootstrap2();
+
+        // src & dest each credited with 50ꜩ
+        let src_acc = init_account(rk.tez_accounts_mut(), &src.pkh, 50);
+        let _dst_acc = init_account(rk.tez_accounts_mut(), &dest.pkh, 50);
+
+        // op‑1: reveal
+        let reveal_content = OperationContent::Reveal(RevealContent {
+            pk: src.pk.clone(),
+            proof: None,
+        });
+
+        // op‑2: transfer 10ꜩ to dest
+        let transfer_content = OperationContent::Transfer(TransferContent {
+            amount: 10.into(),
+            destination: Contract::Implicit(dest.pkh.clone()),
+            parameters: Parameters::default(),
+        });
+
+        let batch = make_operation(
+            100,
+            1,
+            22000,
+            0,
+            src.clone(),
+            vec![reveal_content, transfer_content],
+        );
+
+        let receipts = validate_and_apply_operation(
+            &mut rk,
+            &NotWiredRegistry,
+            &mut TezosXJournal::mock(RuntimeId::Ethereum),
+            batch,
+            &block_ctx!(),
+            false,
+            None,
+            None,
+            &test_safe_roots(),
+        );
+
+        let expected_error =
+            OperationError::Validation(ValidityError::CantPayFees(100_u64.into()));
+
+        assert_eq!(receipts, Err(expected_error));
+
+        assert_eq!(
+            context::implicit_from_public_key_hash(&src.pkh)
+                .unwrap()
+                .balance(rk.host())
+                .unwrap(),
+            50u64.into()
+        );
+
+        assert_eq!(
+            context::implicit_from_public_key_hash(&src.pkh)
+                .unwrap()
+                .manager(rk.tez_accounts())
+                .unwrap(),
+            Manager::NotRevealed(src.pkh.clone())
+        );
+
+        assert_eq!(
+            src_acc.counter(rk.tez_accounts()).unwrap(),
+            0.into(),
+            "Counter should not have been incremented."
+        );
+    }
+
+    #[test]
+    fn apply_smart_contract_failure_reverts_batch() {
+        let mut host = test_host();
+        let mut rk = RuntimeKeyspaces::init(&mut host).unwrap();
+
+        let src = bootstrap1();
+        // Funded for: 3 fees of 10 (= 30) + 2 transfer amounts of 1
+        // (= 2) + storage burn for the second op (4 × COST_PER_BYTES = 1000) +
+        // 18 mutez change. The batch reverts via FAILWITH; only the
+        // fees survive, so final balance is 1050 - 30 = 1020.
+        let src_acc = init_account(rk.tez_accounts_mut(), &src.pkh, 1050);
+
+        let fail_dest = ContractKt1Hash::from_base58_check(CONTRACT_1).unwrap();
+        let succ_dest = ContractKt1Hash::from_base58_check(CONTRACT_2).unwrap();
+
+        init_contract(
+            &mut rk,
+            &fail_dest,
+            FAILING_SCRIPT,
+            &Micheline::from(()),
+            &0_u64.into(),
+        );
+        let succ_account = init_contract(
+            &mut rk,
+            &succ_dest,
+            SCRIPT,
+            &Micheline::from("initial"),
+            &0_u64.into(),
+        );
+
+        let reveal_content = OperationContent::Reveal(RevealContent {
+            pk: src.pk.clone(),
+            proof: None,
+        });
+
+        let succ_transfer = OperationContent::Transfer(TransferContent {
+            amount: 1.into(),
+            destination: Contract::Originated(succ_dest.clone()),
+            parameters: Parameters {
+                entrypoint: mir::ast::Entrypoint::default(),
+                value: Micheline::from("Hello world")
+                    .encode(&mut Gas::default())
+                    .unwrap()
+                    .unwrap(),
+            },
+        });
+
+        let fail_transfer = OperationContent::Transfer(TransferContent {
+            amount: 1.into(),
+            destination: Contract::Originated(fail_dest.clone()),
+            parameters: Parameters {
+                entrypoint: mir::ast::Entrypoint::default(),
+                value: Micheline::from(())
+                    .encode(&mut Gas::default())
+                    .unwrap()
+                    .unwrap(),
+            },
+        });
+
+        let batch = make_operation(
+            10_u64,
+            1,
+            21010,
+            100,
+            src.clone(),
+            vec![reveal_content, succ_transfer, fail_transfer],
+        );
+
+        let receipts = ProcessedOperation::into_receipts(
+            validate_and_apply_operation(
+                &mut rk,
+                &NotWiredRegistry,
+                &mut TezosXJournal::mock(RuntimeId::Ethereum),
+                batch,
+                &block_ctx!(),
+                false,
+                None,
+                None,
+                &test_safe_roots(),
+            )
+            .unwrap(),
+        );
+
+        println!("{receipts:?}");
+
+        assert!(
+            matches!(
+                &receipts[0].receipt,
+                OperationResultSum::Reveal(OperationResult {
+                    result: ContentResult::BackTracked(_),
+                    ..
+                })
+            ),
+            "First receipt should be BackTracked Reveal"
+        );
+
+        assert!(
+            matches!(
+                &receipts[1].receipt,
+                OperationResultSum::Transfer(OperationResult {
+                    result: ContentResult::BackTracked(_),
+                    ..
+                })
+            ),
+            "Second receipt should be BackTracked Transfer"
+        );
+
+        assert!(
+            matches!(
+                &receipts[2].receipt,
+                OperationResultSum::Transfer(OperationResult {
+                    result: ContentResult::Failed(_),
+                    ..
+                })
+            ),
+            "Third receipt should be Failed Transfer"
+        );
+
+        // Storage must have reverted
+        assert!(
+            succ_account.storage(rk.host()).unwrap()
+                == Micheline::from("initial")
+                    .encode(&mut Gas::default())
+                    .unwrap()
+                    .unwrap(),
+        );
+
+        assert_eq!(
+            src_acc.counter(rk.tez_accounts()).unwrap(),
+            3.into(),
+            "Counter should have been incremented three times."
+        );
+
+        // Initial balance: 1050 tez, paid in fees: (3*10) tez,
+        // transfer + storage burn reverted via SafeStorage.
+        assert_eq!(
+            src_acc.balance(rk.host()).unwrap(),
+            1020.into(),
+            "Fees should have been paid for failed operation"
+        );
+    }
+
+    #[test]
+    fn origination_of_a_smart_contract() {
+        let mut host = test_host();
+        let mut rk = RuntimeKeyspaces::init(&mut host).unwrap();
+
+        let src = bootstrap1();
+        init_account(rk.tez_accounts_mut(), &src.pkh, 1000000_u64);
+        reveal_account(rk.tez_accounts_mut(), &src);
+
+        let src_account = context::implicit_from_public_key_hash(&src.pkh)
+            .expect("Should have succeeded to create an account");
+
+        // Retrieve initial balance for the end of the test
+        let initial_balance = src_account
+            .balance(rk.host())
+            .expect("Should have found a balance");
+
+        let fee = 15u64;
+        let smart_contract_balance = 30u64;
+        /*
+        octez-client convert script "
+                  parameter string;
+                  storage string;
+                  code { CAR; NIL operation; PAIR }
+                " from Michelson to binary
+         */
+        let code =
+            hex::decode("02000000170500036805010368050202000000080316053d036d0342")
+                .unwrap();
+
+        // octez-client -E https://rpc.tzkt.io/mainnet convert data  '"hello"' from Michelson to binary
+        let storage = hex::decode("010000000568656c6c6f").unwrap();
+        let operation = make_origination_operation(
+            fee,
+            1,
+            5000,
+            500,
+            src.clone(),
+            smart_contract_balance,
+            Script {
+                code: code.clone(),
+                storage: storage.clone(),
+            },
+        );
+
+        let origination_storage_fee: u64 =
+            ((code.len() as u64) + (storage.len() as u64)) * COST_PER_BYTES;
+
+        let processed = validate_and_apply_operation(
+            &mut rk,
+            &NotWiredRegistry,
+            &mut TezosXJournal::mock(RuntimeId::Ethereum),
+            operation.clone(),
+            &block_ctx!(),
+            false,
+            None,
+            None,
+            &test_safe_roots(),
+        )
+        .expect(
+            "validate_and_apply_operation should not have failed with a kernel error",
+        );
+        let receipt = ProcessedOperation::into_receipts(processed);
+
+        let mut origination_nonce = OriginationNonce::default();
+        let expected_kt1 = origination_nonce.generate_kt1();
+
+        let expected_receipt = OperationWithMetadata {
+            content: operation.content[0].clone(),
+            receipt: OperationResultSum::Origination(OperationResult {
+                balance_updates: vec![
+                    BalanceUpdate {
+                        balance: Balance::Account(Contract::Implicit(src.pkh.clone())),
+                        changes: -15,
+                        update_origin: UpdateOrigin::BlockApplication,
+                    },
+                    BalanceUpdate {
+                        balance: Balance::BlockFees,
+                        changes: 15,
+                        update_origin: UpdateOrigin::BlockApplication,
+                    },
+                ],
+                result: ContentResult::Applied(OriginationSuccess {
+                    balance_updates: vec![
+                        // Variable burn pair (storage_bus): 38 × COST_PER_BYTES.
+                        BalanceUpdate {
+                            balance: Balance::Account(Contract::Implicit(
+                                src.pkh.clone(),
+                            )),
+                            changes: -38,
+                            update_origin: UpdateOrigin::BlockApplication,
+                        },
+                        BalanceUpdate {
+                            balance: Balance::StorageFees,
+                            changes: 38,
+                            update_origin: UpdateOrigin::BlockApplication,
+                        },
+                        // Slot burn pair (origination_bus): ORIGINATION_SIZE × COST_PER_BYTES.
+                        BalanceUpdate {
+                            balance: Balance::Account(Contract::Implicit(
+                                src.pkh.clone(),
+                            )),
+                            changes: -257,
+                            update_origin: UpdateOrigin::BlockApplication,
+                        },
+                        BalanceUpdate {
+                            balance: Balance::StorageFees,
+                            changes: 257,
+                            update_origin: UpdateOrigin::BlockApplication,
+                        },
+                        // Prior: initial-balance transfer (sender → contract).
+                        BalanceUpdate {
+                            balance: Balance::Account(Contract::Implicit(
+                                src.pkh.clone(),
+                            )),
+                            changes: -30,
+                            update_origin: UpdateOrigin::BlockApplication,
+                        },
+                        BalanceUpdate {
+                            balance: Balance::Account(Contract::Originated(
+                                expected_kt1.clone(),
+                            )),
+                            changes: 30,
+                            update_origin: UpdateOrigin::BlockApplication,
+                        },
+                    ],
+                    originated_contracts: vec![Originated {
+                        contract: expected_kt1.clone(),
+                    }],
+                    consumed_milligas: 2_352_668_u64.into(),
+                    storage_size: 38u64.into(),
+                    paid_storage_size_diff: 38u64.into(),
+                    lazy_storage_diff: None,
+                }),
+                internal_operation_results: vec![],
+            }),
+        };
+
+        assert_eq!(receipt, vec![expected_receipt]);
+
+        // Now check that everything in the durable storage is updated
+
+        // Balance of the source
+        let current_balance = src_account
+            .balance(rk.host())
+            .expect("Should have found a balance for the source");
+
+        let expected_balance = initial_balance
+            .0
+            .checked_sub(&fee.into())
+            .expect("Should have been able to debit the fees")
+            .checked_sub(&smart_contract_balance.into())
+            .expect("Should have been able to debit the smart contract balance")
+            .checked_sub(&(ORIGINATION_SIZE * COST_PER_BYTES).into())
+            .expect("Should have been able to debit the origination cost")
+            .checked_sub(&origination_storage_fee.into())
+            .expect("Should have been able to debit the storage fees");
+
+        assert_eq!(
+            current_balance.0, expected_balance,
+            "Source current balance doesn't match the expected one"
+        );
+
+        let smart_contract_account =
+            context::originated_from_contract(&Contract::Originated(expected_kt1))
+                .expect("Should have been able to create an account from the KT1");
+
+        // Balance of the smart contract
+        let current_kt1_balance = smart_contract_account
+            .balance(rk.host())
+            .expect("Should have found a balance for the smart contract");
+
+        assert_eq!(
+            current_kt1_balance,
+            smart_contract_balance.into(),
+            "Smart contract current balance doesn't match the expected one"
+        );
+
+        // Verify code and storage
+        let smart_contract_code = smart_contract_account
+            .code(rk.host())
+            .expect("Should have found a code for the KT1");
+        assert_eq!(
+            smart_contract_code,
+            Code::Code(code),
+            "Current code for smart contract is not the same as the one originated"
+        );
+        let smart_contract_storage = smart_contract_account
+            .storage(rk.host())
+            .expect("Should have found a code for the KT1");
+        assert_eq!(
+            smart_contract_storage, storage,
+            "Current storage for smart contract is not the same as the one originated"
+        );
+    }
+
+    /// Grows its storage, then emits `[EMIT ; SET_DELEGATE]` — an applied
+    /// operation followed by one the kernel does not support. Executing the
+    /// `SET_DELEGATE` raises without producing any receipt, leaving the applied
+    /// event as the last entry of the receipt list.
+    static EMIT_THEN_SET_DELEGATE_SCRIPT: &str = r#"
+        parameter unit;
+        storage bytes;
+        code {
+            DROP;
+            PUSH bytes 0xdeadbeefdeadbeefdeadbeefdeadbeefdeadbeefdeadbeefdeadbeef;
+            UNIT;
+            EMIT %tick unit;
+            NONE key_hash;
+            SET_DELEGATE;
+            NIL operation;
+            SWAP;
+            CONS;
+            SWAP;
+            CONS;
+            PAIR }"#;
+
+    /// L2-1863: an internal operation that raises produces no receipt and
+    /// abandons its batch, so no `Skipped` sibling is recorded after it either.
+    /// A sibling applied *before* it is then the last receipt, and deriving the
+    /// enclosing operation's status from that tail reported `Applied` for an
+    /// operation whose subtree failed — committing the callee's storage write
+    /// under a `Failed` receipt, with its storage burn escaped.
+    ///
+    /// The status now comes from the verdict carried out of the subtree, so the
+    /// top-level operation backtracks and the write is rolled back.
+    #[test]
+    fn test_internal_op_raise_after_applied_sibling_backtracks_top_level() {
+        let mut host = test_host();
+        let mut rk = RuntimeKeyspaces::init(&mut host).unwrap();
+        let src = bootstrap1();
+        init_account(rk.tez_accounts_mut(), &src.pkh, 1_000_000);
+        reveal_account(rk.tez_accounts_mut(), &src);
+
+        // Fans out a single transfer to the contract below.
+        let emitter_hash = ContractKt1Hash::from_base58_check(CONTRACT_1)
+            .expect("ContractKt1Hash b58 conversion should have succeed");
+        init_contract(
+            &mut rk,
+            &emitter_hash,
+            SCRIPT_EMITING_INTERNAL_TRANSFER,
+            &Micheline::from(()),
+            &1_000_u64.into(),
+        );
+        let raising_hash = ContractKt1Hash::from_base58_check(CONTRACT_2)
+            .expect("ContractKt1Hash b58 conversion should have succeed");
+        let initial_storage = Micheline::Bytes(vec![]);
+        let raising_account = init_contract(
+            &mut rk,
+            &raising_hash,
+            EMIT_THEN_SET_DELEGATE_SCRIPT,
+            &initial_storage,
+            &1_000_u64.into(),
+        );
+
+        let addrs: Vec<Micheline> = vec![Micheline::Bytes(
+            Contract::Originated(raising_hash.clone())
+                .to_bytes()
+                .unwrap(),
+        )];
+        let operation = make_transfer_operation(
+            10,
+            1,
+            100_000,
+            // Enough storage limit to pay for the callee's growth, so that a
+            // backtrack here can only come from the internal failure.
+            1_000,
+            src.clone(),
+            0_u64.into(),
+            Contract::Originated(emitter_hash),
+            Parameters {
+                entrypoint: mir::ast::Entrypoint::default(),
+                value: Micheline::Seq(&addrs)
+                    .encode(&mut Gas::default())
+                    .unwrap()
+                    .unwrap(),
+            },
+        );
+        let receipts = ProcessedOperation::into_receipts(
+            validate_and_apply_operation(
+                &mut rk,
+                &NotWiredRegistry,
+                &mut TezosXJournal::mock(RuntimeId::Ethereum),
+                operation,
+                &block_ctx!(),
+                false,
+                None,
+                None,
+                &test_safe_roots(),
+            )
+            .expect(
+                "validate_and_apply_operation should not have failed with a kernel error",
+            ),
+        );
+
+        let internal = match &receipts[0].receipt {
+            OperationResultSum::Transfer(OperationResult {
+                result: ContentResult::BackTracked(_),
+                internal_operation_results,
+                ..
+            }) => internal_operation_results,
+            other => panic!(
+                "The top-level transfer must backtrack: its subtree failed, even \
+                 though the last internal receipt is applied. Got {other:?}"
+            ),
+        };
+        assert_eq!(
+            internal.len(),
+            2,
+            "Expected the transfer to the callee and its event, got {internal:?}"
+        );
+        // The transfer whose subtree raised.
+        assert!(
+            matches!(
+                &internal[0],
+                InternalOperationSum::Transfer(InternalContentWithMetadata {
+                    result: ContentResult::Failed(_),
+                    ..
+                })
+            ),
+            "Expected the transfer to the callee to be Failed, got {:?}",
+            internal[0]
+        );
+        // The applied sibling that used to be read as the subtree's verdict: it
+        // is demoted with the rest of the operation instead.
+        assert!(
+            matches!(
+                &internal[1],
+                InternalOperationSum::Event(InternalContentWithMetadata {
+                    result: ContentResult::BackTracked(_),
+                    ..
+                })
+            ),
+            "Expected the event emitted before the raise to be BackTracked, got {:?}",
+            internal[1]
+        );
+        // The state effect the `Applied` status used to commit: the callee's
+        // storage write is rolled back with the rest of the operation.
+        assert_eq!(
+            raising_account.storage(rk.host()).unwrap(),
+            initial_storage
+                .encode(&mut Gas::default())
+                .unwrap()
+                .unwrap(),
+            "The callee's storage write must be rolled back, not committed under \
+             a failed receipt"
+        );
+    }
+
+    // Claiming index 0 first (as a CRAC-reached `CREATE_CONTRACT` would),
+    // a native origination must continue at index 1 rather than restart
+    // its own nonce at 0 and collide.
+    #[test]
+    fn test_native_origination_claims_from_journal_nonce() {
+        let mut host = test_host();
+        let mut rk = RuntimeKeyspaces::init(&mut host).unwrap();
+
+        let src = bootstrap1();
+        init_account(rk.tez_accounts_mut(), &src.pkh, 50000);
+        reveal_account(rk.tez_accounts_mut(), &src);
+
+        let code =
+            hex::decode("02000000170500036805010368050202000000080316053d036d0342")
+                .unwrap();
+        let storage = hex::decode("010000000568656c6c6f").unwrap();
+        let operation = make_origination_operation(
+            15,
+            1,
+            5000,
+            500,
+            src.clone(),
+            30,
+            Script { code, storage },
+        );
+        let op_hash = operation.hash().unwrap();
+
+        let mut journal = journal_with_operation_hash(op_hash.clone());
+        assert_eq!(journal.michelson.next_origination_index(), 0);
+
+        let receipts = ProcessedOperation::into_receipts(
+            validate_and_apply_operation(
+                &mut rk,
+                &NotWiredRegistry,
+                &mut journal,
+                operation,
+                &block_ctx!(),
+                false,
+                None,
+                None,
+                &test_safe_roots(),
+            )
+            .expect(
+                "validate_and_apply_operation should not have failed with a kernel error",
+            ),
+        );
+
+        let expected_kt1 = mir::interpreter::compute_contract_address(&op_hash, 1);
+        match &receipts[0].receipt {
+            OperationResultSum::Origination(OperationResult {
+                result: ContentResult::Applied(success),
+                ..
+            }) => assert_eq!(
+                success.originated_contracts,
+                vec![Originated {
+                    contract: expected_kt1
+                }],
+                "The native origination must claim index 1, after the CRAC-claimed 0"
+            ),
+            other => panic!("Expected an applied origination, got {other:?}"),
+        }
+        assert_eq!(
+            journal.michelson.origination_index(),
+            2,
+            "The claimed index must be visible to the operation's next claimant"
+        );
+    }
+
+    #[test]
+    fn test_internal_receipts_failure_backtrack_all() {
+        let mut host = test_host();
+        let mut rk = RuntimeKeyspaces::init(&mut host).unwrap();
+        let src = bootstrap1();
+
+        // Initialize accounts with higher balances for the test
+        init_account(rk.tez_accounts_mut(), &src.pkh, 100);
+
+        // Create a script that emits internal operations to multiple targets
+        let contract_chapo_hash = ContractKt1Hash::from_base58_check(CONTRACT_1)
+            .expect("ContractKt1Hash b58 conversion should have succeed");
+        init_contract(
+            &mut rk,
+            &contract_chapo_hash,
+            SCRIPT_EMITING_INTERNAL_TRANSFER,
+            &Micheline::from(()),
+            &100_u64.into(),
+        );
+
+        // Create a failing contract
+        let internal_fail_contract_hash = ContractKt1Hash::from_base58_check(CONTRACT_2)
+            .expect("ContractKt1Hash b58 conversion should have succeed");
+        init_contract(
+            &mut rk,
+            &internal_fail_contract_hash,
+            FAILING_SCRIPT,
+            &Micheline::from(()),
+            &100_u64.into(),
+        );
+
+        // Create a successful contract
+        let internal_success_contract_hash =
+            ContractKt1Hash::from_base58_check(CONTRACT_3)
+                .expect("ContractKt1Hash b58 conversion should have succeed");
+        init_contract(
+            &mut rk,
+            &internal_success_contract_hash,
+            UNIT_SCRIPT,
+            &Micheline::from(()),
+            &100_u64.into(),
+        );
+
+        let success_micheline_address = Micheline::Bytes(
+            Contract::Originated(internal_success_contract_hash.clone())
+                .to_bytes()
+                .unwrap(),
+        );
+        let fail_micheline_address = Micheline::Bytes(
+            Contract::Originated(internal_fail_contract_hash.clone())
+                .to_bytes()
+                .unwrap(),
+        );
+        let addrs: Vec<Micheline> = vec![
+            success_micheline_address.clone(),
+            fail_micheline_address,
+            success_micheline_address,
+        ];
+        let param_value = Micheline::Seq(&addrs);
+        let operation = make_operation(
+            10,
+            1,
+            21150,
+            0,
+            src.clone(),
+            vec![
+                OperationContent::Reveal(RevealContent {
+                    pk: src.pk.clone(),
+                    proof: None,
+                }),
+                OperationContent::Transfer(TransferContent {
+                    amount: 0.into(),
+                    destination: Contract::Originated(contract_chapo_hash),
+                    parameters: Parameters {
+                        entrypoint: mir::ast::Entrypoint::default(),
+                        value: param_value.encode(&mut Gas::default()).unwrap().unwrap(),
+                    },
+                }),
+            ],
+        );
+        let receipts = ProcessedOperation::into_receipts(
+            validate_and_apply_operation(
+                &mut rk,
+                &NotWiredRegistry,
+                &mut TezosXJournal::mock(RuntimeId::Ethereum),
+                operation,
+                &block_ctx!(),
+                false,
+                None,
+                None,
+                &test_safe_roots(),
+            )
+            .expect(
+                "validate_and_apply_operation should not have failed with a kernel error",
+            ),
+        );
+        assert_eq!(
+            receipts.len(),
+            2,
+            "There should be two receipts: one for reveal and one for transfer"
+        );
+        assert!(
+            matches!(
+                &receipts[0].receipt,
+                OperationResultSum::Reveal(OperationResult {
+                    result: ContentResult::BackTracked(_),
+                    ..
+                })
+            ),
+            "First receipt should be a BackTracked Reveal but is {:?}",
+            receipts[0].receipt
+        );
+        assert!(
+            matches!(
+                &receipts[1].receipt,
+                OperationResultSum::Transfer(OperationResult {
+                    result: ContentResult::BackTracked(_),
+                    ..
+                })
+            ),
+            "Second receipt should be a BackTracked Transfer but is {:?}",
+            receipts[1].receipt
+        );
+
+        // Check Internal Operations
+        if let OperationResultSum::Transfer(OperationResult {
+            internal_operation_results,
+            ..
+        }) = &receipts[1].receipt
+        {
+            assert_eq!(
+                internal_operation_results.len(),
+                3,
+                "There should be three internal operations"
+            );
+
+            // Check the first internal operation
+            if let InternalOperationSum::Transfer(InternalContentWithMetadata {
+                content: TransferContent { destination, .. },
+                result:
+                    ContentResult::BackTracked(BacktrackedResult {
+                        errors: None,
+                        result:
+                            TransferTarget::ToContract(TransferSuccess {
+                                balance_updates,
+                                ..
+                            }),
+                    }),
+                ..
+            }) = &internal_operation_results[0]
+            {
+                assert_eq!(
+                    destination,
+                    &Contract::Originated(internal_success_contract_hash.clone()),
+                    "First internal operation should target the successful contract"
+                );
+                assert_eq!(
+                    balance_updates.len(),
+                    2,
+                    "Balance updates should have two entries"
+                );
+            } else {
+                panic!(
+                    "First internal operation is not a transfer its {:?}",
+                    internal_operation_results[0]
+                );
+            }
+
+            // Check the second internal operation
+            if let InternalOperationSum::Transfer(InternalContentWithMetadata {
+                content: TransferContent { destination, .. },
+                result: ContentResult::Failed(_),
+                ..
+            }) = &internal_operation_results[1]
+            {
+                assert_eq!(
+                    destination,
+                    &Contract::Originated(internal_fail_contract_hash),
+                    "Second internal operation should target the failing contract"
+                );
+            } else {
+                panic!("Second internal operation is not a transfer or does not match expected structure");
+            }
+
+            // Check the third internal operation
+            if let InternalOperationSum::Transfer(InternalContentWithMetadata {
+                content: TransferContent { destination, .. },
+                result: ContentResult::Skipped,
+                ..
+            }) = &internal_operation_results[2]
+            {
+                assert_eq!(
+                    destination,
+                    &Contract::Originated(internal_success_contract_hash),
+                    "Third internal operation should target the successful contract"
+                );
+            } else {
+                panic!("Third internal operation is not a transfer or does not match expected structure");
+            }
+        } else {
+            panic!("Second receipt is not a Transfer with Internal Operations");
+        }
+    }
+
+    /// On parameter `n : nat`, emits one internal `TRANSFER_TOKENS` back to
+    /// `SELF` with `n - 1`, stopping at `0`: a top-level call with `n` unfolds
+    /// into a chain of `n` internal transfers.
+    static SELF_RECURSIVE_TRANSFER_SCRIPT: &str = r#"
+        parameter nat;
+        storage unit;
+        code {
+            CAR;
+            DUP;
+            INT;
+            EQ;
+            IF { DROP; UNIT; NIL operation; PAIR }
+               { PUSH nat 1;
+                 SWAP;
+                 SUB;
+                 ABS;
+                 SELF;
+                 PUSH mutez 0;
+                 DIG 2;
+                 TRANSFER_TOKENS;
+                 NIL operation;
+                 SWAP;
+                 CONS;
+                 UNIT;
+                 SWAP;
+                 PAIR } }"#;
+
+    /// A deep self-transfer chain applies through the iterative worklist,
+    /// yielding a flat DFS list of one applied internal transfer per level.
+    #[test]
+    fn test_deep_internal_transfer_recursion_applies() {
+        const DEPTH: usize = 400;
+
+        // Run on a deliberately small stack — 1 MiB, the size of the wasm
+        // shadow stack the fast executor overflowed at ~150 levels before
+        // internal-operation processing became iterative (L2-1860). The heap
+        // worklist completes at DEPTH on it; reverting to the `transfer` ⇄
+        // `execute_internal_operations` recursion overflows it. Note a stack
+        // overflow aborts the process ("stack overflow, aborting"), it does not
+        // unwind, so that regression shows up as a hard abort of this test
+        // binary rather than a failure reported through `join` below.
+        // `stack_size` overrides the runner's RUST_MIN_STACK.
+        std::thread::Builder::new()
+            .stack_size(1024 * 1024)
+            .spawn(|| {
+                let mut host = test_host();
+                let mut rk = RuntimeKeyspaces::init(&mut host).unwrap();
+                let src = bootstrap1();
+                init_account(rk.tez_accounts_mut(), &src.pkh, 1_000_000);
+                reveal_account(rk.tez_accounts_mut(), &src);
+
+                let contract_hash = ContractKt1Hash::from_base58_check(CONTRACT_1)
+                    .expect("ContractKt1Hash b58 conversion should have succeed");
+                init_contract(
+                    &mut rk,
+                    &contract_hash,
+                    SELF_RECURSIVE_TRANSFER_SCRIPT,
+                    &Micheline::from(()),
+                    &0_u64.into(),
+                );
+
+                let operation = make_transfer_operation(
+                    10,
+                    1,
+                    660_000,
+                    0,
+                    src.clone(),
+                    0_u64.into(),
+                    Contract::Originated(contract_hash.clone()),
+                    Parameters {
+                        entrypoint: mir::ast::Entrypoint::default(),
+                        value: Micheline::from(DEPTH as i128)
+                            .encode(&mut Gas::default())
+                            .unwrap()
+                            .unwrap(),
+                    },
+                );
+                let receipts = ProcessedOperation::into_receipts(
+                    validate_and_apply_operation(
+                        &mut rk,
+                        &NotWiredRegistry,
+                        &mut TezosXJournal::mock(RuntimeId::Ethereum),
+                        operation,
+                        &block_ctx!(),
+                        false,
+                        None,
+                        None,
+                        &test_safe_roots(),
+                    )
+                    .expect(
+                        "validate_and_apply_operation should not have failed with a kernel error",
+                    ),
+                );
+
+                assert_eq!(
+                    receipts.len(),
+                    1,
+                    "There should be a single top-level receipt"
+                );
+                let internal_operation_results = match &receipts[0].receipt {
+                    OperationResultSum::Transfer(OperationResult {
+                        result: ContentResult::Applied(_),
+                        internal_operation_results,
+                        ..
+                    }) => internal_operation_results.clone(),
+                    other => panic!(
+                        "Top-level operation should be an applied transfer but is {other:?}"
+                    ),
+                };
+                assert_eq!(
+                    internal_operation_results.len(),
+                    DEPTH,
+                    "The chain of {DEPTH} self-transfers should yield {DEPTH} internal receipts"
+                );
+                for (i, internal) in internal_operation_results.iter().enumerate() {
+                    match internal {
+                        InternalOperationSum::Transfer(InternalContentWithMetadata {
+                            content: TransferContent { destination, .. },
+                            result: ContentResult::Applied(_),
+                            ..
+                        }) => assert_eq!(
+                            destination,
+                            &Contract::Originated(contract_hash.clone()),
+                            "Internal transfer #{i} should target the recursing contract"
+                        ),
+                        other => panic!(
+                            "Internal operation #{i} should be an applied transfer but is {other:?}"
+                        ),
+                    }
+                }
+            })
+            .expect("failed to spawn the bounded-stack worker")
+            .join()
+            .expect("the deep internal-transfer recursion assertions failed");
+    }
+
+    /// Negative case: depth is bounded by gas, not the stack. Too little gas to
+    /// run the whole chain backtracks the top-level operation (failure
+    /// contained, no kernel error) instead of overflowing.
+    #[test]
+    fn test_deep_internal_transfer_recursion_bounded_by_gas() {
+        const DEPTH: usize = 200;
+
+        let mut host = test_host();
+        let mut rk = RuntimeKeyspaces::init(&mut host).unwrap();
+        let src = bootstrap1();
+        init_account(rk.tez_accounts_mut(), &src.pkh, 1_000_000);
+        reveal_account(rk.tez_accounts_mut(), &src);
+
+        let contract_hash = ContractKt1Hash::from_base58_check(CONTRACT_1)
+            .expect("ContractKt1Hash b58 conversion should have succeed");
+        init_contract(
+            &mut rk,
+            &contract_hash,
+            SELF_RECURSIVE_TRANSFER_SCRIPT,
+            &Micheline::from(()),
+            &0_u64.into(),
+        );
+
+        // Enough gas to start the chain but far too little to reach depth 200.
+        let operation = make_transfer_operation(
+            10,
+            1,
+            30_000,
+            0,
+            src.clone(),
+            0_u64.into(),
+            Contract::Originated(contract_hash.clone()),
+            Parameters {
+                entrypoint: mir::ast::Entrypoint::default(),
+                value: Micheline::from(DEPTH as i128)
+                    .encode(&mut Gas::default())
+                    .unwrap()
+                    .unwrap(),
+            },
+        );
+        let receipts = ProcessedOperation::into_receipts(
+            validate_and_apply_operation(
+                &mut rk,
+                &NotWiredRegistry,
+                &mut TezosXJournal::mock(RuntimeId::Ethereum),
+                operation,
+                &block_ctx!(),
+                false,
+                None,
+                None,
+                &test_safe_roots(),
+            )
+            .expect(
+                "validate_and_apply_operation should not have failed with a kernel error",
+            ),
+        );
+
+        assert_eq!(
+            receipts.len(),
+            1,
+            "There should be a single top-level receipt"
+        );
+        let internal = match &receipts[0].receipt {
+            OperationResultSum::Transfer(OperationResult {
+                result: ContentResult::BackTracked(_),
+                internal_operation_results,
+                ..
+            }) => internal_operation_results,
+            other => {
+                panic!("Expected the top-level transfer to backtrack, got {other:?}")
+            }
+        };
+        // The chain must get partway before running out of gas — not die at the
+        // first level for some unrelated reason, nor complete all DEPTH levels.
+        assert!(
+            !internal.is_empty() && internal.len() < DEPTH,
+            "Expected the chain to stop mid-way (0 < len < {DEPTH}), got {}",
+            internal.len()
+        );
+        // The deepest transfer reached is the one that ran out of gas.
+        match internal.last() {
+            Some(InternalOperationSum::Transfer(InternalContentWithMetadata {
+                result: ContentResult::Failed(ApplyOperationErrors { errors }),
+                ..
+            })) => assert!(
+                errors.iter().any(|e| matches!(
+                    e,
+                    ApplyOperationError::Transfer(TransferError::OutOfGas(_))
+                )),
+                "Expected the deepest internal transfer to fail out of gas, got \
+                 {errors:?}"
+            ),
+            other => panic!(
+                "Expected the deepest internal transfer to have failed, got {other:?}"
+            ),
+        }
+    }
+
+    /// Emits one internal `SET_DELEGATE`, which the kernel does not support:
+    /// executing it raises `UnSupportedSetDelegate` rather than producing a
+    /// receipt.
+    static SET_DELEGATE_SCRIPT: &str = r#"
+        parameter unit;
+        storage unit;
+        code {
+            DROP;
+            NONE key_hash;
+            SET_DELEGATE;
+            NIL operation;
+            SWAP;
+            CONS;
+            UNIT;
+            SWAP;
+            PAIR }"#;
+
+    /// On parameter `n : nat`, emits one internal `TRANSFER_TOKENS` back to
+    /// `SELF` with `n - 1`, and `FAILWITH`s at `0`: a call with `n` unfolds
+    /// into a chain of `n` internal transfers whose deepest one fails.
+    static SELF_RECURSIVE_FAILING_SCRIPT: &str = r#"
+        parameter nat;
+        storage unit;
+        code {
+            CAR;
+            DUP;
+            INT;
+            EQ;
+            IF { DROP; PUSH string "bottom of the chain"; FAILWITH }
+               { PUSH nat 1;
+                 SWAP;
+                 SUB;
+                 ABS;
+                 SELF;
+                 PUSH mutez 0;
+                 DIG 2;
+                 TRANSFER_TOKENS;
+                 NIL operation;
+                 SWAP;
+                 CONS;
+                 UNIT;
+                 SWAP;
+                 PAIR } }"#;
+
+    /// Injects a chain of `DEPTH` self-transfers into whatever contract its
+    /// storage points at, on a `unit` call.
+    static CHAIN_STARTER_SCRIPT: &str = r#"
+        parameter unit;
+        storage address;
+        code {
+            CDR;
+            DUP;
+            CONTRACT nat;
+            IF_NONE { PUSH string "Invalid contract address"; FAILWITH } {};
+            PUSH mutez 0;
+            PUSH nat 4;
+            TRANSFER_TOKENS;
+            NIL operation;
+            SWAP;
+            CONS;
+            PAIR }"#;
+
+    /// An error raised while executing a *nested* batch — here an unsupported
+    /// internal `SET_DELEGATE` emitted at depth 2 — is contained: it fails the
+    /// transfer that emitted that batch, whose receipt reads `Failed
+    /// (FailedToExecuteInternalOperation …)` and carries neither its own
+    /// success payload nor its delegated storage cost, and skips that
+    /// transfer's remaining siblings. This is the only path that resolves a
+    /// pending parent from a raise rather than from a drained subtree.
+    #[test]
+    fn test_internal_op_error_fails_the_emitting_transfer() {
+        let mut host = test_host();
+        let mut rk = RuntimeKeyspaces::init(&mut host).unwrap();
+        let src = bootstrap1();
+        init_account(rk.tez_accounts_mut(), &src.pkh, 1_000_000);
+        reveal_account(rk.tez_accounts_mut(), &src);
+
+        // Fans out to [set-delegate emitter, benign contract].
+        let emitter_hash = ContractKt1Hash::from_base58_check(CONTRACT_1)
+            .expect("ContractKt1Hash b58 conversion should have succeed");
+        init_contract(
+            &mut rk,
+            &emitter_hash,
+            SCRIPT_EMITING_INTERNAL_TRANSFER,
+            &Micheline::from(()),
+            &1_000_u64.into(),
+        );
+        let set_delegate_hash = ContractKt1Hash::from_base58_check(CONTRACT_2)
+            .expect("ContractKt1Hash b58 conversion should have succeed");
+        init_contract(
+            &mut rk,
+            &set_delegate_hash,
+            SET_DELEGATE_SCRIPT,
+            &Micheline::from(()),
+            &1_000_u64.into(),
+        );
+        let sibling_hash = ContractKt1Hash::from_base58_check(CONTRACT_3)
+            .expect("ContractKt1Hash b58 conversion should have succeed");
+        init_contract(
+            &mut rk,
+            &sibling_hash,
+            UNIT_SCRIPT,
+            &Micheline::from(()),
+            &1_000_u64.into(),
+        );
+
+        let addrs: Vec<Micheline> = vec![
+            Micheline::Bytes(
+                Contract::Originated(set_delegate_hash.clone())
+                    .to_bytes()
+                    .unwrap(),
+            ),
+            Micheline::Bytes(
+                Contract::Originated(sibling_hash.clone())
+                    .to_bytes()
+                    .unwrap(),
+            ),
+        ];
+        let operation = make_transfer_operation(
+            10,
+            1,
+            100_000,
+            0,
+            src.clone(),
+            0_u64.into(),
+            Contract::Originated(emitter_hash),
+            Parameters {
+                entrypoint: mir::ast::Entrypoint::default(),
+                value: Micheline::Seq(&addrs)
+                    .encode(&mut Gas::default())
+                    .unwrap()
+                    .unwrap(),
+            },
+        );
+        let receipts = ProcessedOperation::into_receipts(
+            validate_and_apply_operation(
+                &mut rk,
+                &NotWiredRegistry,
+                &mut TezosXJournal::mock(RuntimeId::Ethereum),
+                operation,
+                &block_ctx!(),
+                false,
+                None,
+                None,
+                &test_safe_roots(),
+            )
+            .expect(
+                "validate_and_apply_operation should not have failed with a kernel error",
+            ),
+        );
+
+        let internal = match &receipts[0].receipt {
+            OperationResultSum::Transfer(OperationResult {
+                result: ContentResult::BackTracked(_),
+                internal_operation_results,
+                ..
+            }) => internal_operation_results,
+            other => panic!(
+                "Expected the top-level transfer to backtrack on the contained \
+                 error, got {other:?}"
+            ),
+        };
+        // The unsupported SET_DELEGATE itself gets no receipt — the error
+        // replaces the receipt of the transfer that emitted it.
+        assert_eq!(
+            internal.len(),
+            2,
+            "Expected the two transfers the caller emitted and nothing for the \
+             SET_DELEGATE, got {internal:?}"
+        );
+        match &internal[0] {
+            InternalOperationSum::Transfer(InternalContentWithMetadata {
+                content: TransferContent { destination, .. },
+                result: ContentResult::Failed(ApplyOperationErrors { errors }),
+                ..
+            }) => {
+                assert_eq!(
+                    destination,
+                    &Contract::Originated(set_delegate_hash),
+                    "The failed transfer should be the one to the emitter"
+                );
+                match errors.as_slice() {
+                    [ApplyOperationError::Transfer(
+                        TransferError::FailedToExecuteInternalOperation(msg),
+                    )] => assert!(
+                        msg.contains("Set delegate operation is unsupported"),
+                        "The emitting transfer should report the error its \
+                         subtree raised, got {msg}"
+                    ),
+                    other => panic!(
+                        "Expected a single FailedToExecuteInternalOperation, got \
+                         {other:?}"
+                    ),
+                }
+            }
+            other => panic!(
+                "Expected the transfer whose subtree raised to be Failed, got \
+                 {other:?}"
+            ),
+        }
+        // Its siblings are skipped: the raise failed the enclosing batch, not
+        // just the transfer itself.
+        match &internal[1] {
+            InternalOperationSum::Transfer(InternalContentWithMetadata {
+                content: TransferContent { destination, .. },
+                result: ContentResult::Skipped,
+                ..
+            }) => assert_eq!(
+                destination,
+                &Contract::Originated(sibling_hash),
+                "The skipped transfer should be the sibling"
+            ),
+            other => panic!("Expected the sibling transfer to be Skipped, got {other:?}"),
+        }
+    }
+
+    /// A failure at the bottom of a nested chain settles every level above it:
+    /// each transfer whose subtree ends non-applied is `BackTracked`, and the
+    /// failure crosses each nesting boundary so the siblings of every one of
+    /// them are `Skipped`. `Skipped` is the discriminating assertion here: the
+    /// top-level backtrack sweeps `Applied` internals to `BackTracked`
+    /// regardless, but leaves `Skipped` alone.
+    #[test]
+    fn test_internal_op_failure_settles_every_enclosing_level() {
+        // The chain the starter injects, from its `PUSH nat 4`: self-calls with
+        // 4, 3, 2, 1 and 0, the last of which FAILWITHs. Counting the transfer
+        // to the starter itself, the failure sits CHAIN + 1 levels below the
+        // top-level operation.
+        const CHAIN: usize = 5;
+
+        let mut host = test_host();
+        let mut rk = RuntimeKeyspaces::init(&mut host).unwrap();
+        let src = bootstrap1();
+        init_account(rk.tez_accounts_mut(), &src.pkh, 1_000_000);
+        reveal_account(rk.tez_accounts_mut(), &src);
+
+        let emitter_hash = ContractKt1Hash::from_base58_check(CONTRACT_1)
+            .expect("ContractKt1Hash b58 conversion should have succeed");
+        init_contract(
+            &mut rk,
+            &emitter_hash,
+            SCRIPT_EMITING_INTERNAL_TRANSFER,
+            &Micheline::from(()),
+            &1_000_u64.into(),
+        );
+        let recursive_hash = ContractKt1Hash::from_base58_check(CONTRACT_3)
+            .expect("ContractKt1Hash b58 conversion should have succeed");
+        init_contract(
+            &mut rk,
+            &recursive_hash,
+            SELF_RECURSIVE_FAILING_SCRIPT,
+            &Micheline::from(()),
+            &1_000_u64.into(),
+        );
+        // Takes the `unit` call the emitter makes and turns it into a `nat`
+        // call on the recursing contract.
+        let starter_hash = ContractKt1Hash::from_base58_check(CONTRACT_2)
+            .expect("ContractKt1Hash b58 conversion should have succeed");
+        init_contract(
+            &mut rk,
+            &starter_hash,
+            CHAIN_STARTER_SCRIPT,
+            &Micheline::Bytes(
+                Contract::Originated(recursive_hash.clone())
+                    .to_bytes()
+                    .unwrap(),
+            ),
+            &1_000_u64.into(),
+        );
+
+        // Fan out to [chain starter, an implicit account]. The second transfer
+        // never runs; it is there to be skipped.
+        let addrs: Vec<Micheline> = vec![
+            Micheline::Bytes(
+                Contract::Originated(starter_hash.clone())
+                    .to_bytes()
+                    .unwrap(),
+            ),
+            Micheline::Bytes(Contract::Implicit(src.pkh.clone()).to_bytes().unwrap()),
+        ];
+        let operation = make_transfer_operation(
+            10,
+            1,
+            200_000,
+            0,
+            src.clone(),
+            0_u64.into(),
+            Contract::Originated(emitter_hash),
+            Parameters {
+                entrypoint: mir::ast::Entrypoint::default(),
+                value: Micheline::Seq(&addrs)
+                    .encode(&mut Gas::default())
+                    .unwrap()
+                    .unwrap(),
+            },
+        );
+        let receipts = ProcessedOperation::into_receipts(
+            validate_and_apply_operation(
+                &mut rk,
+                &NotWiredRegistry,
+                &mut TezosXJournal::mock(RuntimeId::Ethereum),
+                operation,
+                &block_ctx!(),
+                false,
+                None,
+                None,
+                &test_safe_roots(),
+            )
+            .expect(
+                "validate_and_apply_operation should not have failed with a kernel error",
+            ),
+        );
+
+        let internal = match &receipts[0].receipt {
+            OperationResultSum::Transfer(OperationResult {
+                result: ContentResult::BackTracked(_),
+                internal_operation_results,
+                ..
+            }) => internal_operation_results,
+            other => {
+                panic!("Expected the top-level transfer to backtrack, got {other:?}")
+            }
+        };
+        // In DFS order: the transfer to the starter, the CHAIN transfers it
+        // injected, then the skipped sibling.
+        assert_eq!(
+            internal.len(),
+            CHAIN + 2,
+            "Expected the starter, its {CHAIN}-transfer chain and the sibling, \
+             got {internal:?}"
+        );
+        // Every level above the failure backtracks...
+        for (i, op) in internal[..CHAIN].iter().enumerate() {
+            assert!(
+                matches!(
+                    op,
+                    InternalOperationSum::Transfer(InternalContentWithMetadata {
+                        result: ContentResult::BackTracked(_),
+                        ..
+                    })
+                ),
+                "Internal transfer #{i} encloses the failure and should be \
+                 BackTracked, got {op:?}"
+            );
+        }
+        // ... the deepest call is the one that actually failed ...
+        match &internal[CHAIN] {
+            InternalOperationSum::Transfer(InternalContentWithMetadata {
+                content: TransferContent { destination, .. },
+                result: ContentResult::Failed(_),
+                ..
+            }) => assert_eq!(
+                destination,
+                &Contract::Originated(recursive_hash),
+                "The failing transfer should be the deepest self-call"
+            ),
+            other => panic!("Expected the deepest transfer to be Failed, got {other:?}"),
+        }
+        // ... and the failure reached the outermost batch, CHAIN + 1 levels
+        // up, where it skipped the sibling of the transfer that started it.
+        assert!(
+            matches!(
+                &internal[CHAIN + 1],
+                InternalOperationSum::Transfer(InternalContentWithMetadata {
+                    content: TransferContent {
+                        destination: Contract::Implicit(_),
+                        ..
+                    },
+                    result: ContentResult::Skipped,
+                    ..
+                })
+            ),
+            "The sibling of the chain starter should be Skipped, got {:?}",
+            internal[CHAIN + 1]
+        );
+    }
+
+    /// L2-1637: a contract `DUP`s an `operation` value and emits both
+    /// copies. `operation` is `Duplicable`, so this typechecks, but the
+    /// two copies share one MIR counter — the identity L1 uses to
+    /// enforce internal-operation linearity. The kernel must reject the
+    /// second copy as an internal-operation replay instead of applying
+    /// it a second time under a fresh display nonce; otherwise the
+    /// carried side effect (here a plain transfer, but equally a
+    /// ticket-carrying transfer) would run twice while L1 backtracks.
+    #[test]
+    fn test_internal_transfer_replay_is_rejected() {
+        let mut host = test_host();
+        let mut rk = RuntimeKeyspaces::init(&mut host).unwrap();
+        let src = bootstrap1();
+        init_account(rk.tez_accounts_mut(), &src.pkh, 100000);
+        reveal_account(rk.tez_accounts_mut(), &src);
+
+        // Parent: build one internal transfer, DUP the resulting
+        // `operation`, and emit both copies in the returned list.
+        static DUP_TRANSFER_SCRIPT: &str = r#"
+            parameter address;
+            storage unit;
+            code {
+                CAR;
+                CONTRACT unit;
+                IF_NONE { PUSH string "Invalid contract address"; FAILWITH } {};
+                PUSH mutez 0;
+                PUSH unit Unit;
+                TRANSFER_TOKENS;
+                DUP;
+                NIL operation;
+                SWAP; CONS;
+                SWAP; CONS;
+                PUSH unit Unit;
+                SWAP;
+                PAIR
+            }"#;
+
+        let parent_hash = ContractKt1Hash::from_base58_check(CONTRACT_1)
+            .expect("ContractKt1Hash b58 conversion should have succeed");
+        init_contract(
+            &mut rk,
+            &parent_hash,
+            DUP_TRANSFER_SCRIPT,
+            &Micheline::from(()),
+            &100_u64.into(),
+        );
+
+        let receiver_hash = ContractKt1Hash::from_base58_check(CONTRACT_2)
+            .expect("ContractKt1Hash b58 conversion should have succeed");
+        init_contract(
+            &mut rk,
+            &receiver_hash,
+            UNIT_SCRIPT,
+            &Micheline::from(()),
+            &100_u64.into(),
+        );
+
+        let receiver_address =
+            Micheline::Bytes(Contract::Originated(receiver_hash).to_bytes().unwrap());
+
+        let operation = make_transfer_operation(
+            10,
+            1,
+            30000,
+            0,
+            src.clone(),
+            0.into(),
+            Contract::Originated(parent_hash),
+            Parameters {
+                entrypoint: mir::ast::Entrypoint::default(),
+                value: receiver_address
+                    .encode(&mut Gas::default())
+                    .unwrap()
+                    .unwrap(),
+            },
+        );
+
+        let receipts = ProcessedOperation::into_receipts(
+            validate_and_apply_operation(
+                &mut rk,
+                &NotWiredRegistry,
+                &mut TezosXJournal::mock(RuntimeId::Ethereum),
+                operation,
+                &block_ctx!(),
+                false,
+                None,
+                None,
+                &test_safe_roots(),
+            )
+            .expect(
+                "validate_and_apply_operation should not have failed with a kernel error",
+            ),
+        );
+
+        assert_eq!(receipts.len(), 1, "There should be one transfer receipt");
+        assert!(
+            matches!(
+                &receipts[0].receipt,
+                OperationResultSum::Transfer(OperationResult {
+                    result: ContentResult::BackTracked(_),
+                    ..
+                })
+            ),
+            "The duplicated internal operation must make the whole operation backtrack, but receipt is {:?}",
+            receipts[0].receipt
+        );
+
+        let internal_receipts = get_internal_receipts(&receipts[0].receipt);
+        assert_eq!(
+            internal_receipts.len(),
+            2,
+            "Both copies of the duplicated operation must appear in the receipt"
+        );
+        // The first copy applied, then was demoted to BackTracked when
+        // the operation failed on the replay.
+        assert!(
+            matches!(
+                &internal_receipts[0],
+                InternalOperationSum::Transfer(InternalContentWithMetadata {
+                    result: ContentResult::BackTracked(_),
+                    ..
+                })
+            ),
+            "First copy should be BackTracked but is {:?}",
+            internal_receipts[0]
+        );
+        // The second copy is rejected as an internal-operation replay.
+        match &internal_receipts[1] {
+            InternalOperationSum::Transfer(InternalContentWithMetadata {
+                result: ContentResult::Failed(errors),
+                ..
+            }) => assert_eq!(
+                errors.errors,
+                vec![ApplyOperationError::InternalOperationReplay],
+                "Second copy must be rejected as an internal-operation replay"
+            ),
+            other => {
+                panic!("Second copy should be a Failed transfer but is {other:?}")
+            }
+        }
+    }
+
+    /// L2-1637, origination variant: a contract `DUP`s an internal
+    /// `CREATE_CONTRACT` `operation` and emits both copies. Both carry
+    /// the same MIR counter (and the same pre-computed KT1), so the
+    /// second must be rejected as a replay rather than originating the
+    /// same contract twice.
+    #[test]
+    fn test_internal_origination_replay_is_rejected() {
+        let mut host = test_host();
+        let mut rk = RuntimeKeyspaces::init(&mut host).unwrap();
+        let src = bootstrap1();
+        init_account(rk.tez_accounts_mut(), &src.pkh, 100000);
+        reveal_account(rk.tez_accounts_mut(), &src);
+
+        // Parent: one internal origination, DUP the `operation`, emit
+        // both copies; store the (single) child address.
+        static DUP_ORIGINATION_SCRIPT: &str = r#"
+            parameter unit;
+            storage (option address);
+            code {
+                DROP;
+                UNIT;
+                PUSH mutez 0;
+                NONE key_hash;
+                CREATE_CONTRACT { parameter unit; storage unit; code { CDR; NIL operation; PAIR } };
+                DIP { SOME };
+                DUP;
+                NIL operation;
+                SWAP; CONS;
+                SWAP; CONS;
+                PAIR
+            }"#;
+
+        let parent_hash = ContractKt1Hash::from_base58_check(CONTRACT_1)
+            .expect("ContractKt1Hash b58 conversion should have succeed");
+        init_contract(
+            &mut rk,
+            &parent_hash,
+            DUP_ORIGINATION_SCRIPT,
+            &Micheline::prim0(mir::lexer::Prim::None, &mut Gas::default()).unwrap(),
+            &1000000_u64.into(),
+        );
+
+        let operation = make_transfer_operation(
+            10,
+            1,
+            50000,
+            10000,
+            src.clone(),
+            0.into(),
+            Contract::Originated(parent_hash),
+            Parameters {
+                entrypoint: mir::ast::Entrypoint::default(),
+                value: Micheline::from(())
+                    .encode(&mut Gas::default())
+                    .unwrap()
+                    .unwrap(),
+            },
+        );
+
+        let receipts = ProcessedOperation::into_receipts(
+            validate_and_apply_operation(
+                &mut rk,
+                &NotWiredRegistry,
+                &mut TezosXJournal::mock(RuntimeId::Ethereum),
+                operation,
+                &block_ctx!(),
+                false,
+                None,
+                None,
+                &test_safe_roots(),
+            )
+            .expect(
+                "validate_and_apply_operation should not have failed with a kernel error",
+            ),
+        );
+
+        assert_eq!(receipts.len(), 1, "There should be one transfer receipt");
+        assert!(
+            matches!(
+                &receipts[0].receipt,
+                OperationResultSum::Transfer(OperationResult {
+                    result: ContentResult::BackTracked(_),
+                    ..
+                })
+            ),
+            "The duplicated internal origination must make the whole operation backtrack, but receipt is {:?}",
+            receipts[0].receipt
+        );
+
+        let internal_receipts = get_internal_receipts(&receipts[0].receipt);
+        assert_eq!(
+            internal_receipts.len(),
+            2,
+            "Both copies of the duplicated origination must appear in the receipt"
+        );
+        assert!(
+            matches!(
+                &internal_receipts[0],
+                InternalOperationSum::Origination(InternalContentWithMetadata {
+                    result: ContentResult::BackTracked(_),
+                    ..
+                })
+            ),
+            "First copy should be BackTracked but is {:?}",
+            internal_receipts[0]
+        );
+        match &internal_receipts[1] {
+            InternalOperationSum::Origination(InternalContentWithMetadata {
+                result: ContentResult::Failed(errors),
+                ..
+            }) => assert_eq!(
+                errors.errors,
+                vec![ApplyOperationError::InternalOperationReplay],
+                "Second copy must be rejected as an internal-operation replay"
+            ),
+            other => {
+                panic!("Second copy should be a Failed origination but is {other:?}")
+            }
+        }
+    }
+
+    /// L2-1637, event variant: a contract `DUP`s an internal `EMIT`
+    /// `operation` and returns both copies. They share one MIR counter,
+    /// so the second must be rejected as a replay rather than emitting
+    /// the same event twice — exercising the `Emit` arm's replay path.
+    #[test]
+    fn test_internal_emit_replay_is_rejected() {
+        let mut host = test_host();
+        let mut rk = RuntimeKeyspaces::init(&mut host).unwrap();
+        let src = bootstrap1();
+        init_account(rk.tez_accounts_mut(), &src.pkh, 100000);
+        reveal_account(rk.tez_accounts_mut(), &src);
+
+        // Parent: build one internal EMIT operation, DUP the resulting
+        // `operation`, and return both copies in the operation list.
+        static DUP_EMIT_SCRIPT: &str = r#"
+            parameter unit;
+            storage unit;
+            code {
+                DROP;
+                PUSH nat 42;
+                EMIT %foo nat;
+                DUP;
+                NIL operation;
+                SWAP; CONS;
+                SWAP; CONS;
+                PUSH unit Unit;
+                SWAP;
+                PAIR
+            }"#;
+
+        let parent_hash = ContractKt1Hash::from_base58_check(CONTRACT_1)
+            .expect("ContractKt1Hash b58 conversion should have succeed");
+        init_contract(
+            &mut rk,
+            &parent_hash,
+            DUP_EMIT_SCRIPT,
+            &Micheline::from(()),
+            &100_u64.into(),
+        );
+
+        let operation = make_transfer_operation(
+            10,
+            1,
+            30000,
+            0,
+            src.clone(),
+            0.into(),
+            Contract::Originated(parent_hash),
+            Parameters {
+                entrypoint: mir::ast::Entrypoint::default(),
+                value: Micheline::from(())
+                    .encode(&mut Gas::default())
+                    .unwrap()
+                    .unwrap(),
+            },
+        );
+
+        let receipts = ProcessedOperation::into_receipts(
+            validate_and_apply_operation(
+                &mut rk,
+                &NotWiredRegistry,
+                &mut TezosXJournal::mock(RuntimeId::Ethereum),
+                operation,
+                &block_ctx!(),
+                false,
+                None,
+                None,
+                &test_safe_roots(),
+            )
+            .expect(
+                "validate_and_apply_operation should not have failed with a kernel error",
+            ),
+        );
+
+        assert_eq!(receipts.len(), 1, "There should be one transfer receipt");
+        assert!(
+            matches!(
+                &receipts[0].receipt,
+                OperationResultSum::Transfer(OperationResult {
+                    result: ContentResult::BackTracked(_),
+                    ..
+                })
+            ),
+            "The duplicated internal event must make the whole operation backtrack, but receipt is {:?}",
+            receipts[0].receipt
+        );
+
+        let internal_receipts = get_internal_receipts(&receipts[0].receipt);
+        assert_eq!(
+            internal_receipts.len(),
+            2,
+            "Both copies of the duplicated event must appear in the receipt"
+        );
+        // The first copy applied, then was demoted to BackTracked when
+        // the operation failed on the replay.
+        assert!(
+            matches!(
+                &internal_receipts[0],
+                InternalOperationSum::Event(InternalContentWithMetadata {
+                    result: ContentResult::BackTracked(_),
+                    ..
+                })
+            ),
+            "First copy should be BackTracked but is {:?}",
+            internal_receipts[0]
+        );
+        // The second copy is rejected as an internal-operation replay.
+        match &internal_receipts[1] {
+            InternalOperationSum::Event(InternalContentWithMetadata {
+                result: ContentResult::Failed(errors),
+                ..
+            }) => assert_eq!(
+                errors.errors,
+                vec![ApplyOperationError::InternalOperationReplay],
+                "Second copy must be rejected as an internal-operation replay"
+            ),
+            other => {
+                panic!("Second copy should be a Failed event but is {other:?}")
+            }
+        }
+    }
+
+    #[test]
+    fn test_smart_contract_amount_instruction() {
+        // Write AMOUNT in the storage
+        const SCRIPT: &str = "
+            parameter unit;
+            storage mutez;
+            code {
+                DROP;
+                AMOUNT;
+                NIL operation;
+                PAIR
+            }
+        ";
+        let mut host = test_host();
+        let mut rk = RuntimeKeyspaces::init(&mut host).unwrap();
+        let src = bootstrap1();
+        init_account(rk.tez_accounts_mut(), &src.pkh, 50);
+        reveal_account(rk.tez_accounts_mut(), &src);
+
+        let contract_hash = ContractKt1Hash::from_base58_check(CONTRACT_3)
+            .expect("ContractKt1Hash b58 conversion should have succeed");
+
+        let initial_amount = 0;
+        let transfer_amount = 30;
+        let src_contract = init_contract(
+            &mut rk,
+            &contract_hash,
+            SCRIPT,
+            &Micheline::from(initial_amount),
+            &0_u64.into(),
+        );
+
+        let operation = make_transfer_operation(
+            15,
+            1,
+            21040,
+            5,
+            src.clone(),
+            transfer_amount.into(),
+            Contract::Originated(contract_hash.clone()),
+            Parameters {
+                entrypoint: mir::ast::Entrypoint::default(),
+                value: Micheline::from(())
+                    .encode(&mut Gas::default())
+                    .unwrap()
+                    .unwrap(),
+            },
+        );
+
+        let _processed = validate_and_apply_operation(
+            &mut rk,
+            &NotWiredRegistry,
+            &mut journal_with_operation_hash(operation.hash().unwrap()),
+            operation,
+            &block_ctx!(),
+            false,
+            None,
+            None,
+            &test_safe_roots(),
+        )
+        .expect(
+            "validate_and_apply_operation should not have failed with a kernel error",
+        );
+
+        assert_eq!(
+            src_contract.storage(rk.host()).unwrap(),
+            Micheline::from(i128::from(transfer_amount))
+                .encode(&mut Gas::default())
+                .unwrap()
+                .unwrap(),
+            "Storage should contain the amount sent"
+        );
+    }
+
+    #[test]
+    fn test_smart_contract_balance_instruction() {
+        // Write BALANCE in the storage
+        const SCRIPT: &str = "
+            parameter unit;
+            storage mutez;
+            code {
+                DROP;
+                BALANCE;
+                NIL operation;
+                PAIR
+            }
+        ";
+        let mut host = test_host();
+        let mut rk = RuntimeKeyspaces::init(&mut host).unwrap();
+        let src = bootstrap1();
+        // Fund source for fee + transfer + storage burn for
+        // recording the contract balance into its storage.
+        init_account(rk.tez_accounts_mut(), &src.pkh, 5_000);
+        reveal_account(rk.tez_accounts_mut(), &src);
+
+        let contract_hash = ContractKt1Hash::from_base58_check(CONTRACT_3)
+            .expect("ContractKt1Hash b58 conversion should have succeed");
+
+        let transfer_amount = 30;
+        let initial_balance = 200;
+        let src_contract = init_contract(
+            &mut rk,
+            &contract_hash,
+            SCRIPT,
+            &Micheline::from(0),
+            &initial_balance.into(),
+        );
+        let operation = make_transfer_operation(
+            15,
+            1,
+            21040,
+            5,
+            src.clone(),
+            transfer_amount.into(),
+            Contract::Originated(contract_hash.clone()),
+            Parameters {
+                entrypoint: mir::ast::Entrypoint::default(),
+                value: Micheline::from(())
+                    .encode(&mut Gas::default())
+                    .unwrap()
+                    .unwrap(),
+            },
+        );
+
+        let _processed = validate_and_apply_operation(
+            &mut rk,
+            &NotWiredRegistry,
+            &mut journal_with_operation_hash(operation.hash().unwrap()),
+            operation,
+            &block_ctx!(),
+            false,
+            None,
+            None,
+            &test_safe_roots(),
+        )
+        .expect(
+            "validate_and_apply_operation should not have failed with a kernel error",
+        );
+
+        assert_eq!(
+            src_contract.storage(rk.host()).unwrap(),
+            Micheline::from(i128::from(initial_balance + transfer_amount))
+                .encode(&mut Gas::default())
+                .unwrap()
+                .unwrap(),
+            "Storage should contain the balance of the contract"
+        );
+    }
+
+    #[test]
+    fn test_smart_contract_self_address_instruction() {
+        // Write SELF_ADDRESS in the storage
+        const SCRIPT_ADDR: &str = "
+            parameter unit;
+            storage address;
+            code {
+                DROP;
+                SELF_ADDRESS;
+                NIL operation;
+                PAIR
+            }
+        ";
+        let mut host = test_host();
+        let mut rk = RuntimeKeyspaces::init(&mut host).unwrap();
+        let src = bootstrap1();
+        init_account(rk.tez_accounts_mut(), &src.pkh, 50);
+        reveal_account(rk.tez_accounts_mut(), &src);
+
+        let contract_hash = ContractKt1Hash::from_base58_check(CONTRACT_3)
+            .expect("ContractKt1Hash b58 conversion should have succeed");
+
+        let micheline_address = Micheline::Bytes(
+            Contract::Originated(contract_hash.clone())
+                .to_bytes()
+                .unwrap(),
+        );
+        let src_contract = init_contract(
+            &mut rk,
+            &contract_hash,
+            SCRIPT_ADDR,
+            &micheline_address,
+            &0_u64.into(),
+        );
+
+        let operation = make_transfer_operation(
+            15,
+            1,
+            21040,
+            5,
+            src.clone(),
+            30_u64.into(),
+            Contract::Originated(contract_hash.clone()),
+            Parameters {
+                entrypoint: mir::ast::Entrypoint::default(),
+                value: Micheline::from(())
+                    .encode(&mut Gas::default())
+                    .unwrap()
+                    .unwrap(),
+            },
+        );
+
+        let _processed = validate_and_apply_operation(
+            &mut rk,
+            &NotWiredRegistry,
+            &mut journal_with_operation_hash(operation.hash().unwrap()),
+            operation,
+            &block_ctx!(),
+            false,
+            None,
+            None,
+            &test_safe_roots(),
+        )
+        .expect(
+            "validate_and_apply_operation should not have failed with a kernel error",
+        );
+
+        assert_eq!(
+            src_contract.storage(rk.host()).unwrap(),
+            micheline_address
+                .encode(&mut Gas::default())
+                .unwrap()
+                .unwrap(),
+            "Storage should contain the self address of the contract"
+        );
+    }
+
+    fn get_internal_receipts(op: &OperationResultSum) -> &Vec<InternalOperationSum> {
+        if let OperationResultSum::Transfer(OperationResult {
+            internal_operation_results,
+            ..
+        }) = op
+        {
+            internal_operation_results
+        } else {
+            panic!("Expected a Transfer operation result")
+        }
+    }
+
+    #[test]
+    fn test_apply_origination_slot_burn_failure_backtracks() {
+        let mut host = test_host();
+        let mut rk = RuntimeKeyspaces::init(&mut host).unwrap();
+        let src = bootstrap1();
+
+        // 283 = 15 fee + 30 initial balance + 38 variable burn
+        // (code 28 bytes + storage 10 bytes = 38 bytes × COST_PER_BYTES)
+        // + 200 leftover, insufficient for the 257 slot burn that follows.
+        let funded = 283_u64;
+        init_account(rk.tez_accounts_mut(), &src.pkh, funded);
+        reveal_account(rk.tez_accounts_mut(), &src);
+
+        let fee = 15u64;
+        let smart_contract_balance = 30u64;
+        /*
+        octez-client convert script "
+                  parameter string;
+                  storage string;
+                  code { CAR; NIL operation; PAIR }
+                " from Michelson to binary
+         */
+        let code =
+            hex::decode("02000000170500036805010368050202000000080316053d036d0342")
+                .unwrap();
+
+        // octez-client -E https://rpc.tzkt.io/mainnet convert data  '"hello"' from Michelson to binary
+        let storage = hex::decode("010000000568656c6c6f").unwrap();
+        let operation = make_origination_operation(
+            fee,
+            1,
+            5000,
+            500,
+            src.clone(),
+            smart_contract_balance,
+            Script { code, storage },
+        );
+
+        let receipts = ProcessedOperation::into_receipts(
+            validate_and_apply_operation(
+                &mut rk,
+                &NotWiredRegistry,
+                &mut TezosXJournal::mock(RuntimeId::Ethereum),
+                operation.clone(),
+                &block_ctx!(),
+                false,
+                None,
+                None,
+                &test_safe_roots(),
+            )
+            .expect(
+                "kernel error not expected — burn failure routes through Backtracked",
+            ),
+        );
+
+        let mut origination_nonce = OriginationNonce::default();
+        let expected_kt1 = origination_nonce.generate_kt1();
+
+        let expected_receipts = vec![OperationWithMetadata {
+            content: operation.content[0].clone(),
+            receipt: OperationResultSum::Origination(OperationResult {
+                balance_updates: vec![
+                    BalanceUpdate {
+                        balance: Balance::Account(Contract::Implicit(src.pkh.clone())),
+                        changes: -(fee as i64),
+                        update_origin: UpdateOrigin::BlockApplication,
+                    },
+                    BalanceUpdate {
+                        balance: Balance::BlockFees,
+                        changes: fee as i64,
+                        update_origin: UpdateOrigin::BlockApplication,
+                    },
+                ],
+                result: ContentResult::BackTracked(BacktrackedResult {
+                    errors: Some(ApplyOperationErrors {
+                        errors: vec![ApplyOperationError::CannotPayStorageFee(
+                            BalanceTooLow {
+                                contract: Contract::Implicit(src.pkh.clone()),
+                                // 283 - 15 fee - 30 transfer - 38 variable burn = 200
+                                balance: 200_u64.into(),
+                                // ORIGINATION_SIZE × COST_PER_BYTES
+                                amount: 257_u64.into(),
+                            },
+                        )],
+                    }),
+                    result: OriginationSuccess {
+                        balance_updates: vec![
+                            BalanceUpdate {
+                                balance: Balance::Account(Contract::Implicit(
+                                    src.pkh.clone(),
+                                )),
+                                changes: -(smart_contract_balance as i64),
+                                update_origin: UpdateOrigin::BlockApplication,
+                            },
+                            BalanceUpdate {
+                                balance: Balance::Account(Contract::Originated(
+                                    expected_kt1.clone(),
+                                )),
+                                changes: smart_contract_balance as i64,
+                                update_origin: UpdateOrigin::BlockApplication,
+                            },
+                        ],
+                        originated_contracts: vec![Originated {
+                            contract: expected_kt1.clone(),
+                        }],
+                        consumed_milligas: 2_352_668_u64.into(),
+                        storage_size: 38_u64.into(),
+                        paid_storage_size_diff: 38_u64.into(),
+                        lazy_storage_diff: None,
+                    },
+                }),
+                internal_operation_results: vec![],
+            }),
+        }];
+
+        assert_eq!(receipts, expected_receipts);
+
+        // Source paid only the fee; SafeStorage rolled back the
+        // initial-balance transfer, the variable burn, and the
+        // pre-burn smart-contract setup.
+        let src_account =
+            context::implicit_from_public_key_hash(&src.pkh).expect("source account");
+        assert_eq!(
+            src_account.balance(rk.host()).unwrap(),
+            (funded - fee).into()
+        );
+
+        // SafeStorage rolled back the origination: the smart contract is
+        // nowhere to be found in durable storage.
+        let originated_account = context::originated_from_kt1(&expected_kt1)
+            .expect("originated account handle");
+        assert!(
+            !originated_account.exists(rk.host()).unwrap(),
+            "originated contract must be rolled back"
+        );
+
+        // Initial-balance transfer rolled back too.
+        assert_eq!(
+            originated_account.balance(rk.host()).unwrap(),
+            0_u64.into(),
+            "originated contract balance must be 0 (initial transfer rolled back)"
+        );
+    }
+
+    #[test]
+    fn test_internal_origination_of_a_smart_contract() {
+        let mut host = test_host();
+        let mut rk = RuntimeKeyspaces::init(&mut host).unwrap();
+        let parser = mir::parser::Parser::new();
+        let src = bootstrap1();
+        let init_src_balance = 100000;
+        let expected_init_contract_balance = 1000000;
+        init_account(rk.tez_accounts_mut(), &src.pkh, 100000);
+        reveal_account(rk.tez_accounts_mut(), &src);
+        let mut gas = Gas::default();
+
+        let originated_code = "CDR;
+                        NIL operation;
+                        PAIR;";
+        let originated_script =
+            make_create_contract_block("unit", "unit", originated_code);
+        let parsed_script = parser
+            .parse_top_level(&originated_script)
+            .expect("Should have parsed the script");
+        let init_script = make_script_emitting_internal_origination(&originated_script);
+
+        // Create a script that emits internal operations to multiple targets
+        let contract_chapo_hash = ContractKt1Hash::from_base58_check(CONTRACT_1)
+            .expect("ContractKt1Hash b58 conversion should have succeed");
+        init_contract(
+            &mut rk,
+            &contract_chapo_hash,
+            &init_script,
+            &Micheline::prim0(mir::lexer::Prim::None, &mut gas).unwrap(),
+            &1000000_u64.into(),
+        );
+
+        let operation = make_operation(
+            10,
+            1,
+            22100,
+            500,
+            src.clone(),
+            vec![OperationContent::Transfer(TransferContent {
+                amount: 1000.into(),
+                destination: Contract::Originated(contract_chapo_hash.clone()),
+                parameters: Parameters {
+                    entrypoint: mir::ast::Entrypoint::default(),
+                    value: Micheline::from(())
+                        .encode(&mut Gas::default())
+                        .unwrap()
+                        .unwrap(),
+                },
+            })],
+        );
+        let receipts = ProcessedOperation::into_receipts(
+            validate_and_apply_operation(
+                &mut rk,
+                &NotWiredRegistry,
+                &mut TezosXJournal::mock(RuntimeId::Ethereum),
+                operation.clone(),
+                &block_ctx!(),
+                false,
+                None,
+                None,
+                &test_safe_roots(),
+            )
+            .expect(
+                "validate_and_apply_operation should not have failed with a kernel error",
+            ),
+        );
+        assert_eq!(
+            receipts.len(),
+            1,
+            "There should be one receipt for the transfer operation"
+        );
+        assert!(
+            matches!(
+                &receipts[0].receipt,
+                OperationResultSum::Transfer(OperationResult {
+                    result: ContentResult::Applied(_),
+                    ..
+                })
+            ),
+            "First receipt should be an Applied Transfer but is {:?}",
+            receipts[0]
+        );
+        let internal_receipts = get_internal_receipts(&receipts[0].receipt);
+
+        assert_eq!(
+            internal_receipts.len(),
+            1,
+            "There should be one internal operation"
+        );
+        let expected_address =
+            OriginationNonce::initial(OperationHash::default()).generate_kt1();
+
+        assert_eq!(
+            internal_receipts[0],
+            InternalOperationSum::Origination(InternalContentWithMetadata {
+                content: OriginationContent {
+                    balance: 1000.into(),
+                    delegate: None,
+                    script: Script {
+                        code: parsed_script.encode(&mut Gas::default()).unwrap().unwrap(),
+                        storage: Micheline::from(())
+                            .encode(&mut Gas::default())
+                            .unwrap()
+                            .unwrap(),
+                    },
+                },
+                result: ContentResult::Applied(OriginationSuccess {
+                    balance_updates: vec![
+                        // Variable burn pair (storage_bus): 30 × COST_PER_BYTES.
+                        BalanceUpdate {
+                            balance: Balance::Account(Contract::Implicit(
+                                src.pkh.clone()
+                            )),
+                            changes: -30,
+                            update_origin: UpdateOrigin::BlockApplication,
+                        },
+                        BalanceUpdate {
+                            balance: Balance::StorageFees,
+                            changes: 30,
+                            update_origin: UpdateOrigin::BlockApplication,
+                        },
+                        // Slot burn pair (origination_bus): ORIGINATION_SIZE × COST_PER_BYTES.
+                        BalanceUpdate {
+                            balance: Balance::Account(Contract::Implicit(
+                                src.pkh.clone()
+                            )),
+                            changes: -257,
+                            update_origin: UpdateOrigin::BlockApplication,
+                        },
+                        BalanceUpdate {
+                            balance: Balance::StorageFees,
+                            changes: 257,
+                            update_origin: UpdateOrigin::BlockApplication,
+                        },
+                        // Prior: initial-balance transfer (parent → child).
+                        BalanceUpdate {
+                            balance: Balance::Account(Contract::Originated(
+                                contract_chapo_hash.clone()
+                            )),
+                            changes: -1000,
+                            update_origin: UpdateOrigin::BlockApplication,
+                        },
+                        BalanceUpdate {
+                            balance: Balance::Account(Contract::Originated(
+                                expected_address.clone()
+                            )),
+                            changes: 1000,
+                            update_origin: UpdateOrigin::BlockApplication,
+                        },
+                    ],
+                    originated_contracts: vec![Originated {
+                        contract: expected_address.clone(),
+                    }],
+                    consumed_milligas: 2_302_423_u64.into(),
+                    storage_size: 30_u64.into(),
+                    paid_storage_size_diff: 30_u64.into(),
+                    lazy_storage_diff: None,
+                }),
+                sender: Contract::Originated(contract_chapo_hash.clone()),
+                nonce: 0
+            }),
+            "Internal origination should match the expected structure"
+        );
+
+        // Check Balances of everything is correct
+        let src_account = context::implicit_from_public_key_hash(&src.pkh)
+            .expect("Should have succeeded to create an account");
+        let init_contract_account =
+            context::originated_from_contract(&Contract::Originated(contract_chapo_hash))
+                .expect("Should have succeeded to create an account");
+        let originated_account =
+            context::originated_from_contract(&Contract::Originated(expected_address))
+                .expect("Should have succeeded to create an account");
+        let expected_src_balance = init_src_balance
+            - 10 // fee for the operation
+            - 30 // origination cost paid by the contract (30 bytes × COST_PER_BYTES)
+            - 257 // storage cost paid by the source (ORIGINATION_SIZE × COST_PER_BYTES)
+            - 27 // post-execution storage burn for the transfer-to-chapo
+                 // (paid_storage_size_diff = 27 bytes × COST_PER_BYTES)
+            - 1000; // amount sent to the originated contract
+        assert_eq!(
+            src_account.balance(rk.host()).unwrap(),
+            expected_src_balance.into(),
+            "Source balance should be correct"
+        );
+        assert_eq!(
+            init_contract_account.balance(rk.host()).unwrap(),
+            expected_init_contract_balance.into(),
+            "Init contract balance should be correct"
+        );
+        assert_eq!(
+            originated_account.balance(rk.host()).unwrap(),
+            1000u64.into(),
+            "Originated contract balance should be correct"
+        );
+    }
+
+    #[test]
+    fn internal_operation_cap_is_block_cumulative() {
+        // L2-1644: the 65535 internal-operation cap (L1's
+        // Too_many_internal_operations) is cumulative across the block,
+        // threaded via BlockCtx::internal_operations_base. An operation whose
+        // internal op would allocate nonce 65535 fails IN ISOLATION (the block
+        // is not aborted), like L1 backtracking the offending operation.
+        let run = |base: u128| {
+            let mut host = test_host();
+            let mut rk = RuntimeKeyspaces::init(&mut host).unwrap();
+            let src = bootstrap1();
+            init_account(rk.tez_accounts_mut(), &src.pkh, 100000);
+            reveal_account(rk.tez_accounts_mut(), &src);
+            let mut gas = Gas::default();
+            let originated_script =
+                make_create_contract_block("unit", "unit", "CDR; NIL operation; PAIR;");
+            let init_script =
+                make_script_emitting_internal_origination(&originated_script);
+            let contract_hash = ContractKt1Hash::from_base58_check(CONTRACT_1).unwrap();
+            init_contract(
+                &mut rk,
+                &contract_hash,
+                &init_script,
+                &Micheline::prim0(mir::lexer::Prim::None, &mut gas).unwrap(),
+                &1000000_u64.into(),
+            );
+            let operation = make_operation(
+                10,
+                1,
+                22100,
+                500,
+                src.clone(),
+                vec![OperationContent::Transfer(TransferContent {
+                    amount: 1000.into(),
+                    destination: Contract::Originated(contract_hash),
+                    parameters: Parameters {
+                        entrypoint: mir::ast::Entrypoint::default(),
+                        value: Micheline::from(())
+                            .encode(&mut Gas::default())
+                            .unwrap()
+                            .unwrap(),
+                    },
+                })],
+            );
+            validate_and_apply_operation(
+                &mut rk,
+                &NotWiredRegistry,
+                &mut TezosXJournal::mock(RuntimeId::Ethereum),
+                operation,
+                &BlockCtx {
+                    level: &0u32.into(),
+                    now: &0i64.into(),
+                    chain_id: &HashTrait::try_from_bytes(&[0, 0, 0, 0]).unwrap(),
+                    internal_operations_base: base,
+                    tracing_enabled: false,
+                    http_trace_enabled: false,
+                },
+                false,
+                None,
+                None,
+                &test_safe_roots(),
+            )
+        };
+        let applied = |result| {
+            matches!(
+                &ProcessedOperation::into_receipts(result)[0].receipt,
+                OperationResultSum::Transfer(OperationResult {
+                    result: ContentResult::Applied(_),
+                    ..
+                })
+            )
+        };
+        // Just below the cap: the internal origination takes nonce 65534 and
+        // is applied.
+        assert!(applied(run(65_534).expect("no kernel error")));
+        // At the cap: producing the internal op would allocate nonce 65535, so
+        // the operation fails in isolation and the block is not aborted.
+        assert!(!applied(run(65_535).expect("block must not abort")));
+    }
+
+    /// Regression for L2-1642: the KT1 returned by CREATE_CONTRACT, stored
+    /// in `originated_contracts`, and written to durable storage must be
+    /// derived from origination index 0 for the first origination of an
+    /// operation, matching Tezos L1 (use-then-increment). The pre-fix kernel
+    /// incremented before deriving, producing the first KT1 from index 1,
+    /// which disagreed with the L1-canonical address computed from the
+    /// (renumbered) receipt nonce. For a single internal origination the
+    /// per-operation local nonce is 0, which is exactly what `renumber_nonces`
+    /// (kernel/src/apply.rs) assigns at block finalization for the first
+    /// internal op, so this also pins the post-renumber value.
+    #[test]
+    fn test_create_contract_kt1_uses_l1_canonical_index_zero() {
+        let mut host = test_host();
+        let mut rk = RuntimeKeyspaces::init(&mut host).unwrap();
+        let src = bootstrap1();
+        init_account(rk.tez_accounts_mut(), &src.pkh, 100000);
+        reveal_account(rk.tez_accounts_mut(), &src);
+        let mut gas = Gas::default();
+
+        // A contract whose code performs exactly one CREATE_CONTRACT.
+        let originated_code = "CDR; NIL operation; PAIR;";
+        let originated_script =
+            make_create_contract_block("unit", "unit", originated_code);
+        let init_script = make_script_emitting_internal_origination(&originated_script);
+
+        let contract_chapo_hash = ContractKt1Hash::from_base58_check(CONTRACT_1)
+            .expect("ContractKt1Hash b58 conversion should have succeed");
+        init_contract(
+            &mut rk,
+            &contract_chapo_hash,
+            &init_script,
+            &Micheline::prim0(mir::lexer::Prim::None, &mut gas).unwrap(),
+            &1000000_u64.into(),
+        );
+
+        // Operation hash of the call that triggers the internal CREATE_CONTRACT.
+        let op_hash = OperationHash::default();
+
+        let operation = make_operation(
+            10,
+            1,
+            22100,
+            500,
+            src.clone(),
+            vec![OperationContent::Transfer(TransferContent {
+                amount: 1000.into(),
+                destination: Contract::Originated(contract_chapo_hash),
+                parameters: Parameters {
+                    entrypoint: mir::ast::Entrypoint::default(),
+                    value: Micheline::from(())
+                        .encode(&mut Gas::default())
+                        .unwrap()
+                        .unwrap(),
+                },
+            })],
+        );
+        let receipts = ProcessedOperation::into_receipts(
+            validate_and_apply_operation(
+                &mut rk,
+                &NotWiredRegistry,
+                &mut journal_with_operation_hash(op_hash.clone()),
+                operation,
+                &block_ctx!(),
+                false,
+                None,
+                None,
+                &test_safe_roots(),
+            )
+            .expect(
+                "validate_and_apply_operation should not have failed with a kernel error",
+            ),
+        );
+
+        let internal_receipts = get_internal_receipts(&receipts[0].receipt);
+        assert_eq!(
+            internal_receipts.len(),
+            1,
+            "There should be exactly one internal origination"
+        );
+
+        let (originated_kt1, nonce) = match &internal_receipts[0] {
+            InternalOperationSum::Origination(InternalContentWithMetadata {
+                result:
+                    ContentResult::Applied(OriginationSuccess {
+                        originated_contracts,
+                        ..
+                    }),
+                nonce,
+                ..
+            }) => {
+                assert_eq!(
+                    originated_contracts.len(),
+                    1,
+                    "There should be exactly one originated contract"
+                );
+                (originated_contracts[0].contract.clone(), *nonce)
+            }
+            other => panic!("Expected an Applied internal origination, got {other:?}"),
+        };
+
+        // The internal origination is the first (and only) internal op: its
+        // local nonce is 0, and renumber_nonces preserves 0 for the first
+        // internal op of the first operation in a block.
+        assert_eq!(nonce, 0, "First internal-operation nonce must be 0");
+
+        // L1-canonical: derived from index 0 (== the receipt nonce), not the
+        // pre-fix index 1 (L2-1642).
+        let l1_canonical = mir::interpreter::compute_contract_address(&op_hash, 0);
+        let pre_fix_buggy = mir::interpreter::compute_contract_address(&op_hash, 1);
+        assert_eq!(
+            originated_kt1, l1_canonical,
+            "Originated KT1 must use the L1-canonical index 0"
+        );
+        assert_eq!(
+            originated_kt1,
+            mir::interpreter::compute_contract_address(&op_hash, nonce as u32),
+            "Originated KT1 must agree with the (renumbered) receipt nonce"
+        );
+        assert_ne!(
+            originated_kt1, pre_fix_buggy,
+            "Originated KT1 must NOT use the pre-fix index 1 (L2-1642)"
+        );
+
+        // The contract is actually stored at the L1-canonical KT1.
+        let originated_account = context::originated_from_kt1(&l1_canonical)
+            .expect("originated account handle");
+        assert!(
+            originated_account.exists(rk.host()).unwrap(),
+            "Contract must be stored at the L1-canonical KT1"
+        );
+    }
+
+    /// In this test, the CREATE_CONTRACT instruction is called three
+    /// times.  The result of the first call is dropped.  The results
+    /// of the two other calls are swapped.  The point is to check
+    /// that the addresses of the originated contracts are not mixed
+    /// up.
+    #[test]
+    fn test_internal_originations_generated_addresses() {
+        let mut host = test_host();
+        let mut rk = RuntimeKeyspaces::init(&mut host).unwrap();
+        let mut gas = Gas::default();
+        let parser = mir::parser::Parser::new();
+        let src = bootstrap1();
+        init_account(rk.tez_accounts_mut(), &src.pkh, 1000000);
+        reveal_account(rk.tez_accounts_mut(), &src);
+
+        let originated_code = "CDR;
+                        NIL operation;
+                        PAIR;";
+        let originated_script_1 =
+            make_create_contract_block("unit", "unit", originated_code);
+        let originated_script_2 =
+            make_create_contract_block("nat", "nat", originated_code);
+        let parsed_script_2 = parser
+            .parse_top_level(&originated_script_2)
+            .expect("Should have parsed the script");
+        let originated_script_3 =
+            make_create_contract_block("bytes", "bytes", originated_code);
+        let parsed_script_3 = parser
+            .parse_top_level(&originated_script_3)
+            .expect("Should have parsed the script");
+        let init_script = make_script_emitting_two_internal_originations(
+            &originated_script_1,
+            &originated_script_2,
+            &originated_script_3,
+        );
+
+        // Create a script that emits internal operations to multiple targets
+        let contract_chapo_hash = ContractKt1Hash::from_base58_check(CONTRACT_1)
+            .expect("ContractKt1Hash b58 conversion should have succeed");
+        init_contract(
+            &mut rk,
+            &contract_chapo_hash,
+            &init_script,
+            &Micheline::prim0(mir::lexer::Prim::None, &mut gas).unwrap(),
+            &0.into(),
+        );
+
+        let operation = make_operation(
+            10,
+            1,
+            22300,
+            2000,
+            src.clone(),
+            vec![OperationContent::Transfer(TransferContent {
+                amount: 0.into(),
+                destination: Contract::Originated(contract_chapo_hash.clone()),
+                parameters: Parameters {
+                    entrypoint: mir::ast::Entrypoint::default(),
+                    value: Micheline::from(())
+                        .encode(&mut Gas::default())
+                        .unwrap()
+                        .unwrap(),
+                },
+            })],
+        );
+        let receipts = ProcessedOperation::into_receipts(
+            validate_and_apply_operation(
+                &mut rk,
+                &NotWiredRegistry,
+                &mut TezosXJournal::mock(RuntimeId::Ethereum),
+                operation.clone(),
+                &block_ctx!(),
+                false,
+                None,
+                None,
+                &test_safe_roots(),
+            )
+            .expect(
+                "validate_and_apply_operation should not have failed with a kernel error",
+            ),
+        );
+        assert_eq!(
+            receipts.len(),
+            1,
+            "There should be one receipt for the transfer operation"
+        );
+        assert!(
+            matches!(
+                &receipts[0].receipt,
+                OperationResultSum::Transfer(OperationResult {
+                    result: ContentResult::Applied(_),
+                    ..
+                })
+            ),
+            "First receipt should be an Applied Transfer but is {:?}",
+            receipts[0].receipt
+        );
+        let internal_receipts = get_internal_receipts(&receipts[0].receipt);
+
+        assert_eq!(
+            internal_receipts.len(),
+            2,
+            "There should be two internal operations"
+        );
+        let (_expected_address_1, expected_address_2, expected_address_3) = {
+            let mut nonce = OriginationNonce::initial(OperationHash::default());
+            let expected_address_1 = nonce.generate_kt1();
+            let expected_address_2 = nonce.generate_kt1();
+            let expected_address_3 = nonce.generate_kt1();
+            (expected_address_1, expected_address_2, expected_address_3)
+        };
+
+        assert_eq!(
+            internal_receipts[0],
+            InternalOperationSum::Origination(InternalContentWithMetadata {
+                content: OriginationContent {
+                    balance: 0.into(),
+                    delegate: None,
+                    script: Script {
+                        code: parsed_script_3
+                            .encode(&mut Gas::default())
+                            .unwrap()
+                            .unwrap(),
+                        storage: Micheline::from(vec![])
+                            .encode(&mut Gas::default())
+                            .unwrap()
+                            .unwrap(),
+                    },
+                },
+                result: ContentResult::Applied(OriginationSuccess {
+                    balance_updates: vec![
+                        // Variable burn pair: 33 × COST_PER_BYTES.
+                        BalanceUpdate {
+                            balance: Balance::Account(Contract::Implicit(
+                                src.pkh.clone()
+                            )),
+                            changes: -33,
+                            update_origin: UpdateOrigin::BlockApplication,
+                        },
+                        BalanceUpdate {
+                            balance: Balance::StorageFees,
+                            changes: 33,
+                            update_origin: UpdateOrigin::BlockApplication,
+                        },
+                        // Slot burn pair: ORIGINATION_SIZE × COST_PER_BYTES.
+                        BalanceUpdate {
+                            balance: Balance::Account(Contract::Implicit(
+                                src.pkh.clone()
+                            )),
+                            changes: -257,
+                            update_origin: UpdateOrigin::BlockApplication,
+                        },
+                        BalanceUpdate {
+                            balance: Balance::StorageFees,
+                            changes: 257,
+                            update_origin: UpdateOrigin::BlockApplication,
+                        },
+                    ],
+                    originated_contracts: vec![Originated {
+                        contract: expected_address_3,
+                    },],
+                    consumed_milligas: 2_302_435_u64.into(),
+                    storage_size: 33_u64.into(),
+                    paid_storage_size_diff: 33_u64.into(),
+                    lazy_storage_diff: None,
+                }),
+                sender: Contract::Originated(contract_chapo_hash.clone()),
+                nonce: 0
+            }),
+            "Internal origination should match the expected structure"
+        );
+
+        assert_eq!(
+            internal_receipts[1],
+            InternalOperationSum::Origination(InternalContentWithMetadata {
+                content: OriginationContent {
+                    balance: 0.into(),
+                    delegate: None,
+                    script: Script {
+                        code: parsed_script_2
+                            .encode(&mut Gas::default())
+                            .unwrap()
+                            .unwrap(),
+                        storage: Micheline::from(num_bigint::BigUint::from(1u32))
+                            .encode(&mut Gas::default())
+                            .unwrap()
+                            .unwrap(),
+                    },
+                },
+                result: ContentResult::Applied(OriginationSuccess {
+                    balance_updates: vec![
+                        // Variable burn pair: 30 × COST_PER_BYTES.
+                        BalanceUpdate {
+                            balance: Balance::Account(Contract::Implicit(
+                                src.pkh.clone()
+                            )),
+                            changes: -30,
+                            update_origin: UpdateOrigin::BlockApplication,
+                        },
+                        BalanceUpdate {
+                            balance: Balance::StorageFees,
+                            changes: 30,
+                            update_origin: UpdateOrigin::BlockApplication,
+                        },
+                        // Slot burn pair: ORIGINATION_SIZE × COST_PER_BYTES.
+                        BalanceUpdate {
+                            balance: Balance::Account(Contract::Implicit(
+                                src.pkh.clone()
+                            )),
+                            changes: -257,
+                            update_origin: UpdateOrigin::BlockApplication,
+                        },
+                        BalanceUpdate {
+                            balance: Balance::StorageFees,
+                            changes: 257,
+                            update_origin: UpdateOrigin::BlockApplication,
+                        },
+                    ],
+                    originated_contracts: vec![Originated {
+                        contract: expected_address_2,
+                    }],
+                    consumed_milligas: 2_302_523_u64.into(),
+                    storage_size: 30_u64.into(),
+                    paid_storage_size_diff: 30_u64.into(),
+                    lazy_storage_diff: None,
+                }),
+                sender: Contract::Originated(contract_chapo_hash),
+                nonce: 1
+            }),
+            "Internal origination should match the expected structure"
+        );
+    }
+
+    fn backtrack_result<M: OperationKind>(result: M::Success) -> BacktrackedResult<M> {
+        BacktrackedResult {
+            errors: None,
+            result,
+        }
+    }
+
+    #[test]
+    fn test_try_apply_three_origination_batch() {
+        let mut host = test_host();
+        let mut rk = RuntimeKeyspaces::init(&mut host).unwrap();
+        let parser = mir::parser::Parser::new();
+
+        let src = bootstrap1();
+
+        // src & dest each credited with 400000ꜩ
+        let src_acc = init_account(rk.tez_accounts_mut(), &src.pkh, 400000);
+
+        // op‑1: reveal
+        let reveal_content = OperationContent::Reveal(RevealContent {
+            pk: src.pk.clone(),
+            proof: None,
+        });
+
+        println!("Balance: {:?}", src_acc.balance(rk.host()).unwrap());
+
+        // op‑2 orgination: create a contract with 15ꜩ balance successfully
+        let origination_content_1 = OperationContent::Origination(OriginationContent {
+            balance: 15.into(),
+            delegate: None,
+            script: Script {
+                code: parser
+                    .parse_top_level(UNIT_SCRIPT)
+                    .unwrap()
+                    .encode(&mut Gas::default())
+                    .unwrap()
+                    .unwrap(),
+                storage: Micheline::from(())
+                    .encode(&mut Gas::default())
+                    .unwrap()
+                    .unwrap(),
+            },
+        });
+
+        // op‑3 orgination: create a contract with 20ꜩ balance successfully
+        let origination_content_2 = OperationContent::Origination(OriginationContent {
+            balance: 20.into(),
+            delegate: None,
+            script: Script {
+                code: parser
+                    .parse_top_level(UNIT_SCRIPT)
+                    .unwrap()
+                    .encode(&mut Gas::default())
+                    .unwrap()
+                    .unwrap(),
+                storage: Micheline::from(())
+                    .encode(&mut Gas::default())
+                    .unwrap()
+                    .unwrap(),
+            },
+        });
+
+        // op‑4 orgination: create a contract with 999999ꜩ balance fails
+        let origination_content_3 = OperationContent::Origination(OriginationContent {
+            balance: 999999.into(),
+            delegate: None,
+            script: Script {
+                code: parser
+                    .parse_top_level(UNIT_SCRIPT)
+                    .unwrap()
+                    .encode(&mut Gas::default())
+                    .unwrap()
+                    .unwrap(),
+                storage: Micheline::from(())
+                    .encode(&mut Gas::default())
+                    .unwrap()
+                    .unwrap(),
+            },
+        });
+
+        // op-5 transfer: self-transfer 1ꜩ is skipped
+        let transfer_content = OperationContent::Transfer(TransferContent {
+            amount: 1.into(),
+            destination: src_acc.contract(),
+            parameters: Parameters::default(),
+        });
+
+        let batch = make_operation(
+            5,
+            1,
+            21040,
+            10_000,
+            src.clone(),
+            vec![
+                reveal_content,
+                origination_content_1,
+                origination_content_2,
+                origination_content_3,
+                transfer_content,
+            ],
+        );
+
+        let receipts = ProcessedOperation::into_receipts(
+            validate_and_apply_operation(
+                &mut rk,
+                &NotWiredRegistry,
+                &mut TezosXJournal::mock(RuntimeId::Ethereum),
+                batch.clone(),
+                &block_ctx!(),
+                false,
+                None,
+                None,
+                &test_safe_roots(),
+            )
+            .unwrap(),
+        );
+
+        let mut orignation_nonce = OriginationNonce::initial(OperationHash::default());
+        let expected_kt1_1 = orignation_nonce.generate_kt1();
+        let expected_kt1_2 = orignation_nonce.generate_kt1();
+        let expected_receipts = zip_operations(
+            batch,
+            vec![
+                OperationResultSum::Reveal(OperationResult {
+                    balance_updates: vec![
+                        BalanceUpdate {
+                            balance: Balance::Account(Contract::Implicit(
+                                src.pkh.clone(),
+                            )),
+                            changes: -5,
+                            update_origin: UpdateOrigin::BlockApplication,
+                        },
+                        BalanceUpdate {
+                            balance: Balance::BlockFees,
+                            changes: 5,
+                            update_origin: UpdateOrigin::BlockApplication,
+                        },
+                    ],
+                    result: ContentResult::BackTracked(backtrack_result(RevealSuccess {
+                        consumed_milligas: 148786_u64.into(),
+                    })),
+                    internal_operation_results: vec![],
+                }),
+                OperationResultSum::Origination(OperationResult {
+                    balance_updates: vec![
+                        BalanceUpdate {
+                            balance: Balance::Account(Contract::Implicit(
+                                src.pkh.clone(),
+                            )),
+                            changes: -5,
+                            update_origin: UpdateOrigin::BlockApplication,
+                        },
+                        BalanceUpdate {
+                            balance: Balance::BlockFees,
+                            changes: 5,
+                            update_origin: UpdateOrigin::BlockApplication,
+                        },
+                    ],
+                    result: ContentResult::BackTracked(backtrack_result(
+                        OriginationSuccess {
+                            balance_updates: vec![
+                                // Variable burn pair: 30 × COST_PER_BYTES.
+                                BalanceUpdate {
+                                    balance: Balance::Account(Contract::Implicit(
+                                        src.pkh.clone(),
+                                    )),
+                                    changes: -30,
+                                    update_origin: UpdateOrigin::BlockApplication,
+                                },
+                                BalanceUpdate {
+                                    balance: Balance::StorageFees,
+                                    changes: 30,
+                                    update_origin: UpdateOrigin::BlockApplication,
+                                },
+                                // Slot burn pair: ORIGINATION_SIZE × COST_PER_BYTES.
+                                BalanceUpdate {
+                                    balance: Balance::Account(Contract::Implicit(
+                                        src.pkh.clone(),
+                                    )),
+                                    changes: -257,
+                                    update_origin: UpdateOrigin::BlockApplication,
+                                },
+                                BalanceUpdate {
+                                    balance: Balance::StorageFees,
+                                    changes: 257,
+                                    update_origin: UpdateOrigin::BlockApplication,
+                                },
+                                BalanceUpdate {
+                                    balance: Balance::Account(Contract::Implicit(
+                                        src.pkh.clone(),
+                                    )),
+                                    changes: -15,
+                                    update_origin: UpdateOrigin::BlockApplication,
+                                },
+                                BalanceUpdate {
+                                    balance: Balance::Account(Contract::Originated(
+                                        expected_kt1_1.clone(),
+                                    )),
+                                    changes: 15,
+                                    update_origin: UpdateOrigin::BlockApplication,
+                                },
+                            ],
+                            originated_contracts: vec![Originated {
+                                contract: expected_kt1_1.clone(),
+                            }],
+                            consumed_milligas: 2_303_798_u64.into(),
+                            storage_size: 30.into(),
+                            paid_storage_size_diff: 30.into(),
+                            lazy_storage_diff: None,
+                        },
+                    )),
+                    internal_operation_results: vec![],
+                }),
+                OperationResultSum::Origination(OperationResult {
+                    balance_updates: vec![
+                        BalanceUpdate {
+                            balance: Balance::Account(Contract::Implicit(
+                                src.pkh.clone(),
+                            )),
+                            changes: -5,
+                            update_origin: UpdateOrigin::BlockApplication,
+                        },
+                        BalanceUpdate {
+                            balance: Balance::BlockFees,
+                            changes: 5,
+                            update_origin: UpdateOrigin::BlockApplication,
+                        },
+                    ],
+                    result: ContentResult::BackTracked(backtrack_result(
+                        OriginationSuccess {
+                            balance_updates: vec![
+                                // Variable burn pair: 30 × COST_PER_BYTES.
+                                BalanceUpdate {
+                                    balance: Balance::Account(Contract::Implicit(
+                                        src.pkh.clone(),
+                                    )),
+                                    changes: -30,
+                                    update_origin: UpdateOrigin::BlockApplication,
+                                },
+                                BalanceUpdate {
+                                    balance: Balance::StorageFees,
+                                    changes: 30,
+                                    update_origin: UpdateOrigin::BlockApplication,
+                                },
+                                // Slot burn pair: ORIGINATION_SIZE × COST_PER_BYTES.
+                                BalanceUpdate {
+                                    balance: Balance::Account(Contract::Implicit(
+                                        src.pkh.clone(),
+                                    )),
+                                    changes: -257,
+                                    update_origin: UpdateOrigin::BlockApplication,
+                                },
+                                BalanceUpdate {
+                                    balance: Balance::StorageFees,
+                                    changes: 257,
+                                    update_origin: UpdateOrigin::BlockApplication,
+                                },
+                                BalanceUpdate {
+                                    balance: Balance::Account(Contract::Implicit(
+                                        src.pkh.clone(),
+                                    )),
+                                    changes: -20,
+                                    update_origin: UpdateOrigin::BlockApplication,
+                                },
+                                BalanceUpdate {
+                                    balance: Balance::Account(Contract::Originated(
+                                        expected_kt1_2.clone(),
+                                    )),
+                                    changes: 20,
+                                    update_origin: UpdateOrigin::BlockApplication,
+                                },
+                            ],
+                            originated_contracts: vec![Originated {
+                                contract: expected_kt1_2.clone(),
+                            }],
+                            consumed_milligas: 2_303_798_u64.into(),
+                            storage_size: 30.into(),
+                            paid_storage_size_diff: 30.into(),
+                            lazy_storage_diff: None,
+                        },
+                    )),
+                    internal_operation_results: vec![],
+                }),
+                OperationResultSum::Origination(OperationResult {
+                    balance_updates: vec![
+                        BalanceUpdate {
+                            balance: Balance::Account(Contract::Implicit(
+                                src.pkh.clone(),
+                            )),
+                            changes: -5,
+                            update_origin: UpdateOrigin::BlockApplication,
+                        },
+                        BalanceUpdate {
+                            balance: Balance::BlockFees,
+                            changes: 5,
+                            update_origin: UpdateOrigin::BlockApplication,
+                        },
+                    ],
+                    result: ContentResult::Failed(
+                        ApplyOperationError::Origination(
+                            OriginationError::BalanceTooLow(BalanceTooLow {
+                                contract: Contract::Implicit(src.pkh.clone()),
+                                balance: 399_366_u64.into(),
+                                amount: 999_999_u64.into(),
+                            }),
+                        )
+                        .into(),
+                    ),
+                    internal_operation_results: vec![],
+                }),
+                OperationResultSum::Transfer(OperationResult {
+                    balance_updates: vec![
+                        BalanceUpdate {
+                            balance: Balance::Account(Contract::Implicit(
+                                src.pkh.clone(),
+                            )),
+                            changes: -5,
+                            update_origin: UpdateOrigin::BlockApplication,
+                        },
+                        BalanceUpdate {
+                            balance: Balance::BlockFees,
+                            changes: 5,
+                            update_origin: UpdateOrigin::BlockApplication,
+                        },
+                    ],
+                    result: ContentResult::Skipped,
+                    internal_operation_results: vec![],
+                }),
+            ],
+        );
+        assert_eq!(
+            receipts, expected_receipts,
+            "Receipts do not match the expected ones"
+        );
+        // Check the balances
+        assert_eq!(
+            src_acc.balance(rk.host()).unwrap(),
+            399975.into(),
+            "Source account balance should be 399980ꜩ after the operations"
+        );
+
+        // Check the counters
+        assert_eq!(
+            src_acc.counter(rk.tez_accounts()).unwrap(),
+            5.into(),
+            "Source account counter should be 4 after the operations"
+        );
+
+        // Check the originated contracts
+        let expected_contracts = [expected_kt1_1, expected_kt1_2];
+        for (i, expected_kt1) in expected_contracts.iter().enumerate() {
+            let account = context::originated_from_contract(&Contract::Originated(
+                expected_kt1.clone(),
+            ))
+            .unwrap();
+            assert!(
+                account.code(rk.host()).is_err(),
+                "Account {i} for KT1{expected_kt1} should not exist"
+            );
+        }
+    }
+
+    #[test]
+    fn test_origination_contract_typecheck_storage() {
+        let mut host = test_host();
+        let mut rk = RuntimeKeyspaces::init(&mut host).unwrap();
+
+        let src = bootstrap1();
+
+        init_account(rk.tez_accounts_mut(), &src.pkh, 50000);
+        reveal_account(rk.tez_accounts_mut(), &src);
+
+        let balance = 10.into();
+
+        let code = mir::parser::Parser::new()
+            .parse_top_level(UNIT_SCRIPT)
+            .expect("Should have succeeded to parse the script")
+            .encode(&mut Gas::default())
+            .unwrap()
+            .unwrap();
+        let storage = Micheline::from(42)
+            .encode(&mut Gas::default())
+            .unwrap()
+            .unwrap();
+        let origination_content = OriginationContent {
+            balance,
+            delegate: None,
+            script: Script { code, storage },
+        };
+        let operation = make_operation(
+            10,
+            1,
+            1000,
+            0,
+            src.clone(),
+            vec![OperationContent::Origination(origination_content)],
+        );
+        let receipts = ProcessedOperation::into_receipts(
+            validate_and_apply_operation(
+                &mut rk,
+                &NotWiredRegistry,
+                &mut TezosXJournal::mock(RuntimeId::Ethereum),
+                operation,
+                &block_ctx!(),
+                false,
+                None,
+                None,
+                &test_safe_roots(),
+            )
+            .expect(
+                "validate_and_apply_operation should not have failed with a kernel error",
+            ),
+        );
+
+        assert_eq!(receipts.len(), 1, "There should be one receipt");
+        assert!(matches!(
+            &receipts[0].receipt,
+            OperationResultSum::Origination(OperationResult {
+            result: ContentResult::Failed(ApplyOperationErrors { errors }),
+            ..
+            }) if errors.len() == 1 && matches!(
+            &errors[0],
+            ApplyOperationError::Origination(
+                OriginationError::MirTypecheckingError(_)
+            )
+            )
+        ), "Expected Failed Origination operation result with MirTypecheckingError, got {:?}", receipts[0]);
+    }
+
+    // L2-1706: an oversized script is rejected at origination with
+    // `ScriptTooLarge`. The gate runs before decoding, so raw bytes suffice.
+    #[test]
+    fn test_origination_script_too_large() {
+        let mut host = test_host();
+        let mut rk = RuntimeKeyspaces::init(&mut host).unwrap();
+
+        let src = bootstrap1();
+
+        init_account(rk.tez_accounts_mut(), &src.pkh, 50000);
+        reveal_account(rk.tez_accounts_mut(), &src);
+
+        let code = vec![1u8; crate::MICHELSON_MAXIMUM_SCRIPT_SIZE + 1];
+        let storage = vec![];
+        let origination_content = OriginationContent {
+            balance: 10.into(),
+            delegate: None,
+            script: Script { code, storage },
+        };
+        let operation = make_operation(
+            10,
+            1,
+            1000,
+            0,
+            src.clone(),
+            vec![OperationContent::Origination(origination_content)],
+        );
+        let receipts = ProcessedOperation::into_receipts(
+            validate_and_apply_operation(
+                &mut rk,
+                &NotWiredRegistry,
+                &mut TezosXJournal::mock(RuntimeId::Ethereum),
+                operation,
+                &block_ctx!(),
+                false,
+                None,
+                None,
+                &test_safe_roots(),
+            )
+            .expect(
+                "validate_and_apply_operation should not have failed with a kernel error",
+            ),
+        );
+
+        assert_eq!(receipts.len(), 1, "There should be one receipt");
+        assert!(
+            matches!(
+                &receipts[0].receipt,
+                OperationResultSum::Origination(OperationResult {
+                result: ContentResult::Failed(ApplyOperationErrors { errors }),
+                ..
+                }) if errors.len() == 1 && matches!(
+                &errors[0],
+                ApplyOperationError::Origination(
+                    OriginationError::ScriptTooLarge(_)
+                )
+                )
+            ),
+            "Expected Failed Origination operation result with ScriptTooLarge, got {:?}",
+            receipts[0]
+        );
+    }
+
+    // L2-1706 regression: a deeply nested `or` parameter type exceeds the
+    // type-size cap while staying under the script-size cap (~8 kB), so it is
+    // rejected with `MirTypecheckingError` (`TypeTooLarge`) instead of OOM.
+    #[test]
+    fn test_origination_deeply_nested_or_parameter_rejected() {
+        let mut host = test_host();
+        let mut rk = RuntimeKeyspaces::init(&mut host).unwrap();
+
+        let src = bootstrap1();
+
+        init_account(rk.tez_accounts_mut(), &src.pkh, 50000);
+        reveal_account(rk.tez_accounts_mut(), &src);
+
+        // 1001 `or` levels => 2003 type nodes > 2001 cap, but only ~8 kB.
+        let mut param = String::from("unit");
+        for _ in 0..1001 {
+            param = format!("(or unit {param})");
+        }
+        let script_str = format!(
+            "parameter {param}; storage unit; code {{ CDR; NIL operation; PAIR }}"
+        );
+        let code = mir::parser::Parser::new()
+            .parse_top_level(&script_str)
+            .expect("Should have parsed the deeply nested script")
+            .encode(&mut Gas::default())
+            .unwrap()
+            .unwrap();
+        assert!(
+            code.len() < crate::MICHELSON_MAXIMUM_SCRIPT_SIZE,
+            "script must stay under the byte cap to exercise the type-size cap",
+        );
+        let storage = Micheline::from(0)
+            .encode(&mut Gas::default())
+            .unwrap()
+            .unwrap();
+        let origination_content = OriginationContent {
+            balance: 10.into(),
+            delegate: None,
+            script: Script { code, storage },
+        };
+        let operation = make_operation(
+            10,
+            1,
+            100000,
+            0,
+            src.clone(),
+            vec![OperationContent::Origination(origination_content)],
+        );
+        let receipts = ProcessedOperation::into_receipts(
+            validate_and_apply_operation(
+                &mut rk,
+                &NotWiredRegistry,
+                &mut TezosXJournal::mock(RuntimeId::Ethereum),
+                operation,
+                &block_ctx!(),
+                false,
+                None,
+                None,
+                &test_safe_roots(),
+            )
+            .expect(
+                "validate_and_apply_operation should not have failed with a kernel error",
+            ),
+        );
+
+        assert_eq!(receipts.len(), 1, "There should be one receipt");
+        assert!(matches!(
+            &receipts[0].receipt,
+            OperationResultSum::Origination(OperationResult {
+            result: ContentResult::Failed(ApplyOperationErrors { errors }),
+            ..
+            }) if errors.len() == 1 && matches!(
+            &errors[0],
+            ApplyOperationError::Origination(
+                OriginationError::MirTypecheckingError(msg)
+            ) if msg.contains("type too large")
+            )
+        ), "Expected Failed Origination with MirTypecheckingError(type too large), got {:?}", receipts[0]);
+    }
+
+    #[test]
+    // Tests that empty transfers (external or internal) to implicit accounts
+    // fail, and empty transfers (external or internal) to smart contracts
+    // succeed.
+    fn test_empty_transfers() {
+        let mut host = test_host();
+        let mut rk = RuntimeKeyspaces::init(&mut host).unwrap();
+        let src = bootstrap1();
+        let dst = bootstrap2();
+        let kt1_addr =
+            ContractKt1Hash::from_base58_check("KT1RJ6PbjHpwc3M5rw5s2Nbmefwbuwbdxton")
+                .expect("ContractKt1Hash b58 conversion should have succeeded");
+        // Setup accounts with 50 mutez in their balance
+        init_account(rk.tez_accounts_mut(), &src.pkh, 1000);
+        reveal_account(rk.tez_accounts_mut(), &src);
+        let (code, storage) = (
+            r#"
+                        parameter (or (unit %default) (address %call));
+                        storage unit;
+                        code
+                        { UNPAIR;
+                          IF_LEFT
+                            { DROP; NIL operation; PAIR }
+                            { CONTRACT unit;
+                              { IF_NONE { { UNIT ; FAILWITH } } {} } ;
+                              PUSH mutez 0;
+                              UNIT;
+                              TRANSFER_TOKENS;
+                              NIL operation;
+                              SWAP;
+                              CONS;
+                              PAIR } }
+            "#,
+            &Micheline::from(()),
+        );
+        init_contract(&mut rk, &kt1_addr, code, storage, &0.into());
+
+        // An empty external transfer to an implicit account fails.
+        let operation = make_transfer_operation(
+            15,
+            1,
+            21000,
+            5,
+            src.clone(),
+            0.into(),
+            Contract::Implicit(dst.pkh.clone()),
+            Parameters::default(),
+        );
+        let receipts1 = ProcessedOperation::into_receipts(
+            validate_and_apply_operation(
+                &mut rk,
+                &NotWiredRegistry,
+                &mut TezosXJournal::mock(RuntimeId::Ethereum),
+                operation,
+                &block_ctx!(),
+                false,
+                None,
+                None,
+                &test_safe_roots(),
+            )
+            .expect(
+                "validate_and_apply_operation should not have failed with a kernel error",
+            ),
+        );
+
+        assert_eq!(receipts1.len(), 1, "There should be one receipt");
+        assert!(matches!(
+            &receipts1[0].receipt,
+            OperationResultSum::Transfer(OperationResult {
+                result: ContentResult::Failed(ApplyOperationErrors { errors }),
+                ..
+            }) if errors.len() == 1 && matches!(
+                &errors[0],
+                ApplyOperationError::Transfer(
+                    TransferError::EmptyImplicitTransfer(contract)
+                ) if *contract == Contract::Implicit(dst.pkh.clone())
+            )
+        ), "Expected Failed Transfer operation result with EmptyImplicitTransfer, got {:?}", receipts1[0]);
+
+        // An empty external transfer to a smart contract succeeds.
+        let operation = make_transfer_operation(
+            15,
+            2,
+            21110,
+            5,
+            src.clone(),
+            0.into(),
+            Contract::Originated(kt1_addr.clone()),
+            Parameters {
+                entrypoint: Entrypoint::try_from("default")
+                    .expect("Entrypoint should be valid"),
+                value: Micheline::from(())
+                    .encode(&mut Gas::default())
+                    .unwrap()
+                    .unwrap(),
+            },
+        );
+        let receipts2 = ProcessedOperation::into_receipts(
+            validate_and_apply_operation(
+                &mut rk,
+                &NotWiredRegistry,
+                &mut TezosXJournal::mock(RuntimeId::Ethereum),
+                operation,
+                &block_ctx!(),
+                false,
+                None,
+                None,
+                &test_safe_roots(),
+            )
+            .expect(
+                "validate_and_apply_operation should not have failed with a kernel error",
+            ),
+        );
+
+        assert_eq!(receipts2.len(), 1, "There should be one receipt");
+        assert!(
+            matches!(
+                &receipts2[0].receipt,
+                OperationResultSum::Transfer(OperationResult {
+                    result: ContentResult::Applied(TransferTarget::ToContract(
+                        TransferSuccess { .. }
+                    )),
+                    ..
+                })
+            ),
+            "Expected Successful Transfer operation result, got {:?}",
+            receipts2[0].receipt
+        );
+
+        // An empty internal transfer to an implicit account fails.
+        let operation = make_transfer_operation(
+            15,
+            3,
+            23000,
+            5,
+            src.clone(),
+            0.into(),
+            Contract::Originated(kt1_addr.clone()),
+            Parameters {
+                entrypoint: Entrypoint::try_from("call")
+                    .expect("Entrypoint should be valid"),
+                value: Micheline::from(src.clone().pkh.to_b58check())
+                    .encode(&mut Gas::default())
+                    .unwrap()
+                    .unwrap(),
+            },
+        );
+        let receipts3 = ProcessedOperation::into_receipts(
+            validate_and_apply_operation(
+                &mut rk,
+                &NotWiredRegistry,
+                &mut TezosXJournal::mock(RuntimeId::Ethereum),
+                operation,
+                &block_ctx!(),
+                false,
+                None,
+                None,
+                &test_safe_roots(),
+            )
+            .expect(
+                "validate_and_apply_operation should not have failed with a kernel error",
+            ),
+        );
+
+        assert_eq!(receipts3.len(), 1, "There should be one receipt");
+        assert!(
+            matches!(
+                &receipts3[0].receipt,
+                OperationResultSum::Transfer(OperationResult {
+                    result: ContentResult::BackTracked(BacktrackedResult { result: TransferTarget::ToContract(TransferSuccess { .. }), .. }),
+                    internal_operation_results,
+                    ..
+                }) if internal_operation_results.len() == 1 && matches!(
+                    &internal_operation_results[0],
+                    InternalOperationSum::Transfer(InternalContentWithMetadata {result: ContentResult::Failed(ApplyOperationErrors { errors }), ..})
+                        if errors.len() == 1 && matches!(
+                            &errors[0],
+                            ApplyOperationError::Transfer(
+                                TransferError::EmptyImplicitTransfer(contract)
+                            ) if *contract == Contract::Implicit(src.pkh.clone())
+                        )
+                )
+            ),
+            "Expected Failed Transfer operation result with EmptyImplicitTransfer, got {:?}",
+            receipts3[0].receipt
+        );
+
+        // An empty internal transfer to a smart contract succeeds.
+        let operation = make_transfer_operation(
+            15,
+            4,
+            4000,
+            5,
+            src,
+            0.into(),
+            Contract::Originated(kt1_addr.clone()),
+            Parameters {
+                entrypoint: Entrypoint::try_from("call")
+                    .expect("Entrypoint should be valid"),
+                value: Micheline::from(kt1_addr.to_b58check())
+                    .encode(&mut Gas::default())
+                    .unwrap()
+                    .unwrap(),
+            },
+        );
+        let receipts4 = ProcessedOperation::into_receipts(
+            validate_and_apply_operation(
+                &mut rk,
+                &NotWiredRegistry,
+                &mut TezosXJournal::mock(RuntimeId::Ethereum),
+                operation,
+                &block_ctx!(),
+                false,
+                None,
+                None,
+                &test_safe_roots(),
+            )
+            .expect(
+                "validate_and_apply_operation should not have failed with a kernel error",
+            ),
+        );
+
+        assert_eq!(receipts4.len(), 1, "There should be one receipt");
+        assert!(
+            matches!(
+                &receipts4[0].receipt,
+                OperationResultSum::Transfer(OperationResult {
+                    result: ContentResult::Applied(TransferTarget::ToContract(TransferSuccess{ .. })),
+                    internal_operation_results,
+                    ..
+                }) if internal_operation_results.len() == 1 && matches!(
+                    &internal_operation_results[0],
+                    InternalOperationSum::Transfer(InternalContentWithMetadata {result: ContentResult::Applied(TransferTarget::ToContract(TransferSuccess{ .. })), ..})
+                )
+            ),
+            "Expected Successful Transfer operation result, got {:?}",
+            receipts4[0].receipt
+        );
+    }
+
+    #[test]
+    fn test_view_instruction() {
+        let mut host = test_host();
+        let mut rk = RuntimeKeyspaces::init(&mut host).unwrap();
+        let mut gas = Gas::default();
+        let src = bootstrap1();
+        let mut orignation_nonce = OriginationNonce::initial(OperationHash::default());
+        let view_addr = orignation_nonce.generate_kt1();
+        let caller_addr = orignation_nonce.generate_kt1();
+
+        let arena = Arena::new();
+
+        init_account(rk.tez_accounts_mut(), &src.pkh, 1000);
+        reveal_account(rk.tez_accounts_mut(), &src);
+        let (code_view, storage_view) = (
+            r#"
+                parameter unit ;
+                storage int ;
+                code { CDR ; NIL operation ; PAIR } ;
+                view "get_value" unit int { CDR ; }
+            "#,
+            &Micheline::from(5),
+        );
+        init_contract(&mut rk, &view_addr, code_view, storage_view, &0.into());
+
+        let mich_addr = TypedValue::Address(Address {
+            hash: mir::ast::AddressHash::Kt1(view_addr),
+            entrypoint: Entrypoint::default(),
+        })
+        .into_micheline_optimized_legacy(&arena, &mut gas)
+        .unwrap();
+
+        let (code_caller, storage_caller) = (
+            r#"
+                parameter unit ;
+                storage address ;
+                code { CDR ;
+                    DUP ;
+                    UNIT ;
+                    VIEW "get_value" int ;
+                    IF_NONE { PUSH string "View failed" ; FAILWITH }
+                            { PUSH int 5 ; ASSERT_CMPEQ ; NIL operation ; PAIR } }
+            "#,
+            &mich_addr,
+        );
+
+        init_contract(
+            &mut rk,
+            &caller_addr,
+            code_caller,
+            storage_caller,
+            &0.into(),
+        );
+
+        let operation = make_transfer_operation(
+            15,
+            1,
+            21000,
+            5,
+            src.clone(),
+            0.into(),
+            Contract::Originated(caller_addr),
+            Parameters::default(),
+        );
+
+        let receipts = ProcessedOperation::into_receipts(
+            validate_and_apply_operation(
+                &mut rk,
+                &NotWiredRegistry,
+                &mut TezosXJournal::mock(RuntimeId::Ethereum),
+                operation,
+                &block_ctx!(),
+                false,
+                None,
+                None,
+                &test_safe_roots(),
+            )
+            .expect(
+                "validate_and_apply_operation should not have failed with a kernel error",
+            ),
+        );
+
+        assert_eq!(receipts.len(), 1, "There should be one receipt");
+        assert!(
+            matches!(
+                &receipts[0].receipt,
+                OperationResultSum::Transfer(OperationResult {
+                    result: ContentResult::Applied(TransferTarget::ToContract(
+                        TransferSuccess { .. }
+                    )),
+                    ..
+                })
+            ),
+            "Expected Successful Transfer operation result, got {:?}",
+            receipts[0].receipt
+        );
+    }
+
+    #[test]
+    fn test_view_balance() {
+        let mut host = test_host();
+        let mut rk = RuntimeKeyspaces::init(&mut host).unwrap();
+        let mut gas = Gas::default();
+        let src = bootstrap1();
+        let mut orignation_nonce = OriginationNonce::initial(OperationHash::default());
+        let view_addr = orignation_nonce.generate_kt1();
+        let caller_addr = orignation_nonce.generate_kt1();
+
+        let arena = Arena::new();
+
+        init_account(rk.tez_accounts_mut(), &src.pkh, 1000);
+        reveal_account(rk.tez_accounts_mut(), &src);
+
+        // Contract with a view that returns its BALANCE
+        let view_balance = 500;
+        init_contract(
+            &mut rk,
+            &view_addr,
+            r#"
+                parameter unit ;
+                storage unit ;
+                code { CDR ; NIL operation ; PAIR } ;
+                view "get_balance" unit mutez { DROP ; BALANCE }
+            "#,
+            &Micheline::from(()),
+            &view_balance.into(),
+        );
+
+        let mich_addr = TypedValue::Address(Address {
+            hash: mir::ast::AddressHash::Kt1(view_addr),
+            entrypoint: Entrypoint::default(),
+        })
+        .into_micheline_optimized_legacy(&arena, &mut gas)
+        .unwrap();
+
+        // Caller invokes the view and asserts the result equals 500
+        init_contract(
+            &mut rk,
+            &caller_addr,
+            r#"
+                parameter unit ;
+                storage address ;
+                code { CDR ;
+                    DUP ;
+                    UNIT ;
+                    VIEW "get_balance" mutez ;
+                    IF_NONE { PUSH string "View failed" ; FAILWITH }
+                            { PUSH mutez 500 ; ASSERT_CMPEQ ; NIL operation ; PAIR } }
+            "#,
+            &mich_addr,
+            &0.into(),
+        );
+
+        let operation = make_transfer_operation(
+            15,
+            1,
+            21000,
+            5,
+            src.clone(),
+            0.into(),
+            Contract::Originated(caller_addr),
+            Parameters::default(),
+        );
+
+        let receipts = ProcessedOperation::into_receipts(
+            validate_and_apply_operation(
+                &mut rk,
+                &NotWiredRegistry,
+                &mut TezosXJournal::mock(RuntimeId::Ethereum),
+                operation,
+                &block_ctx!(),
+                false,
+                None,
+                None,
+                &test_safe_roots(),
+            )
+            .expect(
+                "validate_and_apply_operation should not have failed with a kernel error",
+            ),
+        );
+
+        assert_eq!(receipts.len(), 1, "There should be one receipt");
+        assert!(
+            matches!(
+                &receipts[0].receipt,
+                OperationResultSum::Transfer(OperationResult {
+                    result: ContentResult::Applied(TransferTarget::ToContract(
+                        TransferSuccess { .. }
+                    )),
+                    ..
+                })
+            ),
+            "Expected Successful Transfer operation result, got {:?}",
+            receipts[0].receipt
+        );
+    }
+
+    const SCRIPTS_FOLDER: &str = "../../../michelson_test_scripts/big_maps/";
+
+    fn read_script(file: &str) -> String {
+        read_to_string(format!("{SCRIPTS_FOLDER}{file}"))
+            .unwrap_or_else(|_| panic!("Contract source code not found for {file}"))
+    }
+
+    fn big_map_was_removed<Host: KeySpaceLoader + StorageV1>(
+        ctx: &mut TcCtx<'_, '_, Host>,
+        id: BigMapId,
+    ) {
+        let types = ctx
+            .big_map_get_type(&id)
+            .expect("Get big_map type should not panic");
+        assert_eq!(types, None, "Temporary big_map was not correctly removed");
+    }
+
+    struct BigMapTransfer {
+        sender: TezosOriginatedAccount,
+        receiver: TezosOriginatedAccount,
+        receipts: Vec<OperationWithMetadata>,
+    }
+
+    fn transfer_big_map<Host>(
+        ctx: &mut TcCtx<'_, '_, Host>,
+        tz1: &Bootstrap,
+        script_sender: &str,
+        init_sender: &str,
+        script_receiver: &str,
+        init_receiver: &str,
+    ) -> BigMapTransfer
+    where
+        Host: KeySpaceLoader + StorageV1,
+    {
+        let sender_addr = ContractKt1Hash::from_base58_check(CONTRACT_1)
+            .expect("ContractKt1Hash b58 conversion should have succeeded");
+        let receiver_addr = ContractKt1Hash::from_base58_check(CONTRACT_2)
+            .expect("ContractKt1Hash b58 conversion should have succeeded");
+        init_account(ctx.rk.tez_accounts_mut(), &tz1.pkh, 10_000_000);
+        reveal_account(ctx.rk.tez_accounts_mut(), tz1);
+
+        let parser = Parser::new();
+
+        let sender_contract = init_contract(
+            ctx.rk,
+            &sender_addr,
+            script_sender,
+            &parser
+                .parse(init_sender)
+                .expect("Failed to parse sender storage"),
+            &0.into(),
+        );
+
+        let receiver_contract = init_contract(
+            ctx.rk,
+            &receiver_addr,
+            script_receiver,
+            &parser
+                .parse(init_receiver)
+                .expect("Failed to parse receiver storage"),
+            &0.into(),
+        );
+
+        let operation = make_transfer_operation(
+            15,
+            1,
+            21040,
+            60_000,
+            tz1.clone(),
+            10.into(),
+            Contract::Originated(sender_addr.clone()),
+            Parameters {
+                entrypoint: Entrypoint::default(),
+                value: Micheline::from(CONTRACT_2)
+                    .encode(&mut Gas::default())
+                    .unwrap()
+                    .unwrap(),
+            },
+        );
+
+        let mut journal = TezosXJournal::mock(RuntimeId::Ethereum);
+        let receipts = ProcessedOperation::into_receipts(
+            validate_and_apply_operation(
+                &mut *ctx.rk,
+                &NotWiredRegistry,
+                &mut journal,
+                operation,
+                &block_ctx!(),
+                false,
+                None,
+                None,
+                &test_safe_roots(),
+            )
+            .expect(
+                "validate_and_apply_operation should not have failed with a kernel error",
+            ),
+        );
+        clear_temporary_big_maps(
+            ctx.rk.host_mut(),
+            &journal.michelson.temporary_big_map_id_allocator(),
+        )
+        .expect("clearing the temporary big maps should not have failed");
+
+        BigMapTransfer {
+            sender: sender_contract,
+            receiver: receiver_contract,
+            receipts,
+        }
+    }
+
+    fn test_transfer_big_map<'a>(
+        script_receiver: &str,
+        init_receiver: &str,
+        script_sender: &str,
+        init_sender: &str,
+        expected_sender_big_map: Option<BTreeMap<TypedValue<'a>, TypedValue<'a>>>,
+        expected_receiver_big_map: Option<BTreeMap<TypedValue<'a>, TypedValue<'a>>>,
+    ) {
+        let mut host = test_host();
+        let mut rk = RuntimeKeyspaces::init(&mut host).unwrap();
+        make_default_ctx!(ctx, rk);
+        let tz1 = bootstrap1();
+
+        let result = transfer_big_map(
+            &mut ctx,
+            &tz1,
+            script_sender,
+            init_sender,
+            script_receiver,
+            init_receiver,
+        );
+
+        big_map_was_removed(&mut ctx, (-1).into());
+
+        for r in result.receipts {
+            assert!(r.receipt.is_applied())
+        }
+
+        let parser = Parser::new();
+        let sender_contract = result.sender;
+        let receiver_contract = result.receiver;
+
+        if let Some(expected_sender_big_map) = expected_sender_big_map {
+            let storage = sender_contract.storage(ctx.rk.host()).unwrap();
+            let mich_storage =
+                Micheline::decode_raw(&parser.arena, &storage, &mut Gas::default())
+                    .unwrap()
+                    .expect("Coudln't decode storage.");
+            let big_map_id = typecheck_value(
+                &mich_storage,
+                &mut ctx,
+                &Type::Int,
+                AllowForgedLazyStorageId::No,
+            )
+            .expect("Storage has unexpected type");
+            match &big_map_id {
+                TypedValue::Int(id) => crate::mir_ctx::tests::assert_big_map_eq(
+                    &mut ctx,
+                    &parser.arena,
+                    &id.clone().into(),
+                    Type::String,
+                    Type::Bytes,
+                    expected_sender_big_map,
+                ),
+                _ => panic!("ID should've been integer"),
+            };
+        }
+
+        if let Some(expected_receiver_big_map) = expected_receiver_big_map {
+            let storage = receiver_contract.storage(ctx.rk.host()).unwrap();
+            let mich_storage =
+                Micheline::decode_raw(&parser.arena, &storage, &mut Gas::default())
+                    .unwrap()
+                    .expect("Coudln't decode storage.");
+            match mich_storage {
+                Micheline::Int(id) => crate::mir_ctx::tests::assert_big_map_eq(
+                    &mut ctx,
+                    &Arena::new(),
+                    &id.into(),
+                    Type::String,
+                    Type::Bytes,
+                    expected_receiver_big_map,
+                ),
+                _ => panic!("ID should've been integer"),
+            };
+        }
+    }
+
+    // Receiver in {drop, store, store_updated} and Sender in {fresh, stored, stored_updated}
+    #[test]
+    fn big_map_transfer_receiver_drop_sender_fresh() {
+        let script_receiver = read_script("receiver_drop.tz");
+        let script_sender = read_script("sender_fresh.tz");
+        test_transfer_big_map(
+            &script_receiver,
+            "Unit",
+            &script_sender,
+            "Unit",
+            None,
+            None,
+        );
+    }
+
+    #[test]
+    fn big_map_transfer_receiver_drop_sender_stored() {
+        let script_receiver = read_script("receiver_drop.tz");
+        let script_sender = read_script("sender_stored.tz");
+        test_transfer_big_map(
+            &script_receiver,
+            "Unit",
+            &script_sender,
+            "{Elt \"d\" 0x; }",
+            Some(BTreeMap::from([(
+                TypedValue::String("d".into()),
+                TypedValue::Bytes("".into()),
+            )])),
+            None,
+        );
+    }
+
+    #[test]
+    fn big_map_transfer_receiver_drop_sender_stored_updated() {
+        let script_receiver = read_script("receiver_drop.tz");
+        let script_sender = read_script("sender_stored_updated.tz");
+        test_transfer_big_map(
+            &script_receiver,
+            "Unit",
+            &script_sender,
+            "{Elt \"b\" 0x; Elt \"d\" 0x; }",
+            Some(BTreeMap::from([
+                (TypedValue::String("d".into()), TypedValue::Bytes("".into())),
+                (TypedValue::String("b".into()), TypedValue::Bytes("".into())),
+            ])),
+            None,
+        );
+    }
+
+    #[test]
+    fn big_map_transfer_receiver_store_sender_fresh() {
+        let script_receiver = read_script("receiver_store.tz");
+        let script_sender = read_script("sender_fresh.tz");
+        test_transfer_big_map(
+            &script_receiver,
+            "{}",
+            &script_sender,
+            "Unit",
+            None,
+            Some(BTreeMap::from([(
+                TypedValue::String("d".into()),
+                TypedValue::Bytes("".into()),
+            )])),
+        );
+    }
+
+    #[test]
+    fn big_map_transfer_receiver_store_sender_stored() {
+        let script_receiver = read_script("receiver_store.tz");
+        let script_sender = read_script("sender_stored.tz");
+        test_transfer_big_map(
+            &script_receiver,
+            "{}",
+            &script_sender,
+            "{Elt \"d\" 0x; }",
+            Some(BTreeMap::from([(
+                TypedValue::String("d".into()),
+                TypedValue::Bytes("".into()),
+            )])),
+            Some(BTreeMap::from([(
+                TypedValue::String("d".into()),
+                TypedValue::Bytes("".into()),
+            )])),
+        );
+    }
+
+    #[test]
+    fn big_map_transfer_receiver_store_sender_stored_updated() {
+        let script_receiver = read_script("receiver_store.tz");
+        let script_sender = read_script("sender_stored_updated.tz");
+        test_transfer_big_map(
+            &script_receiver,
+            "{}",
+            &script_sender,
+            "{Elt \"b\" 0x; Elt \"d\" 0x; }",
+            Some(BTreeMap::from([
+                (TypedValue::String("d".into()), TypedValue::Bytes("".into())),
+                (TypedValue::String("b".into()), TypedValue::Bytes("".into())),
+            ])),
+            Some(BTreeMap::from([
+                (TypedValue::String("d".into()), TypedValue::Bytes("".into())),
+                (
+                    TypedValue::String("a".into()),
+                    TypedValue::Bytes(vec![0u8, 16u8]),
+                ),
+            ])),
+        );
+    }
+
+    #[test]
+    fn big_map_transfer_receiver_store_updated_sender_fresh() {
+        let script_receiver = read_script("receiver_store_updated.tz");
+        let script_sender = read_script("sender_fresh.tz");
+        test_transfer_big_map(
+            &script_receiver,
+            "{}",
+            &script_sender,
+            "Unit",
+            None,
+            Some(BTreeMap::from([(
+                TypedValue::String("c".into()),
+                TypedValue::Bytes(vec![(16 + 1), (2 * 16 + 4)]),
+            )])),
+        );
+    }
+
+    #[test]
+    fn big_map_transfer_receiver_store_updated_sender_stored() {
+        let script_receiver = read_script("receiver_store_updated.tz");
+        let script_sender = read_script("sender_stored.tz");
+        test_transfer_big_map(
+            &script_receiver,
+            "{}",
+            &script_sender,
+            "{Elt \"d\" 0x; }",
+            Some(BTreeMap::from([(
+                TypedValue::String("d".into()),
+                TypedValue::Bytes("".into()),
+            )])),
+            Some(BTreeMap::from([(
+                TypedValue::String("c".into()),
+                TypedValue::Bytes(vec![(16 + 1), (2 * 16 + 4)]),
+            )])),
+        );
+    }
+
+    #[test]
+    fn big_map_transfer_receiver_store_updated_sender_stored_updated() {
+        let script_receiver = read_script("receiver_store_updated.tz");
+        let script_sender = read_script("sender_stored_updated.tz");
+        test_transfer_big_map(
+            &script_receiver,
+            "{}",
+            &script_sender,
+            "{Elt \"b\" 0x; Elt \"d\" 0x; }",
+            Some(BTreeMap::from([
+                (TypedValue::String("d".into()), TypedValue::Bytes("".into())),
+                (TypedValue::String("b".into()), TypedValue::Bytes("".into())),
+            ])),
+            Some(BTreeMap::from([
+                (
+                    TypedValue::String("c".into()),
+                    TypedValue::Bytes(vec![(16 + 1), (2 * 16 + 4)]),
+                ),
+                (
+                    TypedValue::String("a".into()),
+                    TypedValue::Bytes(vec![0u8, 16u8]),
+                ),
+            ])),
+        );
+    }
+
+    #[test]
+    fn big_map_transfer_with_creation() {
+        let mut host = test_host();
+        let mut rk = RuntimeKeyspaces::init(&mut host).unwrap();
+        make_default_ctx!(ctx, rk);
+        let tz1 = bootstrap1();
+
+        let originator_addr = ContractKt1Hash::from_base58_check(CONTRACT_1)
+            .expect("ContractKt1Hash b58 conversion should have succeeded");
+
+        let script_originator = read_script("originator.tz");
+
+        init_account(ctx.rk.tez_accounts_mut(), &tz1.pkh, 100_000_000);
+        reveal_account(ctx.rk.tez_accounts_mut(), &tz1);
+        let parser = Parser::new();
+
+        let originator_contract = init_contract(
+            ctx.rk,
+            &originator_addr,
+            &script_originator,
+            &parser
+                .parse("{Elt \"b\" 0x; Elt \"d\" 0x; }")
+                .expect("Could not parse initial storage"),
+            &0.into(),
+        );
+
+        let operation = make_transfer_operation(
+            0,
+            1,
+            21040,
+            10_000,
+            tz1.clone(),
+            0.into(),
+            Contract::Originated(originator_addr),
+            Parameters::default(),
+        );
+
+        let receipts = ProcessedOperation::into_receipts(
+            validate_and_apply_operation(
+                &mut *ctx.rk,
+                &NotWiredRegistry,
+                &mut TezosXJournal::mock(RuntimeId::Ethereum),
+                operation,
+                &block_ctx!(),
+                false,
+                None,
+                None,
+                &test_safe_roots(),
+            )
+            .expect(
+                "validate_and_apply_operation should not have failed with a kernel error",
+            ),
+        );
+
+        assert!(receipts.len() == 1);
+
+        let receipt = receipts.first().unwrap();
+
+        let internal_operation_results = match &receipt.receipt {
+            OperationResultSum::Transfer(OperationResult {
+                internal_operation_results,
+                ..
+            }) => internal_operation_results.as_slice(),
+            _ => panic!("Failed to read originated contracts from receipt"),
+        };
+
+        let mut contracts: Vec<Originated> = vec![];
+        for ir in internal_operation_results {
+            let originated_contracts = match &ir {
+                InternalOperationSum::Origination(InternalContentWithMetadata {
+                    result:
+                        ContentResult::Applied(OriginationSuccess {
+                            originated_contracts,
+                            ..
+                        }),
+                    ..
+                }) => originated_contracts,
+                _ => &vec![],
+            };
+            contracts.extend_from_slice(originated_contracts);
+        }
+
+        assert!(contracts.len() == 3);
+
+        let Originated {
+            contract: created_addr_0,
+        } = &contracts[0];
+        let created_acount_0 = context::originated_from_kt1(created_addr_0)
+            .expect("Failed to retrieve generated account");
+
+        let Originated {
+            contract: created_addr_1,
+        } = &contracts[1];
+        let created_acount_1 = context::originated_from_kt1(created_addr_1)
+            .expect("Failed to retrieve generated account");
+
+        let Originated {
+            contract: created_addr_2,
+        } = &contracts[2];
+        let created_acount_2 = context::originated_from_kt1(created_addr_2)
+            .expect("Failed to retrieve generated account");
+
+        let storage_originator = originator_contract
+            .storage(ctx.rk.host())
+            .expect("Failed to fetch storage for originator");
+        let mich_storage_originator = Micheline::decode_raw(
+            &parser.arena,
+            &storage_originator,
+            &mut Gas::default(),
+        )
+        .unwrap()
+        .expect("Couldn't decode storage.");
+        let big_map_id_originator = typecheck_value(
+            &mich_storage_originator,
+            &mut ctx,
+            &Type::Int,
+            AllowForgedLazyStorageId::No,
+        )
+        .expect("Storage has unexpected type");
+        match &big_map_id_originator {
+            TypedValue::Int(id) => crate::mir_ctx::tests::assert_big_map_eq(
+                &mut ctx,
+                &parser.arena,
+                &id.clone().into(),
+                Type::String,
+                Type::Bytes,
+                BTreeMap::from([
+                    (TypedValue::String("d".into()), TypedValue::Bytes(vec![])),
+                    (TypedValue::String("b".into()), TypedValue::Bytes(vec![])),
+                ]),
+            ),
+            _ => panic!("ID should've been integer"),
+        }
+
+        println!("Originator OK");
+
+        let storage_0 = created_acount_0
+            .storage(ctx.rk.host())
+            .expect("Failed to fetch storage for created account #0");
+        let mich_storage_0 =
+            Micheline::decode_raw(&parser.arena, &storage_0, &mut Gas::default())
+                .unwrap()
+                .expect("Couldn't decode storage.");
+        let big_map_id_0 = typecheck_value(
+            &mich_storage_0,
+            &mut ctx,
+            &Type::Int,
+            AllowForgedLazyStorageId::No,
+        )
+        .expect("Storage has unexpected type");
+        match &big_map_id_0 {
+            TypedValue::Int(id) => crate::mir_ctx::tests::assert_big_map_eq(
+                &mut ctx,
+                &parser.arena,
+                &id.clone().into(),
+                Type::String,
+                Type::Bytes,
+                BTreeMap::from([(
+                    TypedValue::String("d".into()),
+                    TypedValue::Bytes("".into()),
+                )]),
+            ),
+            _ => panic!("ID should've been integer"),
+        }
+
+        println!("Created_0 OK");
+
+        let storage_1 = created_acount_1
+            .storage(ctx.rk.host())
+            .expect("Failed to fetch storage for created account #1");
+        let mich_storage_1 =
+            Micheline::decode_raw(&parser.arena, &storage_1, &mut Gas::default())
+                .unwrap()
+                .expect("Coudln't decode storage.");
+        let big_map_id_1 = typecheck_value(
+            &mich_storage_1,
+            &mut ctx,
+            &Type::Int,
+            AllowForgedLazyStorageId::No,
+        )
+        .expect("Storage has unexpected type");
+        match &big_map_id_1 {
+            TypedValue::Int(id) => crate::mir_ctx::tests::assert_big_map_eq(
+                &mut ctx,
+                &parser.arena,
+                &id.clone().into(),
+                Type::String,
+                Type::Bytes,
+                BTreeMap::from([
+                    (TypedValue::String("d".into()), TypedValue::Bytes(vec![])),
+                    (TypedValue::String("b".into()), TypedValue::Bytes(vec![])),
+                ]),
+            ),
+            _ => panic!("ID should've been integer"),
+        }
+
+        println!("Created_1 OK");
+
+        let storage_2 = created_acount_2
+            .storage(ctx.rk.host())
+            .expect("Failed to fetch storage for created account #2");
+        let mich_storage_2 =
+            Micheline::decode_raw(&parser.arena, &storage_2, &mut Gas::default())
+                .unwrap()
+                .expect("Coudln't decode storage.");
+        let big_map_id_2 = typecheck_value(
+            &mich_storage_2,
+            &mut ctx,
+            &Type::Int,
+            AllowForgedLazyStorageId::No,
+        )
+        .expect("Storage has unexpected type");
+        match &big_map_id_2 {
+            TypedValue::Int(id) => crate::mir_ctx::tests::assert_big_map_eq(
+                &mut ctx,
+                &parser.arena,
+                &id.clone().into(),
+                Type::String,
+                Type::Bytes,
+                BTreeMap::from([
+                    (TypedValue::String("d".into()), TypedValue::Bytes(vec![])),
+                    (
+                        TypedValue::String("a".into()),
+                        TypedValue::Bytes(vec![0u8, 16u8]),
+                    ),
+                ]),
+            ),
+            _ => panic!("ID should've been integer"),
+        }
+
+        println!("Created_2 OK");
+    }
+
+    // Regression test for the forged-`big_map`-id vulnerability: an external
+    // operation must not be able to reference another contract's `big_map` by
+    // passing its bare id as a parameter. Before the fix, a writer contract
+    // could overwrite a victim's `big_map` this way (and a reader could read
+    // it). The parameter is now rejected and the victim's storage is left
+    // untouched. Mirrors L1's `allow_forged_lazy_storage_id:false` gate on
+    // operation parameters.
+    #[test]
+    fn forged_big_map_id_in_external_parameter_is_rejected() {
+        use mir::ast::big_map::LazyStorage;
+
+        let mut host = test_host();
+        let mut rk = RuntimeKeyspaces::init(&mut host).unwrap();
+        make_default_ctx!(ctx, rk);
+
+        let tz1 = bootstrap1();
+        init_account(ctx.rk.tez_accounts_mut(), &tz1.pkh, 10_000_000);
+        reveal_account(ctx.rk.tez_accounts_mut(), &tz1);
+
+        // Victim: a contract owning a `big_map nat string` initialised with
+        // `0 -> "genesis-42"`. We allocate the big_map directly in the lazy
+        // storage (as origination would) and point the victim's storage at
+        // its bare id.
+        let victim_id = ctx
+            .big_map_new(&Type::Nat, &Type::String, false)
+            .expect("big_map allocation should succeed");
+        ctx.big_map_update(
+            &victim_id,
+            TypedValue::nat(0),
+            Some(TypedValue::String("genesis-42".into())),
+        )
+        .expect("big_map update should succeed");
+
+        let victim_addr = ContractKt1Hash::from_base58_check(CONTRACT_1)
+            .expect("ContractKt1Hash b58 conversion should have succeeded");
+        let _victim = init_contract(
+            ctx.rk,
+            &victim_addr,
+            "parameter unit ; storage (big_map nat string) ; \
+             code { CDR ; NIL operation ; PAIR }",
+            &Micheline::Int(victim_id.value.0.clone()),
+            &0.into(),
+        );
+
+        // Attacker: a writer taking a `big_map nat string` parameter, writing
+        // "Hacked-by-mi" at key 0 and storing it.
+        let parser = Parser::new();
+        let writer_addr = ContractKt1Hash::from_base58_check(CONTRACT_2)
+            .expect("ContractKt1Hash b58 conversion should have succeeded");
+        let _writer = init_contract(
+            ctx.rk,
+            &writer_addr,
+            "parameter (big_map nat string) ; storage (big_map nat string) ; \
+             code { CAR ; PUSH string \"Hacked-by-mi\" ; SOME ; PUSH nat 0 ; \
+             UPDATE ; NIL operation ; PAIR }",
+            &parser.parse("{}").expect("Failed to parse writer storage"),
+            &0.into(),
+        );
+
+        // Forge the victim's `big_map` id as the writer's parameter.
+        let forged_param = Micheline::Int(victim_id.value.0.clone());
+        let operation = make_transfer_operation(
+            15,
+            1,
+            21040,
+            60_000,
+            tz1.clone(),
+            10.into(),
+            Contract::Originated(writer_addr.clone()),
+            Parameters {
+                entrypoint: Entrypoint::default(),
+                value: forged_param.encode(&mut Gas::default()).unwrap().unwrap(),
+            },
+        );
+
+        let receipts = ProcessedOperation::into_receipts(
+            validate_and_apply_operation(
+                &mut *ctx.rk,
+                &NotWiredRegistry,
+                &mut TezosXJournal::mock(RuntimeId::Ethereum),
+                operation,
+                &block_ctx!(),
+                false,
+                None,
+                None,
+                &test_safe_roots(),
+            )
+            .expect(
+                "validate_and_apply_operation should not have failed with a kernel error",
+            ),
+        );
+
+        // The forged-id parameter must be rejected: the operation is not
+        // applied.
+        assert!(
+            receipts.iter().all(|r| !r.receipt.is_applied()),
+            "forged big_map id parameter should have been rejected, got: {receipts:?}"
+        );
+
+        // And the victim's `big_map` must be left untouched.
+        crate::mir_ctx::tests::assert_big_map_eq(
+            &mut ctx,
+            &Arena::new(),
+            &victim_id,
+            Type::Nat,
+            Type::String,
+            BTreeMap::from([(
+                TypedValue::nat(0),
+                TypedValue::String("genesis-42".into()),
+            )]),
+        );
+    }
+
+    // Regression test for the origination variant of the forged-`big_map`-id
+    // vulnerability: a contract's initial storage supplied in an external
+    // origination must not reference another contract's `big_map` by a forged
+    // id. Doing so would let the freshly-originated contract usurp a big_map it
+    // does not own and read or overwrite it through its own entrypoints. The
+    // origination is now rejected. Mirrors L1's
+    // `allow_forged_lazy_storage_id_in_storage:false` at origination.
+    #[test]
+    fn forged_big_map_id_in_origination_storage_is_rejected() {
+        use mir::ast::big_map::LazyStorage;
+
+        let mut host = test_host();
+        let mut rk = RuntimeKeyspaces::init(&mut host).unwrap();
+        make_default_ctx!(ctx, rk);
+
+        let tz1 = bootstrap1();
+        init_account(ctx.rk.tez_accounts_mut(), &tz1.pkh, 10_000_000);
+        reveal_account(ctx.rk.tez_accounts_mut(), &tz1);
+
+        // Victim big_map { 0 -> "genesis-42" } owned by an existing contract.
+        let victim_id = ctx
+            .big_map_new(&Type::Nat, &Type::String, false)
+            .expect("big_map allocation should succeed");
+        ctx.big_map_update(
+            &victim_id,
+            TypedValue::nat(0),
+            Some(TypedValue::String("genesis-42".into())),
+        )
+        .expect("big_map update should succeed");
+        let victim_addr = ContractKt1Hash::from_base58_check(CONTRACT_1)
+            .expect("ContractKt1Hash b58 conversion should have succeeded");
+        let _victim = init_contract(
+            ctx.rk,
+            &victim_addr,
+            "parameter unit ; storage (big_map nat string) ; \
+             code { CDR ; NIL operation ; PAIR }",
+            &Micheline::Int(victim_id.value.0.clone()),
+            &0.into(),
+        );
+
+        // Originate a contract whose initial storage is the victim's forged
+        // big_map id.
+        let parser = Parser::new();
+        let code = parser
+            .parse_top_level(
+                "parameter unit ; storage (big_map nat string) ; code { CDR ; \
+                 NIL operation ; PAIR }",
+            )
+            .expect("Failed to parse origination code")
+            .encode(&mut Gas::default())
+            .unwrap()
+            .unwrap();
+        let storage = parser
+            .parse(&format!("{victim_id}"))
+            .expect("Failed to parse origination storage")
+            .encode(&mut Gas::default())
+            .unwrap()
+            .unwrap();
+        let operation = make_origination_operation(
+            15,
+            1,
+            21040,
+            60_000,
+            tz1.clone(),
+            0,
+            Script { code, storage },
+        );
+
+        let receipts = ProcessedOperation::into_receipts(
+            validate_and_apply_operation(
+                &mut *ctx.rk,
+                &NotWiredRegistry,
+                &mut TezosXJournal::mock(RuntimeId::Ethereum),
+                operation,
+                &block_ctx!(),
+                false,
+                None,
+                None,
+                &test_safe_roots(),
+            )
+            .expect(
+                "validate_and_apply_operation should not have failed with a kernel error",
+            ),
+        );
+
+        // The origination must be rejected.
+        assert!(
+            receipts.iter().all(|r| !r.receipt.is_applied()),
+            "forged big_map id in origination storage should have been \
+             rejected, got: {receipts:?}"
+        );
+
+        // And the failure must carry the storage typecheck error, i.e. the
+        // forged big_map id is what got it refused (not some unrelated error).
+        let rendered = format!("{receipts:?}");
+        assert!(
+            rendered.contains("unexpected forged lazy storage id"),
+            "origination failure should carry the storage typecheck error, \
+             got: {rendered}"
+        );
+
+        // And the victim's big_map must be left untouched.
+        crate::mir_ctx::tests::assert_big_map_eq(
+            &mut ctx,
+            &Arena::new(),
+            &victim_id,
+            Type::Nat,
+            Type::String,
+            BTreeMap::from([(
+                TypedValue::nat(0),
+                TypedValue::String("genesis-42".into()),
+            )]),
+        );
+    }
+
+    #[test]
+    fn verify_temp_big_map_content_is_cleaned() {
+        let mut host = test_host();
+        let mut rk = RuntimeKeyspaces::init(&mut host).unwrap();
+        make_default_ctx!(ctx, rk);
+        let tz1 = bootstrap1();
+        let parser = Parser::new();
+
+        // A contract that receives a big_map and checks if
+        // there's a "d" key in the big_map received
+        let script_receiver = r#"
+                parameter (big_map string bytes) ;
+                storage bool ;
+                code { CAR; PUSH string "d"; MEM; NIL operation; PAIR }
+            "#;
+        let script_sender = read_script("sender_stored.tz");
+
+        // Transfer the big_map in the storage of the sender ({ Elt "d" 0x })
+        // And the receiver checks if the big_map received contains the key "d"
+        // The storage of the receiver contract should change to 'True' after this
+        // transfer.
+        let result = transfer_big_map(
+            &mut ctx,
+            &tz1,
+            &script_sender,
+            "{Elt \"d\" 0x; }",
+            script_receiver,
+            "False",
+        );
+
+        let receiver = result.receiver;
+
+        for r in result.receipts {
+            assert!(r.receipt.is_applied())
+        }
+
+        // Checks that the storage of the receiver is true
+        let storage = receiver
+            .storage(ctx.rk.host())
+            .expect("Get storage should succeed");
+        let storage = Micheline::decode_raw(&parser.arena, &storage, &mut Gas::default())
+            .unwrap()
+            .expect("Micheline should be decodable");
+        let typed_storage = typecheck_value(
+            &storage,
+            &mut ctx,
+            &Type::Bool,
+            AllowForgedLazyStorageId::No,
+        )
+        .expect("Typecheck value should succeed");
+        assert_eq!(typed_storage, TypedValue::Bool(true));
+
+        // We redeploy a second contract sender, that will send a different big_map
+        // to the receiver contract ({Elt "a" 0x})
+        let second_sender_contract =
+            ContractKt1Hash::from_base58_check(CONTRACT_3).unwrap();
+
+        let _ = init_contract(
+            ctx.rk,
+            &second_sender_contract,
+            &script_sender,
+            &parser
+                .parse("{Elt \"a\" 0x; }")
+                .expect("Failed to parse receiver storage"),
+            &0.into(),
+        );
+
+        let operation = make_transfer_operation(
+            0,
+            2,
+            21040,
+            60_000,
+            tz1.clone(),
+            0.into(),
+            Contract::Originated(second_sender_contract),
+            Parameters {
+                entrypoint: Entrypoint::default(),
+                value: Micheline::from(receiver.kt1().to_base58_check())
+                    .encode(&mut Gas::default())
+                    .unwrap()
+                    .unwrap(),
+            },
+        );
+
+        // After that call, the storage of the receiver should be 'False'
+        // as the big_map passed in argument doesn't have the key "d"
+        let receipts = ProcessedOperation::into_receipts(
+            validate_and_apply_operation(
+                &mut *ctx.rk,
+                &NotWiredRegistry,
+                &mut TezosXJournal::mock(RuntimeId::Ethereum),
+                operation,
+                &block_ctx!(),
+                false,
+                None,
+                None,
+                &test_safe_roots(),
+            )
+            .expect(
+                "validate_and_apply_operation should not have failed with a kernel error",
+            ),
+        );
+
+        for r in receipts {
+            assert!(r.receipt.is_applied())
+        }
+
+        // Checks that the storage of the receiver contract is 'False'
+        let storage = receiver
+            .storage(ctx.rk.host())
+            .expect("Get storage should succeed");
+        let storage = Micheline::decode_raw(&parser.arena, &storage, &mut Gas::default())
+            .unwrap()
+            .expect("Micheline should be decodable");
+        let typed_storage = typecheck_value(
+            &storage,
+            &mut ctx,
+            &Type::Bool,
+            AllowForgedLazyStorageId::No,
+        )
+        .expect("Typecheck value should succeed");
+        assert_eq!(typed_storage, TypedValue::Bool(false));
+    }
+
+    /// Build the gateway's generic %call argument for a plain value
+    /// transfer: `Pair "http://ethereum/<dest>" (Pair {} (Pair 0x (Pair 1 None)))`
+    /// (POST, no headers, empty body, no callback).
+    fn gateway_call_transfer_param<'a>(
+        arena: &'a Arena<Micheline<'a>>,
+        eth_destination: &str,
+    ) -> Micheline<'a> {
+        use crate::enshrined_contracts::tests::build_http_call_micheline;
+        build_http_call_micheline(
+            arena,
+            &format!("http://ethereum/{eth_destination}"),
+            &[],
+            &[],
+            1,
+        )
+    }
+
+    /// Test a successful transfer from a tz1 address to an Ethereum address via the gateway.
+    /// This tests the happy path: source has enough balance, gateway executes, bridge succeeds.
+    #[test]
+    fn apply_transfer_to_gateway_happy_path() {
+        let mut host = test_host();
+        let mut rk = RuntimeKeyspaces::init(&mut host).unwrap();
+
+        let src = bootstrap1();
+
+        // Gateway contract address: KT18oDJJKXMKhfE1bSuAPGp92pYcwVDiqsPw
+        let gateway_kt1 =
+            ContractKt1Hash::from_base58_check("KT18oDJJKXMKhfE1bSuAPGp92pYcwVDiqsPw")
+                .expect("Gateway KT1 address should be valid");
+
+        // Set up source with enough balance (100 mutez: 15 for fees + 50 for transfer + some extra)
+        let source_account = init_account(rk.tez_accounts_mut(), &src.pkh, 100);
+        reveal_account(rk.tez_accounts_mut(), &src);
+
+        // Create Micheline parameters for the generic %call entrypoint:
+        // a POST to the destination Ethereum address with an empty body.
+        // The amount is taken from the operation's amount field via ctx.amount()
+        let eth_destination = "0x1234567890123456789012345678901234567890";
+        let arena = Arena::new();
+        let params_micheline = gateway_call_transfer_param(&arena, eth_destination);
+
+        let operation = make_transfer_operation(
+            15,      // fee
+            1,       // counter
+            100_000, // gas_limit
+            100,     // storage_limit
+            src.clone(),
+            50_u64.into(), // amount to transfer
+            Contract::Originated(gateway_kt1.clone()),
+            Parameters {
+                entrypoint: Entrypoint::try_from("call").unwrap(),
+                value: params_micheline
+                    .encode(&mut Gas::default())
+                    .unwrap()
+                    .unwrap(),
+            },
+        );
+
+        let registry = crate::test_utils::MockRegistry::new("KT1_mock_alias".to_string());
+        let mut journal = TezosXJournal::new(
+            tezosx_journal::CracId::new(1, 0),
+            TezosXHashes::zero(),
+            tezos_ethereum::block::BlockConstants::dummy(),
+        );
+        let processed = validate_and_apply_operation(
+            &mut rk,
+            &registry,
+            &mut journal,
+            operation,
+            &block_ctx!(),
+            false,
+            None,
+            None,
+            &test_safe_roots(),
+        )
+        .expect(
+            "validate_and_apply_operation should not have failed with a kernel error",
+        );
+        let receipt = ProcessedOperation::into_receipts(processed);
+
+        // Verify the operation succeeded
+        assert_eq!(receipt.len(), 1, "There should be one receipt");
+        assert!(
+            matches!(
+                &receipt[0].receipt,
+                OperationResultSum::Transfer(OperationResult {
+                    result: ContentResult::Applied(_),
+                    ..
+                })
+            ),
+            "Expected Applied Transfer result, got {:?}",
+            receipt[0].receipt
+        );
+
+        // Verify that source balance decreased by fee (15) + transfer amount (50)
+        // Initial: 100, Final: 100 - 15 - 50 = 35
+        assert_eq!(
+            source_account.balance(rk.host()).unwrap(),
+            35_u64.into(),
+            "Source balance should have decreased by fee + transfer amount"
+        );
+
+        // Verify that serve was called
+        let serve_calls = registry.serve_calls.borrow();
+        assert_eq!(serve_calls.len(), 1, "Serve should have been called once");
+
+        // Verify that the gateway balance is 0 (funds were forwarded, not locked)
+        let gateway_account = context::originated_from_kt1(&gateway_kt1)
+            .expect("Gateway account should exist");
+        assert_eq!(
+            gateway_account.balance(rk.host()).unwrap(),
+            0_u64.into(),
+            "Gateway balance should be 0 after successful serve call"
+        );
+    }
+
+    // DA fee enforcement: delayed inbox operations (da_fee_check = None) skip the
+    // DA fee check entirely, so zero-fee operations are accepted.
+    #[test]
+    fn da_fee_delayed_inbox_zero_fees_accepted() {
+        let mut host = test_host();
+        let mut rk = RuntimeKeyspaces::init(&mut host).unwrap();
+        let source = bootstrap1();
+        let dest = bootstrap2();
+        let _src_account = init_account(rk.tez_accounts_mut(), &source.pkh, 1_000_000);
+        let _dst_account = init_account(rk.tez_accounts_mut(), &dest.pkh, 0);
+        reveal_account(rk.tez_accounts_mut(), &source);
+
+        // Transfer with fee = 0 mutez.
+        let operation = make_transfer_operation(
+            0,     // fee
+            1,     // counter
+            21000, // gas_limit
+            0,     // storage_limit
+            source,
+            10_u64.into(), // amount
+            Contract::Implicit(dest.pkh),
+            Parameters::default(),
+        );
+
+        // None = delayed inbox: DA fee check is skipped.
+        let result = validate_and_apply_operation(
+            &mut rk,
+            &NotWiredRegistry,
+            &mut TezosXJournal::mock(RuntimeId::Ethereum),
+            operation,
+            &block_ctx!(),
+            false,
+            None,
+            None,
+            &test_safe_roots(),
+        );
+
+        assert!(
+            result.is_ok(),
+            "Delayed inbox operation with zero fees should succeed"
+        );
+    }
+
+    // DA fee enforcement: batch with reveal + transfer whose combined fee covers DA cost.
+    #[test]
+    fn da_fee_batch_sufficient_fees_accepted() {
+        let mut host = test_host();
+        let mut rk = RuntimeKeyspaces::init(&mut host).unwrap();
+        let source = bootstrap1();
+        let dest = bootstrap2();
+        let src_account = init_account(rk.tez_accounts_mut(), &source.pkh, 1_000_000);
+        let dst_account = init_account(rk.tez_accounts_mut(), &dest.pkh, 0);
+
+        let reveal_content = OperationContent::Reveal(RevealContent {
+            pk: source.pk.clone(),
+            proof: None,
+        });
+
+        let transfer_content = OperationContent::Transfer(TransferContent {
+            amount: 10_u64.into(),
+            destination: Contract::Implicit(dest.pkh),
+            parameters: Parameters::default(),
+        });
+
+        // Single batch fee of 10_000 mutez shared across both operations.
+        let batch = make_operation(
+            10_000, // fee
+            1,      // counter
+            22000,  // gas_limit
+            0,      // storage_limit
+            source,
+            vec![reveal_content, transfer_content],
+        );
+
+        // DA fee = 4 mutez/byte: 10_000 mutez covers up to 2500 bytes.
+        let da_fee_per_byte_mutez = 4;
+        let required_da_fees =
+            get_required_da_fees(&batch, da_fee_per_byte_mutez).unwrap();
+        let result = validate_and_apply_operation(
+            &mut rk,
+            &NotWiredRegistry,
+            &mut TezosXJournal::mock(RuntimeId::Ethereum),
+            batch,
+            &block_ctx!(),
+            false,
+            Some(required_da_fees),
+            None,
+            &test_safe_roots(),
+        );
+
+        assert!(result.is_ok(), "Batch with sufficient fees should succeed");
+
+        // Initial: 1_000_000, fee: 10_000 per op × 2 ops = 20_000, transfer: 10
+        assert_eq!(
+            src_account.balance(rk.host()).unwrap(),
+            979_990_u64.into(),
+            "Source balance should be 1_000_000 - 20_000 (fees) - 10 (amount)"
+        );
+        assert_eq!(
+            dst_account.balance(rk.host()).unwrap(),
+            10_u64.into(),
+            "Destination should have received 10 mutez"
+        );
+    }
+
+    // DA fee enforcement: operation with sufficient fees is accepted.
+    #[test]
+    fn da_fee_sufficient_fees_accepted() {
+        let mut host = test_host();
+        let mut rk = RuntimeKeyspaces::init(&mut host).unwrap();
+        let source = bootstrap1();
+        let dest = bootstrap2();
+        let src_account = init_account(rk.tez_accounts_mut(), &source.pkh, 1_000_000);
+        let dst_account = init_account(rk.tez_accounts_mut(), &dest.pkh, 0);
+        reveal_account(rk.tez_accounts_mut(), &source);
+
+        // Transfer with fee = 10_000 mutez, well above DA cost for any reasonable op size.
+        let operation = make_transfer_operation(
+            10_000, // fee
+            1,      // counter
+            21000,  // gas_limit
+            0,      // storage_limit
+            source,
+            10_u64.into(), // amount
+            Contract::Implicit(dest.pkh),
+            Parameters::default(),
+        );
+
+        // DA fee = 4 mutez/byte: 10_000 mutez covers up to 2500 bytes.
+        let da_fee_per_byte_mutez = 4;
+        let required_da_fees =
+            get_required_da_fees(&operation, da_fee_per_byte_mutez).unwrap();
+        let result = validate_and_apply_operation(
+            &mut rk,
+            &NotWiredRegistry,
+            &mut TezosXJournal::mock(RuntimeId::Ethereum),
+            operation,
+            &block_ctx!(),
+            false,
+            Some(required_da_fees),
+            None,
+            &test_safe_roots(),
+        );
+
+        assert!(
+            result.is_ok(),
+            "Operation with sufficient fees should succeed"
+        );
+
+        // Initial: 1_000_000, fee: 10_000, transfer: 10
+        assert_eq!(
+            src_account.balance(rk.host()).unwrap(),
+            989_990_u64.into(),
+            "Source balance should be 1_000_000 - 10_000 (fee) - 10 (amount)"
+        );
+        assert_eq!(
+            dst_account.balance(rk.host()).unwrap(),
+            10_u64.into(),
+            "Destination should have received 10 mutez"
+        );
+    }
+
+    // DA fee enforcement: operation fees below DA cost are rejected.
+    #[test]
+    fn da_fee_insufficient_fees_rejected() {
+        let mut host = test_host();
+        let mut rk = RuntimeKeyspaces::init(&mut host).unwrap();
+        let source = bootstrap1();
+        let _src_account = init_account(rk.tez_accounts_mut(), &source.pkh, 1_000_000);
+        reveal_account(rk.tez_accounts_mut(), &source);
+
+        // Transfer with fee = 1 mutez, well below DA cost.
+        let operation = make_transfer_operation(
+            1,     // fee
+            1,     // counter
+            21000, // gas_limit
+            0,     // storage_limit
+            source,
+            10_u64.into(), // amount
+            Contract::Implicit(bootstrap2().pkh),
+            Parameters::default(),
+        );
+
+        // DA fee = 4 mutez/byte: for any operation > 0 bytes, 1 mutez is insufficient.
+        let da_fee_per_byte_mutez = 4;
+        let required_da_fees =
+            get_required_da_fees(&operation, da_fee_per_byte_mutez).unwrap();
+        let result = validate_and_apply_operation(
+            &mut rk,
+            &NotWiredRegistry,
+            &mut TezosXJournal::mock(RuntimeId::Ethereum),
+            operation,
+            &block_ctx!(),
+            false,
+            Some(required_da_fees),
+            None,
+            &test_safe_roots(),
+        );
+
+        assert_eq!(
+            result,
+            Err(OperationError::Validation(ValidityError::InsufficientFee))
+        );
+    }
+
+    /// Calling the gateway with the generic %call entrypoint (plain tez
+    /// transfer to an EVM address) produces an Applied receipt whose storage
+    /// field is None.
+    ///
+    /// Enshrined contracts always return empty storage bytes; the receipt must
+    /// encode this as absent storage rather than Some([]).
+    #[test]
+    fn gateway_tez_transfer_receipt_storage_is_none() {
+        let mut host = test_host();
+        let mut rk = RuntimeKeyspaces::init(&mut host).unwrap();
+        let src = bootstrap1();
+        let gateway_kt1 =
+            ContractKt1Hash::from_base58_check("KT18oDJJKXMKhfE1bSuAPGp92pYcwVDiqsPw")
+                .expect("Gateway KT1 address should be valid");
+        init_account(rk.tez_accounts_mut(), &src.pkh, 100);
+        reveal_account(rk.tez_accounts_mut(), &src);
+
+        let arena = Arena::new();
+        let operation = make_transfer_operation(
+            15,
+            1,
+            100_000,
+            100,
+            src,
+            50_u64.into(),
+            Contract::Originated(gateway_kt1),
+            Parameters {
+                entrypoint: Entrypoint::try_from("call").unwrap(),
+                value: gateway_call_transfer_param(
+                    &arena,
+                    "0x1111111111111111111111111111111111111111",
+                )
+                .encode(&mut Gas::default())
+                .unwrap()
+                .unwrap(),
+            },
+        );
+
+        let registry = crate::test_utils::MockRegistry::new("KT1_mock_alias".to_string());
+        let mut journal = TezosXJournal::new(
+            tezosx_journal::CracId::new(1, 0),
+            TezosXHashes::zero(),
+            tezos_ethereum::block::BlockConstants::dummy(),
+        );
+        let receipts = ProcessedOperation::into_receipts(
+            validate_and_apply_operation(
+                &mut rk,
+                &registry,
+                &mut journal,
+                operation,
+                &block_ctx!(),
+                false,
+                None,
+                None,
+                &test_safe_roots(),
+            )
+            .expect("validate_and_apply_operation should not fail"),
+        );
+
+        assert_eq!(receipts.len(), 1);
+        assert!(
+            matches!(
+                &receipts[0].receipt,
+                OperationResultSum::Transfer(OperationResult {
+                    result: ContentResult::Applied(TransferTarget::ToContract(
+                        TransferSuccess { storage: None, .. }
+                    )),
+                    ..
+                })
+            ),
+            "Expected Applied transfer with storage=None, got {:?}",
+            receipts[0].receipt
+        );
+    }
+
+    /// Calling the gateway with the call entrypoint (EVM contract call with
+    /// value) produces an Applied receipt whose storage field is None.
+    #[test]
+    fn gateway_contract_call_receipt_storage_is_none() {
+        let mut host = test_host();
+        let mut rk = RuntimeKeyspaces::init(&mut host).unwrap();
+        let mut gas = Gas::default();
+        let src = bootstrap1();
+        let gateway_kt1 =
+            ContractKt1Hash::from_base58_check("KT18oDJJKXMKhfE1bSuAPGp92pYcwVDiqsPw")
+                .expect("Gateway KT1 address should be valid");
+        init_account(rk.tez_accounts_mut(), &src.pkh, 100);
+        reveal_account(rk.tez_accounts_mut(), &src);
+
+        // Encode Pair(dest, Pair(method_sig, abi_params)) for the call entrypoint
+        let arena = Arena::new();
+        let call_value = Micheline::prim2(
+            &arena,
+            mir::lexer::Prim::Pair,
+            Micheline::String("0x2222222222222222222222222222222222222222".to_string()),
+            Micheline::prim2(
+                &arena,
+                mir::lexer::Prim::Pair,
+                Micheline::String("store(uint256)".to_string()),
+                Micheline::prim2(
+                    &arena,
+                    mir::lexer::Prim::Pair,
+                    Micheline::Bytes(vec![0u8; 32]),
+                    Micheline::prim0(mir::lexer::Prim::None, &mut gas).unwrap(),
+                    &mut gas,
+                )
+                .unwrap(),
+                &mut gas,
+            )
+            .unwrap(),
+            &mut gas,
+        )
+        .unwrap();
+
+        let operation = make_transfer_operation(
+            15,
+            1,
+            100_000,
+            100,
+            src,
+            50_u64.into(),
+            Contract::Originated(gateway_kt1),
+            Parameters {
+                entrypoint: Entrypoint::try_from("call_evm").unwrap(),
+                value: call_value.encode(&mut Gas::default()).unwrap().unwrap(),
+            },
+        );
+
+        let registry = crate::test_utils::MockRegistry::new("KT1_mock_alias".to_string());
+        let mut journal = TezosXJournal::new(
+            tezosx_journal::CracId::new(1, 0),
+            TezosXHashes::zero(),
+            tezos_ethereum::block::BlockConstants::dummy(),
+        );
+        let receipts = ProcessedOperation::into_receipts(
+            validate_and_apply_operation(
+                &mut rk,
+                &registry,
+                &mut journal,
+                operation,
+                &block_ctx!(),
+                false,
+                None,
+                None,
+                &test_safe_roots(),
+            )
+            .expect("validate_and_apply_operation should not fail"),
+        );
+
+        assert_eq!(receipts.len(), 1);
+        assert!(
+            matches!(
+                &receipts[0].receipt,
+                OperationResultSum::Transfer(OperationResult {
+                    result: ContentResult::Applied(TransferTarget::ToContract(
+                        TransferSuccess { storage: None, .. }
+                    )),
+                    ..
+                })
+            ),
+            "Expected Applied transfer with storage=None, got {:?}",
+            receipts[0].receipt
+        );
+    }
+
+    /// A gateway call whose EVM execution reverts propagates as a Failed
+    /// receipt (not Applied), confirming that the revert path does not
+    /// produce an Applied result with a spurious storage field.
+    #[test]
+    fn gateway_evm_revert_yields_failed_receipt() {
+        let mut host = test_host();
+        let mut rk = RuntimeKeyspaces::init(&mut host).unwrap();
+        let src = bootstrap1();
+        let gateway_kt1 =
+            ContractKt1Hash::from_base58_check("KT18oDJJKXMKhfE1bSuAPGp92pYcwVDiqsPw")
+                .expect("Gateway KT1 address should be valid");
+        init_account(rk.tez_accounts_mut(), &src.pkh, 100);
+        reveal_account(rk.tez_accounts_mut(), &src);
+
+        let registry = crate::test_utils::MockRegistry::new("KT1_mock_revert")
+            .with_serve_response(400, b"reverted".to_vec());
+
+        let operation = make_transfer_operation(
+            15,
+            1,
+            100_000,
+            100,
+            src,
+            50_u64.into(),
+            Contract::Originated(gateway_kt1),
+            Parameters {
+                entrypoint: Entrypoint::default(),
+                value: Micheline::String(
+                    "0x3333333333333333333333333333333333333333".to_string(),
+                )
+                .encode(&mut Gas::default())
+                .unwrap()
+                .unwrap(),
+            },
+        );
+
+        let mut journal = TezosXJournal::mock(RuntimeId::Ethereum);
+        let receipts = ProcessedOperation::into_receipts(
+            validate_and_apply_operation(
+                &mut rk,
+                &registry,
+                &mut journal,
+                operation,
+                &block_ctx!(),
+                false,
+                None,
+                None,
+                &test_safe_roots(),
+            )
+            .expect("validate_and_apply_operation should not fail at the protocol level"),
+        );
+
+        assert_eq!(receipts.len(), 1);
+        assert!(
+            matches!(
+                &receipts[0].receipt,
+                OperationResultSum::Transfer(OperationResult {
+                    result: ContentResult::Failed(_),
+                    ..
+                })
+            ),
+            "Expected Failed transfer when EVM reverts, got {:?}",
+            receipts[0].receipt
+        );
+    }
+
+    // --- Caught CRAC failures ---
+
+    /// Calls `run()` on an EVM contract through the gateway's `%call_evm`,
+    /// without a callback: that call is its only, hence its last, internal
+    /// operation.
+    const GATEWAY_FORWARDER_SCRIPT: &str = r#"
+        parameter unit;
+        storage unit;
+        code {
+            DROP;
+            PUSH address "KT18oDJJKXMKhfE1bSuAPGp92pYcwVDiqsPw";
+            CONTRACT %call_evm (pair string (pair string (pair bytes (option (contract bytes)))));
+            IF_NONE { PUSH string "No gateway"; FAILWITH } {};
+            PUSH mutez 1;
+            NONE (contract bytes);
+            PUSH bytes 0x;
+            PAIR;
+            PUSH string "run()";
+            PAIR;
+            PUSH string "0x3333333333333333333333333333333333333333";
+            PAIR;
+            TRANSFER_TOKENS;
+            NIL operation;
+            SWAP;
+            CONS;
+            UNIT;
+            SWAP;
+            PAIR
+        }"#;
+
+    /// The receipt of a nested crossing whose Michelson target failed, as
+    /// the target runtime records it: a single failed transfer.
+    fn failed_crac_receipt() -> tezos_tezlink::block::AppliedOperation {
+        use tezos_crypto_rs::hash::{BlockHash, OperationHash, UnknownSignature};
+        use tezos_tezlink::operation_result::{
+            OperationBatchWithMetadata, OperationDataAndMetadata,
+        };
+        let failed = || {
+            ContentResult::Failed(
+                ApplyOperationError::from(
+                    TransferError::FailedToExecuteInternalOperation(
+                        "nested crossing failed".into(),
+                    ),
+                )
+                .into(),
+            )
+        };
+        let target =
+            Contract::Originated(ContractKt1Hash::from_base58_check(CONTRACT_3).unwrap());
+        let failed_transfer =
+            InternalOperationSum::Transfer(InternalContentWithMetadata {
+                sender: Contract::Implicit(bootstrap1().pkh),
+                nonce: 0,
+                content: TransferContent {
+                    amount: 0_u64.into(),
+                    destination: target.clone(),
+                    parameters: Parameters::default(),
+                },
+                result: failed(),
+            });
+        tezos_tezlink::block::AppliedOperation {
+            hash: OperationHash::default(),
+            branch: BlockHash::default(),
+            op_and_receipt: OperationDataAndMetadata::OperationWithMetadata(
+                OperationBatchWithMetadata {
+                    operations: vec![OperationWithMetadata {
+                        content: ManagerOperationContent::Transaction(ManagerOperation {
+                            source: bootstrap1().pkh,
+                            fee: 0_u64.into(),
+                            counter: 0_u64.into(),
+                            gas_limit: 0_u64.into(),
+                            storage_limit: 0_u64.into(),
+                            operation: TransferContent {
+                                amount: 0_u64.into(),
+                                destination: target,
+                                parameters: Parameters::default(),
+                            },
+                        }),
+                        receipt: OperationResultSum::Transfer(OperationResult {
+                            balance_updates: vec![],
+                            result: failed(),
+                            internal_operation_results: vec![failed_transfer],
+                        }),
+                    }],
+                    signature: UnknownSignature::try_from([0u8; 64].as_slice()).unwrap(),
+                },
+            ),
+        }
+    }
+
+    /// A registry whose EVM leg returns successfully after catching the
+    /// failure of a nested crossing, whose failed receipt it leaves on the
+    /// journal.
+    fn registry_catching_a_nested_failure() -> crate::test_utils::MockRegistry {
+        crate::test_utils::MockRegistry::new("KT1_mock_alias").with_serve_journal_hook(
+            |journal| {
+                journal
+                    .michelson
+                    .push_failed_crac_receipt(failed_crac_receipt())
+            },
+        )
+    }
+
+    fn is_failed_transfer(op: &InternalOperationSum) -> bool {
+        matches!(
+            op,
+            InternalOperationSum::Transfer(InternalContentWithMetadata {
+                result: ContentResult::Failed(_),
+                ..
+            })
+        )
+    }
+
+    /// Apply `src → emitter → forwarder → gateway`, with the forwarder
+    /// running [`GATEWAY_FORWARDER_SCRIPT`].
+    fn apply_through_gateway_forwarder(
+        registry: &crate::test_utils::MockRegistry,
+    ) -> Vec<OperationWithMetadata> {
+        let mut host = test_host();
+        let mut rk = RuntimeKeyspaces::init(&mut host).unwrap();
+        let src = bootstrap1();
+        init_account(rk.tez_accounts_mut(), &src.pkh, 1_000_000);
+        reveal_account(rk.tez_accounts_mut(), &src);
+        let emitter = ContractKt1Hash::from_base58_check(CONTRACT_1).unwrap();
+        init_contract(
+            &mut rk,
+            &emitter,
+            SCRIPT_EMITING_INTERNAL_TRANSFER,
+            &Micheline::from(()),
+            &1_000_u64.into(),
+        );
+        let forwarder = ContractKt1Hash::from_base58_check(CONTRACT_2).unwrap();
+        init_contract(
+            &mut rk,
+            &forwarder,
+            GATEWAY_FORWARDER_SCRIPT,
+            &Micheline::from(()),
+            &1_000_u64.into(),
+        );
+        let callees: Vec<Micheline> = vec![Micheline::Bytes(
+            Contract::Originated(forwarder).to_bytes().unwrap(),
+        )];
+        let operation = make_transfer_operation(
+            10,
+            1,
+            100_000,
+            1_000,
+            src,
+            0_u64.into(),
+            Contract::Originated(emitter),
+            Parameters {
+                entrypoint: Entrypoint::default(),
+                value: Micheline::Seq(&callees)
+                    .encode(&mut Gas::default())
+                    .unwrap()
+                    .unwrap(),
+            },
+        );
+        let mut journal = TezosXJournal::new(
+            tezosx_journal::CracId::new(1, 0),
+            TezosXHashes::zero(),
+            tezos_ethereum::block::BlockConstants::dummy(),
+        );
+        ProcessedOperation::into_receipts(
+            validate_and_apply_operation(
+                &mut rk,
+                registry,
+                &mut journal,
+                operation,
+                &block_ctx!(),
+                false,
+                None,
+                None,
+                &test_safe_roots(),
+            )
+            .expect("validate_and_apply_operation should not fail"),
+        )
+    }
+
+    /// In `src → emitter → forwarder → gateway`, the EVM leg catches
+    /// the failure of a nested crossing. Its failed receipt is spliced right
+    /// after `forwarder → gateway`, at the tail of `emitter → forwarder`'s
+    /// subtree. That tail used to be read as the subtree failing, which
+    /// backtracked the whole operation; it now stays applied.
+    #[test]
+    fn caught_crac_failure_at_the_tail_of_a_subtree_keeps_the_operation_applied() {
+        let receipts =
+            apply_through_gateway_forwarder(&registry_catching_a_nested_failure());
+
+        assert_eq!(receipts.len(), 1);
+        let internals = match &receipts[0].receipt {
+            OperationResultSum::Transfer(OperationResult {
+                result: ContentResult::Applied(_),
+                internal_operation_results,
+                ..
+            }) => internal_operation_results,
+            other => panic!("The operation must stay applied, got {other:?}"),
+        };
+        assert_eq!(
+            internals.len(),
+            3,
+            "Expected emitter → forwarder, forwarder → gateway and the caught \
+             failure, got {internals:?}"
+        );
+        assert!(
+            internals[..2].iter().all(InternalOperationSum::is_applied),
+            "The own internal operations must stay applied, got {internals:?}"
+        );
+        assert!(
+            is_failed_transfer(&internals[2]),
+            "The caught failure must keep its failed receipt, got {:?}",
+            internals[2]
+        );
+    }
+
+    /// Run `cross_runtime_transfer` from an implicit account to `dest`.
+    fn run_cross_runtime_transfer(
+        registry: &crate::test_utils::MockRegistry,
+        dest: &Contract,
+        parameters: &Parameters,
+    ) -> Result<crate::CrossRuntimeTransferResult, CracTransferError> {
+        let mut host = test_host();
+        let mut rk = RuntimeKeyspaces::init(&mut host).unwrap();
+        let src = bootstrap1();
+        let sender_account = init_account(rk.tez_accounts_mut(), &src.pkh, 100_000);
+
+        let parser = Parser::new();
+        let mut operation_gas = TezlinkOperationGas::start_milligas(10_000_000)
+            .expect("milligas within limit");
+        let mut tc_ctx = TcCtx {
+            rk: &mut rk,
+            operation_gas: &mut operation_gas,
+            big_map_diff: std::collections::BTreeMap::new(),
+            interpret_context: crate::mir_ctx::InterpretContext::new(),
+            temporary_big_map_id_allocator:
+                tezosx_journal::TemporaryBigMapIdAllocator::new(),
+        };
+        let mut counter = 0u128;
+        let level = BlockNumber { block_number: 0 };
+        let now = Timestamp::from(0);
+        let chain_id = tezos_crypto_rs::hash::ChainId::from([0, 0, 0, 0]);
+        let mut operation_ctx = crate::mir_ctx::OperationCtx {
+            source: &sender_account,
+            counter: &mut counter,
+            level: &level,
+            now: &now,
+            chain_id: &chain_id,
+            source_public_key: &[],
+            crac_chain_depth: 0,
+            crac_origin: None,
+            delegated_storage_cost: 0,
+            applied_counters: std::collections::BTreeSet::new(),
+        };
+        let mut journal = TezosXJournal::new(
+            tezosx_journal::CracId::new(1, 0),
+            TezosXHashes::zero(),
+            tezos_ethereum::block::BlockConstants::dummy(),
+        );
+        let mut nonce_counter: u16 = 0;
+        cross_runtime_transfer(
+            &mut tc_ctx,
+            &mut operation_ctx,
+            registry,
+            &mut journal,
+            &sender_account,
+            &Narith::from(1u64),
+            dest,
+            parameters,
+            &parser,
+            &mut nonce_counter,
+        )
+    }
+
+    /// A crossing that targets the gateway itself, whose EVM leg catches the
+    /// failure of a nested crossing. `transfer` drains the
+    /// failed receipt into the crossing's receipts, where it is the only one,
+    /// and used to make `cross_runtime_transfer` revert the crossing.
+    #[test]
+    fn caught_crac_failure_through_the_gateway_keeps_the_crossing() {
+        let gateway = Contract::Originated(
+            ContractKt1Hash::from_base58_check("KT18oDJJKXMKhfE1bSuAPGp92pYcwVDiqsPw")
+                .unwrap(),
+        );
+        let arena = Arena::new();
+        let mut gas = Gas::default();
+        let call_evm = Micheline::prim2(
+            &arena,
+            mir::lexer::Prim::Pair,
+            Micheline::String("0x3333333333333333333333333333333333333333".to_string()),
+            Micheline::prim2(
+                &arena,
+                mir::lexer::Prim::Pair,
+                Micheline::String("run()".to_string()),
+                Micheline::prim2(
+                    &arena,
+                    mir::lexer::Prim::Pair,
+                    Micheline::Bytes(vec![]),
+                    Micheline::prim0(mir::lexer::Prim::None, &mut gas).unwrap(),
+                    &mut gas,
+                )
+                .unwrap(),
+                &mut gas,
+            )
+            .unwrap(),
+            &mut gas,
+        )
+        .unwrap();
+        let parameters = Parameters {
+            entrypoint: Entrypoint::try_from("call_evm").unwrap(),
+            value: call_evm.encode(&mut Gas::default()).unwrap().unwrap(),
+        };
+        let result = run_cross_runtime_transfer(
+            &registry_catching_a_nested_failure(),
+            &gateway,
+            &parameters,
+        )
+        .unwrap_or_else(|e| panic!("The crossing must succeed, got {:?}", e.error));
+
+        let receipts = &result.internal_receipts;
+        assert_eq!(
+            receipts.len(),
+            1,
+            "Expected the caught failure only, got {receipts:?}"
+        );
+        assert!(
+            is_failed_transfer(&receipts[0]),
+            "The caught failure must keep its failed receipt, got {:?}",
+            receipts[0]
+        );
+    }
+
+    // --- %materialize_alias ---
+
+    /// A registry that materializes aliases like the Michelson runtime does,
+    /// as far as the caller can see: under a world-state snapshot, parking
+    /// the alias origination on the journal. Everything else is the mock's.
+    struct AliasMaterializingRegistry(crate::test_utils::MockRegistry);
+
+    /// The internal operation the registry above parks on the journal, an
+    /// applied one as an alias origination is.
+    fn parked_alias_origination() -> InternalOperationSum {
+        InternalOperationSum::Event(InternalContentWithMetadata {
+            sender: Contract::Originated(
+                ContractKt1Hash::from_base58_check(
+                    "KT1RJ6PbjHpwc3M5rw5s2Nbmefwbuwbdxton",
+                )
+                .unwrap(),
+            ),
+            nonce: 0,
+            content: tezos_tezlink::operation_result::EventContent {
+                ty: mir::serializer::MichelineExpr(vec![]),
+                tag: None,
+                payload: None,
+            },
+            result: ContentResult::Applied(
+                tezos_tezlink::operation_result::EventSuccess {
+                    consumed_milligas: 0u64.into(),
+                },
+            ),
+        })
+    }
+
+    impl tezosx_interfaces::Registry for AliasMaterializingRegistry {
+        type Journal = TezosXJournal;
+
+        #[allow(clippy::too_many_arguments)]
+        fn ensure_alias<Host>(
+            &self,
+            rk: &mut RuntimeKeyspaces<'_, Host, Host::KeySpace>,
+            journal: &mut TezosXJournal,
+            alias_info: tezosx_interfaces::AliasInfo,
+            native_public_key: Option<&[u8]>,
+            target_runtime: RuntimeId,
+            context: tezosx_interfaces::CrossRuntimeContext,
+            gas_remaining: tezosx_interfaces::Gas,
+        ) -> Result<
+            (String, tezosx_interfaces::AliasResolution),
+            tezosx_interfaces::TezosXRuntimeError,
+        >
+        where
+            Host: StorageV1 + KeySpaceLoader,
+        {
+            journal
+                .michelson
+                .checkpoint(
+                    rk.host_mut(),
+                    &OwnedPath::from(
+                        &tezos_evm_runtime::runtime_keyspaces::TEZ_ACCOUNTS_ROOT_PATH,
+                    ),
+                )
+                .unwrap();
+            journal
+                .michelson
+                .push_pending_alias_origination_internal(parked_alias_origination());
+            self.0.ensure_alias(
+                rk,
+                journal,
+                alias_info,
+                native_public_key,
+                target_runtime,
+                context,
+                gas_remaining,
+            )
+        }
+
+        fn alias_exists<Host>(
+            &self,
+            rk: &mut RuntimeKeyspaces<'_, Host, Host::KeySpace>,
+            journal: &mut TezosXJournal,
+            target_runtime: RuntimeId,
+            alias: &str,
+        ) -> Result<bool, tezosx_interfaces::TezosXRuntimeError>
+        where
+            Host: StorageV1 + KeySpaceLoader,
+        {
+            self.0.alias_exists(rk, journal, target_runtime, alias)
+        }
+
+        fn compute_alias(
+            &self,
+            alias_info: &tezosx_interfaces::AliasInfo,
+        ) -> Result<String, tezosx_interfaces::TezosXRuntimeError> {
+            self.0.compute_alias(alias_info)
+        }
+
+        fn address_from_string(
+            &self,
+            address_str: &str,
+            runtime_id: RuntimeId,
+        ) -> Result<Vec<u8>, tezosx_interfaces::TezosXRuntimeError> {
+            self.0.address_from_string(address_str, runtime_id)
+        }
+
+        fn public_key_from_string(
+            &self,
+            public_key: &str,
+            runtime_id: RuntimeId,
+        ) -> Result<Vec<u8>, tezosx_interfaces::TezosXRuntimeError> {
+            self.0.public_key_from_string(public_key, runtime_id)
+        }
+
+        fn read_origin<Host, KS>(
+            &self,
+            rk: &RuntimeKeyspaces<'_, Host, KS>,
+            addr_runtime: RuntimeId,
+            addr: &str,
+            budget: tezosx_interfaces::Gas,
+        ) -> Result<
+            (tezosx_interfaces::Classification, tezosx_interfaces::Gas),
+            tezosx_interfaces::TezosXRuntimeError,
+        >
+        where
+            Host: StorageV1,
+            KS: tezos_smart_rollup_keyspace::KeySpace,
+        {
+            self.0.read_origin(rk, addr_runtime, addr, budget)
+        }
+
+        fn check_is_native_address<Host, KS>(
+            &self,
+            rk: &RuntimeKeyspaces<'_, Host, KS>,
+            addr_runtime: RuntimeId,
+            address: &str,
+            public_key: Option<&str>,
+            budget: &mut tezosx_interfaces::Gas,
+        ) -> Result<(), tezosx_interfaces::TezosXRuntimeError>
+        where
+            Host: StorageV1,
+            KS: tezos_smart_rollup_keyspace::KeySpace,
+        {
+            self.0
+                .check_is_native_address(rk, addr_runtime, address, public_key, budget)
+        }
+
+        fn serve<Host, KS>(
+            &self,
+            rk: &mut RuntimeKeyspaces<'_, Host, KS>,
+            journal: &mut TezosXJournal,
+            request: http::Request<Vec<u8>>,
+        ) -> http::Response<Vec<u8>>
+        where
+            Host: StorageV1 + KeySpaceLoader<KeySpace = KS>,
+            KS: tezos_smart_rollup_keyspace::KeySpace,
+        {
+            self.0.serve(rk, journal, request)
+        }
+    }
+
+    /// An alias materialized by a Michelson operation lands in that
+    /// operation's receipt, right after the gateway call, ahead of the
+    /// `%alias_materialized` event, and leaves no snapshot behind.
+    #[test]
+    fn materialize_alias_from_an_operation_fills_its_receipt() {
+        let mut host = test_host();
+        let mut rk = RuntimeKeyspaces::init(&mut host).unwrap();
+        let src = bootstrap1();
+        init_account(rk.tez_accounts_mut(), &src.pkh, 100);
+        reveal_account(rk.tez_accounts_mut(), &src);
+        let gateway_kt1 =
+            ContractKt1Hash::from_base58_check("KT18oDJJKXMKhfE1bSuAPGp92pYcwVDiqsPw")
+                .unwrap();
+        let arena = Arena::new();
+        let mut gas = Gas::default();
+        let params = Micheline::prim2(
+            &arena,
+            mir::lexer::Prim::Pair,
+            "ethereum".to_string().into(),
+            Micheline::prim2(
+                &arena,
+                mir::lexer::Prim::Pair,
+                "0x7e5f4552091a69125d5dfcb7b8c2659029395bdf"
+                    .to_string()
+                    .into(),
+                Micheline::prim0(mir::lexer::Prim::None, &mut gas).unwrap(),
+                &mut gas,
+            )
+            .unwrap(),
+            &mut gas,
+        )
+        .unwrap();
+        let operation = make_transfer_operation(
+            15,
+            1,
+            100_000,
+            100,
+            src.clone(),
+            0_u64.into(),
+            Contract::Originated(gateway_kt1),
+            Parameters {
+                entrypoint: Entrypoint::try_from("materialize_alias").unwrap(),
+                value: params.encode(&mut Gas::default()).unwrap().unwrap(),
+            },
+        );
+        let registry = AliasMaterializingRegistry(crate::test_utils::MockRegistry::new(
+            "KT1RJ6PbjHpwc3M5rw5s2Nbmefwbuwbdxton",
+        ));
+        let mut journal = TezosXJournal::new(
+            tezosx_journal::CracId::new(1, 0),
+            TezosXHashes::zero(),
+            tezos_ethereum::block::BlockConstants::dummy(),
+        );
+        let receipts = ProcessedOperation::into_receipts(
+            validate_and_apply_operation(
+                &mut rk,
+                &registry,
+                &mut journal,
+                operation,
+                &block_ctx!(),
+                false,
+                None,
+                None,
+                &test_safe_roots(),
+            )
+            .unwrap(),
+        );
+
+        let [receipt] = receipts.as_slice() else {
+            panic!("expected one receipt, got {receipts:?}");
+        };
+        let OperationResultSum::Transfer(OperationResult {
+            result: ContentResult::Applied(_),
+            internal_operation_results,
+            ..
+        }) = &receipt.receipt
+        else {
+            panic!("expected an applied transfer, got {:?}", receipt.receipt);
+        };
+        let [origination, InternalOperationSum::Event(event)] =
+            internal_operation_results.as_slice()
+        else {
+            panic!("expected the alias origination then the event, got {internal_operation_results:?}");
+        };
+        assert_eq!(*origination, parked_alias_origination());
+        assert_eq!(
+            event.content.tag.as_ref().map(|tag| tag.to_string()),
+            Some(crate::enshrined_contracts::ALIAS_MATERIALIZED_EVENT_TAG.to_string())
+        );
+        assert!(journal
+            .michelson
+            .take_pending_alias_origination_internals()
+            .is_empty());
+        assert_eq!(journal.michelson.snapshot_count(), 0);
+        // Where the journal keeps the first snapshot of the accounts.
+        let snapshot =
+            tezos_smart_rollup_host::path::RefPath::assert_from(b"/0/tez/tez_accounts");
+        assert_eq!(rk.host().store_has(&snapshot).unwrap(), None);
+    }
+
+    // --- Tezos alias forwarder tests ---
+
+    /// Test that sending funds to a Tezos alias KT1 triggers the forwarding
+    /// Michelson contract, which calls the TezosXGateway enshrined contract,
+    /// which routes funds cross-runtime via registry.serve().
+    #[test]
+    fn tezos_alias_forwarder_forwards_on_transfer() {
+        let mut host = test_host();
+        let mut rk = RuntimeKeyspaces::init(&mut host).unwrap();
+
+        let evm_address = "0xdeadbeefdeadbeefdeadbeefdeadbeefdeadbeef";
+
+        // Deploy the forwarder contract under the Michelson accounts root
+        // (which is where validate_and_apply_operation reads from)
+        let forwarder_script = r#"
+            parameter unit ;
+            storage string ;
+            code { CDR ;
+                   DUP ;
+                   PUSH string "http://ethereum/" ;
+                   CONCAT ;
+                   NONE (contract bytes) ;
+                   PUSH nat 1 ;
+                   PAIR ;
+                   PUSH bytes 0x ;
+                   PAIR ;
+                   NIL (pair string string) ;
+                   PAIR ;
+                   SWAP ;
+                   PAIR ;
+                   PUSH address "KT18oDJJKXMKhfE1bSuAPGp92pYcwVDiqsPw" ;
+                   CONTRACT %call (pair string (pair (list (pair string string)) (pair bytes (pair nat (option (contract bytes)))))) ;
+                   IF_NONE { PUSH string "gateway" ; FAILWITH } {} ;
+                   SWAP ;
+                   BALANCE ;
+                   SWAP ;
+                   TRANSFER_TOKENS ;
+                   NIL operation ;
+                   SWAP ;
+                   CONS ;
+                   PAIR }
+        "#;
+
+        // Use an arbitrary KT1 for the alias
+        let alias_kt1 =
+            ContractKt1Hash::from_base58_check("KT1QbKzQAyJtzprfvUJZv8VGqwQNch2o89di")
+                .unwrap();
+
+        let storage_micheline = Micheline::String(evm_address.to_string());
+        let _alias_account = init_contract(
+            &mut rk,
+            &alias_kt1,
+            forwarder_script,
+            &storage_micheline,
+            &0_u64.into(),
+        );
+
+        let alias_contract = Contract::Originated(alias_kt1.clone());
+
+        // Set up a source account with funds
+        let src = bootstrap1();
+        let _src_account = init_account(rk.tez_accounts_mut(), &src.pkh, 1_000_000);
+        reveal_account(rk.tez_accounts_mut(), &src);
+
+        // Transfer 50 mutez to the alias KT1
+        let transfer_amount = 50_u64;
+        let operation = make_transfer_operation(
+            15,      // fee
+            1,       // counter
+            500_000, // gas_limit (needs enough for Michelson + gateway)
+            500,     // storage_limit
+            src.clone(),
+            transfer_amount.into(),
+            alias_contract,
+            Parameters::default(), // unit parameter
+        );
+
+        // Use MockRegistry that tracks serve calls
+        let registry = crate::test_utils::MockRegistry::new("KT1_mock_alias".to_string());
+        let processed = validate_and_apply_operation(
+            &mut rk,
+            &registry,
+            &mut TezosXJournal::mock(RuntimeId::Ethereum),
+            operation,
+            &block_ctx!(),
+            false,
+            None,
+            None,
+            &test_safe_roots(),
+        )
+        .expect(
+            "validate_and_apply_operation should not have failed with a kernel error",
+        );
+        let receipt = ProcessedOperation::into_receipts(processed);
+
+        // Verify the operation succeeded
+        assert_eq!(receipt.len(), 1, "There should be one receipt");
+        assert!(
+            matches!(
+                &receipt[0].receipt,
+                OperationResultSum::Transfer(OperationResult {
+                    result: ContentResult::Applied(_),
+                    ..
+                })
+            ),
+            "Expected Applied Transfer result, got {:?}",
+            receipt[0].receipt
+        );
+
+        // Verify serve was called — this means the forwarder called the gateway
+        // which routed the transfer cross-runtime
+        let serve_calls = registry.serve_calls.borrow();
+        assert!(
+            !serve_calls.is_empty(),
+            "serve() should have been called by the gateway (forwarding contract -> gateway -> serve)"
+        );
+
+        // Verify the serve call targeted the ethereum runtime
+        let request = &serve_calls[0];
+        assert_eq!(
+            request.uri().host(),
+            Some("ethereum"),
+            "Cross-runtime call should target the ethereum runtime"
+        );
+
+        // Verify the gateway balance is 0 (funds were forwarded, not locked)
+        let gateway_kt1 =
+            ContractKt1Hash::from_base58_check("KT18oDJJKXMKhfE1bSuAPGp92pYcwVDiqsPw")
+                .unwrap();
+        let gateway_account = context::originated_from_kt1(&gateway_kt1)
+            .expect("Gateway account should exist");
+        assert_eq!(
+            gateway_account.balance(rk.host()).unwrap(),
+            0_u64.into(),
+            "Gateway balance should be 0 after forwarding"
+        );
+    }
+
+    /// Tests that `operation_consumed_milligas` correctly captures gas from
+    /// internal sub-operations (multiple `get_and_reset_milligas_consumed`
+    /// calls within a single manager operation).
+    ///
+    /// Uses `SCRIPT_EMITING_INTERNAL_TRANSFER` which MAP-iterates over a
+    /// list of addresses and emits one `TRANSFER_TOKENS` per address.
+    /// Each internal transfer triggers a separate gas measurement cycle,
+    /// so `total_milligas_consumed` (initial_limit − remaining) is the
+    /// only correct way to compute the total.
+    ///
+    /// Five scenarios:
+    /// 1. **Success**: all internal targets run `UNIT_SCRIPT` → Applied
+    /// 2. **FAILWITH**: one target runs `FAILING_SCRIPT` → BackTracked
+    /// 3. **Out-of-gas**: gas limit too low → Failed, consumes entire limit
+    /// 4. **FAILWITH direct**: transfer to `FAILING_SCRIPT` → Failed, partial gas
+    /// 5. **Skipped**: batch where first op fails → second op Skipped, 0 gas
+    #[test]
+    fn gas_tracking_with_internal_operations() {
+        let mut host = test_host();
+        let mut rk = RuntimeKeyspaces::init(&mut host).unwrap();
+        let src = bootstrap1();
+        init_account(rk.tez_accounts_mut(), &src.pkh, 100_000);
+        reveal_account(rk.tez_accounts_mut(), &src);
+
+        // Chapo contract: emits internal transfers to each address in param
+        let chapo = ContractKt1Hash::from_base58_check(CONTRACT_1).unwrap();
+        init_contract(
+            &mut rk,
+            &chapo,
+            SCRIPT_EMITING_INTERNAL_TRANSFER,
+            &Micheline::from(()),
+            &10_000_u64.into(),
+        );
+
+        // OK target: accepts unit, does nothing
+        let ok_target = ContractKt1Hash::from_base58_check(CONTRACT_2).unwrap();
+        init_contract(
+            &mut rk,
+            &ok_target,
+            UNIT_SCRIPT,
+            &Micheline::from(()),
+            &0_u64.into(),
+        );
+
+        // Fail target: always FAILWITHs
+        let fail_target = ContractKt1Hash::from_base58_check(CONTRACT_3).unwrap();
+        init_contract(
+            &mut rk,
+            &fail_target,
+            FAILING_SCRIPT,
+            &Micheline::from(()),
+            &0_u64.into(),
+        );
+
+        let ok_addr =
+            Micheline::Bytes(Contract::Originated(ok_target.clone()).to_bytes().unwrap());
+        let fail_addr = Micheline::Bytes(
+            Contract::Originated(fail_target.clone())
+                .to_bytes()
+                .unwrap(),
+        );
+
+        // Gas limit that comfortably covers all scenarios except OOG.
+        const AMPLE_GAS: u64 = 21_150;
+
+        // Helper: build, validate and apply an operation with given content
+        // and gas limit. Reads the counter from durable storage each time
+        // so it stays in sync even if an operation is rejected during
+        // validation.
+        let run = |rk: &mut MockRuntimeKeyspaces<'_>,
+                   content: Vec<OperationContent>,
+                   gas_limit: u64|
+         -> Vec<ProcessedOperation> {
+            let counter = context::implicit_from_public_key_hash(&src.pkh)
+                .unwrap()
+                .counter(rk.tez_accounts())
+                .unwrap()
+                .0
+                .to_u64()
+                .unwrap()
+                + 1;
+            let op = make_operation(5, counter, gas_limit, 0, src.clone(), content);
+            validate_and_apply_operation(
+                rk,
+                &NotWiredRegistry,
+                &mut TezosXJournal::mock(RuntimeId::Ethereum),
+                op,
+                &block_ctx!(),
+                false,
+                None,
+                None,
+                &test_safe_roots(),
+            )
+            .expect("should not fail with a kernel error")
+        };
+
+        // Helper: build a direct transfer to a contract with unit parameter.
+        let direct_transfer = |target: &ContractKt1Hash| -> OperationContent {
+            OperationContent::Transfer(TransferContent {
+                amount: 0.into(),
+                destination: Contract::Originated(target.clone()),
+                parameters: Parameters {
+                    entrypoint: mir::ast::Entrypoint::default(),
+                    value: Micheline::from(())
+                        .encode(&mut Gas::default())
+                        .unwrap()
+                        .unwrap(),
+                },
+            })
+        };
+
+        // Helper: build a single transfer-to-chapo content with the given
+        // target addresses as parameter.
+        let chapo_transfer = |addrs: &[Micheline]| -> Vec<OperationContent> {
+            vec![OperationContent::Transfer(TransferContent {
+                amount: 0.into(),
+                destination: Contract::Originated(chapo.clone()),
+                parameters: Parameters {
+                    entrypoint: mir::ast::Entrypoint::default(),
+                    value: Micheline::Seq(addrs)
+                        .encode(&mut Gas::default())
+                        .unwrap()
+                        .unwrap(),
+                },
+            })]
+        };
+
+        // ── Scenario 1: Success ──────────────────────────────────────
+        let addrs_ok = vec![ok_addr.clone(), ok_addr.clone(), ok_addr.clone()];
+        let success = run(&mut rk, chapo_transfer(&addrs_ok), AMPLE_GAS);
+        assert_eq!(success.len(), 1);
+        assert!(
+            matches!(
+                &success[0].operation_with_metadata.receipt,
+                OperationResultSum::Transfer(OperationResult {
+                    result: ContentResult::Applied(_),
+                    ..
+                })
+            ),
+            "Expected Applied, got {:?}",
+            success[0].operation_with_metadata.receipt
+        );
+        let gas_success = success[0].operation_consumed_milligas;
+        assert!(
+            gas_success > 0,
+            "Applied op with internal transfers should consume non-zero gas"
+        );
+
+        // ── Scenario 2: FAILWITH (middle internal target) ────────────
+        let addrs_fail = vec![ok_addr.clone(), fail_addr.clone(), ok_addr.clone()];
+        let failed = run(&mut rk, chapo_transfer(&addrs_fail), AMPLE_GAS);
+        assert_eq!(failed.len(), 1);
+        assert!(
+            matches!(
+                &failed[0].operation_with_metadata.receipt,
+                OperationResultSum::Transfer(OperationResult {
+                    result: ContentResult::BackTracked(_),
+                    ..
+                })
+            ),
+            "Expected BackTracked (internal FAILWITH), got {:?}",
+            failed[0].operation_with_metadata.receipt
+        );
+        let gas_fail = failed[0].operation_consumed_milligas;
+        assert!(
+            gas_fail > 0,
+            "BackTracked op should still report non-zero consumed gas"
+        );
+        assert!(
+            gas_fail < gas_success,
+            "BackTracked gas ({gas_fail}) should be less than success gas ({gas_success}): \
+             the 3rd internal transfer was skipped"
+        );
+
+        // ── Scenario 3: Out-of-gas ──────────────────────────────────
+        // 200 gas = 200_000 milligas. Validation consumes
+        // manager_operation (100k) + check_signature (~65k) ≈ 165k,
+        // leaving ~35k milligas — not enough to interpret the
+        // chapo script.
+        let oog_gas_limit: u64 = 200;
+        let oog = run(&mut rk, chapo_transfer(&addrs_ok), oog_gas_limit);
+        assert_eq!(oog.len(), 1);
+        assert!(
+            matches!(
+                &oog[0].operation_with_metadata.receipt,
+                OperationResultSum::Transfer(OperationResult {
+                    result: ContentResult::Failed(ApplyOperationErrors { errors }),
+                    ..
+                }) if errors.iter().any(|e| match e {
+                    ApplyOperationError::Transfer(TransferError::OutOfGas(gas::OutOfGas)) => true,
+                    ApplyOperationError::Transfer(
+                        TransferError::FailedToExecuteInternalOperation(msg)
+                    ) => msg.contains("Gas exhaustion"),
+                    _ => false,
+                })
+            ),
+            "Expected Failed with gas exhaustion error, got {:?}",
+            oog[0].operation_with_metadata.receipt
+        );
+        let gas_oog = oog[0].operation_consumed_milligas;
+        assert_eq!(
+            u64::from(gas_oog),
+            oog_gas_limit * 1000,
+            "Out-of-gas op should consume its entire gas limit"
+        );
+
+        // ── Scenario 4: Failed (FAILWITH) with partial gas ──────────
+        // Direct transfer to a contract that FAILWITHs immediately.
+        // Unlike scenario 3, the script fails before exhausting gas,
+        // so consumed gas is strictly less than the limit.
+        let fail_direct = run(&mut rk, vec![direct_transfer(&fail_target)], AMPLE_GAS);
+        assert_eq!(fail_direct.len(), 1);
+        assert!(
+            matches!(
+                &fail_direct[0].operation_with_metadata.receipt,
+                OperationResultSum::Transfer(OperationResult {
+                    result: ContentResult::Failed(_),
+                    ..
+                })
+            ),
+            "Expected Failed (FAILWITH), got {:?}",
+            fail_direct[0].operation_with_metadata.receipt
+        );
+        let gas_fail_direct = fail_direct[0].operation_consumed_milligas;
+        assert!(
+            gas_fail_direct > 0,
+            "Failed (FAILWITH) op should consume non-zero gas"
+        );
+        assert!(
+            u64::from(gas_fail_direct) < AMPLE_GAS * 1000,
+            "Failed (FAILWITH) gas ({gas_fail_direct}) should be less than \
+             gas limit ({}) — script fails before exhausting gas",
+            AMPLE_GAS * 1000
+        );
+
+        // ── Scenario 5: Skipped ─────────────────────────────────────
+        // Batch of two operations: first fails (FAILWITH), second is
+        // skipped. Skipped operations consume 0 gas.
+        let skipped = run(
+            &mut rk,
+            vec![
+                direct_transfer(&fail_target), // Op 1 → Failed
+                direct_transfer(&ok_target),   // Op 2 → Skipped
+            ],
+            AMPLE_GAS,
+        );
+        assert_eq!(skipped.len(), 2, "Batch should produce 2 receipts");
+        assert!(
+            matches!(
+                &skipped[0].operation_with_metadata.receipt,
+                OperationResultSum::Transfer(OperationResult {
+                    result: ContentResult::Failed(_),
+                    ..
+                })
+            ),
+            "First op should be Failed, got {:?}",
+            skipped[0].operation_with_metadata.receipt
+        );
+        assert!(
+            matches!(
+                &skipped[1].operation_with_metadata.receipt,
+                OperationResultSum::Transfer(OperationResult {
+                    result: ContentResult::Skipped,
+                    ..
+                })
+            ),
+            "Second op should be Skipped, got {:?}",
+            skipped[1].operation_with_metadata.receipt
+        );
+        assert!(
+            skipped[0].operation_consumed_milligas > 0,
+            "Failed op should consume non-zero gas"
+        );
+        assert_eq!(
+            skipped[1].operation_consumed_milligas, 0,
+            "Skipped op should consume 0 gas"
+        );
+    }
+
+    // --- cross_runtime_transfer metering tests ---
+
+    /// Build a Michelson script that pushes `n` copies of the character 'x' as
+    /// a string then FAILWITHs with it, so the attacker-controlled error body
+    /// is exactly `n` bytes.
+    fn push_failwith_script(n: usize) -> String {
+        let payload = "x".repeat(n);
+        format!(
+            r#"parameter unit;
+               storage unit;
+               code {{ DROP; PUSH string "{payload}"; FAILWITH }}"#
+        )
+    }
+
+    /// Drive a `PUSH string "<n bytes>"; FAILWITH` script through
+    /// `cross_runtime_transfer` and return the `CracTransferError`.
+    ///
+    /// `milligas_limit` is the operation-level budget placed in the
+    /// `TezlinkOperationGas` that `cross_runtime_transfer` charges against.
+    fn run_failwith_crac(
+        n: usize,
+        milligas_limit: u64,
+    ) -> (CracTransferError, u64 /* consumed milligas */) {
+        let mut host = test_host();
+        let mut rk = RuntimeKeyspaces::init(&mut host).unwrap();
+
+        // Sender: an implicit account (tz1).
+        let src = bootstrap1();
+        let sender_account = init_account(rk.tez_accounts_mut(), &src.pkh, 100_000);
+
+        // Destination: a KT1 contract with `PUSH string; FAILWITH`.
+        let dest_kt1 = ContractKt1Hash::from_base58_check(CONTRACT_1).unwrap();
+        init_contract(
+            &mut rk,
+            &dest_kt1,
+            &push_failwith_script(n),
+            &Micheline::from(()),
+            &0_u64.into(),
+        );
+        let dest = Contract::Originated(dest_kt1);
+
+        let parameters = Parameters {
+            entrypoint: mir::ast::Entrypoint::default(),
+            value: Micheline::from(())
+                .encode(&mut Gas::default())
+                .unwrap()
+                .unwrap(),
+        };
+
+        let parser = Parser::new();
+        let mut operation_gas = TezlinkOperationGas::start_milligas(milligas_limit)
+            .expect("milligas within limit");
+        let mut tc_ctx = TcCtx {
+            rk: &mut rk,
+            operation_gas: &mut operation_gas,
+            big_map_diff: std::collections::BTreeMap::new(),
+            interpret_context: crate::mir_ctx::InterpretContext::new(),
+            temporary_big_map_id_allocator:
+                tezosx_journal::TemporaryBigMapIdAllocator::new(),
+        };
+        let mut counter = 0u128;
+        let level = BlockNumber { block_number: 0 };
+        let now = Timestamp::from(0);
+        let chain_id = tezos_crypto_rs::hash::ChainId::from([0, 0, 0, 0]);
+        let mut operation_ctx = crate::mir_ctx::OperationCtx {
+            source: &sender_account,
+            counter: &mut counter,
+            level: &level,
+            now: &now,
+            chain_id: &chain_id,
+            source_public_key: &[],
+            crac_chain_depth: 0,
+            crac_origin: None,
+            delegated_storage_cost: 0,
+            applied_counters: std::collections::BTreeSet::new(),
+        };
+        let mut journal = TezosXJournal::mock(RuntimeId::Ethereum);
+        let mut nonce_counter: u16 = 0;
+
+        let result = cross_runtime_transfer(
+            &mut tc_ctx,
+            &mut operation_ctx,
+            &NotWiredRegistry,
+            &mut journal,
+            &sender_account,
+            &Narith::from(0u64),
+            &dest,
+            &parameters,
+            &parser,
+            &mut nonce_counter,
+        );
+        let err = match result {
+            Ok(_) => panic!("FAILWITH script must return an error"),
+            Err(e) => e,
+        };
+
+        let consumed = u64::from(operation_gas.total_milligas_consumed());
+        (err, consumed)
+    }
+
+    /// Gas consumed by `cross_runtime_transfer` scales with the FAILWITH
+    /// payload length.  The exact delta matches the sum of three
+    /// contributions that grow with `n`:
+    ///
+    /// 1. Storage code read (`STORAGE_READ_PER_BYTE_MILLIGAS` per code byte)
+    /// 2. Micheline decode (`interpret_cost::micheline_decoding_bytes` per code byte)
+    /// 3. `charge_persisted_error` (`PERSISTED_ERROR_PER_BYTE_MILLIGAS` per
+    ///    byte of the persisted Debug body, charged on the one persisted copy
+    ///    of the error — synthetic alias(E_1)→target failed-transfer internal
+    ///    op)
+    ///
+    /// The two scripts differ by exactly `N_LONG - N_SHORT = 190` bytes in
+    /// both binary encoding and rendered error length.
+    #[test]
+    fn cross_runtime_transfer_meters_failwith_body() {
+        // Ample budget: 10 M milligas — well above what either script needs.
+        const BUDGET: u64 = 10_000_000;
+        const N_SHORT: usize = 10;
+        const N_LONG: usize = 200;
+        let (err_short, gas_short) = run_failwith_crac(N_SHORT, BUDGET);
+        let (err_long, gas_long) = run_failwith_crac(N_LONG, BUDGET);
+
+        // Both should fail with an Operation-level error (MichelsonContractInterpretError).
+        assert!(
+            matches!(
+                err_short.error,
+                CracError::Operation(TransferError::MichelsonContractInterpretError(_))
+            ),
+            "expected interpret error (short), got: {:?}",
+            err_short.error
+        );
+        assert!(
+            matches!(
+                err_long.error,
+                CracError::Operation(TransferError::MichelsonContractInterpretError(_))
+            ),
+            "expected interpret error (long), got: {:?}",
+            err_long.error
+        );
+
+        // Exact per-byte delta: encode both scripts to get their binary sizes,
+        // then compute each contribution independently.
+        let parser = mir::parser::Parser::new();
+        let short_script_str = push_failwith_script(N_SHORT);
+        let long_script_str = push_failwith_script(N_LONG);
+        let short_code = parser
+            .parse_top_level(&short_script_str)
+            .unwrap()
+            .encode(&mut Gas::default())
+            .unwrap()
+            .unwrap();
+        let long_code = parser
+            .parse_top_level(&long_script_str)
+            .unwrap()
+            .encode(&mut Gas::default())
+            .unwrap()
+            .unwrap();
+        // Storage read gas (charged per byte of code binary on load).
+        let storage_read_delta = storage_read_cost_milligas(1, long_code.len() as u64)
+            - storage_read_cost_milligas(1, short_code.len() as u64);
+        // Micheline decode gas (charged per byte of code binary on decode).
+        let decode_delta =
+            mir::gas::interpret_cost::micheline_decoding_bytes(long_code.len()).unwrap()
+                as u64
+                - mir::gas::interpret_cost::micheline_decoding_bytes(short_code.len())
+                    .unwrap() as u64;
+        // charge_persisted_error gas (charged per byte of the encoded error).
+        let short_rendered = match &err_short.error {
+            CracError::Operation(te) => te.persisted_len() as u64,
+            other => panic!("expected Operation error (short), got: {other:?}"),
+        };
+        let long_rendered = match &err_long.error {
+            CracError::Operation(te) => te.persisted_len() as u64,
+            other => panic!("expected Operation error (long), got: {other:?}"),
+        };
+        // The error is persisted once (synthetic alias(E_1)→target
+        // failed-transfer entry only), charged per byte over its encoded
+        // length.
+        let metering_delta = u64::from(
+            PERSISTED_ERROR_PER_BYTE_MILLIGAS * (long_rendered - short_rendered),
+        );
+        // CHECK_PRINTABLE gas on the pushed FAILWITH string literal, charged at
+        // typecheck as 10*len+15; the +15 base cancels in the delta.
+        let check_printable_delta = mir::gas::tc_cost::check_printable(N_LONG).unwrap()
+            as u64
+            - mir::gas::tc_cost::check_printable(N_SHORT).unwrap() as u64;
+
+        assert_eq!(
+            gas_long - gas_short,
+            storage_read_delta + decode_delta + metering_delta + check_printable_delta,
+            "exact per-byte delta: storage_read({storage_read_delta}) \
+             + decode({decode_delta}) + metering({metering_delta}) \
+             + check_printable({check_printable_delta})"
+        );
+    }
+
+    /// When the gas budget is too tight to meter the FAILWITH body,
+    /// `cross_runtime_transfer` returns `OutOfGas` AND still records the
+    /// failed CRAC receipt (small — no bloated body), preserving the
+    /// invariant that a failed CRAC receipt is always produced.  The
+    /// `internal_receipts` field on the error is still present (not dropped)
+    /// even on OOG.
+    #[test]
+    fn cross_runtime_transfer_oog_on_large_failwith_body() {
+        // A body that will overflow a tight budget.  We first run with an
+        // ample budget to find the actual gas cost, then re-run with a budget
+        // below that threshold.
+        const N: usize = 500;
+        const AMPLE: u64 = 10_000_000;
+        let (_, gas_ample) = run_failwith_crac(N, AMPLE);
+
+        // Budget just below what the ample run consumed → must OOG.
+        let tight_budget = gas_ample - 1;
+        let (err_tight, _gas_tight) = run_failwith_crac(N, tight_budget);
+
+        assert!(
+            matches!(
+                err_tight.error,
+                CracError::Operation(TransferError::OutOfGas(_))
+            ),
+            "expected OutOfGas on tight budget, got: {:?}",
+            err_tight.error
+        );
+        // Top-level FAILWITH has no internal ops, so internal_receipts is
+        // empty — but it must still be present as a field (not dropped).
+        assert!(
+            err_tight.internal_receipts.is_empty(),
+            "internal_receipts must be present (not dropped) even on OOG; \
+             got: {:?}",
+            err_tight.internal_receipts
+        );
+    }
+
+    /// Drive a CRAC where the top-level contract (`SCRIPT_EMITING_INTERNAL_TRANSFER`)
+    /// issues an internal `TRANSFER_TOKENS` to a `push_failwith_script(n)` contract.
+    /// The outer call succeeds but the inner FAILWITHs, so
+    /// `cross_runtime_transfer` takes the internal-revert branch and returns
+    /// `Err(CracTransferError { error: FailedToExecuteInternalOperation, internal_receipts: [Failed(...)] })`.
+    ///
+    /// Returns `(CracTransferError, consumed_milligas)`.
+    fn run_internal_failwith_crac(
+        n: usize,
+        milligas_limit: u64,
+    ) -> (CracTransferError, u64 /* consumed milligas */) {
+        let mut host = test_host();
+        let mut rk = RuntimeKeyspaces::init(&mut host).unwrap();
+
+        // Sender: implicit account.
+        let src = bootstrap1();
+        let sender_account = init_account(rk.tez_accounts_mut(), &src.pkh, 100_000);
+
+        // Outer contract: issues TRANSFER_TOKENS to a list of addresses.
+        // Balance 100 mutez so it can forward 10 mutez per internal op.
+        let outer_kt1 = ContractKt1Hash::from_base58_check(CONTRACT_1).unwrap();
+        init_contract(
+            &mut rk,
+            &outer_kt1,
+            SCRIPT_EMITING_INTERNAL_TRANSFER,
+            &Micheline::from(()),
+            &100_u64.into(),
+        );
+
+        // Inner contract: FAILWITHs with `n` bytes.
+        let inner_kt1 = ContractKt1Hash::from_base58_check(CONTRACT_2).unwrap();
+        init_contract(
+            &mut rk,
+            &inner_kt1,
+            &push_failwith_script(n),
+            &Micheline::from(()),
+            &0_u64.into(),
+        );
+
+        // Parameter for the outer contract: a single-element list containing the
+        // inner contract's address (binary Micheline representation).
+        let inner_addr_bytes =
+            Contract::Originated(inner_kt1.clone()).to_bytes().unwrap();
+        let inner_micheline_addr = Micheline::Bytes(inner_addr_bytes);
+        let addrs = vec![inner_micheline_addr];
+        let param_micheline = Micheline::Seq(&addrs);
+        let param_bytes = param_micheline
+            .encode(&mut Gas::default())
+            .unwrap()
+            .unwrap();
+
+        let parameters = Parameters {
+            entrypoint: mir::ast::Entrypoint::default(),
+            value: param_bytes,
+        };
+
+        let parser = mir::parser::Parser::new();
+        let mut operation_gas = TezlinkOperationGas::start_milligas(milligas_limit)
+            .expect("milligas within limit");
+        let mut tc_ctx = TcCtx {
+            rk: &mut rk,
+            operation_gas: &mut operation_gas,
+            big_map_diff: std::collections::BTreeMap::new(),
+            interpret_context: crate::mir_ctx::InterpretContext::new(),
+            temporary_big_map_id_allocator:
+                tezosx_journal::TemporaryBigMapIdAllocator::new(),
+        };
+        let mut counter = 0u128;
+        let level = BlockNumber { block_number: 0 };
+        let now = Timestamp::from(0);
+        let chain_id = tezos_crypto_rs::hash::ChainId::from([0, 0, 0, 0]);
+        let mut operation_ctx = crate::mir_ctx::OperationCtx {
+            source: &sender_account,
+            counter: &mut counter,
+            level: &level,
+            now: &now,
+            chain_id: &chain_id,
+            source_public_key: &[],
+            crac_chain_depth: 0,
+            crac_origin: None,
+            delegated_storage_cost: 0,
+            applied_counters: std::collections::BTreeSet::new(),
+        };
+        let mut journal = TezosXJournal::mock(RuntimeId::Ethereum);
+        let mut nonce_counter: u16 = 0;
+
+        let dest = Contract::Originated(outer_kt1);
+        let result = cross_runtime_transfer(
+            &mut tc_ctx,
+            &mut operation_ctx,
+            &NotWiredRegistry,
+            &mut journal,
+            &sender_account,
+            &Narith::from(0u64),
+            &dest,
+            &parameters,
+            &parser,
+            &mut nonce_counter,
+        );
+        let err = match result {
+            Ok(_) => {
+                panic!("cross_runtime_transfer must fail when an internal op FAILWITHs")
+            }
+            Err(e) => e,
+        };
+
+        let consumed = u64::from(operation_gas.total_milligas_consumed());
+        (err, consumed)
+    }
+
+    /// Gas consumed by `cross_runtime_transfer` scales with the FAILWITH
+    /// payload of an **internal** op — closing the bypass by which an
+    /// attacker-controlled `TRANSFER_TOKENS` target could route a large body
+    /// into the persisted receipt without paying gas.
+    ///
+    /// (a) Consumed gas scales with `n` (internal body is metered).
+    /// (b) Under a tight budget the call OOGs AND the `internal_receipts`
+    ///     entry is still present but carries a small (bounded) body.
+    #[test]
+    fn cross_runtime_transfer_meters_internal_failwith_body() {
+        const BUDGET: u64 = 10_000_000;
+        const N_SHORT: usize = 10;
+        const N_LONG: usize = 200;
+
+        let (err_short, gas_short) = run_internal_failwith_crac(N_SHORT, BUDGET);
+        let (err_long, gas_long) = run_internal_failwith_crac(N_LONG, BUDGET);
+
+        // (a) The internal-revert branch is taken: top-level error is
+        // `FailedToExecuteInternalOperation` and internal_receipts are present.
+        assert!(
+            matches!(
+                err_short.error,
+                CracError::Operation(TransferError::FailedToExecuteInternalOperation(_))
+            ),
+            "expected FailedToExecuteInternalOperation (short), got: {:?}",
+            err_short.error
+        );
+        assert!(
+            matches!(
+                err_long.error,
+                CracError::Operation(TransferError::FailedToExecuteInternalOperation(_))
+            ),
+            "expected FailedToExecuteInternalOperation (long), got: {:?}",
+            err_long.error
+        );
+
+        // The internal receipt carries the `Failed` entry.
+        assert_eq!(
+            err_short.internal_receipts.len(),
+            1,
+            "expected one internal receipt (short)"
+        );
+        assert_eq!(
+            err_long.internal_receipts.len(),
+            1,
+            "expected one internal receipt (long)"
+        );
+
+        // Gas scales with the internal FAILWITH body length — metering is applied.
+        assert!(
+            gas_long > gas_short,
+            "longer internal FAILWITH body should cost more gas: \
+             {gas_long} vs {gas_short}"
+        );
+
+        // (b) Under a tight budget the transfer OOGs.
+        // Find the exact cost of the long run then use budget-1.
+        let tight_budget = gas_long - 1;
+        let (err_oog, _) = run_internal_failwith_crac(N_LONG, tight_budget);
+
+        assert!(
+            matches!(
+                err_oog.error,
+                CracError::Operation(TransferError::FailedToExecuteInternalOperation(_))
+                    | CracError::Operation(TransferError::OutOfGas(_))
+            ),
+            "expected operation-level error on OOG (internal-revert path), got: {:?}",
+            err_oog.error
+        );
+
+        // The internal receipt entry must still be present on OOG: the failed
+        // CRAC receipt is always produced even when the body is bounded.
+        assert_eq!(
+            err_oog.internal_receipts.len(),
+            1,
+            "internal_receipts must not be dropped on OOG; got: {:?}",
+            err_oog.internal_receipts
+        );
+
+        // The internal-receipt body must be bounded (not the full n-byte payload):
+        // when OOG the oversized `Failed(errors)` is replaced with
+        // `Failed(OutOfGas)`.
+        let oog_body_len = match &err_oog.internal_receipts[0] {
+            InternalOperationSum::Transfer(r) => match &r.result {
+                ContentResult::Failed(errors) => errors
+                    .errors
+                    .iter()
+                    .map(|e| e.persisted_len())
+                    .sum::<usize>(),
+                other => {
+                    panic!("expected Failed internal receipt on OOG, got: {other:?}")
+                }
+            },
+            other => panic!("expected Transfer internal receipt, got: {other:?}"),
+        };
+        // A bounded body must be much smaller than the N_LONG-byte payload.
+        let long_payload_debug_len = ApplyOperationError::Transfer(
+            TransferError::MichelsonContractInterpretError("x".repeat(N_LONG)),
+        )
+        .persisted_len();
+        assert!(
+            oog_body_len < long_payload_debug_len,
+            "OOG internal receipt body ({oog_body_len} bytes) must be smaller \
+             than the full payload ({long_payload_debug_len} bytes)"
+        );
+    }
+
+    // --- Fee refund test helpers ---
+
+    /// Balance update: fee debited from source account.
+    fn bu_fee_debit(pkh: &PublicKeyHash, fee: u64) -> BalanceUpdate {
+        BalanceUpdate {
+            balance: Balance::Account(Contract::Implicit(pkh.clone())),
+            changes: -(fee as i64),
+            update_origin: UpdateOrigin::BlockApplication,
+        }
+    }
+
+    /// Balance update: fee credited to block fees accumulator.
+    fn bu_fee_credit(fee: u64) -> BalanceUpdate {
+        BalanceUpdate {
+            balance: Balance::BlockFees,
+            changes: fee as i64,
+            update_origin: UpdateOrigin::BlockApplication,
+        }
+    }
+
+    /// Balance update: refund credited back to source account.
+    fn bu_refund_credit(pkh: &PublicKeyHash, amount: u64) -> BalanceUpdate {
+        BalanceUpdate {
+            balance: Balance::Account(Contract::Implicit(pkh.clone())),
+            changes: amount as i64,
+            update_origin: UpdateOrigin::BlockApplication,
+        }
+    }
+
+    /// Balance update: refund debited from block fees accumulator.
+    fn bu_refund_debit(amount: u64) -> BalanceUpdate {
+        BalanceUpdate {
+            balance: Balance::BlockFees,
+            changes: -(amount as i64),
+            update_origin: UpdateOrigin::BlockApplication,
+        }
+    }
+
+    /// Standard base_fee_per_gas for fee refund tests.
+    const TEST_BASE_FEE_PER_GAS: u64 = 10u64.pow(9);
+    /// Standard Michelson-to-EVM gas multiplier for fee refund tests.
+    const TEST_GAS_MULTIPLIER: u64 = 10;
+
+    /// Result of a fee refund test setup.
+    struct RefundTestCtx<'host> {
+        rk: MockRuntimeKeyspaces<'host>,
+        src: Bootstrap,
+        source: TezosImplicitAccount,
+        destination: TezosImplicitAccount,
+        receipt: Vec<OperationWithMetadata>,
+        total_consumed_milligas: u64,
+    }
+
+    impl RefundTestCtx<'_> {
+        /// Extract balance_updates from the first receipt (must be a Transfer).
+        fn balance_updates(&self) -> &[BalanceUpdate] {
+            match &self.receipt[0].receipt {
+                OperationResultSum::Transfer(op_result) => &op_result.balance_updates,
+                other => panic!("Expected Transfer receipt, got {other:?}"),
+            }
+        }
+
+        /// Compute the expected refund: fee - da_fees - michelson_gas_to_mutez(consumed).
+        fn expected_refund(&self, fee: u64, da_fees: u64) -> u64 {
+            let consumed_gas = self.total_consumed_milligas.div_ceil(1000);
+            let consumed_gas_fees = (U256::from(TEST_BASE_FEE_PER_GAS)
+                * U256::from(TEST_GAS_MULTIPLIER)
+                * U256::from(consumed_gas)
+                / U256::exp10(12))
+            .low_u64();
+            fee.saturating_sub(da_fees.saturating_add(consumed_gas_fees))
+        }
+    }
+
+    /// Set up accounts, build a transfer operation, run it through
+    /// `validate_and_apply_operation`, and return the context for assertions.
+    ///
+    /// `da_fees`: if `Some`, a `FeeRefundConfig` is passed; if `None`, no config.
+    fn run_refund_transfer(
+        host: &mut MockKernelHost,
+        fee: u64,
+        amount: u64,
+        initial_src_balance: u64,
+        da_fees: Option<u64>,
+    ) -> RefundTestCtx<'_> {
+        let mut rk = RuntimeKeyspaces::init(host).unwrap();
+
+        let src = bootstrap1();
+        let dst = bootstrap2();
+
+        let source = init_account(rk.tez_accounts_mut(), &src.pkh, initial_src_balance);
+        reveal_account(rk.tez_accounts_mut(), &src);
+        let destination = init_account(rk.tez_accounts_mut(), &dst.pkh, 50);
+
+        let operation = make_transfer_operation(
+            fee,
+            1,
+            21040,
+            5,
+            src.clone(),
+            amount.into(),
+            Contract::Implicit(dst.pkh.clone()),
+            Parameters::default(),
+        );
+
+        let refund_config = da_fees.map(|da| FeeRefundConfig {
+            da_fees: da,
+            base_fee_per_gas: U256::from(TEST_BASE_FEE_PER_GAS),
+            michelson_to_evm_gas_multiplier: TEST_GAS_MULTIPLIER,
+        });
+
+        let processed = validate_and_apply_operation(
+            &mut rk,
+            &NotWiredRegistry,
+            &mut TezosXJournal::mock(RuntimeId::Ethereum),
+            operation,
+            &block_ctx!(),
+            false,
+            None,
+            refund_config,
+            &test_safe_roots(),
+        )
+        .expect("validate_and_apply_operation should succeed");
+
+        let total_consumed_milligas =
+            ProcessedOperation::total_consumed_milligas(&processed);
+        let receipt = ProcessedOperation::into_receipts(processed);
+
+        RefundTestCtx {
+            rk,
+            src,
+            source,
+            destination,
+            receipt,
+            total_consumed_milligas,
+        }
+    }
+
+    // Transfer with fee refund enabled: surplus fees are credited back to source.
+    #[test]
+    fn apply_transfer_with_fee_refund() {
+        let fee: u64 = 1000;
+        let amount: u64 = 30;
+        let initial_balance: u64 = 2000;
+        let da_fees: u64 = 50;
+
+        let mut host = test_host();
+
+        let ctx =
+            run_refund_transfer(&mut host, fee, amount, initial_balance, Some(da_fees));
+        let bus = ctx.balance_updates();
+
+        // With refund: 4 entries (fee debit/credit + refund credit/debit).
+        assert_eq!(bus.len(), 4, "Expected 4 balance_updates, got {:?}", bus);
+
+        assert_eq!(bus[0], bu_fee_debit(&ctx.src.pkh, fee));
+        assert_eq!(bus[1], bu_fee_credit(fee));
+
+        let expected_refund = ctx.expected_refund(fee, da_fees);
+        assert!(expected_refund > 0, "Test expects a positive refund");
+
+        assert_eq!(bus[2], bu_refund_credit(&ctx.src.pkh, expected_refund));
+        assert_eq!(bus[3], bu_refund_debit(expected_refund));
+
+        // Token conservation: all fee-level balance updates sum to zero.
+        let total: i64 = bus.iter().map(|bu| bu.changes).sum();
+        assert_eq!(total, 0, "Fee-level balance updates must sum to zero");
+
+        // Verify final balances.
+        assert_eq!(
+            ctx.source.balance(ctx.rk.host()).unwrap(),
+            (initial_balance - fee + expected_refund - amount).into(),
+            "Source balance should reflect fee, refund, and transfer"
+        );
+        assert_eq!(
+            ctx.destination.balance(ctx.rk.host()).unwrap(),
+            (50 + amount).into(),
+            "Destination balance should increase by transfer amount"
+        );
+    }
+
+    // Transfer with fee refund where costs exceed fee: saturating_sub yields refund = 0.
+    #[test]
+    fn apply_transfer_with_zero_refund() {
+        // Use a very small fee so that da_fees + consumed_gas_fees >= fee,
+        // making the refund saturate to 0.
+        let fee: u64 = 31;
+        let amount: u64 = 5;
+        let da_fees: u64 = 10;
+
+        let mut host = test_host();
+
+        let ctx = run_refund_transfer(&mut host, fee, amount, 100, Some(da_fees));
+        let bus = ctx.balance_updates();
+
+        // With zero refund: only 2 entries (fee debit/credit), no refund entries.
+        assert_eq!(bus.len(), 2, "Expected 2 balance_updates, got {:?}", bus);
+
+        // Source balance = initial - fee - amount (no refund).
+        assert_eq!(
+            ctx.source.balance(ctx.rk.host()).unwrap(),
+            (100 - fee - amount).into(),
+        );
+    }
+
+    // Transfer without fee refund config (None): no refund entries.
+    #[test]
+    fn apply_transfer_without_fee_refund_config() {
+        let fee: u64 = 1000;
+        let amount: u64 = 30;
+
+        let mut host = test_host();
+
+        let ctx = run_refund_transfer(&mut host, fee, amount, 2000, None);
+        let bus = ctx.balance_updates();
+
+        // Without refund config: only 2 entries (fee debit/credit).
+        assert_eq!(bus.len(), 2, "Expected 2 balance_updates, got {:?}", bus);
+
+        // Source balance = initial - fee - amount.
+        assert_eq!(
+            ctx.source.balance(ctx.rk.host()).unwrap(),
+            (2000 - fee - amount).into(),
+        );
+    }
+
+    // Failed transfer with fee refund: refund still applies after revert.
+    // The operation fails (BalanceTooLow) but the source still gets refunded
+    // because fee refund runs after promote/revert, outside the transaction.
+    #[test]
+    fn apply_failed_transfer_with_fee_refund() {
+        let fee: u64 = 1000;
+        let initial_balance: u64 = 2000;
+        let da_fees: u64 = 50;
+        // amount > balance after fee deduction → BalanceTooLow
+        let amount: u64 = initial_balance;
+
+        let mut host = test_host();
+
+        let ctx =
+            run_refund_transfer(&mut host, fee, amount, initial_balance, Some(da_fees));
+
+        // The operation should have failed.
+        assert!(
+            matches!(
+                &ctx.receipt[0].receipt,
+                OperationResultSum::Transfer(OperationResult {
+                    result: ContentResult::Failed(_),
+                    ..
+                })
+            ),
+            "Expected a Failed transfer result"
+        );
+
+        let bus = ctx.balance_updates();
+
+        // Even though the transfer failed, fee refund still produces 4 entries.
+        assert_eq!(bus.len(), 4, "Expected 4 balance_updates, got {:?}", bus);
+
+        assert_eq!(bus[0], bu_fee_debit(&ctx.src.pkh, fee));
+        assert_eq!(bus[1], bu_fee_credit(fee));
+
+        let expected_refund = ctx.expected_refund(fee, da_fees);
+        assert!(expected_refund > 0, "Test expects a positive refund");
+
+        // IMPORTANT: Failed operations MUST consume gas, even though the transfer reverted.
+        // This validates that the refund calculation properly accounts for gas consumption.
+        assert!(
+            ctx.total_consumed_milligas > 0,
+            "Failed operation MUST consume gas; got {} milligas",
+            ctx.total_consumed_milligas
+        );
+
+        assert_eq!(bus[2], bu_refund_credit(&ctx.src.pkh, expected_refund));
+        assert_eq!(bus[3], bu_refund_debit(expected_refund));
+
+        // Token conservation.
+        let total: i64 = bus.iter().map(|bu| bu.changes).sum();
+        assert_eq!(total, 0, "Fee-level balance updates must sum to zero");
+
+        // Source paid fees but got refund; transfer was reverted so amount not deducted.
+        assert_eq!(
+            ctx.source.balance(ctx.rk.host()).unwrap(),
+            (initial_balance - fee + expected_refund).into(),
+            "Source should pay fee minus refund, transfer amount reverted"
+        );
+        // Destination unchanged: transfer was reverted.
+        assert_eq!(
+            ctx.destination.balance(ctx.rk.host()).unwrap(),
+            50_u64.into(),
+            "Destination should be unchanged after failed transfer"
+        );
+    }
+
+    #[test]
+    fn index_address_receipt_diff_emitted_after_state_change() {
+        use crate::context::address_registry;
+        use crate::contract_from_address;
+        use mir::ast::ByteReprTrait;
+
+        const DEST: &str = CONTRACT_1;
+        const A: &str = "tz1Nw5nr152qddEjKT2dKBH8XcBMDAg72iLw";
+
+        let mut host = test_host();
+        let mut rk = RuntimeKeyspaces::init(&mut host).unwrap();
+        // Real networks seed the registry at activation; do the same here.
+        crate::mir_ctx::init_address_registry(rk.tez_accounts_mut()).unwrap();
+        let src = bootstrap1();
+        init_account(rk.tez_accounts_mut(), &src.pkh, 1_000_000);
+        reveal_account(rk.tez_accounts_mut(), &src);
+
+        let dest = ContractKt1Hash::from_base58_check(DEST).unwrap();
+        let account = init_contract(
+            &mut rk,
+            &dest,
+            INDEX_ADDRESS_SCRIPT,
+            &Micheline::from(999i128),
+            &0_u64.into(),
+        );
+
+        let a_hash = mir::ast::AddressHash::from_base58_check(A).unwrap();
+        let a_entry = address_registry::entry_key(&a_hash).unwrap();
+        let baseline_a: Option<Narith> = rk.tez_accounts().read_nom(&a_entry).unwrap();
+        assert_eq!(baseline_a, None, "A must start unregistered");
+
+        let encode_address = |address: &str| {
+            mir::parser::Parser::new()
+                .parse(&format!("\"{address}\""))
+                .unwrap()
+                .encode(&mut Gas::default())
+                .unwrap()
+                .unwrap()
+        };
+
+        let first_operation = make_transfer_operation(
+            10,
+            1,
+            100_000,
+            100,
+            src.clone(),
+            0_u64.into(),
+            Contract::Originated(dest.clone()),
+            Parameters {
+                entrypoint: mir::ast::Entrypoint::default(),
+                value: encode_address(A),
+            },
+        );
+        let first_receipts = ProcessedOperation::into_receipts(
+            validate_and_apply_operation(
+                &mut rk,
+                &NotWiredRegistry,
+                &mut TezosXJournal::mock(RuntimeId::Ethereum),
+                first_operation,
+                &block_ctx!(),
+                false,
+                None,
+                None,
+                &test_safe_roots(),
+            )
+            .expect("first indexing operation should apply"),
+        );
+
+        let first_index: Option<Narith> = rk.tez_accounts().read_nom(&a_entry).unwrap();
+        let first_index = first_index.expect("first INDEX_ADDRESS must register A");
+        let first_storage = Micheline::from(first_index.0.clone())
+            .encode(&mut Gas::default())
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            account.storage(rk.host()).unwrap(),
+            first_storage,
+            "contract storage must record the registered address index"
+        );
+
+        match &first_receipts[0].receipt {
+            OperationResultSum::Transfer(OperationResult {
+                result:
+                    ContentResult::Applied(TransferTarget::ToContract(TransferSuccess {
+                        address_registry_diff,
+                        ..
+                    })),
+                ..
+            }) => {
+                assert_eq!(
+                    address_registry_diff.len(),
+                    1,
+                    "first fresh INDEX_ADDRESS should emit one registry diff"
+                );
+                assert_eq!(
+                    address_registry_diff[0].index,
+                    Zarith(first_index.0.clone().into()),
+                    "receipt diff should carry the allocated index"
+                );
+                assert_eq!(
+                    address_registry_diff[0].address,
+                    contract_from_address(a_hash.clone()).unwrap(),
+                    "receipt diff should carry the indexed address A"
+                );
+            }
+            receipt => panic!("first operation should apply, got {receipt:?}"),
+        }
+
+        let second_operation = make_transfer_operation(
+            10,
+            2,
+            100_000,
+            100,
+            src,
+            0_u64.into(),
+            Contract::Originated(dest),
+            Parameters {
+                entrypoint: mir::ast::Entrypoint::default(),
+                value: encode_address(A),
+            },
+        );
+        let second_receipts = ProcessedOperation::into_receipts(
+            validate_and_apply_operation(
+                &mut rk,
+                &NotWiredRegistry,
+                &mut TezosXJournal::mock(RuntimeId::Ethereum),
+                second_operation,
+                &block_ctx!(),
+                false,
+                None,
+                None,
+                &test_safe_roots(),
+            )
+            .expect("second idempotent indexing operation should apply"),
+        );
+
+        let second_index: Option<Narith> = rk.tez_accounts().read_nom(&a_entry).unwrap();
+        assert_eq!(
+            second_index,
+            Some(first_index),
+            "idempotent INDEX_ADDRESS should keep the first index"
+        );
+        match &second_receipts[0].receipt {
+            OperationResultSum::Transfer(OperationResult {
+                result:
+                    ContentResult::Applied(TransferTarget::ToContract(TransferSuccess {
+                        address_registry_diff,
+                        ..
+                    })),
+                ..
+            }) => assert!(
+                address_registry_diff.is_empty(),
+                "idempotent second INDEX_ADDRESS should not emit a new diff"
+            ),
+            receipt => panic!("second operation should apply, got {receipt:?}"),
+        }
+    }
+
+    /// Script of a parent contract that indexes one address itself and then
+    /// emits an internal transfer of another address to a child contract
+    /// (`parameter (pair child (pair indexed_by_parent sent_to_child))`).
+    const INDEX_THEN_CALL_CHILD_SCRIPT: &str = r#"
+        parameter (pair address (pair address address));
+        storage nat;
+        code {
+            CAR;
+            UNPAIR;
+            CONTRACT address;
+            IF_NONE { PUSH string "Invalid child"; FAILWITH } {};
+            SWAP;
+            UNPAIR;
+            INDEX_ADDRESS;
+            DUG 2;
+            PUSH mutez 0;
+            SWAP;
+            TRANSFER_TOKENS;
+            NIL operation;
+            SWAP;
+            CONS;
+            PAIR
+        }"#;
+
+    const INDEX_ADDRESS_SCRIPT: &str = r#"
+        parameter address;
+        storage nat;
+        code {
+            CAR;
+            INDEX_ADDRESS;
+            NIL operation;
+            PAIR
+        }"#;
+
+    /// Each frame reports only its own registrations: a parent and a child
+    /// that both run INDEX_ADDRESS each keep their own entry on their own
+    /// receipt (as on L1, where the diff is captured at the end of each
+    /// script execution, before the returned internal operations are applied).
+    #[test]
+    fn parent_and_child_index_address_diffs_land_on_their_own_receipts() {
+        use crate::context::address_registry;
+        use crate::contract_from_address;
+        use tezos_tezlink::operation_result::AddressRegistry;
+
+        const PARENT: &str = CONTRACT_1;
+        const CHILD: &str = CONTRACT_2;
+        const P: &str = "tz1Nw5nr152qddEjKT2dKBH8XcBMDAg72iLw";
+        const C: &str = "tz1KqTpEZ7Yob7QbPE4Hy4Wo8fHG8LhKxZSx";
+
+        let mut host = test_host();
+        let mut rk = RuntimeKeyspaces::init(&mut host).unwrap();
+        // Real networks seed the registry at activation; do the same here.
+        crate::mir_ctx::init_address_registry(rk.tez_accounts_mut()).unwrap();
+        let src = bootstrap1();
+        init_account(rk.tez_accounts_mut(), &src.pkh, 1_000_000);
+        reveal_account(rk.tez_accounts_mut(), &src);
+
+        let child = ContractKt1Hash::from_base58_check(CHILD).unwrap();
+        init_contract(
+            &mut rk,
+            &child,
+            INDEX_ADDRESS_SCRIPT,
+            &Micheline::from(999i128),
+            &0_u64.into(),
+        );
+        let parent = ContractKt1Hash::from_base58_check(PARENT).unwrap();
+        init_contract(
+            &mut rk,
+            &parent,
+            INDEX_THEN_CALL_CHILD_SCRIPT,
+            &Micheline::from(999i128),
+            &0_u64.into(),
+        );
+
+        let value = mir::parser::Parser::new()
+            .parse(&format!("Pair \"{CHILD}\" (Pair \"{P}\" \"{C}\")"))
+            .unwrap()
+            .encode(&mut Gas::default())
+            .unwrap()
+            .unwrap();
+        let operation = make_transfer_operation(
+            10,
+            1,
+            200_000,
+            100,
+            src,
+            0_u64.into(),
+            Contract::Originated(parent),
+            Parameters {
+                entrypoint: mir::ast::Entrypoint::default(),
+                value,
+            },
+        );
+        let receipts = ProcessedOperation::into_receipts(
+            validate_and_apply_operation(
+                &mut rk,
+                &NotWiredRegistry,
+                &mut TezosXJournal::mock(RuntimeId::Ethereum),
+                operation,
+                &block_ctx!(),
+                false,
+                None,
+                None,
+                &test_safe_roots(),
+            )
+            .expect("parent operation should apply"),
+        );
+
+        let index_of = |address: &str| -> Zarith {
+            use mir::ast::ByteReprTrait;
+            let hash = mir::ast::AddressHash::from_base58_check(address).unwrap();
+            let entry = address_registry::entry_key(&hash).unwrap();
+            let index: Narith = rk
+                .tez_accounts()
+                .read_nom(&entry)
+                .unwrap()
+                .expect("address must be registered");
+            Zarith(index.0.into())
+        };
+        let expected_diff = |address: &str| {
+            use mir::ast::ByteReprTrait;
+            vec![AddressRegistry {
+                address: contract_from_address(
+                    mir::ast::AddressHash::from_base58_check(address).unwrap(),
+                )
+                .unwrap(),
+                index: index_of(address),
+            }]
+        };
+
+        let internal_operation_results = match &receipts[0].receipt {
+            OperationResultSum::Transfer(OperationResult {
+                result:
+                    ContentResult::Applied(TransferTarget::ToContract(TransferSuccess {
+                        address_registry_diff,
+                        ..
+                    })),
+                internal_operation_results,
+                ..
+            }) => {
+                assert_eq!(
+                    *address_registry_diff,
+                    expected_diff(P),
+                    "parent receipt must carry exactly the parent's registration"
+                );
+                internal_operation_results
+            }
+            receipt => panic!("parent operation should apply, got {receipt:?}"),
+        };
+        assert_eq!(internal_operation_results.len(), 1);
+        match &internal_operation_results[0] {
+            InternalOperationSum::Transfer(InternalContentWithMetadata {
+                result:
+                    ContentResult::Applied(TransferTarget::ToContract(TransferSuccess {
+                        address_registry_diff,
+                        ..
+                    })),
+                ..
+            }) => {
+                assert_eq!(
+                    *address_registry_diff,
+                    expected_diff(C),
+                    "child receipt must carry exactly the child's registration"
+                );
+            }
+            receipt => panic!("internal operation should apply, got {receipt:?}"),
+        }
+    }
+
+    /// A child that registers an address and then fails must not leak its
+    /// (reverted) registration into any receipt: the parent's backtracked
+    /// receipt keeps only the parent's own entry, the child's receipt is
+    /// `Failed`, and the durable registry is rolled back entirely.
+    #[test]
+    fn failed_child_index_address_diff_is_not_reported() {
+        use crate::context::address_registry;
+        use crate::contract_from_address;
+        use mir::ast::ByteReprTrait;
+
+        const PARENT: &str = CONTRACT_1;
+        const CHILD: &str = CONTRACT_2;
+        const P: &str = "tz1Nw5nr152qddEjKT2dKBH8XcBMDAg72iLw";
+        const C: &str = "tz1KqTpEZ7Yob7QbPE4Hy4Wo8fHG8LhKxZSx";
+
+        let mut host = test_host();
+        let mut rk = RuntimeKeyspaces::init(&mut host).unwrap();
+        // Real networks seed the registry at activation; do the same here.
+        crate::mir_ctx::init_address_registry(rk.tez_accounts_mut()).unwrap();
+        let src = bootstrap1();
+        init_account(rk.tez_accounts_mut(), &src.pkh, 1_000_000);
+        reveal_account(rk.tez_accounts_mut(), &src);
+
+        let child = ContractKt1Hash::from_base58_check(CHILD).unwrap();
+        init_contract(
+            &mut rk,
+            &child,
+            r#"
+                parameter address;
+                storage nat;
+                code {
+                    CAR;
+                    INDEX_ADDRESS;
+                    DROP;
+                    PUSH string "child failed after registering";
+                    FAILWITH
+                }"#,
+            &Micheline::from(999i128),
+            &0_u64.into(),
+        );
+        let parent = ContractKt1Hash::from_base58_check(PARENT).unwrap();
+        init_contract(
+            &mut rk,
+            &parent,
+            INDEX_THEN_CALL_CHILD_SCRIPT,
+            &Micheline::from(999i128),
+            &0_u64.into(),
+        );
+
+        let value = mir::parser::Parser::new()
+            .parse(&format!("Pair \"{CHILD}\" (Pair \"{P}\" \"{C}\")"))
+            .unwrap()
+            .encode(&mut Gas::default())
+            .unwrap()
+            .unwrap();
+        let operation = make_transfer_operation(
+            10,
+            1,
+            200_000,
+            100,
+            src,
+            0_u64.into(),
+            Contract::Originated(parent),
+            Parameters {
+                entrypoint: mir::ast::Entrypoint::default(),
+                value,
+            },
+        );
+        let receipts = ProcessedOperation::into_receipts(
+            validate_and_apply_operation(
+                &mut rk,
+                &NotWiredRegistry,
+                &mut TezosXJournal::mock(RuntimeId::Ethereum),
+                operation,
+                &block_ctx!(),
+                false,
+                None,
+                None,
+                &test_safe_roots(),
+            )
+            .expect("operation should produce backtracked receipts"),
+        );
+
+        let internal_operation_results = match &receipts[0].receipt {
+            OperationResultSum::Transfer(OperationResult {
+                result:
+                    ContentResult::BackTracked(BacktrackedResult {
+                        result:
+                            TransferTarget::ToContract(TransferSuccess {
+                                address_registry_diff,
+                                ..
+                            }),
+                        ..
+                    }),
+                internal_operation_results,
+                ..
+            }) => {
+                assert_eq!(
+                    address_registry_diff.len(),
+                    1,
+                    "backtracked parent keeps exactly its own registration"
+                );
+                assert_eq!(
+                    address_registry_diff[0].address,
+                    contract_from_address(
+                        mir::ast::AddressHash::from_base58_check(P).unwrap()
+                    )
+                    .unwrap(),
+                    "the parent's entry must be the address the parent indexed"
+                );
+                internal_operation_results
+            }
+            receipt => panic!("parent should be backtracked, got {receipt:?}"),
+        };
+        assert_eq!(internal_operation_results.len(), 1);
+        assert!(
+            matches!(
+                &internal_operation_results[0],
+                InternalOperationSum::Transfer(InternalContentWithMetadata {
+                    result: ContentResult::Failed(_),
+                    ..
+                })
+            ),
+            "child receipt must be Failed, carrying no registry diff"
+        );
+
+        // The whole operation was reverted: neither address stays registered.
+        for address in [P, C] {
+            let hash = mir::ast::AddressHash::from_base58_check(address).unwrap();
+            let entry = address_registry::entry_key(&hash).unwrap();
+            assert_eq!(
+                rk.tez_accounts().read_nom::<Narith>(&entry).unwrap(),
+                None,
+                "registry write for {address} must be rolled back"
+            );
+        }
+    }
+
+    /// Multiple fresh registrations in one execution are reported in
+    /// registration order, and already-registered addresses contribute no
+    /// entry — mirroring L1's `test_index_address_diffs`
+    /// (tezt/tests/contract_onchain_opcodes.ml).
+    #[test]
+    fn index_address_receipt_diff_is_ordered_and_skips_registered() {
+        use crate::context::address_registry;
+        use crate::contract_from_address;
+        use mir::ast::ByteReprTrait;
+        use num_bigint::BigUint;
+        use tezos_tezlink::operation_result::AddressRegistry;
+
+        const DEST: &str = CONTRACT_1;
+        const X: &str = "tz1Nw5nr152qddEjKT2dKBH8XcBMDAg72iLw";
+        const A: &str = "tz1KqTpEZ7Yob7QbPE4Hy4Wo8fHG8LhKxZSx";
+        const B: &str = "KT1BEqzn5Wx8uJrZNvuS9DVHmLvG9td3fDLi";
+        const C: &str = CONTRACT_2;
+
+        let mut host = test_host();
+        let mut rk = RuntimeKeyspaces::init(&mut host).unwrap();
+        // Real networks seed the registry at activation; do the same here.
+        crate::mir_ctx::init_address_registry(rk.tez_accounts_mut()).unwrap();
+        let src = bootstrap1();
+        init_account(rk.tez_accounts_mut(), &src.pkh, 1_000_000);
+        reveal_account(rk.tez_accounts_mut(), &src);
+
+        let dest = ContractKt1Hash::from_base58_check(DEST).unwrap();
+        let parser = mir::parser::Parser::new();
+        let empty_list = parser.parse("{}").unwrap();
+        init_contract(
+            &mut rk,
+            &dest,
+            r#"
+                parameter (list address);
+                storage (list nat);
+                code {
+                    CAR;
+                    MAP { INDEX_ADDRESS };
+                    NIL operation;
+                    PAIR
+                }"#,
+            &empty_list,
+            &0_u64.into(),
+        );
+
+        let call = |rk: &mut MockRuntimeKeyspaces<'_>, counter: u64, arg: &str| {
+            let value = mir::parser::Parser::new()
+                .parse(arg)
+                .unwrap()
+                .encode(&mut Gas::default())
+                .unwrap()
+                .unwrap();
+            let operation = make_transfer_operation(
+                10,
+                counter,
+                200_000,
+                100,
+                bootstrap1(),
+                0_u64.into(),
+                Contract::Originated(dest.clone()),
+                Parameters {
+                    entrypoint: mir::ast::Entrypoint::default(),
+                    value,
+                },
+            );
+            ProcessedOperation::into_receipts(
+                validate_and_apply_operation(
+                    rk,
+                    &NotWiredRegistry,
+                    &mut TezosXJournal::mock(RuntimeId::Ethereum),
+                    operation,
+                    &block_ctx!(),
+                    false,
+                    None,
+                    None,
+                    &test_safe_roots(),
+                )
+                .expect("indexing operation should apply"),
+            )
+        };
+
+        // Index 0 is reserved for the pre-registered null address (as on L1),
+        // so the first call registers X at index 1.
+        let _ = call(&mut rk, 1, &format!("{{ \"{X}\" }}"));
+
+        // Second call: X is already registered; A, B, C are fresh.
+        let receipts = call(
+            &mut rk,
+            2,
+            &format!("{{ \"{X}\"; \"{A}\"; \"{B}\"; \"{C}\" }}"),
+        );
+
+        let expected: Vec<AddressRegistry> = [(A, 2), (B, 3), (C, 4)]
+            .into_iter()
+            .map(|(address, index)| AddressRegistry {
+                address: contract_from_address(
+                    mir::ast::AddressHash::from_base58_check(address).unwrap(),
+                )
+                .unwrap(),
+                index: Zarith(index.into()),
+            })
+            .collect();
+        match &receipts[0].receipt {
+            OperationResultSum::Transfer(OperationResult {
+                result:
+                    ContentResult::Applied(TransferTarget::ToContract(TransferSuccess {
+                        address_registry_diff,
+                        ..
+                    })),
+                ..
+            }) => assert_eq!(
+                *address_registry_diff, expected,
+                "diff must list the fresh registrations in order, skipping X"
+            ),
+            receipt => panic!("second operation should apply, got {receipt:?}"),
+        }
+
+        // The durable registry matches the reported indices.
+        for (address, index) in [(X, 1u32), (A, 2), (B, 3), (C, 4)] {
+            let hash = mir::ast::AddressHash::from_base58_check(address).unwrap();
+            let entry = address_registry::entry_key(&hash).unwrap();
+            let stored: Narith = rk
+                .tez_accounts()
+                .read_nom(&entry)
+                .unwrap()
+                .expect("address must be registered");
+            assert_eq!(stored.0, BigUint::from(index));
+        }
+    }
+
+    /// Sr1 addresses consume a registry index but are currently absent from
+    /// the receipt diff (see the TODO in `Ctx::index_address`). Pin the
+    /// behaviour so any change is deliberate.
+    #[test]
+    fn sr1_index_address_registers_but_emits_no_receipt_diff() {
+        use crate::context::address_registry;
+        use mir::ast::ByteReprTrait;
+        use num_bigint::BigUint;
+
+        const DEST: &str = CONTRACT_1;
+        const SR1: &str = "sr1RYurGZtN8KNSpkMcCt9CgWeUaNkzsAfXf";
+
+        let mut host = test_host();
+        let mut rk = RuntimeKeyspaces::init(&mut host).unwrap();
+        // Real networks seed the registry at activation; do the same here.
+        crate::mir_ctx::init_address_registry(rk.tez_accounts_mut()).unwrap();
+        let src = bootstrap1();
+        init_account(rk.tez_accounts_mut(), &src.pkh, 1_000_000);
+        reveal_account(rk.tez_accounts_mut(), &src);
+
+        let dest = ContractKt1Hash::from_base58_check(DEST).unwrap();
+        init_contract(
+            &mut rk,
+            &dest,
+            INDEX_ADDRESS_SCRIPT,
+            &Micheline::from(999i128),
+            &0_u64.into(),
+        );
+
+        let value = mir::parser::Parser::new()
+            .parse(&format!("\"{SR1}\""))
+            .unwrap()
+            .encode(&mut Gas::default())
+            .unwrap()
+            .unwrap();
+        let operation = make_transfer_operation(
+            10,
+            1,
+            100_000,
+            100,
+            src,
+            0_u64.into(),
+            Contract::Originated(dest),
+            Parameters {
+                entrypoint: mir::ast::Entrypoint::default(),
+                value,
+            },
+        );
+        let receipts = ProcessedOperation::into_receipts(
+            validate_and_apply_operation(
+                &mut rk,
+                &NotWiredRegistry,
+                &mut TezosXJournal::mock(RuntimeId::Ethereum),
+                operation,
+                &block_ctx!(),
+                false,
+                None,
+                None,
+                &test_safe_roots(),
+            )
+            .expect("sr1 indexing operation should apply"),
+        );
+
+        // Index 0 is reserved for the pre-registered null address, so sr1 is
+        // assigned index 1 and the counter advances to 2.
+        let sr1_hash = mir::ast::Address::from_base58_check(SR1).unwrap().hash;
+        let entry = address_registry::entry_key(&sr1_hash).unwrap();
+        let stored: Narith = rk
+            .tez_accounts()
+            .read_nom(&entry)
+            .unwrap()
+            .expect("sr1 address must be registered");
+        assert_eq!(stored.0, BigUint::from(1u32));
+        let counter: Narith = rk
+            .tez_accounts()
+            .read_nom(&address_registry::COUNTER_KEY)
+            .unwrap()
+            .expect("counter must be initialised");
+        assert_eq!(counter.0, BigUint::from(2u32));
+
+        // …but the receipt diff stays empty.
+        match &receipts[0].receipt {
+            OperationResultSum::Transfer(OperationResult {
+                result:
+                    ContentResult::Applied(TransferTarget::ToContract(TransferSuccess {
+                        address_registry_diff,
+                        ..
+                    })),
+                ..
+            }) => assert!(
+                address_registry_diff.is_empty(),
+                "sr1 registrations are not reported in the receipt diff"
+            ),
+            receipt => panic!("sr1 operation should apply, got {receipt:?}"),
+        }
+    }
+
+    fn origination_success_from_receipts(
+        receipts: &[OperationWithMetadata],
+        index: usize,
+    ) -> &OriginationSuccess {
+        match &receipts[index].receipt {
+            OperationResultSum::Origination(OperationResult {
+                result: ContentResult::Applied(success),
+                ..
+            }) => success,
+            other => {
+                panic!("Expected Applied Origination at index {index}, got: {other:?}")
+            }
+        }
+    }
+
+    /// Origination receipt exposes the contribution of the big-maps
+    /// present in the initial storage.
+    #[test]
+    fn test_origination_bills_initial_big_map() {
+        let mut host = test_host();
+        let mut rk = RuntimeKeyspaces::init(&mut host).unwrap();
+        let src = bootstrap1();
+        init_account(rk.tez_accounts_mut(), &src.pkh, 10_000_000);
+        reveal_account(rk.tez_accounts_mut(), &src);
+
+        let parser = mir::parser::Parser::new();
+        let code = parser
+            .parse_top_level(BIG_MAP_UNIT_SCRIPT)
+            .expect("Failed to parse BIG_MAP_UNIT_SCRIPT")
+            .encode(&mut Gas::default())
+            .unwrap()
+            .unwrap();
+        let storage = parser
+            .parse(r#"Pair { Elt "k" "v" } Unit"#)
+            .expect("Failed to parse initial storage")
+            .encode(&mut Gas::default())
+            .unwrap()
+            .unwrap();
+
+        let operation = make_origination_operation(
+            15,
+            1,
+            100_000,
+            10_000,
+            src.clone(),
+            0,
+            Script {
+                code: code.clone(),
+                storage,
+            },
+        );
+
+        let receipts = ProcessedOperation::into_receipts(
+            validate_and_apply_operation(
+                &mut rk,
+                &NotWiredRegistry,
+                &mut TezosXJournal::mock(RuntimeId::Ethereum),
+                operation,
+                &block_ctx!(),
+                false,
+                None,
+                None,
+                &test_safe_roots(),
+            )
+            .expect("validate_and_apply_operation must not return a kernel error"),
+        );
+
+        assert_eq!(receipts.len(), 1, "Expected one receipt");
+        let success = origination_success_from_receipts(&receipts, 0);
+
+        let empty_storage = parser
+            .parse(r#"Pair {} Unit"#)
+            .expect("Failed to parse empty storage")
+            .encode(&mut Gas::default())
+            .unwrap()
+            .unwrap();
+
+        let mut host2 = test_host();
+        let mut rk2 = RuntimeKeyspaces::init(&mut host2).unwrap();
+        let src2 = bootstrap2();
+        init_account(rk2.tez_accounts_mut(), &src2.pkh, 10_000_000);
+        reveal_account(rk2.tez_accounts_mut(), &src2);
+
+        let operation2 = make_origination_operation(
+            15,
+            1,
+            100_000,
+            10_000,
+            src2.clone(),
+            0,
+            Script {
+                code,
+                storage: empty_storage,
+            },
+        );
+
+        let receipts2 = ProcessedOperation::into_receipts(
+            validate_and_apply_operation(
+                &mut rk2,
+                &NotWiredRegistry,
+                &mut TezosXJournal::mock(RuntimeId::Ethereum),
+                operation2,
+                &block_ctx!(),
+                false,
+                None,
+                None,
+                &test_safe_roots(),
+            )
+            .expect("baseline origination must not fail"),
+        );
+
+        assert_eq!(receipts2.len(), 1, "Expected one baseline receipt");
+        let baseline = origination_success_from_receipts(&receipts2, 0);
+
+        // The 33-byte slot forfait is present in both originations and
+        // cancels in the delta; only the per-key forfait + value size remain.
+        let expected_delta: u64 = 65 + 6;
+        let delta = success.storage_size.0.clone() - baseline.storage_size.0.clone();
+        assert_eq!(delta, expected_delta.into());
+
+        assert_eq!(success.paid_storage_size_diff, success.storage_size);
+    }
+
+    /// Two back-to-back originations on the same `TcCtx` must each
+    /// reflect only their own big-map content — the accumulator must
+    /// be drained between them, not shared.
+    #[test]
+    fn test_origination_anti_contamination() {
+        let mut host = test_host();
+        let mut rk = RuntimeKeyspaces::init(&mut host).unwrap();
+        let src = bootstrap1();
+        init_account(rk.tez_accounts_mut(), &src.pkh, 20_000_000);
+        reveal_account(rk.tez_accounts_mut(), &src);
+
+        let parser = mir::parser::Parser::new();
+        let code = parser
+            .parse_top_level(BIG_MAP_UNIT_SCRIPT)
+            .expect("Failed to parse BIG_MAP_UNIT_SCRIPT")
+            .encode(&mut Gas::default())
+            .unwrap()
+            .unwrap();
+        let storage_a = parser
+            .parse(r#"Pair { Elt "a" "x" } Unit"#)
+            .expect("Failed to parse storage A")
+            .encode(&mut Gas::default())
+            .unwrap()
+            .unwrap();
+        let storage_b = parser
+            .parse(r#"Pair { Elt "b" "yy" } Unit"#)
+            .expect("Failed to parse storage B")
+            .encode(&mut Gas::default())
+            .unwrap()
+            .unwrap();
+
+        let batch = make_operation(
+            15,
+            1,
+            200_000,
+            20_000,
+            src.clone(),
+            vec![
+                OperationContent::Origination(OriginationContent {
+                    balance: 0.into(),
+                    delegate: None,
+                    script: Script {
+                        code: code.clone(),
+                        storage: storage_a,
+                    },
+                }),
+                OperationContent::Origination(OriginationContent {
+                    balance: 0.into(),
+                    delegate: None,
+                    script: Script {
+                        code,
+                        storage: storage_b,
+                    },
+                }),
+            ],
+        );
+
+        let receipts = ProcessedOperation::into_receipts(
+            validate_and_apply_operation(
+                &mut rk,
+                &NotWiredRegistry,
+                &mut TezosXJournal::mock(RuntimeId::Ethereum),
+                batch,
+                &block_ctx!(),
+                false,
+                None,
+                None,
+                &test_safe_roots(),
+            )
+            .expect("validate_and_apply_operation must not return a kernel error"),
+        );
+
+        assert_eq!(receipts.len(), 2);
+        let success_a = origination_success_from_receipts(&receipts, 0);
+        let success_b = origination_success_from_receipts(&receipts, 1);
+
+        assert_eq!(success_a.paid_storage_size_diff, success_a.storage_size);
+        assert_eq!(success_b.paid_storage_size_diff, success_b.storage_size);
+
+        // A and B differ only by `enc("yy") - enc("x") = 1`. Any other
+        // value would mean the accumulator leaked between originations.
+        let size_a = success_a.storage_size.0.clone();
+        let size_b = success_b.storage_size.0.clone();
+        assert_eq!(size_b - size_a, 1u64.into());
+    }
+
+    const PAYER_PKH: &str = "tz1KqTpEZ7Yob7QbPE4Hy4Wo8fHG8LhKxZSx";
+
+    /// [`burn_pass`]: when the parent's storage burn succeeds but the
+    /// internal's burn exhausts the shared budget, the call returns
+    /// `OperationQuotaExceeded` and the *pre-burn* internals are
+    /// surfaced — no half-applied storage-fees entry survives.
+    #[test]
+    fn burn_pass_internal_overshoot_returns_quota_exceeded() {
+        let mut host = test_host();
+        let mut rk = RuntimeKeyspaces::init(&mut host).unwrap();
+        let pkh = PublicKeyHash::from_b58check(PAYER_PKH).unwrap();
+        let payer = init_account(rk.tez_accounts_mut(), &pkh, 10_000_000);
+        let internal = InternalOperationSum::Transfer(InternalContentWithMetadata {
+            sender: payer.contract(),
+            nonce: 0,
+            content: TransferContent {
+                amount: 0_u64.into(),
+                destination: payer.contract(),
+                parameters: Parameters::default(),
+            },
+            result: ContentResult::Applied(TransferTarget::ToContract(TransferSuccess {
+                paid_storage_size_diff: 5_u64.into(),
+                ..Default::default()
+            })),
+        });
+        let mut content: ContentResult<TransferContent> =
+            ContentResult::Applied(TransferTarget::ToContract(TransferSuccess {
+                paid_storage_size_diff: 4_u64.into(),
+                ..Default::default()
+            }));
+        let mut storage_limit_remaining = num_bigint::BigUint::from(8_u64);
+        let (internals, outcome) = burn_pass::<_, TransferContent, _>(
+            rk.host_mut(),
+            &payer,
+            &mut storage_limit_remaining,
+            &mut content,
+            vec![TaggedInternalOp::own(internal, 0)],
+        );
+        assert_eq!(outcome, Err(ApplyOperationError::OperationQuotaExceeded));
+
+        // The returned internal must be the pre-burn one: no
+        // storage-fee balance_updates survived the clone-then-rebuild
+        // rollback.
+        let InternalOperationSum::Transfer(inner) = &internals[0] else {
+            panic!("expected internal Transfer");
+        };
+        let ContentResult::Applied(TransferTarget::ToContract(success)) = &inner.result
+        else {
+            panic!("expected Applied internal target");
+        };
+        assert!(
+            success.balance_updates.is_empty(),
+            "internal must carry no storage-fee balance_updates on rollback",
+        );
+    }
+
+    /// [`burn_pass`]: two internals compete for a shared budget that
+    /// fits the first slot burn but not the second. The
+    /// clone-then-rebuild pass discards the first internal's
+    /// half-applied burn so no storage-fees / payer-debit entry
+    /// survives on any internal.
+    #[test]
+    fn burn_pass_two_internals_share_budget_with_rollback() {
+        let mut host = test_host();
+        let mut rk = RuntimeKeyspaces::init(&mut host).unwrap();
+        let pkh = PublicKeyHash::from_b58check(PAYER_PKH).unwrap();
+        let payer = init_account(rk.tez_accounts_mut(), &pkh, 10_000_000);
+        let make_internal = || {
+            TaggedInternalOp::own(
+                InternalOperationSum::Transfer(InternalContentWithMetadata {
+                    sender: payer.contract(),
+                    nonce: 0,
+                    content: TransferContent {
+                        amount: 0_u64.into(),
+                        destination: payer.contract(),
+                        parameters: Parameters::default(),
+                    },
+                    result: ContentResult::Applied(TransferTarget::ToContract(
+                        TransferSuccess {
+                            allocated_destination_contract: true,
+                            ..Default::default()
+                        },
+                    )),
+                }),
+                0,
+            )
+        };
+        let mut content: ContentResult<TransferContent> = ContentResult::Applied(
+            TransferTarget::ToContract(TransferSuccess::default()),
+        );
+        // Budget fits one slot (257) but not two (514): remainder
+        // after internal 0 is `2 * ORIGINATION_SIZE - 1 - 257 == 256`,
+        // and internal 1 needs 257.
+        let mut storage_limit_remaining =
+            num_bigint::BigUint::from(2 * ORIGINATION_SIZE - 1);
+        let (internals, outcome) = burn_pass::<_, TransferContent, _>(
+            rk.host_mut(),
+            &payer,
+            &mut storage_limit_remaining,
+            &mut content,
+            vec![make_internal(), make_internal()],
+        );
+        assert_eq!(outcome, Err(ApplyOperationError::OperationQuotaExceeded));
+
+        assert_eq!(internals.len(), 2);
+        let payer_contract = payer.contract();
+        for internal in &internals {
+            let InternalOperationSum::Transfer(inner) = internal else {
+                panic!("expected internal Transfer");
+            };
+            let ContentResult::Applied(TransferTarget::ToContract(success)) =
+                &inner.result
+            else {
+                panic!("expected Applied internal target");
+            };
+            assert!(
+                success.balance_updates.iter().all(|bu| {
+                    !matches!(bu.balance, Balance::StorageFees)
+                        && !matches!(&bu.balance, Balance::Account(c) if c == &payer_contract)
+                }),
+                "no storage-fees / payer-debit entry must survive on a rolled-back internal",
+            );
+        }
+    }
+
+    /// [`burn_pass`]: an internal op tagged `Crac` is left untouched —
+    /// no `balance_updates` are appended on it, and its
+    /// `paid_storage_size_diff` does not consume the shared
+    /// `storage_limit`. An `Own` entry sitting next to it is burned
+    /// as usual. The vec order is preserved.
+    #[test]
+    fn burn_pass_skips_crac_tagged_entries() {
+        let mut host = test_host();
+        let mut rk = RuntimeKeyspaces::init(&mut host).unwrap();
+        let pkh = PublicKeyHash::from_b58check(PAYER_PKH).unwrap();
+        let payer = init_account(rk.tez_accounts_mut(), &pkh, 100_000);
+
+        let own_op = InternalOperationSum::Transfer(InternalContentWithMetadata {
+            sender: payer.contract(),
+            nonce: 0,
+            content: TransferContent {
+                amount: 0_u64.into(),
+                destination: payer.contract(),
+                parameters: Parameters::default(),
+            },
+            result: ContentResult::Applied(TransferTarget::ToContract(TransferSuccess {
+                paid_storage_size_diff: 4_u64.into(),
+                ..Default::default()
+            })),
+        });
+        let crac_op = InternalOperationSum::Transfer(InternalContentWithMetadata {
+            sender: payer.contract(),
+            nonce: 1,
+            content: TransferContent {
+                amount: 0_u64.into(),
+                destination: payer.contract(),
+                parameters: Parameters::default(),
+            },
+            result: ContentResult::Applied(TransferTarget::ToContract(TransferSuccess {
+                // Non-zero diff is the worst case: a buggy burn would
+                // try to charge 7 bytes and consume from the budget.
+                paid_storage_size_diff: 7_u64.into(),
+                ..Default::default()
+            })),
+        });
+        let tagged = vec![
+            TaggedInternalOp::own(own_op, 0),
+            TaggedInternalOp::from_crac(crac_op),
+        ];
+        let mut content: ContentResult<TransferContent> = ContentResult::Applied(
+            TransferTarget::ToContract(TransferSuccess::default()),
+        );
+
+        // Storage limit deliberately tight: 4 bytes is just enough for
+        // the Own internal alone. A buggy burn that also charged the
+        // Crac internal (7 bytes) would overshoot and return an error.
+        let mut storage_limit_remaining = num_bigint::BigUint::from(4_u64);
+        let (internals, outcome) = burn_pass::<_, TransferContent, _>(
+            rk.host_mut(),
+            &payer,
+            &mut storage_limit_remaining,
+            &mut content,
+            tagged,
+        );
+        outcome.expect("Own internal must be burned, Crac internal must be skipped");
+
+        // (a) The Own internal got its `Debited / Credited(StorageFees)`
+        // pair, charging 4 × COST_PER_BYTES against the payer's balance.
+        let own_burn = 4 * COST_PER_BYTES;
+        assert_eq!(
+            payer.balance(rk.host()).unwrap(),
+            (100_000 - own_burn).into()
+        );
+
+        assert_eq!(internals.len(), 2);
+
+        // (b) The Own internal's body carries the storage-fee pair.
+        let InternalOperationSum::Transfer(own_after) = &internals[0] else {
+            panic!("expected Own internal at index 0");
+        };
+        let ContentResult::Applied(TransferTarget::ToContract(own_success)) =
+            &own_after.result
+        else {
+            panic!("expected Applied Own");
+        };
+        assert_eq!(own_success.balance_updates.len(), 2);
+
+        // (c) The Crac internal is intact: empty balance_updates.
+        let InternalOperationSum::Transfer(crac_after) = &internals[1] else {
+            panic!("expected Crac internal at index 1");
+        };
+        let ContentResult::Applied(TransferTarget::ToContract(crac_success)) =
+            &crac_after.result
+        else {
+            panic!("expected Applied Crac");
+        };
+        assert!(
+            crac_success.balance_updates.is_empty(),
+            "Crac internal must not have storage-fee balance_updates"
+        );
+
+        // (d) The vec order is preserved (Own first, Crac second).
+        assert_eq!(own_after.nonce, 0);
+        assert_eq!(crac_after.nonce, 1);
+    }
+
+    /// Pins the unparser contract the receipt sites in
+    /// [`execute_pending_operations`] rely on for L2-1831 and L2-1836.
+    ///
+    /// Scope, stated precisely because it is narrower than it looks. The
+    /// consuming and borrowing unparsers are observationally equivalent —
+    /// same output, same charged gas — and differ only in peak heap. So no
+    /// test here can detect which one a receipt site calls, and reverting a
+    /// site to `...unwrap_or_clone()` would leave these green. What they
+    /// do guard is the contract that makes borrowing worth doing: that
+    /// reading through the `Rc` copies nothing, retains nothing, and charges
+    /// before it allocates. Break any of those and the sites become unsafe
+    /// again even while still calling the borrowed walk.
+    ///
+    /// The heap exhaustion itself is not reproducible as a unit test — it
+    /// needs a payload measured in gigabytes. Bounding it, rather than
+    /// reproducing it, is what
+    /// [`an_oversized_payload_runs_out_of_gas_instead_of_allocating`] covers.
+    ///
+    /// These assert on `Rc` identity and refcounts rather than on values,
+    /// because a copy compares equal to its original: only asking whether two
+    /// references denote one allocation distinguishes them.
+    mod receipt_payloads_are_not_copied {
+        use super::*;
+        use mir::ast::RcTypedValue;
+        use mir::typechecker::type_props::TypeProperty;
+        use pretty_assertions::assert_eq;
+
+        /// A payload big enough that a copy is obvious in a profile, small
+        /// enough to stay a fast unit test.
+        fn payload() -> RcTypedValue<'static> {
+            RcTypedValue::new(TypedValue::Bytes(vec![0xab; 64 * 1024]))
+        }
+
+        /// L2-1831: a `DUP`ed operation's occurrences share one parameter, and
+        /// unparsing each occurrence's receipt must leave that sharing intact.
+        ///
+        /// Reverting the site to `param.unwrap_or_clone()` fails this:
+        /// at a strong count above one `try_unwrap` cannot succeed, so it
+        /// deep-copies the 64 KiB buffer — unmetered — once per occurrence.
+        #[test]
+        fn a_shared_transfer_parameter_survives_its_receipt_unparse() {
+            let parser = Parser::new();
+            let mut gas = Gas::default();
+
+            let param = payload();
+            // Two occurrences of one `DUP`ed operation, as
+            // `NIL operation; DUP 2; CONS; SWAP; CONS` produces.
+            let second_occurrence = param.clone();
+            assert_eq!(param.strong_count(), 2);
+
+            for _ in 0..2 {
+                param
+                    .clone_into_micheline_optimized_legacy(
+                        &parser.arena,
+                        &mut gas,
+                        Some(TypeProperty::Passable),
+                    )
+                    .expect("a transfer parameter is Passable, so it is never refused");
+            }
+
+            assert_eq!(
+                param.strong_count(),
+                2,
+                "unparsing both receipts must not clone the shared payload"
+            );
+            assert!(
+                param.ptr_eq(&second_occurrence),
+                "both occurrences must still denote one allocation"
+            );
+        }
+
+        /// L2-1836, unique-operation case: borrowing for the receipt retains
+        /// no reference, so a `CREATE_CONTRACT` that was never `DUP`ed still
+        /// holds its storage alone afterwards.
+        ///
+        /// The previous code was `unwrap_or_clone` on a fresh clone, where the clone
+        /// bumps the count before `try_unwrap` inspects it — so it could never
+        /// succeed, and *every* origination paid a copy, shared or not.
+        ///
+        /// This is only half the picture: see
+        /// [`a_duped_create_contract_shares_one_storage_across_occurrences`]
+        /// for why unique ownership here must not be relied on downstream.
+        #[test]
+        fn a_create_contract_receipt_leaves_its_storage_uniquely_owned() {
+            let parser = Parser::new();
+            let mut gas = Gas::default();
+
+            let storage = payload();
+            assert_eq!(storage.strong_count(), 1);
+
+            storage
+                .clone_into_micheline_optimized_legacy(
+                    &parser.arena,
+                    &mut gas,
+                    Some(TypeProperty::Storable),
+                )
+                .expect("an originated storage is Storable, so it is never refused");
+
+            assert_eq!(
+                storage.strong_count(),
+                1,
+                "the receipt must not retain a reference, so the origination's \
+                 unwrap_or_clone moves rather than copying the storage a second time"
+            );
+            // The move is now possible: nothing else holds the payload.
+            assert!(storage.try_unwrap().is_ok());
+        }
+
+        /// L2-1836, the case that actually bites: a `DUP`ed `CREATE_CONTRACT`
+        /// puts the *same* storage in every occurrence, so the origination
+        /// path cannot assume unique ownership.
+        ///
+        /// ```michelson
+        /// CREATE_CONTRACT { parameter unit ; storage bytes ; ... } ;
+        /// NIL operation ; DUP 2 ; CONS ; SWAP ; CONS ;
+        /// ```
+        ///
+        /// Both occurrences' `OperationInfo` hold `Rc` clones of one payload,
+        /// so a `storage.unwrap_or_clone()` feeding `originate_contract`
+        /// finds a strong count above one, fails to `try_unwrap`, and
+        /// deep-copies — unmetered, and before `handle_storage_with_big_maps`
+        /// charges anything. Threading the `Rc` through instead is what
+        /// removes that copy.
+        #[test]
+        fn a_duped_create_contract_shares_one_storage_across_occurrences() {
+            let parser = Parser::new();
+            let mut gas = Gas::default();
+
+            // One storage, as `CREATE_CONTRACT` builds it...
+            let storage = payload();
+            // ...and two occurrences of the operation carrying it, as
+            // `DUP 2; CONS; SWAP; CONS` produces. Cloning an `OperationInfo`
+            // clones this field, which is an `Rc` bump.
+            let occurrences = [storage.clone(), storage.clone()];
+
+            assert!(
+                occurrences[0].ptr_eq(&occurrences[1]),
+                "a DUPed operation's occurrences must share one storage"
+            );
+            assert!(
+                occurrences[0].strong_count() >= 2,
+                "so unwrap_or_clone on this path could never move — it would copy"
+            );
+
+            // Unparsing the first occurrence's receipt must leave the second
+            // occurrence's storage alone, which is what lets the origination
+            // take it behind the pointer rather than by value.
+            occurrences[0]
+                .clone_into_micheline_optimized_legacy(
+                    &parser.arena,
+                    &mut gas,
+                    Some(TypeProperty::Storable),
+                )
+                .expect("an originated storage is Storable, so it is never refused");
+
+            assert!(
+                storage.ptr_eq(&occurrences[1]),
+                "the receipt must not have detached the shared storage"
+            );
+        }
+
+        /// The bound itself: the walk charges before it clones a leaf, so a
+        /// payload too large for the remaining gas fails *without* allocating
+        /// the copy. This is what turns an abort into a recoverable error.
+        ///
+        /// Swapping a charging constructor (`Micheline::bytes_cloned`) for a
+        /// non-charging one would let this budget through and fail the test.
+        #[test]
+        fn an_oversized_payload_runs_out_of_gas_instead_of_allocating() {
+            let parser = Parser::new();
+            // Far below `unparsing_cost::bytes` for 64 KiB, which is
+            // 125 + 10 milligas per byte.
+            let mut gas = Gas::new(1_000);
+
+            let param = payload();
+            let result = param.clone_into_micheline_optimized_legacy(
+                &parser.arena,
+                &mut gas,
+                Some(TypeProperty::Passable),
+            );
+
+            assert!(
+                matches!(result, Err(mir::ast::BorrowedUnparseError::OutOfGas)),
+                "expected a bounded out-of-gas error, got {result:?}"
+            );
+            assert_eq!(
+                param.strong_count(),
+                1,
+                "running out of gas must not have left a copy behind"
+            );
+        }
+    }
+}

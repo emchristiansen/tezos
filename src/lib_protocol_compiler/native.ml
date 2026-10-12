@@ -28,7 +28,7 @@
 
     The [main] function is the entry point for the forked process.
     While [Updater.compile] is the 'forking' function to be called by
-    the [tezos-node] process.
+    the [octez-node] process.
 
 *)
 
@@ -66,7 +66,7 @@ let pack_objects output objects =
   Asmpackager.package_files
     ~backend
     ~ppf_dump:Format.err_formatter
-    Env.initial_safe_string
+    Protocol_compiler_env.env
     objects
     output ;
   Warnings.check_fatal () ;

@@ -6,9 +6,9 @@
  (public_name tezos-protocol-016-PtMumbai.parameters)
  (instrumentation (backend bisect_ppx))
  (libraries
-  tezos-base
-  tezos-protocol-environment
-  tezos-protocol-016-PtMumbai)
+  octez-libs.base
+  octez-proto-libs.protocol-environment
+  tezos-protocol-016-PtMumbai.protocol)
  (library_flags (:standard -linkall))
  (flags
   (:standard)
@@ -16,12 +16,21 @@
   -open Tezos_protocol_016_PtMumbai)
  (modules (:standard \ gen)))
 
+(rule
+ (targets signature.ml)
+ (action
+  (write-file
+   %{targets}
+   "  module Bls = Tezos_crypto.Signature.Bls\n  module Ed25519 = Tezos_crypto.Signature.Ed25519\n  module P256 = Tezos_crypto.Signature.P256\n  module Secp256k1 = Tezos_crypto.Signature.Secp256k1\n  include Tezos_crypto.Signature.V1")))
+
 (executable
  (name gen)
  (libraries
-  tezos-base
+  octez-rust-deps
+  bls12-381.archive
+  octez-libs.base
   tezos-protocol-016-PtMumbai.parameters
-  tezos-protocol-016-PtMumbai)
+  tezos-protocol-016-PtMumbai.protocol)
  (link_flags
   (:standard)
   (:include %{workspace_root}/macos-link-flags.sexp)

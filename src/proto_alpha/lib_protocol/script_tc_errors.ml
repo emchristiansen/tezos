@@ -62,6 +62,8 @@ type error += Unexpected_operation of Script.location
 
 type error += Unexpected_contract of Script.location
 
+type error += Unpackable_type of Script.location
+
 type error += No_such_entrypoint of Entrypoint.t
 
 type error += Duplicate_entrypoint of Entrypoint.t
@@ -76,8 +78,6 @@ type error += Tx_rollup_invalid_ticket_amount of Z.t
 
 type error += Forbidden_zero_ticket_quantity
 
-type error += Tx_rollup_addresses_disabled of Script.location
-
 (* Smart-contract rollup errors *)
 
 type error += Sc_rollup_disabled of Script.location
@@ -85,6 +85,8 @@ type error += Sc_rollup_disabled of Script.location
 (* Zero Knowledge rollup errors *)
 
 type error += Zk_rollup_disabled of Script.location
+
+type error += Tz5_account_disabled of Script.location
 
 type error += Zk_rollup_bad_deposit_parameter of Script.location * Script.expr
 
@@ -172,6 +174,11 @@ type error += Inconsistent_type_sizes : int * int -> error
 
 type error +=
   | Inconsistent_types : Script.location * Script.expr * Script.expr -> error
+
+type error +=
+  | Unexpected_implicit_account_parameters_type :
+      Script.location * Script.expr
+      -> error
 
 type error +=
   | Inconsistent_memo_sizes : Sapling.Memo_size.t * Sapling.Memo_size.t -> error

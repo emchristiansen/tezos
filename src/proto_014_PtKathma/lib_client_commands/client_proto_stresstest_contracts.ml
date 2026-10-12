@@ -121,11 +121,11 @@ let init (cctxt : Protocol_client_context.full)
       contract_parameters
   in
   (if sum_of_probabilities > 1.0 then
-   failwith "sum of smart contract call probabilities is greater than 1.0!"
-  else return_unit)
+     failwith "sum of smart contract call probabilities is greater than 1.0!"
+   else return_unit)
   >>=? fun () ->
   let init_one (alias, params) =
-    Client_proto_contracts.ContractAlias.get_contract cctxt alias
+    Client_proto_contracts.Contract_alias.get_contract cctxt alias
     >>=? fun contract ->
     (match List.find (fun x -> String.equal alias x.alias) all_contracts with
     | None -> failwith "unknown smart contract alias: %s" alias
@@ -170,7 +170,7 @@ let originate_command =
     ~desc:"Originate all supported smart contracts for use in the stresstest."
     no_options
     (prefixes ["stresstest"; "originate"; "smart"; "contracts"; "from"]
-    @@ ContractAlias.destination_param
+    @@ Contract_alias.destination_param
          ~name:"src"
          ~desc:"name of the source contract"
     @@ stop)

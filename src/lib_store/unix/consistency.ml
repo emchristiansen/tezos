@@ -29,9 +29,10 @@ open Store_errors
 (* A non-empty store is considered consistent if the following
    invariants hold:
 
-   - genesis, caboose, savepoint, checkpoint, current_head associated
-   files exists, are decodable and the blocks they point to may be
-   read in the block store and are consistent with their definition;
+   - genesis, caboose, savepoint, checkpoint and current_head
+   associated files exists, are decodable and the blocks they are
+   pointing to can be read in the block store and are consistent with
+   their definition;
 
    - genesis ≤ caboose ≤ savepoint ≤ [cementing_highwatermark] ≤
    checkpoint ≤ current_head
@@ -42,9 +43,8 @@ open Store_errors
    store.
 *)
 
-(* [check_cementing_highwatermark ~chain_dir block_store] checks that
-   the cementing_highwatermark is consistent with the cemented
-   store. *)
+(* Checks that [cementing_highwatermark] is consistent with the
+   cemented store. *)
 let check_cementing_highwatermark ~cementing_highwatermark block_store =
   let open Lwt_result_syntax in
   let cemented_store = Block_store.cemented_block_store block_store in
@@ -65,27 +65,26 @@ let check_cementing_highwatermark ~cementing_highwatermark block_store =
       return_unit
   | None, None -> return_unit
 
-let is_block_stored block_store (descriptor, expected_metadata, block_name) =
+let is_block_stored block_store ((hash, level), expected_metadata, block_name) =
   let open Lwt_result_syntax in
   let* o =
     Block_store.read_block
       ~read_metadata:expected_metadata
       block_store
-      (Block (fst descriptor, 0))
+      (Block (hash, 0))
   in
   match o with
-  | None -> tzfail (Unexpected_missing_block {block_name})
+  | None -> tzfail (Unexpected_missing_block {block_name; level; hash})
   | Some _block ->
       if expected_metadata then
         (* Force read the metadata of a block to avoid false negatives
            due to the cache.*)
         let* o =
-          Block_store.read_block_metadata
-            block_store
-            (Block (fst descriptor, 0))
+          Block_store.read_block_metadata block_store (Block (hash, 0))
         in
         match o with
-        | None -> tzfail (Unexpected_missing_block_metadata {block_name})
+        | None ->
+            tzfail (Unexpected_missing_block_metadata {block_name; level; hash})
         | Some _ -> return_unit
       else return_unit
 
@@ -150,13 +149,34 @@ let check_invariant ~genesis ~caboose ~savepoint ~cementing_highwatermark
          head = snd current_head;
        })
 
-(* [check_consistency ~store_dir genesis] aims to provide a quick
-   check (in terms of execution time) which checks that files may be
-   read and they are consistent w.r.t to the given invariant.
+let create_lockfile path chain_dir =
+  let open Lwt_syntax in
+  protect (fun () ->
+      let* fd =
+        Lwt_unix.openfile
+          (path chain_dir |> Naming.file_path)
+          [Unix.O_CREAT; O_RDWR; O_CLOEXEC; O_SYNC]
+          0o777
+      in
+      return_ok fd)
+
+(* [check_consistency chain_dir genesis] aims to provide a quick check
+   (in terms of execution time) which checks that files can be read
+   and they are consistent w.r.t to the given invariant.
 
    Hypothesis: an existing store is provided. *)
 let check_consistency chain_dir genesis =
   let open Lwt_result_syntax in
+  let* lockfile_fd = create_lockfile Naming.lockfile chain_dir in
+  let*! () = Lwt_unix.lockf lockfile_fd Unix.F_LOCK 0 in
+  let* block_store_lockfile_fd =
+    create_lockfile Naming.block_store_lockfile chain_dir
+  in
+  let*! () = Lwt_unix.lockf block_store_lockfile_fd Unix.F_LOCK 0 in
+  let* stored_data_lockfile_fd =
+    create_lockfile Naming.stored_data_lockfile chain_dir
+  in
+  let*! () = Lwt_unix.lockf stored_data_lockfile_fd Unix.F_LOCK 0 in
   (* Try loading all the block's data files *)
   let* genesis_data = Stored_data.load (Naming.genesis_block_file chain_dir) in
   let*! genesis_block = Stored_data.get genesis_data in
@@ -180,30 +200,25 @@ let check_consistency chain_dir genesis =
   let* protocol_levels_data =
     Stored_data.load (Naming.protocol_levels_file chain_dir)
   in
-
   let* _invalid_blocks_data =
     Stored_data.load (Naming.invalid_blocks_file chain_dir)
   in
-
   let* _forked_chains_data =
     Stored_data.load (Naming.forked_chains_file chain_dir)
   in
-
   let* _target_data = Stored_data.load (Naming.target_file chain_dir) in
-
-  (* Open the store and try to read the blocks *)
-  (* [~readonly:false] to recover from a potential interrupted merge *)
+  (* Open the store and try to read the blocks. [readonly] is set to
+     false to avoid the Block_store.load to automatically recover from
+     a potential interrupted merge. *)
   let* block_store = Block_store.load chain_dir ~genesis_block ~readonly:true in
   Lwt.finalize
     (fun () ->
-      (* TODO should we check context as well? *)
       let genesis_descr = Block_repr.descriptor genesis_block in
       let expected_blocks =
         [
           (genesis_descr, false, "genesis");
           (caboose, false, "caboose");
           (savepoint, true, "savepoint");
-          (* is this really true? *)
           (checkpoint, true, "checkpoint");
           (current_head, true, "current_head");
         ]
@@ -240,8 +255,19 @@ let check_consistency chain_dir genesis =
           ~current_head
       in
       return_unit)
-    (fun () -> Block_store.close block_store)
+    (fun () ->
+      let*! () = Lwt_unix.lockf stored_data_lockfile_fd Unix.F_ULOCK 0 in
+      let*! () = Lwt_unix.close stored_data_lockfile_fd in
+      let*! () = Lwt_unix.lockf block_store_lockfile_fd Unix.F_ULOCK 0 in
+      let*! () = Lwt_unix.close block_store_lockfile_fd in
+      let*! () = Lwt_unix.lockf lockfile_fd Unix.F_ULOCK 0 in
+      let*! () = Lwt_unix.close lockfile_fd in
+      Block_store.close block_store)
 
+(* [fix_floating_stores chain_dir] fixes the floating store by
+   removing the potential leftover from an interrupted store
+   merge. In addition to that, it fixes the integrity of the existing
+   floating stores. *)
 let fix_floating_stores chain_dir =
   let open Lwt_result_syntax in
   let store_kinds = [Floating_block_store.RO; RW; RW_TMP; RO_TMP] in
@@ -324,10 +350,6 @@ let fix_head chain_dir block_store genesis_block =
               highest_cemented_level
           in
           WithExceptions.Option.get ~loc:__LOC__ o
-          (* If the highest of the floating blocks is genesis and there is
-             at least one cemented file, then it means that the floating
-             blocks were truncated. The head is then chosen as the highest
-             cemented block known. *)
         else return floating_head
   in
   (* Make sure that the inferred head have metadata *)
@@ -360,9 +382,8 @@ let fix_head chain_dir block_store genesis_block =
   in
   return inferred_head
 
-(* Search for the lowest block with metadata (for savepoint) and the
-   lowest block (for caboose) from the cemented store.
-   We assume that the given [cemented_block_files] list is sorted in
+(* Returns the lowest block of the given cemented cycle. As a
+   store invariant, the cemented cycle is expected to be sorted in an
    ascending order (lowest block files comes first). *)
 let lowest_cemented_block cemented_block_files =
   match cemented_block_files with
@@ -412,8 +433,8 @@ let lowest_cemented_metadata cemented_dir =
       let*! m =
         Seq_s.of_seq (Array.to_seq metadata_files)
         |> Seq_s.S.find_map
-             (fun {Cemented_block_store.metadata_file; start_level; end_level}
-             ->
+             (fun
+               {Cemented_block_store.metadata_file; start_level; end_level} ->
                let*! lowest_metadata_entry =
                  Option.catch_s (fun () -> lowest_metadata_entry metadata_file)
                in
@@ -451,9 +472,9 @@ let lowest_head_predecessor_in_floating block_store ~head =
   let highest_cemented_block =
     Cemented_block_store.get_highest_cemented_level cemented_block_store
   in
-  let* head_lafl =
+  let* head_lpbl =
     match Block_repr.metadata head with
-    | Some m -> return m.last_allowed_fork_level
+    | Some m -> return m.last_preserved_block_level
     | None ->
         (*Assumption: head must have metadata *)
         tzfail
@@ -462,8 +483,8 @@ let lowest_head_predecessor_in_floating block_store ~head =
   in
   let start =
     match highest_cemented_block with
-    | Some hcb -> max Int32.(succ hcb) head_lafl
-    | None -> head_lafl
+    | Some hcb -> max Int32.(succ hcb) head_lpbl
+    | None -> head_lpbl
   in
   let head_descr = Block_repr.descriptor head in
   let head_level = Block_repr.level head in
@@ -664,9 +685,10 @@ let fix_savepoint_and_caboose ?history_mode chain_dir block_store head genesis =
       in
       return (savepoint, caboose)
 
-(* [fix_checkpoint chain_dir block_store ~head ~savepoint] fixes the checkpoint by
-   setting it to the last allowed fork level of the current head. If
-   the metadata of this block is not available, the savepoint is used.
+(* [fix_checkpoint chain_dir block_store ~head ~savepoint] fixes the
+   checkpoint by setting it to the last preserved block level of the
+   current head. If the metadata of this block is not available, the
+   savepoint is used.
    Assumptions:
    - head is valid,
    - savepoint is valid,
@@ -684,13 +706,13 @@ let fix_checkpoint chain_dir block_store ~head ~savepoint =
     match head_metadata with
     | None -> return savepoint
     | Some head_metadata -> (
-        let lafl = Block_repr.last_allowed_fork_level head_metadata in
+        let lpbl = Block_repr.last_preserved_block_level head_metadata in
         let* block =
           read_block_at_level
             ~read_metadata:false
             block_store
             ~head:(Block_repr.descriptor head)
-            lafl
+            lpbl
         in
         match block with
         | None -> return savepoint
@@ -724,15 +746,30 @@ let fix_checkpoint chain_dir block_store ~head ~savepoint =
   in
   return inferred_checkpoint
 
-let check_block_protocol_hash context_index ~expected block =
+let check_block_protocol_hash block_store context_index ~expected block =
   let open Lwt_result_syntax in
-  protect @@ fun () ->
-  let*! ctxt = Context.checkout_exn context_index (Block_repr.context block) in
-  let*! got = Context.get_protocol ctxt in
-  return Protocol_hash.(got = expected)
+  protect (fun () ->
+      let* resulting_context_hash_opt =
+        Block_store.resulting_context_hash
+          ~fetch_expect_predecessor_context:(fun () ->
+            let* (module Protocol) = Registered_protocol.get_result expected in
+            return
+              (Protocol.expected_context_hash = Predecessor_resulting_context))
+          block_store
+          (Block (Block_repr.hash block, 0))
+      in
+      match resulting_context_hash_opt with
+      | Some ctxt_hash -> (
+          let*! ctxt = Context_ops.checkout context_index ctxt_hash in
+          match ctxt with
+          | Some ctxt ->
+              let*! got = Context_ops.get_protocol ctxt in
+              return Protocol_hash.(got = expected)
+          | None -> return_false)
+      | None -> return_false)
 
 (** Look into the cemented store for the lowest block with an
-    associated proto level that is above the savepoint. *)
+    associated proto level that is below the savepoint. *)
 let find_activation_blocks_in_cemented block_store ~savepoint_level ~proto_level
     =
   let open Lwt_result_syntax in
@@ -800,16 +837,20 @@ let find_activation_blocks_in_cemented block_store ~savepoint_level ~proto_level
           let min_proto_level = Block_repr.proto_level min_b in
           let max_proto_level = Block_repr.proto_level max_b in
           if Compare.Int.(min_proto_level > proto_level) then
-            (* Too recent *)
+            (* The proto_level was activated below the lower bound of
+               this cycle (in an older cycle), continuing the
+               search. *)
             find_activation_cycle cycle (pred n)
           else if Compare.Int.(max_proto_level < proto_level) then
-            (* Too high, it must be in the previous cycle *)
+            (* The proto_level was activated above the upper bound of
+               this cycle (in a more recent cycle), it must be in the
+               previously searched cycle. *)
             return previous_cycle
           else if
             min_proto_level <= proto_level && proto_level <= max_proto_level
           then
-            (* Activation may have occured in a previous cycle *)
-            find_activation_cycle cycle (pred n)
+            (* Activation have occurred in this cycle. *)
+            return cycle
           else
             (* All cases are covered:
                (proto_level < min) v (max < proto_level) v
@@ -870,7 +911,8 @@ let find_activation_blocks_in_floating block_store ~head ~savepoint_level
         Compare.Int.(
           predecessor_proto_level < block_proto_level
           && block_proto_level = proto_level)
-      then (* Found *)
+      then
+        (* Found *)
         return (block, succ)
       else (* Continue *)
         loop predecessor_proto_level block predecessor
@@ -964,6 +1006,7 @@ let fix_protocol_levels chain_dir block_store context_index genesis
             | Some b ->
                 let* protocol_matches =
                   check_block_protocol_hash
+                    block_store
                     context_index
                     ~expected:proto_info.protocol
                     b
@@ -1023,17 +1066,17 @@ let fix_protocol_levels chain_dir block_store context_index genesis
         let*! protocol =
           let*! ctxt =
             if is_genesis then
-              Context.checkout_exn context_index (Block_repr.context lowest)
+              Context_ops.checkout_exn context_index (Block_repr.context lowest)
             else
               (* The successor of the lowest has the same protocol
                  committed as the lowest and it will be correct
                  whether the context hash semantics is the current's
                  or the predecessor's resulting context. *)
-              Context.checkout_exn
+              Context_ops.checkout_exn
                 context_index
                 (Block_repr.context succ_lowest)
           in
-          Context.get_protocol ctxt
+          Context_ops.get_protocol ctxt
         in
         (* Protocol above savepoints should be registered *)
         let* (module Proto) = Registered_protocol.get_result protocol in

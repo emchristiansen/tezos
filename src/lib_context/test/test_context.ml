@@ -26,11 +26,35 @@
 (* Testing
    -------
    Component:    Context
-   Invocation:   dune build @src/lib_context/runtest
+   Invocation:   dune exec src/lib_context/test/main.exe \
+                  -- --file test_context.ml
    Subject:      On context features.
 *)
 
-module Assert_lib = Lib_test_extra.Assert_lib
+(** Module concerning assertions about raw trees i.e. values of type
+    [[< `Tree of 'a Tezos_base.TzPervasives.String.Map.t | `Value of bytes] as 'a] *)
+module Raw_Tree = struct
+  (** [equal loc msg rt0 rt1] checks that the raw tree [rt0] and [rt1] are equal.
+      Will fail with the message [msg] displaying the location [loc] otherwise *)
+  let equal ?loc ?msg r1 r2 =
+    let rec aux r1 r2 =
+      match (r1, r2) with
+      | `Value v1, `Value v2 ->
+          Assert.Bytes.equal ?loc ?msg v1 v2 ;
+          true
+      | `Tree t1, `Tree t2 ->
+          if not (Tezos_base.TzPervasives.String.Map.equal aux t1 t2) then
+            Assert.String.fail "<tree>" "<tree>" ?msg ?loc
+          else true
+      | `Tree _, `Value v ->
+          Assert.String.fail ?loc ?msg "<tree>" (Bytes.to_string v)
+      | `Value v, `Tree _ ->
+          Assert.String.fail ?loc ?msg (Bytes.to_string v) "<tree>"
+    in
+    let _b : bool = aux r1 r2 in
+    ()
+end
+
 module Assert = Assert
 
 let equal_context_hash ?loc ?msg l1 l2 =
@@ -68,14 +92,16 @@ let chain_id = Chain_id.of_block_hash genesis_block
 (** Test functors *)
 
 (* Context-generic tests *)
-module Make_generic (Tag : sig
-  val tag : string
-end) (Type_parameters : sig
-  type memory_context_tree
-end)
-(Context : Tezos_context_sigs.Context.TEZOS_CONTEXT
-             with type memory_context_tree :=
-               Type_parameters.memory_context_tree) =
+module Make_generic
+    (Tag : sig
+      val tag : string
+    end)
+    (Type_parameters : sig
+      type memory_context_tree
+    end)
+    (Context :
+      Tezos_context_sigs.Context.TEZOS_CONTEXT
+        with type memory_context_tree := Type_parameters.memory_context_tree) =
 struct
   open Context
 
@@ -346,7 +372,7 @@ struct
           in
           Assert.String.List_list.equal ~loc:__LOC__ ecs cs ;
           Assert.String.List_list.equal ~loc:__LOC__ ens ns ;
-          Lwt.return ()
+          Lwt.return_unit
         in
         let* () =
           fold
@@ -405,7 +431,7 @@ struct
           in
           Assert.String.List_list.equal ~loc:__LOC__ ecs cs ;
           Assert.String.List_list.equal ~loc:__LOC__ ens ns ;
-          Lwt.return ()
+          Lwt.return_unit
         in
         let* () =
           fold
@@ -441,7 +467,7 @@ struct
         Assert.Bytes.Option.equal ~loc:__LOC__ None v ;
         let* v1 = Tree.remove v1 [] in
         Assert.Bool.equal ~loc:__LOC__ true (Tree.is_empty v1) ;
-        Lwt.return ()
+        Lwt.return_unit
 
   let test_raw {idx; genesis; _} =
     let* o = checkout idx genesis in
@@ -460,8 +486,8 @@ struct
         let c = String.Map.add "bar" (`Tree b) a in
         let d = String.Map.singleton "foo" (`Tree c) in
         let e = `Tree d in
-        Assert_lib.Raw_Tree.equal ~loc:__LOC__ e raw ;
-        Lwt.return ()
+        Raw_Tree.equal ~loc:__LOC__ e raw ;
+        Lwt.return_unit
 
   let string n = String.make n 'a'
 
@@ -491,7 +517,7 @@ struct
           (Context_hash.of_b58check_exn
              "CoVexcEHMXmSA2k42aNc5MCDtVJFRs3CC6vcQWYwFoj7EFsBPw1c")
           h ;
-        Lwt.return ()
+        Lwt.return_unit
 
   let test_is_empty {idx; block2; _} =
     let* o = checkout idx block2 in
@@ -657,9 +683,6 @@ struct
       test "fold" test_fold;
       test "trees" test_trees;
       test "raw" test_raw;
-      (* NOTE: importing the context from a snapshot requires using an [`Always]
-         indexing strategy. See the docs for [Context.restore_context] for more
-         details. *)
       test "encoding" test_encoding;
       test "get_hash_version" test_get_version_hash;
       test "set_hash_version_tzresult" test_set_version_hash_tzresult;
@@ -667,10 +690,7 @@ struct
       test "proof exn" test_proof_exn;
     ]
 
-  let tests =
-    List.map
-      (fun (s, f) -> Alcotest_lwt.test_case s `Quick (wrap_context_init f))
-      tests
+  let tests = List.map (fun (title, f) -> (title, wrap_context_init f ())) tests
 end
 
 module Generic_disk =
@@ -693,8 +713,12 @@ module Generic_memory =
     end)
     (Tezos_context_memory.Context)
 
-let () =
-  Lwt_main.run
-    (Alcotest_lwt.run
-       "tezos-context"
-       [("context", List.concat [Generic_disk.tests; Generic_memory.tests])])
+let register_test title tags f = Tezt.Test.register ~__FILE__ ~tags ~title @@ f
+
+let register () =
+  List.iter
+    (fun (title, f) -> register_test title ["context"; "disk"] f)
+    Generic_disk.tests ;
+  List.iter
+    (fun (title, f) -> register_test title ["context"; "memory"] f)
+    Generic_memory.tests

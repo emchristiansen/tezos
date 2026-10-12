@@ -55,6 +55,11 @@ type reveal_proof =
     }
       (** The existence or not of a confirmed slot for a given page ID when the
           [input_requested] is the [Needs_reveal Request_dal_page]. *)
+  | Dal_parameters_proof
+      (** Proof for revealing DAL parameters that were used for the slots
+          published at [published_level]. The [published_level] parameter
+          enables the kernel to retrieve historical DAL parameters,
+          eliminating the need for each kernel to store past DAL parameters. *)
 
 (** A PVM proof [pvm_step] is combined with an [input_proof] to provide
     the proof necessary to validate a single step in the refutation
@@ -148,23 +153,26 @@ val stop_of_pvm_step :
         output from the [input] proof is too recent to be allowed into
         the PVM proof ;
 
-      - DAL parameters and [dal_attestation_lag], to be able to check the page
-        content membership to a slot if needed ;
+      - DAL related parameters, to be able to check the page content membership
+        to a slot or check the revealed parameters if needed ;
 
       - the [pvm_name], used to check that the proof given has the right
         PVM kind.
 
+      - The level at which DAL is activated (None if the DAL is not enabled).
     It also returns the optional input executed during the proof and the
-    input_request for the state at the beginning of the proof.
-*)
+    input_request for the state at the beginning of the proof. *)
 val valid :
   pvm:('state, 'proof, 'output) Sc_rollups.PVM.implementation ->
   metadata:Sc_rollup_metadata_repr.t ->
   Sc_rollup_inbox_repr.history_proof ->
   Raw_level_repr.t ->
   Dal_slot_repr.History.t ->
-  Dal_slot_repr.parameters ->
-  dal_attestation_lag:int ->
+  find_dal_parameters:
+    (Raw_level_repr.t -> Constants_parametric_repr.dal tzresult Lwt.t) ->
+  dal_activation_level:Raw_level_repr.t option ->
+  is_reveal_enabled:Sc_rollup_PVM_sig.is_reveal_enabled ->
+  dal_attested_slots_validity_lag:int ->
   'proof t ->
   (Sc_rollup_PVM_sig.input option * Sc_rollup_PVM_sig.input_request) tzresult
   Lwt.t
@@ -217,17 +225,14 @@ module type PVM_with_context_and_state = sig
     val page_info :
       (Dal_slot_repr.Page.content * Dal_slot_repr.Page.proof) option
 
-    (** Some parameters of the DAL. Needed when checking a page's proof against
-        a slot's {!val: Dal_slot_repr.commitment}. *)
-    val dal_parameters : Dal_slot_repr.parameters
+    (** The level at which the DAL got activated, [None] if the DAL has not yet been activated. *)
+    val dal_activation_level : Raw_level_repr.t option
 
-    (** The lag between the time an endorsement is published on L1
-        (its published_level) and the level it should be confirmed. *)
-    val dal_attestation_lag : int
+    val dal_attested_slots_validity_lag : int
   end
 end
 
-(** [produce ~metadata pvm_and_state inbox_context inbox_history
+(** [produce ~metadata ~find_dal_parameters pvm_and_state inbox_context inbox_history
     commit_inbox_level] will construct a full refutation game proof out of
     the [state] given in [pvm_and_state].  It uses the [inbox] if necessary to
     provide input in the proof. If the input is above or at [commit_level] it
@@ -250,9 +255,47 @@ end
 *)
 val produce :
   metadata:Sc_rollup_metadata_repr.t ->
+  find_dal_parameters:
+    (Raw_level_repr.t -> Constants_parametric_repr.dal tzresult Lwt.t) ->
   (module PVM_with_context_and_state) ->
   Raw_level_repr.t ->
+  is_reveal_enabled:Sc_rollup_PVM_sig.is_reveal_enabled ->
   serialized t tzresult Lwt.t
+
+module Dal_helpers : sig
+  (** We consider that a DAL page or slot published at a level [published_level]
+      is valid, and produce or verify a proof for it if, and only if, the level
+      is in the following boundaries:
+
+      - DAL is activated and [published_level] >= [dal_activation_level]
+
+      - [published_level] > [origination_level]: this means that the slot of the
+        page was published after the rollup origination
+
+      - (attestation complete) [published_level] + [dal_attestation_lag] <=
+        [import_inbox_level]: this means that the slot of the page has been
+        attested before or at the [import_inbox_level]
+
+      - (TTL not expired) [published_level] + [dal_attestation_lag] -
+        [dal_attested_slots_validity_lag] >= [import_inbox_level]: this means that
+        slot TTL has not expired
+
+      The [dal_attestation_lag] is given by the [lag_check] value.
+      When [lag_check] is [Exact lag], then [dal_attestation_lag] is [lag].
+      When [lag_check] is [Lag_interval (min_lag, max_lag)], then
+      [dal_attestation_lag] is [min_lag] for the "attestation complete" check,
+      and is [max_lag] for the "TTL not expired" check. This means that the
+      function returns [true] if there exists at least one lag in the interval
+      for which the page would be valid. *)
+  val import_level_is_valid :
+    dal_activation_level:Raw_level_repr.t option ->
+    lag_check:Dal_slot_repr.History.lag_check ->
+    origination_level:Raw_level_repr.t ->
+    import_inbox_level:Raw_level_repr.t ->
+    published_level:Raw_level_repr.t ->
+    dal_attested_slots_validity_lag:int ->
+    bool
+end
 
 (**/**)
 

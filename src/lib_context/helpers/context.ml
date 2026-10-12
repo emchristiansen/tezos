@@ -65,6 +65,33 @@ module Make_config (Conf : Conf) = struct
       ~inode_child_order:Conf.inode_child_order
 end
 
+type raw = [`Value of bytes | `Tree of raw String.Map.t]
+
+let raw_encoding : raw Data_encoding.t =
+  let open Data_encoding in
+  mu "Tree.raw" (fun encoding ->
+      let map_encoding =
+        conv
+          String.Map.bindings
+          (fun bindings -> String.Map.of_seq (List.to_seq bindings))
+          (list (tup2 string encoding))
+      in
+      union
+        [
+          case
+            ~title:"tree"
+            (Tag 0)
+            map_encoding
+            (function `Tree t -> Some t | `Value _ -> None)
+            (fun t -> `Tree t);
+          case
+            ~title:"value"
+            (Tag 1)
+            bytes
+            (function `Value v -> Some v | `Tree _ -> None)
+            (fun v -> `Value v);
+        ])
+
 module Make_tree (Conf : Conf) (Store : DB) = struct
   include Store.Tree
   include Make_config (Conf)
@@ -125,8 +152,8 @@ module Make_tree (Conf : Conf) (Store : DB) = struct
     | `Tree l -> raw_of_node (fun l -> k (`Tree (String.Map.of_seq l))) l
     | `Contents (v, _) -> k (`Value v)
 
-  and raw_of_node :
-      type a. ((string * raw) Seq.t -> a) -> (string * concrete) list -> a =
+  and raw_of_node : type a.
+      ((string * raw) Seq.t -> a) -> (string * concrete) list -> a =
    fun k -> function
     | [] -> k Seq.empty
     | (n, v) :: t ->
@@ -144,8 +171,8 @@ module Make_tree (Conf : Conf) (Store : DB) = struct
     | `Tree l -> concrete_of_node (fun l -> k (`Tree l)) (String.Map.to_seq l)
     | `Value v -> k (`Contents (v, ()))
 
-  and concrete_of_node :
-      type a. ((string * concrete) list -> a) -> (string * raw) Seq.t -> a =
+  and concrete_of_node : type a.
+      ((string * concrete) list -> a) -> (string * raw) Seq.t -> a =
    fun k seq ->
     match seq () with
     | Nil -> k []
@@ -156,30 +183,7 @@ module Make_tree (Conf : Conf) (Store : DB) = struct
 
   let of_raw = concrete_of_raw Store.Tree.of_concrete
 
-  let raw_encoding : raw Data_encoding.t =
-    let open Data_encoding in
-    mu "Tree.raw" (fun encoding ->
-        let map_encoding =
-          conv
-            String.Map.bindings
-            (fun bindings -> String.Map.of_seq (List.to_seq bindings))
-            (list (tup2 string encoding))
-        in
-        union
-          [
-            case
-              ~title:"tree"
-              (Tag 0)
-              map_encoding
-              (function `Tree t -> Some t | `Value _ -> None)
-              (fun t -> `Tree t);
-            case
-              ~title:"value"
-              (Tag 1)
-              bytes
-              (function `Value v -> Some v | `Tree _ -> None)
-              (fun v -> `Value v);
-          ])
+  let raw_encoding = raw_encoding
 
   (** [unshallow t] is the tree equivalent to [t] but with all subtrees evaluated,
     i.e. without "reference" nodes.
@@ -234,7 +238,7 @@ module Make_tree (Conf : Conf) (Store : DB) = struct
                 hash
             in
             raise (Context_dangling_hash str)
-        | exn -> raise exn)
+        | exn -> Lwt.reraise exn)
 
   let add_tree tree key value =
     Lwt.catch
@@ -250,7 +254,7 @@ module Make_tree (Conf : Conf) (Store : DB) = struct
                 hash
             in
             raise (Context_dangling_hash str)
-        | exn -> raise exn)
+        | exn -> Lwt.reraise exn)
 end
 
 module Proof_encoding = Tezos_context_merkle_proof_encoding
@@ -277,8 +281,8 @@ struct
         | Inode i -> Inode (to_inode to_inode_tree i)
         | Extender e -> Extender (to_inode_extender to_inode_tree e)
 
-      and to_inode_extender :
-          type a b. (a -> b) -> a DB_proof.inode_extender -> b inode_extender =
+      and to_inode_extender : type a b.
+          (a -> b) -> a DB_proof.inode_extender -> b inode_extender =
        fun f {length; segments = segment; proof} ->
         {length; segment; proof = f proof}
 
@@ -301,8 +305,8 @@ struct
         | Inode i -> Inode (of_inode of_inode_tree i)
         | Extender e -> Extender (of_inode_extender of_inode_tree e)
 
-      and of_inode_extender :
-          type a b. (a -> b) -> a inode_extender -> b DB_proof.inode_extender =
+      and of_inode_extender : type a b.
+          (a -> b) -> a inode_extender -> b DB_proof.inode_extender =
        fun f {length; segment = segments; proof} ->
         {length; segments; proof = f proof}
 

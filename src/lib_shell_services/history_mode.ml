@@ -42,12 +42,11 @@ type t =
   | Rolling of additional_cycles option
 
 (* The default_offset value defines a window of stored cycles which is
-   suitable for baking services. It currently corresponds to 6 as we
-   store 1 cycle below the last allowed fork level of the current
-   head, which is set to [preserved_cycles] cycles in the past.
-   TODO: https://gitlab.com/tezos/tezos/-/issues/1406
+   suitable for baking services. It currently corresponds to 2 as we
+   store 1 cycle below the last preserved block level of the current
+   head, which is set to [blocks_preservation_cycles] cycles in the past.
    As this value is potentially both network and protocol specific, it
-   could be lifted as a protocol value or an hardcoded node
+   could be lifted as a protocol value or a hardcoded node
    configuration argument. *)
 let default_offset = 1
 
@@ -57,7 +56,7 @@ let default_full = Full None
 
 let default_rolling = Rolling None
 
-let default = default_full
+let default = default_rolling
 
 module Legacy = struct
   type t = Archive | Full | Rolling
@@ -125,8 +124,8 @@ let encoding =
          case
            ~title:"rolling"
            ~description:
-             "Rolling mode only retain the most recent cycles by periodically \
-              periodically discarding older blocks to reduce the storage size."
+             "Rolling mode only retains the most recent cycles by periodically \
+              discarding older blocks to reduce the storage size."
            (Tag 2)
            (obj1 (req "rolling" additional_cycles_encoding))
            (function

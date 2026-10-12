@@ -1,0 +1,1424 @@
+// SPDX-FileCopyrightText: 2025 Functori <contact@functori.com>
+//
+// SPDX-License-Identifier: MIT
+
+use crate::{
+    apply::{extract_cross_runtime_effects, RuntimeExecutionInfo, TezosExecutionInfo},
+    block_in_progress::BlockInProgress,
+    blueprint_storage::{DelayedTransactionFetchingResult, EVMBlockHeader},
+    bridge::{execute_tezlink_deposit, Deposit, TEZLINK_DEPOSITOR},
+    configuration::EVM_CHAIN_ID,
+    delayed_inbox::DelayedInbox,
+    error,
+    fees::{DEFAULT_MICHELSON_TO_EVM_GAS_MULTIPLIER, MINIMUM_BASE_FEE_PER_GAS},
+    journal::{
+        close_tezosx_journal, fake_top_level_call_from_tezos_operation,
+        prepare_tezosx_journal, TezosXHashes,
+    },
+    l2block::L2Block,
+    registry_impl::RegistryImpl,
+    simulation::start_simulation_mode,
+    storage::{
+        read_michelson_to_evm_gas_multiplier, store_michelson_to_evm_gas_multiplier,
+    },
+    tick_model::constants::MAXIMUM_GAS_LIMIT,
+    transaction::TransactionContent,
+};
+use evm_inspectors::TracerInput;
+use mir::ast::PublicKeyHash;
+use num_traits::ToPrimitive;
+use primitive_types::{H160, H256, U256};
+use revm::{context::result::ExecutionResult, primitives::hardfork::SpecId};
+use revm_etherlink::{
+    helpers::legacy::{h160_to_alloy, u256_to_alloy},
+    storage::block::BLOCKS_STORED,
+};
+use rlp::{Decodable, DecoderError, Encodable};
+use sha3::{Digest, Keccak256};
+use std::fmt::Debug;
+use tezos_crypto_rs::hash::{BlockHash, ChainId, OperationHash, UnknownSignature};
+use tezos_data_encoding::nom::NomReader;
+use tezos_ethereum::tx_common::EthereumTransactionCommon;
+use tezos_ethereum::{
+    rlp_helpers::{decode_field, decode_tx_hash, next},
+    transaction::TransactionHash,
+};
+use tezos_evm_logging::{log, Level::*};
+use tezos_tezlink::operation::ManagerOperationField;
+use tezosx_types::{michelson_gas_to_mutez, Mutez, Wei};
+
+use tezos_evm_runtime::{
+    extensions::WithGas,
+    runtime_keyspaces::{
+        RuntimeKeyspaces, ETH_ACCOUNTS_ROOT_PATH, TEZ_ACCOUNTS_ROOT_PATH,
+    },
+};
+use tezos_execution::{
+    get_required_da_fees, mir_ctx::BlockCtx, FeeRefundConfig, ProcessedOperation,
+};
+use tezos_smart_rollup::{outbox::OutboxQueue, types::Timestamp};
+use tezos_smart_rollup_host::path::{OwnedPath, Path, RefPath};
+use tezos_smart_rollup_host::storage::StorageV1;
+use tezos_smart_rollup_host::wasm::WasmHost;
+use tezos_smart_rollup_keyspace::{KeySpace, KeySpaceLoader};
+use tezos_tezlink::{
+    block::{AppliedOperation, TezBlock},
+    enc_wrappers::BlockNumber,
+    operation::{ManagerOperation, ManagerOperationContent, Operation},
+    operation_result::{
+        OperationBatchWithMetadata, OperationDataAndMetadata, OperationError,
+        OperationResult, OperationResultSum, OperationWithMetadata,
+    },
+};
+use tezosx_interfaces::{Registry, RuntimeId};
+use tezosx_journal::TezosXJournal;
+
+use crate::apply::push_withdrawals_to_outbox;
+use revm_etherlink::journal::commit_evm_journal_from_external;
+
+pub use tezos_evm_runtime::safe_storage::ETHERLINK_SAFE_STORAGE_ROOT_PATH;
+
+pub const TEZ_SAFE_STORAGE_ROOT_PATH: RefPath = RefPath::assert_from(b"/tez/world_state");
+
+/// True if `branch` is a recent block of this instance; genesis is accepted only while the chain is under [`BLOCKS_STORED`] blocks.
+pub(crate) fn is_valid_tez_branch<Host: StorageV1>(
+    host: &Host,
+    branch: &H256,
+) -> Result<bool, crate::Error> {
+    if crate::block_storage::is_recent_block_hash(
+        host,
+        &TEZ_SAFE_STORAGE_ROOT_PATH,
+        branch,
+    )? {
+        return Ok(true);
+    }
+    if *branch == H256(*TezBlock::genesis_block_hash()) {
+        let current =
+            crate::block_storage::read_current_number(host, &TEZ_SAFE_STORAGE_ROOT_PATH)
+                .unwrap_or_else(|_| U256::zero());
+        return Ok(current < U256::from(BLOCKS_STORED));
+    }
+    Ok(false)
+}
+
+/// Choose the SafeStorage roots to snapshot for a single Tezos operation.
+///
+/// [validate_and_apply_operation] wraps each operation in a transactional
+/// snapshot of every root in `full_roots` (one `store_copy` + `store_move`
+/// per root, twice — once for validation, once for application). Most
+/// operations only read or write account state under
+/// [`TEZ_ACCOUNTS_ROOT_PATH`]. For these operations, a snapshot of the EVM
+/// world state and of the Tez block/global-state root is pure overhead. For
+/// batches that provably touch nothing else (see
+/// [Operation::touches_only_accounts]), narrow the snapshot to the two
+/// account roots; otherwise keep the full conservative set.
+///
+/// Both account roots always stay in the snapshot. The [`RuntimeKeyspaces`]
+/// value built inside the snapshot loads its keyspaces in the `/tmp` copy
+/// (the temporary copy that the snapshot writes to). A root that this copy
+/// does not hold reads as empty, and it loses its writes at
+/// [`SafeStorage::promote`](tezos_evm_runtime::safe_storage::SafeStorage::promote).
+fn operation_safe_roots(
+    operation: &Operation,
+    full_roots: &[OwnedPath],
+) -> Vec<OwnedPath> {
+    if !operation.touches_only_accounts() {
+        return full_roots.to_vec();
+    }
+    full_roots
+        .iter()
+        .filter(|root| {
+            root.as_bytes() == TEZ_ACCOUNTS_ROOT_PATH.as_bytes()
+                || root.as_bytes() == ETH_ACCOUNTS_ROOT_PATH.as_bytes()
+        })
+        .cloned()
+        .collect()
+}
+
+#[derive(Debug, Default)]
+pub struct DebugFeatures {
+    pub enable_debug_precompiles: bool,
+}
+
+impl DebugFeatures {
+    pub fn read_from_storage(base: &impl KeySpace) -> Self {
+        let enable_debug_precompiles = crate::storage::enable_debug_precompiles(base);
+
+        DebugFeatures {
+            enable_debug_precompiles,
+        }
+    }
+}
+
+#[derive(Debug, Default)]
+pub struct ExperimentalFeatures {
+    enable_michelson_gas_refund: bool,
+    /// If `Some(level)`, the Michelson runtime is enabled and activates at the
+    /// given EVM block number. `None` means the feature flag is not set.
+    enabled_michelson_target_sunrise_level: Option<U256>,
+}
+
+impl ExperimentalFeatures {
+    pub fn read_from_storage(base: &impl KeySpace) -> Self {
+        let (enable_michelson_gas_refund, tezos_runtime_enabled) = (
+            crate::storage::enable_michelson_gas_refund(base),
+            crate::storage::enable_tezos_runtime(base),
+        );
+
+        let enabled_michelson_target_sunrise_level = if tezos_runtime_enabled {
+            // The target sunrise level defaults to 0 if not set. This allows
+            // current deployment where only enable_tezos_runtime is set to still
+            // activate the Michelson runtime.
+            Some(
+                crate::storage::read_michelson_runtime_target_sunrise_level(base)
+                    .unwrap_or(U256::zero()),
+            )
+        } else {
+            None
+        };
+
+        ExperimentalFeatures {
+            enable_michelson_gas_refund,
+            enabled_michelson_target_sunrise_level,
+        }
+    }
+
+    pub fn is_tezos_runtime_enabled(&self, current_level: U256) -> bool {
+        self.enabled_michelson_target_sunrise_level
+            .is_some_and(|target| current_level >= target)
+    }
+
+    pub fn tezos_runtime_feature_flag(&self) -> bool {
+        self.enabled_michelson_target_sunrise_level.is_some()
+    }
+
+    pub(crate) fn is_michelson_gas_refund_enabled(&self) -> bool {
+        self.enable_michelson_gas_refund
+    }
+}
+
+#[derive(Debug)]
+pub struct TezosXChainConfig {
+    evm_chain_id: U256,
+    pub limits: EvmLimits,
+    pub spec_id: SpecId,
+    pub experimental_features: ExperimentalFeatures,
+    pub debug_features: DebugFeatures,
+    michelson_chain_id: ChainId,
+}
+
+impl TezosXChainConfig {
+    pub fn tezos_runtime_feature_flag(&self) -> bool {
+        self.experimental_features.tezos_runtime_feature_flag()
+    }
+}
+
+const TEZOS_OP_TAG: u8 = 1;
+const DEPOSIT_OP_TAG: u8 = 2;
+
+#[derive(Debug, PartialEq)]
+pub struct TezlinkOperation {
+    pub tx_hash: TransactionHash,
+    pub content: TezlinkContent,
+}
+
+impl Encodable for TezlinkOperation {
+    fn rlp_append(&self, stream: &mut rlp::RlpStream) {
+        stream.begin_list(2);
+        stream.append_iter(self.tx_hash);
+        stream.append(&self.content);
+    }
+}
+
+impl Decodable for TezlinkOperation {
+    fn decode(decoder: &rlp::Rlp) -> Result<Self, rlp::DecoderError> {
+        if !decoder.is_list() {
+            return Err(DecoderError::RlpExpectedToBeList);
+        }
+        if decoder.item_count()? != 2 {
+            return Err(DecoderError::RlpIncorrectListLen);
+        }
+        let mut it = decoder.iter();
+        let tx_hash: TransactionHash = decode_tx_hash(next(&mut it)?)?;
+        let content: TezlinkContent =
+            decode_field(&next(&mut it)?, "Transaction content")?;
+        Ok(TezlinkOperation { tx_hash, content })
+    }
+}
+
+#[derive(Debug, PartialEq)]
+pub enum TezlinkContent {
+    Tezos(Operation),
+    Deposit(Deposit),
+}
+
+impl Encodable for TezlinkContent {
+    fn rlp_append(&self, stream: &mut rlp::RlpStream) {
+        stream.begin_list(2);
+        match &self {
+            Self::Tezos(tez) => {
+                stream.append(&TEZOS_OP_TAG);
+                stream.append(tez);
+            }
+            Self::Deposit(dep) => {
+                stream.append(&DEPOSIT_OP_TAG);
+                dep.rlp_append(stream)
+            }
+        }
+    }
+}
+
+impl Decodable for TezlinkContent {
+    fn decode(decoder: &rlp::Rlp) -> Result<Self, DecoderError> {
+        if !decoder.is_list() {
+            return Err(DecoderError::RlpExpectedToBeList);
+        }
+        if decoder.item_count()? != 2 {
+            return Err(DecoderError::RlpIncorrectListLen);
+        }
+        let tag: u8 = decoder.at(0)?.as_val()?;
+        let tx = decoder.at(1)?;
+        match tag {
+            DEPOSIT_OP_TAG => {
+                let deposit = Deposit::decode(&tx)?;
+                Ok(Self::Deposit(deposit))
+            }
+            TEZOS_OP_TAG => {
+                let eth = Operation::decode(&tx)?;
+                Ok(Self::Tezos(eth))
+            }
+            _ => Err(DecoderError::Custom("Unknown operation tag.")),
+        }
+    }
+}
+
+impl From<crate::transaction::Transaction> for TezosXTransaction {
+    fn from(tx: crate::transaction::Transaction) -> Self {
+        Self::Ethereum(Box::new(tx))
+    }
+}
+
+impl TryFrom<TezosXTransaction> for crate::transaction::Transaction {
+    type Error = ();
+
+    fn try_from(tx: TezosXTransaction) -> Result<Self, Self::Error> {
+        match tx {
+            TezosXTransaction::Ethereum(tx) => Ok(*tx),
+            TezosXTransaction::Tezos(_) => Err(()),
+        }
+    }
+}
+
+impl TezlinkOperation {
+    pub fn is_delayed(&self) -> bool {
+        match self.content {
+            TezlinkContent::Tezos(_) => false,
+            TezlinkContent::Deposit(_) => true,
+        }
+    }
+
+    pub fn data_size(&self) -> u64 {
+        0
+    }
+}
+
+impl From<TezlinkOperation> for TezosXTransaction {
+    fn from(op: TezlinkOperation) -> Self {
+        Self::Tezos(op)
+    }
+}
+
+impl TryFrom<TezosXTransaction> for TezlinkOperation {
+    type Error = ();
+
+    fn try_from(tx: TezosXTransaction) -> Result<Self, Self::Error> {
+        match tx {
+            TezosXTransaction::Tezos(op) => Ok(op),
+            TezosXTransaction::Ethereum(_) => Err(()),
+        }
+    }
+}
+
+impl crate::blueprint_storage::EVMBlockHeader {
+    pub fn hash(&self) -> H256 {
+        self.hash
+    }
+
+    pub fn genesis_header() -> Self {
+        EVMBlockHeader {
+            hash: crate::block::GENESIS_PARENT_HASH,
+            receipts_root: vec![0; 32],
+            transactions_root: vec![0; 32],
+        }
+    }
+}
+
+fn ethereum_transaction_from_bytes(
+    bytes: &[u8],
+) -> anyhow::Result<crate::transaction::Transaction> {
+    let tx_hash = Keccak256::digest(bytes).into();
+    let tx_common = EthereumTransactionCommon::from_bytes(bytes)?;
+
+    Ok(crate::transaction::Transaction {
+        tx_hash,
+        content: TransactionContent::Ethereum(tx_common),
+    })
+}
+
+#[derive(Debug, PartialEq)]
+pub enum TezosXTransaction {
+    Ethereum(Box<crate::transaction::Transaction>),
+    Tezos(TezlinkOperation),
+}
+
+impl Decodable for TezosXTransaction {
+    fn decode(decoder: &rlp::Rlp) -> Result<Self, rlp::DecoderError> {
+        if !decoder.is_list() {
+            return Err(DecoderError::RlpExpectedToBeList);
+        }
+        if decoder.item_count()? != 2 {
+            return Err(DecoderError::RlpIncorrectListLen);
+        }
+        let mut it = decoder.iter();
+        let runtime_id: u8 = decode_field(&next(&mut it)?, "runtime_id")?;
+        match RuntimeId::try_from(runtime_id) {
+            Ok(RuntimeId::Tezos) => {
+                let op = decode_field(&next(&mut it)?, "tezos_operation")?;
+                Ok(Self::Tezos(op))
+            }
+            Ok(RuntimeId::Ethereum) => {
+                let tx = decode_field(&next(&mut it)?, "ethereum_transaction")?;
+                Ok(TezosXTransaction::Ethereum(Box::new(tx)))
+            }
+            Err(message) => Err(rlp::DecoderError::Custom(message)),
+        }
+    }
+}
+
+impl Encodable for TezosXTransaction {
+    fn rlp_append(&self, stream: &mut rlp::RlpStream) {
+        stream.begin_list(2);
+        match self {
+            Self::Ethereum(tx) => {
+                let tag: u8 = RuntimeId::Ethereum.into();
+                stream.append(&tag);
+                stream.append(tx);
+            }
+            Self::Tezos(op) => {
+                let tag: u8 = RuntimeId::Tezos.into();
+                stream.append(&tag);
+                stream.append(op);
+            }
+        }
+    }
+}
+
+impl TezosXTransaction {
+    pub fn is_delayed(&self) -> bool {
+        match self {
+            Self::Ethereum(tx) => tx.is_delayed(),
+            Self::Tezos(op) => op.is_delayed(),
+        }
+    }
+
+    pub fn tx_hash(&self) -> TransactionHash {
+        match self {
+            Self::Ethereum(tx) => tx.tx_hash,
+            Self::Tezos(op) => op.tx_hash,
+        }
+    }
+
+    pub fn data_size(&self) -> u64 {
+        match self {
+            Self::Ethereum(tx) => tx.data_size(),
+            Self::Tezos(op) => op.data_size(),
+        }
+    }
+}
+
+pub struct TezosXBlockConstants {
+    pub evm_runtime_block_constants: tezos_ethereum::block::BlockConstants,
+    pub michelson_runtime_block_constants: TezlinkBlockConstants,
+}
+
+fn read_or_init_michelson_to_evm_gas_multiplier(host: &mut impl StorageV1) -> u64 {
+    match read_michelson_to_evm_gas_multiplier(host) {
+        Ok(value) => value,
+        Err(_) => {
+            let _ = store_michelson_to_evm_gas_multiplier(
+                host,
+                DEFAULT_MICHELSON_TO_EVM_GAS_MULTIPLIER,
+            );
+            DEFAULT_MICHELSON_TO_EVM_GAS_MULTIPLIER
+        }
+    }
+}
+
+impl TezosXChainConfig {
+    pub fn get_evm_chain_id(&self) -> U256 {
+        self.evm_chain_id
+    }
+
+    pub fn is_tezos_runtime_enabled(&self, current_level: U256) -> bool {
+        self.experimental_features
+            .is_tezos_runtime_enabled(current_level)
+    }
+
+    pub fn init_registry(&self) -> RegistryImpl {
+        RegistryImpl::new(self.evm_chain_id, self.michelson_chain_id.clone())
+    }
+
+    pub fn constants(
+        &self,
+        host: &mut impl StorageV1,
+        block_in_progress: &BlockInProgress,
+        da_fee_per_byte: U256,
+        coinbase: H160,
+    ) -> anyhow::Result<TezosXBlockConstants> {
+        let level: BlockNumber = block_in_progress.number.try_into()?;
+        let da_fee_per_byte_mutez = Wei::from_u256(da_fee_per_byte)
+            .to_mutez_exact()
+            .map_err(|_| crate::Error::InvalidConversion)?
+            .as_u64();
+        let michelson_to_evm_gas_multiplier =
+            read_or_init_michelson_to_evm_gas_multiplier(host);
+        let safe_roots = self.world_states(level.into());
+        Ok(TezosXBlockConstants {
+            evm_runtime_block_constants: block_in_progress.constants(
+                self.evm_chain_id,
+                self.limits.minimum_base_fee_per_gas,
+                da_fee_per_byte,
+                crate::block::GAS_LIMIT,
+                coinbase,
+                self.is_tezos_runtime_enabled(level.into()),
+                self.spec_id,
+            ),
+            michelson_runtime_block_constants: TezlinkBlockConstants {
+                level,
+                da_fee_per_byte_mutez,
+                michelson_to_evm_gas_multiplier,
+                safe_roots,
+            },
+        })
+    }
+
+    pub fn michelson_to_evm_gas_multiplier(
+        &self,
+        constants: &TezosXBlockConstants,
+    ) -> u64 {
+        constants
+            .michelson_runtime_block_constants
+            .michelson_to_evm_gas_multiplier
+    }
+
+    pub fn base_fee_per_gas(&self, host: &impl StorageV1, timestamp: Timestamp) -> U256 {
+        crate::gas_price::base_fee_per_gas(
+            host,
+            timestamp,
+            self.get_limits().minimum_base_fee_per_gas,
+        )
+    }
+
+    pub fn transaction_from_bytes(
+        bytes: &[u8],
+        blueprint_version: u8,
+    ) -> anyhow::Result<TezosXTransaction> {
+        match blueprint_version {
+            0 => {
+                // Blueprints version 0 can only contain Ethereum
+                // transactions, they are not prefixed by a tag.
+                let tx = ethereum_transaction_from_bytes(bytes)?;
+                Ok(TezosXTransaction::Ethereum(Box::new(tx)))
+            }
+            1 => {
+                // Blueprints version 1 can contain both Tezos
+                // operations and Ethereum transactions, prefixed by
+                // 0x00 or 0x01 respectively.
+                let Some((tag, tx_common)) = bytes.split_first() else {
+                    return Err(error::Error::NomReadError(
+                        "Unexpected empty transaction.".to_string(),
+                    ))?;
+                };
+                match RuntimeId::try_from(*tag) {
+                    Ok(RuntimeId::Tezos) => {
+                        let op = tezos_operation_from_bytes(tx_common)?;
+                        Ok(TezosXTransaction::Tezos(op))
+                    }
+                    Ok(RuntimeId::Ethereum) => {
+                        let tx = ethereum_transaction_from_bytes(tx_common)?;
+                        Ok(TezosXTransaction::Ethereum(Box::new(tx)))
+                    }
+                    Err(message) => {
+                        log!(Error, "Unknown runtime id tag: {tag}, {message}");
+                        Err(DecoderError::Custom("Unknown runtime id").into())
+                    }
+                }
+            }
+            _ => {
+                log!(Error, "Unknown blueprint version: {blueprint_version:?}");
+                Err(DecoderError::Custom("Unknown blueprint version").into())
+            }
+        }
+    }
+
+    pub fn fetch_hashes_from_delayed_inbox(
+        base: &impl KeySpace,
+        delayed_hashes: Vec<crate::delayed_inbox::Hash>,
+        delayed_inbox: &DelayedInbox,
+        current_blueprint_size: usize,
+        block_number: U256,
+    ) -> anyhow::Result<(DelayedTransactionFetchingResult<TezosXTransaction>, usize)>
+    {
+        crate::blueprint_storage::fetch_hashes_from_delayed_inbox(
+            base,
+            delayed_hashes,
+            delayed_inbox,
+            current_blueprint_size,
+            block_number,
+        )
+    }
+
+    pub fn can_fit_in_reboot(
+        &self,
+        executed_gas: U256,
+        transaction: &TezosXTransaction,
+        block_constants: &TezosXBlockConstants,
+    ) -> anyhow::Result<bool> {
+        let evm_gas_limit = match transaction {
+            TezosXTransaction::Ethereum(transaction) => transaction.execution_gas_limit(
+                &block_constants.evm_runtime_block_constants.block_fees,
+            )?,
+            TezosXTransaction::Tezos(operation) => tezos_op_evm_gas_limit(
+                operation,
+                block_constants
+                    .michelson_runtime_block_constants
+                    .michelson_to_evm_gas_multiplier,
+            )?,
+        };
+        Ok(crate::block::can_fit_in_reboot(
+            &self.limits,
+            executed_gas,
+            evm_gas_limit,
+        ))
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    pub fn apply_transaction<Host>(
+        &self,
+        block_in_progress: &BlockInProgress,
+        rk: &mut RuntimeKeyspaces<'_, Host, Host::KeySpace>,
+        registry: &impl Registry<Journal = tezosx_journal::TezosXJournal>,
+        outbox_queue: &OutboxQueue<'_, impl Path>,
+        block_constants: &TezosXBlockConstants,
+        transaction: TezosXTransaction,
+        index: u32,
+        sequencer_pool_address: Option<H160>,
+        tracer_input: Option<TracerInput>,
+        // skip_signature_check can be used to simulate the application of
+        // ill-signed Tezos operations, it has no effect in the EVM case.
+        skip_signature_check: bool,
+        // skip_fees_check can be used to simulate the application of Tezos
+        // operations with no fees, it has no effect in the EVM case.
+        skip_fees_check: bool,
+        http_trace_enabled: bool,
+    ) -> Result<crate::apply::ExecutionResult<RuntimeExecutionInfo>, anyhow::Error>
+    where
+        Host: StorageV1 + KeySpaceLoader + WithGas,
+    {
+        match transaction {
+            TezosXTransaction::Ethereum(transaction) => {
+                let (origin_runtime, id) = match &transaction.content {
+                    TransactionContent::Ethereum(_)
+                    | TransactionContent::EthereumDelayed(_)
+                    | TransactionContent::Deposit(_)
+                    | TransactionContent::FaDeposit(_) => (1, index), // Ethereum
+                    TransactionContent::TezosDelayed(raw_operation) => {
+                        let operation = TezlinkOperation {
+                            tx_hash: transaction.tx_hash,
+                            content: TezlinkContent::Tezos(raw_operation.clone()),
+                        };
+
+                        return self.apply_tezos_operation(
+                            block_in_progress,
+                            rk,
+                            registry,
+                            outbox_queue,
+                            operation,
+                            block_constants,
+                            sequencer_pool_address,
+                            tracer_input,
+                            false, // da fees are disabled for delayed operations
+                            skip_signature_check,
+                            skip_fees_check,
+                            true, // branch already checked at delayed-inbox entry
+                            http_trace_enabled,
+                        );
+                    } // Tezos
+                };
+                let crac_id = tezosx_journal::CracId::new(origin_runtime, id);
+                // Cumulative base for the per-block internal-op cap.
+                let internal_operations_base = crate::apply::count_internal_operations(
+                    &block_in_progress.cumulative_tezos_operation_receipts.list,
+                );
+                crate::apply::apply_transaction(
+                    rk,
+                    registry,
+                    outbox_queue,
+                    &block_constants.evm_runtime_block_constants,
+                    *transaction,
+                    crac_id,
+                    index,
+                    sequencer_pool_address,
+                    tracer_input,
+                    &self.limits,
+                    http_trace_enabled,
+                    internal_operations_base,
+                    &self.debug_features,
+                )
+            }
+            TezosXTransaction::Tezos(operation) => self.apply_tezos_operation(
+                block_in_progress,
+                rk,
+                registry,
+                outbox_queue,
+                operation,
+                block_constants,
+                sequencer_pool_address,
+                tracer_input,
+                true, // da fees are enabled when the sequencer injects a transaction
+                skip_signature_check,
+                skip_fees_check,
+                false, // branch validated at inclusion for sequencer-injected ops
+                http_trace_enabled,
+            ),
+        }
+    }
+
+    pub fn finalize_and_store<Host>(
+        &self,
+        rk: &mut RuntimeKeyspaces<'_, Host, Host::KeySpace>,
+        block_in_progress: BlockInProgress,
+        block_constants: &TezosXBlockConstants,
+        _chain_header: EVMBlockHeader,
+    ) -> anyhow::Result<L2Block>
+    where
+        Host: StorageV1 + KeySpaceLoader,
+    {
+        let current_level = block_in_progress.number;
+        block_in_progress.finalize_and_store(
+            rk,
+            block_constants,
+            self.is_tezos_runtime_enabled(current_level),
+        )
+    }
+
+    pub fn start_simulation_mode<Host>(
+        &self,
+        rk: &mut RuntimeKeyspaces<'_, Host, Host::KeySpace>,
+        base: &mut impl KeySpace,
+        registry: &impl Registry<Journal = tezosx_journal::TezosXJournal>,
+    ) -> anyhow::Result<()>
+    where
+        Host: StorageV1 + KeySpaceLoader + WasmHost,
+    {
+        start_simulation_mode(rk, base, registry, &self.spec_id)
+    }
+
+    /// The durable roots the failsafe mirror shadows: the world-state roots
+    /// this chain configuration owns at `block_number`.
+    pub fn world_states(&self, block_number: U256) -> Vec<OwnedPath> {
+        self.storage_root_paths(block_number)
+            .iter()
+            .map(OwnedPath::from)
+            .collect()
+    }
+
+    pub fn storage_root_paths(&self, block_number: U256) -> Vec<RefPath<'_>> {
+        if self.is_tezos_runtime_enabled(block_number) {
+            vec![
+                ETHERLINK_SAFE_STORAGE_ROOT_PATH,
+                TEZ_SAFE_STORAGE_ROOT_PATH,
+                TEZ_ACCOUNTS_ROOT_PATH,
+                ETH_ACCOUNTS_ROOT_PATH,
+            ]
+        } else {
+            vec![ETHERLINK_SAFE_STORAGE_ROOT_PATH, ETH_ACCOUNTS_ROOT_PATH]
+        }
+    }
+}
+
+impl TezosXChainConfig {
+    #[allow(clippy::too_many_arguments)]
+    fn apply_tezos_operation<Host>(
+        &self,
+        block_in_progress: &BlockInProgress,
+        rk: &mut RuntimeKeyspaces<'_, Host, Host::KeySpace>,
+        registry: &impl Registry<Journal = tezosx_journal::TezosXJournal>,
+        outbox_queue: &OutboxQueue<'_, impl Path>,
+        operation: TezlinkOperation,
+        block_constants: &TezosXBlockConstants,
+        sequencer_pool_address: Option<H160>,
+        tracer_input: Option<TracerInput>,
+        da_fees_enabled: bool,
+        skip_signature_check: bool,
+        skip_fees_check: bool,
+        skip_branch_check: bool,
+        http_trace_enabled: bool,
+    ) -> Result<crate::apply::ExecutionResult<RuntimeExecutionInfo>, anyhow::Error>
+    where
+        Host: StorageV1 + KeySpaceLoader + WithGas,
+    {
+        let tx_hash = operation.tx_hash;
+        let crac_id = tezosx_journal::CracId::new(0, block_in_progress.michelson_index);
+        // The journal holds the single origination nonce for the whole
+        // manager operation, seeded from the Tezos operation hash. Both
+        // arms seed it with the very hash the operation's receipt carries,
+        // so the KT1s a `CREATE_CONTRACT` derives and the hash observers
+        // see in the Tezos block cannot drift apart.
+        let michelson_op_hash = match &operation.content {
+            TezlinkContent::Tezos(operation) => operation.hash()?,
+            // Mirroring `pure_xtz_deposit` / `pure_fa_deposit` in apply.rs, which likewise seed the
+            // journal with the deposit's own `transaction_hash`
+            TezlinkContent::Deposit(_) => OperationHash::from(operation.tx_hash),
+        };
+        // The EVM-side identity of this operation is the fake transaction it
+        // registers in the EVM block, NOT its Tezos hash: that fake hash is
+        // what a `debug_trace*` request targets. It derives from the Michelson
+        // hash above, so it must be computed after it.
+        let operation_hashes = TezosXHashes::from_michelson_operation(michelson_op_hash);
+        // Seed the journal with this block's EVM environment so any
+        // inbound CRAC the Michelson operation dispatches to the EVM
+        // runtime exposes the live block observables (BASEFEE,
+        // GASLIMIT, ...) rather than zero.
+        let mut journal = prepare_tezosx_journal(
+            crac_id,
+            &operation_hashes,
+            &block_constants.evm_runtime_block_constants,
+            http_trace_enabled,
+            &DebugFeatures::default(),
+            0,
+            tracer_input,
+        );
+        fake_top_level_call_from_tezos_operation(
+            &mut journal,
+            registry,
+            &operation,
+            block_constants
+                .michelson_runtime_block_constants
+                .michelson_to_evm_gas_multiplier,
+        );
+        let result = apply_tezos_operation(
+            &self.michelson_chain_id,
+            block_in_progress,
+            rk,
+            registry,
+            &block_constants.michelson_runtime_block_constants,
+            operation,
+            sequencer_pool_address,
+            skip_signature_check,
+            skip_fees_check,
+            skip_branch_check,
+            Some(outbox_queue),
+            Some(&block_constants.evm_runtime_block_constants),
+            &mut journal,
+            self.experimental_features.is_michelson_gas_refund_enabled(),
+            tracer_input.is_some(),
+            http_trace_enabled,
+            da_fees_enabled,
+        );
+        // Persist HTTP traces regardless of [result] so that partial
+        // traces from an operation that failed mid-execution remain
+        // observable through the [http_trace*] RPCs. Matches the
+        // Ethereum / TezosDelayed apply sites in apply.rs.
+        //
+        // TODO: https://linear.app/tezos/issue/L2-1243
+        // The Tezlink-submitted path stores traces under the Tezos
+        // operation hash only, so [http_traceTransaction] queries
+        // that pass the fake Ethereum hash of a Tezos→EVM CRAC
+        // (the hash users see in [eth_getBlockByNumber]) return
+        // the empty list. Extend this site to dual-index the
+        // traces under each generated Ethereum fake hash once the
+        // mapping is available here.
+        crate::storage::maybe_store_http_traces_for_tx(
+            rk.host_mut(),
+            http_trace_enabled,
+            &tx_hash,
+            &journal,
+        );
+
+        match result {
+            Ok(crate::apply::ExecutionResult::Valid(res)) => {
+                let result = res.to_execution_result(
+                    self.michelson_to_evm_gas_multiplier(block_constants),
+                );
+                journal.fake_top_level_call_end(
+                    michelson_milligas_to_evm_gas(
+                        res.consumed_milligas,
+                        block_constants
+                            .michelson_runtime_block_constants
+                            .michelson_to_evm_gas_multiplier,
+                    ),
+                    matches!(result, ExecutionResult::Success { .. }),
+                );
+                close_tezosx_journal(rk.host_mut(), journal, Some(&result))?;
+                Ok(crate::apply::ExecutionResult::Valid(
+                    RuntimeExecutionInfo::Tezos(res),
+                ))
+            }
+            Ok(crate::apply::ExecutionResult::Invalid) => {
+                close_tezosx_journal(rk.host_mut(), journal, None)?;
+                Ok(crate::apply::ExecutionResult::Invalid)
+            }
+            Err(err) => {
+                close_tezosx_journal(rk.host_mut(), journal, None)?;
+                Err(err)
+            }
+        }
+    }
+}
+
+impl TezosXChainConfig {
+    pub fn create_config(
+        evm_chain_id: U256,
+        limits: EvmLimits,
+        spec_id: SpecId,
+        experimental_features: ExperimentalFeatures,
+        debug_features: DebugFeatures,
+        michelson_chain_id: ChainId,
+    ) -> Self {
+        Self {
+            evm_chain_id,
+            limits,
+            spec_id,
+            experimental_features,
+            debug_features,
+            michelson_chain_id,
+        }
+    }
+
+    pub fn get_limits(&self) -> &EvmLimits {
+        &self.limits
+    }
+
+    pub fn limits_mut(&mut self) -> &mut EvmLimits {
+        &mut self.limits
+    }
+
+    pub fn michelson_chain_id(&self) -> &ChainId {
+        &self.michelson_chain_id
+    }
+}
+
+fn tezos_operation_from_bytes(bytes: &[u8]) -> anyhow::Result<TezlinkOperation> {
+    let operation = Operation::nom_read_exact(bytes)
+        .map_err(|decode_error| error::Error::NomReadError(decode_error.to_string()))?;
+    let tx_hash = operation.hash()?.into();
+    Ok(TezlinkOperation {
+        tx_hash,
+        content: TezlinkContent::Tezos(operation),
+    })
+}
+
+pub struct TezlinkBlockConstants {
+    pub level: BlockNumber,
+    /// DA fee per byte in mutez, read once at block start from durable storage.
+    /// When `disable_da_fees` is set, this is 0.
+    pub da_fee_per_byte_mutez: u64,
+    /// Conversion factor from Michelson gas to EVM gas, read once at block
+    /// start from durable storage (falls back to the compile-time constant).
+    pub michelson_to_evm_gas_multiplier: u64,
+    /// SafeStorage roots to snapshot when validating/applying a Tezos
+    /// operation. Mirrors `TezosXChainConfig::storage_root_paths` so the
+    /// inner transactional wrap covers every subtree that a Tezos operation
+    /// may read or write.
+    pub safe_roots: Vec<OwnedPath>,
+}
+
+enum CreditDaFees {
+    Skip,
+    Execute {
+        sequencer_pool_address: Option<H160>,
+        da_fees_mutez: Mutez,
+    },
+}
+
+impl CreditDaFees {
+    fn da_fees(&self) -> u64 {
+        match self {
+            CreditDaFees::Skip => 0,
+            CreditDaFees::Execute { da_fees_mutez, .. } => da_fees_mutez.as_u64(),
+        }
+    }
+
+    /// The sequencer pool and what it is owed, for the commit to pay.
+    /// `None` when no pool is configured or nothing is owed.
+    fn to_credit(&self) -> Option<(revm::primitives::Address, revm::primitives::U256)> {
+        match self {
+            CreditDaFees::Skip => None,
+            CreditDaFees::Execute {
+                sequencer_pool_address,
+                da_fees_mutez,
+            } => sequencer_pool_address.map(|address| {
+                (
+                    h160_to_alloy(&address),
+                    u256_to_alloy(&da_fees_mutez.to_wei().as_u256()),
+                )
+            }),
+        }
+    }
+}
+
+/// Fees computed from an operation before execution.
+struct FeesData {
+    /// Total required fees (DA + gas) to check against declared fees,
+    /// or `None` in simulation (skip_fees_check).
+    required_fees: Option<u64>,
+    /// Action to credit the sequencer pool with DA fees after execution.
+    /// Also carries the DA fees amount (via `da_fees()`).
+    credit_da_fees: CreditDaFees,
+}
+
+/// Outcome of the pre-execution fee computation.
+enum FeesOutcome {
+    /// The fees the operation must cover, and the DA-fee credit action.
+    Payable(FeesData),
+    /// A required fee (DA or gas) lies past the mutez domain, so no
+    /// account can cover it. The operation is invalid, like one whose
+    /// declared fees are insufficient; it is not a kernel error, since
+    /// the gas limit the fee derives from is chosen by the operation's
+    /// author.
+    Unpayable,
+}
+
+/// Convert Michelson gas (in Tezos-gas units) into EVM-gas units,
+/// using the cross-runtime conversion coefficient `multiplier`
+/// (evm_gas / michelson_gas).
+pub(crate) fn michelson_gas_to_evm_gas(
+    michelson_gas: u64,
+    michelson_to_evm_gas_multiplier: u64,
+) -> u64 {
+    michelson_gas.saturating_mul(michelson_to_evm_gas_multiplier)
+}
+
+/// Convert Michelson milligas (the unit returned by the Michelson
+/// runtime after execution) into EVM-gas units. Mirrors the
+/// post-execution conversion done in
+/// `BlockInProgress::register_valid_transaction` so both the
+/// declared-gas-limit path and the consumed-milligas path use the
+/// same coefficient.
+pub(crate) fn michelson_milligas_to_evm_gas(
+    milligas: u64,
+    michelson_to_evm_gas_multiplier: u64,
+) -> u64 {
+    michelson_gas_to_evm_gas(milligas / 1000, michelson_to_evm_gas_multiplier)
+}
+
+/// Convert an operation's declared gas limit (sum across its
+/// manager contents) into EVM-gas units, using the same coefficient
+/// as the post-execution conversion in
+/// `BlockInProgress::register_valid_transaction`.
+///
+/// Deposits have no user-declared gas limit, so they are reported
+/// as zero (always fitting). Their cost is bounded by the bridge
+/// precompile.
+pub(crate) fn tezos_op_evm_gas_limit(
+    op: &TezlinkOperation,
+    michelson_to_evm_gas_multiplier: u64,
+) -> anyhow::Result<u64> {
+    match &op.content {
+        TezlinkContent::Tezos(operation) => {
+            let total_michelson_gas: u64 = operation
+                .content
+                .iter()
+                .filter_map(|c| c.gas_limit().ok())
+                .filter_map(|gl| gl.0.to_u64())
+                .try_fold(0u64, |acc, x| acc.checked_add(x))
+                .ok_or_else(|| anyhow::anyhow!("gas limit sum overflow"))?;
+            Ok(michelson_gas_to_evm_gas(
+                total_michelson_gas,
+                michelson_to_evm_gas_multiplier,
+            ))
+        }
+        TezlinkContent::Deposit(_) => Ok(0),
+    }
+}
+
+/// Returns the required fees if any and the function to execute
+/// regarding DA fees, either skipped if operation is a simulation
+/// or credit sequencer pool address accordingly.
+fn get_fees_data(
+    operation: &Operation,
+    skip_fees_check: bool,
+    da_fee_per_byte_mutez: u64,
+    base_fee_per_gas: U256,
+    michelson_to_evm_gas_multiplier: u64,
+    sequencer_pool_address: Option<H160>,
+    enable_da_fees: bool,
+) -> Result<FeesOutcome, anyhow::Error> {
+    if skip_fees_check {
+        Ok(FeesOutcome::Payable(FeesData {
+            required_fees: None,
+            credit_da_fees: CreditDaFees::Skip,
+        }))
+    } else {
+        let required_da_fees = if enable_da_fees {
+            get_required_da_fees(operation, da_fee_per_byte_mutez)?
+        } else {
+            0
+        };
+        // Narrowed once, at construction: the DA fee is credited to the
+        // sequencer pool later purely in mutez, never as a raw u64.
+        let Ok(da_fees_mutez) = Mutez::try_from(required_da_fees) else {
+            return Ok(FeesOutcome::Unpayable);
+        };
+
+        let total_gas_limit: u64 = operation
+            .content
+            .iter()
+            .filter_map(|c| c.gas_limit().ok())
+            .filter_map(|gl| gl.0.to_u64())
+            .try_fold(0u64, |acc, x| acc.checked_add(x))
+            .ok_or_else(|| anyhow::anyhow!("gas limit sum overflow"))?;
+
+        let Ok(required_execution_gas_fees) = michelson_gas_to_mutez(
+            base_fee_per_gas,
+            michelson_to_evm_gas_multiplier,
+            total_gas_limit,
+        ) else {
+            return Ok(FeesOutcome::Unpayable);
+        };
+
+        // Two payable halves can still add up past the mutez domain: the
+        // sum is bounded like its summands.
+        let Ok(required_fees) = da_fees_mutez.checked_add(required_execution_gas_fees)
+        else {
+            return Ok(FeesOutcome::Unpayable);
+        };
+
+        Ok(FeesOutcome::Payable(FeesData {
+            required_fees: Some(required_fees.as_u64()),
+            credit_da_fees: CreditDaFees::Execute {
+                sequencer_pool_address,
+                da_fees_mutez,
+            },
+        }))
+    }
+}
+
+#[allow(clippy::too_many_arguments)]
+pub fn apply_tezos_operation<Host>(
+    chain_id: &ChainId,
+    block_in_progress: &BlockInProgress,
+    rk: &mut RuntimeKeyspaces<'_, Host, Host::KeySpace>,
+    registry: &impl Registry<Journal = tezosx_journal::TezosXJournal>,
+    block_constants: &TezlinkBlockConstants,
+    operation: TezlinkOperation,
+    sequencer_pool_address: Option<H160>,
+    skip_signature_check: bool,
+    skip_fees_check: bool,
+    // Delayed-origin ops are branch-checked once at delayed-inbox entry; skip the
+    // check here so a branch aging out before forced inclusion cannot drop them.
+    skip_branch_check: bool,
+    outbox_queue: Option<&OutboxQueue<'_, impl Path>>,
+    evm_block_constants: Option<&tezos_ethereum::block::BlockConstants>,
+    external_journal: &mut TezosXJournal,
+    enable_gas_refund: bool,
+    // Forwarded to validate_and_apply_operation to gate per-op trace promotion
+    // (and its store_has probe) on whether each tracer is actually active.
+    tracing_enabled: bool,
+    http_trace_enabled: bool,
+    enable_da_fees: bool,
+) -> Result<crate::apply::ExecutionResult<TezosExecutionInfo>, anyhow::Error>
+where
+    Host: StorageV1 + KeySpaceLoader + WithGas,
+{
+    let level = block_constants.level;
+    let now = block_in_progress.timestamp;
+    let block_ctx = BlockCtx {
+        level: &level,
+        now: &now,
+        chain_id,
+        internal_operations_base: crate::apply::count_internal_operations(
+            &block_in_progress.cumulative_tezos_operation_receipts.list,
+        ),
+        tracing_enabled,
+        http_trace_enabled,
+    };
+
+    match operation.content {
+        TezlinkContent::Tezos(operation) => {
+            // Read the operation hash back from the journal rather than computing for a second
+            // blake2b.
+            let hash = external_journal.michelson.operation_hash().clone();
+
+            let FeesData {
+                required_fees: fees,
+                credit_da_fees,
+            } = match get_fees_data(
+                &operation,
+                skip_fees_check,
+                block_constants.da_fee_per_byte_mutez,
+                block_in_progress.base_fee_per_gas,
+                block_constants.michelson_to_evm_gas_multiplier,
+                sequencer_pool_address,
+                enable_da_fees,
+            )? {
+                FeesOutcome::Payable(fees_data) => fees_data,
+                FeesOutcome::Unpayable => {
+                    log!(
+                        Error,
+                        "Dropping Tezos operation {}: its required fees exceed the mutez domain",
+                        hex::encode(*hash)
+                    );
+                    return Ok(crate::apply::ExecutionResult::Invalid);
+                }
+            };
+
+            let fee_refund_config = if enable_gas_refund {
+                Some(FeeRefundConfig {
+                    da_fees: credit_da_fees.da_fees(),
+                    base_fee_per_gas: block_in_progress.base_fee_per_gas,
+                    michelson_to_evm_gas_multiplier: block_constants
+                        .michelson_to_evm_gas_multiplier,
+                })
+            } else {
+                None
+            };
+
+            let branch = operation.branch.clone();
+            let signature = operation.signature.clone();
+
+            // The branch must be a recent block of this instance (see is_valid_tez_branch); reject otherwise.
+            if !skip_branch_check && !is_valid_tez_branch(rk.host(), &H256(*branch))? {
+                log!(
+                    Error,
+                    "Dropping Tezos operation {}: branch {} is not a recent block of this instance",
+                    hex::encode(*hash),
+                    hex::encode(*branch)
+                );
+                return Ok(crate::apply::ExecutionResult::Invalid);
+            }
+
+            // Try to apply the operation with the tezos_execution crate, return a receipt
+            // on whether it failed or not
+            let journal = external_journal;
+            // Snapshot only the roots this operation can touch (often just the
+            // account roots) instead of the full conservative set.
+            let safe_roots =
+                operation_safe_roots(&operation, &block_constants.safe_roots);
+            let processed_operations = match tezos_execution::validate_and_apply_operation(
+                rk,
+                registry,
+                journal,
+                operation,
+                &block_ctx,
+                skip_signature_check,
+                fees,
+                fee_refund_config,
+                &safe_roots,
+            ) {
+                Ok(receipt) => receipt,
+                Err(OperationError::Validation(err)) => {
+                    log!(Error, "Found an invalid operation, dropping it: {:?}", err);
+                    return Ok(crate::apply::ExecutionResult::Invalid);
+                }
+                Err(OperationError::RuntimeError(err)) => {
+                    return Err(err.into());
+                }
+                Err(OperationError::KeySpace(err)) => {
+                    return Err(err.into());
+                }
+                Err(OperationError::BlockAbort(msg)) => {
+                    return Err(anyhow::anyhow!("cross-runtime call block abort: {msg}"));
+                }
+            };
+            let consumed_milligas =
+                ProcessedOperation::total_consumed_milligas(&processed_operations);
+            let operations = ProcessedOperation::into_receipts(processed_operations);
+
+            // Add the applied operation in the block in progress
+            let applied_operation = AppliedOperation {
+                hash,
+                branch,
+                op_and_receipt: OperationDataAndMetadata::OperationWithMetadata(
+                    OperationBatchWithMetadata {
+                        operations,
+                        signature,
+                    },
+                ),
+            };
+
+            // Extract cross-runtime side effects accumulated
+            // during the Michelson execution (e.g. CRAC into EVM)
+            // BEFORE the commit: `commit_evm_journal_from_external`
+            // runs `JournalInner::finalize()` which clears
+            // `inner.logs` as part of revm's standard cleanup, so
+            // reading them after gives an empty buffer.
+            let cross_runtime_effects = extract_cross_runtime_effects(
+                journal,
+                consumed_milligas,
+                block_constants,
+            );
+
+            if let (Some(outbox_queue), Some(evm_block_constants)) =
+                (outbox_queue, evm_block_constants)
+            {
+                let etherlink_withdrawals = commit_evm_journal_from_external(
+                    rk,
+                    registry,
+                    evm_block_constants,
+                    journal,
+                    credit_da_fees.to_credit(),
+                )?;
+                push_withdrawals_to_outbox(
+                    rk.host_mut(),
+                    outbox_queue,
+                    etherlink_withdrawals,
+                )?;
+            }
+
+            Ok(crate::apply::ExecutionResult::Valid(TezosExecutionInfo {
+                op: applied_operation,
+                cross_runtime_effects,
+                consumed_milligas,
+            }))
+        }
+        TezlinkContent::Deposit(deposit) => {
+            log!(Debug, "Execute Tezlink deposit: {deposit:?}");
+
+            let deposit_result = execute_tezlink_deposit(rk, &deposit)?;
+
+            let source = PublicKeyHash::nom_read_exact(&TEZLINK_DEPOSITOR[1..]).unwrap();
+
+            let applied_operation = AppliedOperation {
+                hash: operation.tx_hash.into(),
+                branch: BlockHash::from(
+                    block_in_progress.ethereum_parent_hash.to_fixed_bytes(),
+                ),
+                op_and_receipt: OperationDataAndMetadata::OperationWithMetadata(
+                    OperationBatchWithMetadata {
+                        operations: vec![OperationWithMetadata {
+                            content: ManagerOperationContent::Transaction(
+                                ManagerOperation {
+                                    source,
+                                    fee: 0.into(),
+                                    counter: 0.into(),
+                                    gas_limit: 0.into(),
+                                    storage_limit: 0.into(),
+                                    operation: deposit_result.outcome.1,
+                                },
+                            ),
+                            receipt: OperationResultSum::Transfer(OperationResult {
+                                balance_updates: vec![],
+                                result: deposit_result.outcome.0,
+                                internal_operation_results: vec![],
+                            }),
+                        }],
+                        signature: UnknownSignature::nom_read_exact(&[0u8; 64]).unwrap(),
+                    },
+                ),
+            };
+            Ok(crate::apply::ExecutionResult::Valid(TezosExecutionInfo {
+                op: applied_operation,
+                cross_runtime_effects: Vec::new(),
+                // Deposits bypass the Michelson interpreter — no gas consumed.
+                consumed_milligas: 0,
+            }))
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug)]
+pub struct EvmLimits {
+    pub maximum_gas_limit: u64,
+    pub minimum_base_fee_per_gas: U256,
+}
+
+impl Default for EvmLimits {
+    fn default() -> Self {
+        Self {
+            maximum_gas_limit: MAXIMUM_GAS_LIMIT,
+            minimum_base_fee_per_gas: MINIMUM_BASE_FEE_PER_GAS.into(),
+        }
+    }
+}
+
+impl Default for TezosXChainConfig {
+    fn default() -> Self {
+        Self::create_config(
+            U256::from(EVM_CHAIN_ID),
+            EvmLimits::default(),
+            SpecId::default(),
+            ExperimentalFeatures::default(),
+            DebugFeatures::default(),
+            ChainId::from(EVM_CHAIN_ID.to_le_bytes()),
+        )
+    }
+}
+
+/// Reveal operation bytes from protocol encoding regression tests.
+#[cfg(test)]
+pub(crate) const REVEAL_OP_HEX: &str = "0e5751c026e543b2e8ab2eb06099daa1d1e5df47778f7787faab45cdf12fe3a86b0002298c03ed7d454a101eb7022bc95f7e5f41ac7821dc05edecc004adcacdb7d401004798d2cc98473d7e250c898885718afd2e4efbcb1a1595ab9730761ed830de0f0066804fe735e06e97e26da8236b6341b91c625d5e82b3524ec0a88cc982365e70f8a5b9bc65df2ea6d21ee244cc3a96fb33031c394c78b1179ff1b8a44237740c";
+
+/// Builds a test [`Operation`] from [`REVEAL_OP_HEX`]. Shared by the test
+/// modules that exercise Tezos operation encoding/decoding.
+#[cfg(test)]
+pub(crate) fn make_test_operation() -> Operation {
+    let bytes = hex::decode(REVEAL_OP_HEX).unwrap();
+    Operation::nom_read_exact(&bytes).unwrap()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn tezlink_content_tezos_rlp_roundtrip() {
+        let op = make_test_operation();
+        let content = TezlinkContent::Tezos(op);
+        let encoded = rlp::encode(&content);
+        let decoded: TezlinkContent = rlp::decode(&encoded).unwrap();
+        assert_eq!(decoded, content);
+    }
+
+    #[test]
+    fn get_fees_data_rejects_da_fees_past_mutez_domain() {
+        // A pathological da_fee_per_byte_mutez pushes the DA fee for any
+        // non-empty operation past the mutez domain: narrowing at
+        // construction must flag the operation as unpayable rather than
+        // truncate or saturate.
+        let op = make_test_operation();
+        let result = get_fees_data(&op, false, u64::MAX, U256::one(), 1, None, true);
+        assert!(matches!(result, Ok(FeesOutcome::Unpayable)));
+    }
+
+    #[test]
+    fn get_fees_data_rejects_gas_fees_past_mutez_domain() {
+        // A pathological base_fee_per_gas pushes the gas-limit-derived wei
+        // amount past the mutez domain: the caller-visible effect of
+        // `Wei::to_mutez_floor` becoming fallible is that the operation is
+        // now unpayable (hence invalid) instead of silently wrapping via the
+        // legacy helper's `low_u64()`. The gas limit is the operation
+        // author's choice, so this must not surface as a kernel error.
+        let op = make_test_operation();
+        let huge_base_fee = U256::from(10u64).pow(U256::from(40u64));
+        let result = get_fees_data(&op, false, 0, huge_base_fee, 1, None, false);
+        assert!(matches!(result, Ok(FeesOutcome::Unpayable)));
+    }
+
+    #[test]
+    fn get_fees_data_rejects_fee_sum_past_mutez_domain() {
+        use tezos_data_encoding::enc::BinWriter;
+
+        // Each half fits the mutez domain on its own; their sum does not.
+        let op = make_test_operation();
+        let op_size = op.to_bytes().unwrap().len() as u64;
+        // The DA fee lands in (i64::MAX - op_size, i64::MAX].
+        let da_fee_per_byte = (i64::MAX as u64) / op_size;
+        // The gas fee is gas_limit * 10^6 mutez: positive, far above op_size,
+        // and itself well within the domain.
+        let base_fee = U256::exp10(18);
+        let result = get_fees_data(&op, false, da_fee_per_byte, base_fee, 1, None, true);
+        assert!(matches!(result, Ok(FeesOutcome::Unpayable)));
+    }
+}

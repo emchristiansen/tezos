@@ -44,50 +44,100 @@ module Denunciator = struct
       ~pp1:pp_print_top_error_of_trace
       ("errors", Error_monad.(TzTrace.encoding error_encoding))
 
-  let double_endorsement_detected =
+  let double_attestation_detected =
     declare_2
+      ~alternative_color:Internal_event.Magenta
       ~section
       ~level
-      ~name:"double_endorsement_detected"
-      ~msg:"double endorsement detected"
-      ("existing_endorsement", Operation_hash.encoding)
-      ("new_endorsement", Operation_hash.encoding)
+      ~name:"double_attestation_detected"
+      ~msg:"double attestation detected"
+      ("existing_attestation", Operation_hash.encoding)
+      ("new_attestation", Operation_hash.encoding)
 
-  let double_endorsement_denounced =
+  let double_attestation_denounced =
     declare_2
+      ~alternative_color:Internal_event.Blue
       ~section
       ~level
-      ~name:"double_endorsement_denounced"
-      ~msg:"double endorsement evidence injected: {hash}"
+      ~name:"double_attestation_denounced"
+      ~msg:"double attestation evidence injected: {hash}"
       ("hash", Operation_hash.encoding)
       ~pp2:pp_ignore
       ("bytes", Data_encoding.bytes)
 
-  let double_preendorsement_detected =
+  let attestation_conflict_ignored =
     declare_2
       ~section
-      ~level
-      ~name:"double_preendorsement_detected"
-      ~msg:"double preendorsement detected"
-      ("existing_preendorsement", Operation_hash.encoding)
-      ("new_preendorsement", Operation_hash.encoding)
+      ~level:Debug
+      ~name:"attestation_conflict_ignored"
+      ~msg:
+        "{existing_attestation} is conflicting with {new_attestation} but no \
+         misbehavior was found."
+      ("existing_attestation", Operation_hash.encoding)
+      ("new_attestation", Operation_hash.encoding)
 
-  let double_preendorsement_denounced =
+  let double_preattestation_detected =
     declare_2
+      ~alternative_color:Internal_event.Magenta
       ~section
       ~level
-      ~name:"double_preendorsement_denounced"
-      ~msg:"double preendorsement evidence injected: {hash}"
+      ~name:"double_preattestation_detected"
+      ~msg:"double preattestation detected"
+      ("existing_preattestation", Operation_hash.encoding)
+      ("new_preattestation", Operation_hash.encoding)
+
+  let double_preattestation_denounced =
+    declare_2
+      ~alternative_color:Internal_event.Blue
+      ~section
+      ~level
+      ~name:"double_preattestation_denounced"
+      ~msg:"double preattestation evidence injected: {hash}"
       ("hash", Operation_hash.encoding)
       ~pp2:pp_ignore
       ("bytes", Data_encoding.bytes)
 
-  let inconsistent_endorsement =
+  let preattestation_conflict_ignored =
+    declare_2
+      ~section
+      ~level:Debug
+      ~name:"preattestation_conflict_ignored"
+      ~msg:
+        "{existing_preattestation} is conflicting with {new_preattestation} \
+         but no misbehavior was found."
+      ("existing_preattestation", Operation_hash.encoding)
+      ("new_preattestation", Operation_hash.encoding)
+
+  let double_consensus_already_denounced =
+    declare_1
+      ~section
+      ~level:Debug
+      ~name:"double_consensus_already_denounced"
+      ~msg:"double consensus operation already denounced in {hash}"
+      ("hash", Operation_hash.encoding)
+
+  let consensus_operation_too_old =
+    declare_1
+      ~section
+      ~level:Debug
+      ~name:"consensus_operation_too_old"
+      ~msg:"operation {hash} is too old to be handled"
+      ("hash", Operation_hash.encoding)
+
+  let consensus_operation_too_far_in_future =
+    declare_1
+      ~section
+      ~level:Debug
+      ~name:"consensus_operation_too_far_in_future"
+      ~msg:"operation {hash} too far in the future"
+      ("hash", Operation_hash.encoding)
+
+  let inconsistent_attestation =
     declare_1
       ~section
       ~level:Error
-      ~name:"inconsistent_endorsement"
-      ~msg:"inconsistent endorsement found {hash}"
+      ~name:"inconsistent_attestation"
+      ~msg:"inconsistent attestation found {hash}"
       ("hash", Operation_hash.encoding)
 
   let unexpected_pruned_block =
@@ -108,6 +158,7 @@ module Denunciator = struct
 
   let double_baking_detected =
     declare_0
+      ~alternative_color:Internal_event.Magenta
       ~section
       ~level
       ~name:"double_baking_detected"
@@ -116,6 +167,7 @@ module Denunciator = struct
 
   let double_baking_denounced =
     declare_2
+      ~alternative_color:Internal_event.Blue
       ~section
       ~level
       ~name:"double_baking_denounced"

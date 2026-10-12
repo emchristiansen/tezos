@@ -3,13 +3,17 @@
 
 (library
  (name tezos_layer2_utils_016_PtMumbai)
- (public_name tezos-layer2-utils-016-PtMumbai)
+ (public_name octez-protocol-016-PtMumbai-libs.layer2-utils)
  (instrumentation (backend bisect_ppx))
  (libraries
-  tezos-base
-  tezos-protocol-016-PtMumbai
-  tezos-client-016-PtMumbai)
- (inline_tests (flags -verbose) (modes native))
+  octez-libs.base
+  tezos-protocol-016-PtMumbai.protocol
+  octez-protocol-016-PtMumbai-libs.client)
+ (inline_tests
+  (flags -verbose)
+  (modes native)
+  (executable (link_flags -linkall -cclib -lblst -cclib -loctez_rust_deps))
+  (libraries bls12-381.archive octez-rust-deps))
  (preprocess (pps ppx_expect))
  (library_flags (:standard -linkall))
  (flags

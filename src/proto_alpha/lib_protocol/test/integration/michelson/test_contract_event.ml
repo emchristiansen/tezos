@@ -29,8 +29,8 @@ open Alpha_context
 (** Testing
     -------
     Component:  Protocol (event logging)
-    Invocation: cd src/proto_alpha/lib_protocol/test/integration/michelson && \
-                dune exec ./main.exe -- test '^event logging$'
+    Invocation: dune exec src/proto_alpha/lib_protocol/test/integration/michelson/main.exe \
+                  -- --file test_contract_event.ml
     Subject:  This module tests that the event logs can be written to the receipt
               in correct order and expected format.
 *)
@@ -51,22 +51,24 @@ let originate_contract file storage src b =
     Alpha_context.Script.{code = lazy_expr code; storage = lazy_expr storage}
   in
   let* operation, dst =
-    Op.contract_origination (B b) src ~fee:(Test_tez.of_int 10) ~script
+    Op.contract_origination (B b) src ~fee:(Tez_helpers.of_int 10) ~script
   in
   let* incr = Incremental.begin_construction b in
   let* incr = Incremental.add_operation incr operation in
   let+ b = Incremental.finalize_block incr in
   (dst, b)
 
+let path = project_root // Filename.dirname __FILE__
+
 (** Run emit.tz and assert that both the order of events and data content are correct *)
 let contract_test () =
   let open Lwt_result_syntax in
-  let* b, src = Context.init1 ~consensus_threshold:0 () in
-  let* dst, b = originate_contract "contracts/emit.tz" "Unit" src b in
-  let fee = Test_tez.of_int 10 in
+  let* b, src = Context.init1 ~consensus_threshold_size:0 () in
+  let* dst, b = originate_contract (path // "contracts/emit.tz") "Unit" src b in
+  let fee = Tez_helpers.of_int 10 in
   let parameters = Script.unit_parameter in
   let* operation =
-    Op.transaction ~fee ~parameters (B b) src dst (Test_tez.of_int 0)
+    Op.transaction ~fee ~parameters (B b) src dst (Tez_helpers.of_int 0)
   in
   let* incr = Incremental.begin_construction b in
   let* incr = Incremental.add_operation incr operation in
@@ -77,26 +79,26 @@ let contract_test () =
        contents =
          Single_result
            (Manager_operation_result
-             {
-               internal_operation_results =
-                 [
-                   Internal_operation_result
-                     ( {
-                         operation =
-                           Event {tag = tag1; payload = data1; ty = ty1};
-                         _;
-                       },
-                       Applied (IEvent_result _) );
-                   Internal_operation_result
-                     ( {
-                         operation =
-                           Event {tag = tag2; payload = data2; ty = ty2};
-                         _;
-                       },
-                       Applied (IEvent_result _) );
-                 ];
-               _;
-             });
+              {
+                internal_operation_results =
+                  [
+                    Internal_operation_result
+                      ( {
+                          operation =
+                            Event {tag = tag1; payload = data1; ty = ty1};
+                          _;
+                        },
+                        Applied (IEvent_result _) );
+                    Internal_operation_result
+                      ( {
+                          operation =
+                            Event {tag = tag2; payload = data2; ty = ty2};
+                          _;
+                        },
+                        Applied (IEvent_result _) );
+                  ];
+                _;
+              });
      };
   ] ->
       let open Micheline in
@@ -132,3 +134,7 @@ let tests =
       `Quick
       contract_test;
   ]
+
+let () =
+  Alcotest_lwt.run ~__FILE__ Protocol.name [("event logging", tests)]
+  |> Lwt_main.run

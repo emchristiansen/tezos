@@ -116,6 +116,9 @@ let bigarray_copy (a : gen) =
 let to_numpy (mat : t) : Pytypes.pyobject =
   Numpy.of_bigarray (bigarray_copy (to_genarray mat))
 
+let to_numpy_vector vec =
+  Numpy.of_bigarray (bigarray_copy (Bigarray.genarray_of_array1 vec))
+
 let of_numpy (npy : Pytypes.pyobject) : t =
   let genmat = Numpy.to_bigarray Bigarray.Float64 Bigarray.c_layout npy in
   let genmat = bigarray_copy genmat in
@@ -132,7 +135,7 @@ let of_numpy (npy : Pytypes.pyobject) : t =
 let numpy_mul (mat1 : t) (mat2 : t) =
   let py_mat =
     Py.Module.get_function
-      (Pymodules.numpy ())
+      (Pyinit.numpy ())
       "matmul"
       [|to_numpy mat1; to_numpy mat2|]
   in
@@ -141,7 +144,7 @@ let numpy_mul (mat1 : t) (mat2 : t) =
 let numpy_add (mat1 : t) (mat2 : t) =
   let py_mat =
     Py.Module.get_function
-      (Pymodules.numpy ())
+      (Pyinit.numpy ())
       "add"
       [|to_numpy mat1; to_numpy mat2|]
   in
@@ -150,7 +153,7 @@ let numpy_add (mat1 : t) (mat2 : t) =
 let numpy_sub (mat1 : t) (mat2 : t) =
   let py_mat =
     Py.Module.get_function
-      (Pymodules.numpy ())
+      (Pyinit.numpy ())
       "sub"
       [|to_numpy mat1; to_numpy mat2|]
   in
@@ -158,6 +161,6 @@ let numpy_sub (mat1 : t) (mat2 : t) =
 
 let numpy_show (mat : t) : string =
   let py_str =
-    Py.Module.get_function (Pymodules.numpy ()) "array2string" [|to_numpy mat|]
+    Py.Module.get_function (Pyinit.numpy ()) "array2string" [|to_numpy mat|]
   in
   Py.String.to_string py_str

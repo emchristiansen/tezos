@@ -2,13 +2,38 @@
 Blocks and Operations
 =====================
 
-The content of a Tezos block is made up of operations, which implement
+The content of a Tezos block is made up of a block header and a payload consisting of a list of operations.
+
+This page first describes the protocol-specific part of the block header, and then explains what operations are.
+For the protocol-independent part of the block header, see :ref:`shell_header`.
+
+.. _proto_block_header_alpha:
+
+Protocol-specific block header
+~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+
+:ref:`Recall<shell_proto_interact_alpha>` that, for the shell to interact with the economic protocol, two notions are defined abstractly at the level of the shell and made concrete at the level of the consensus protocol.
+Namely, these two notions are the protocol-specific header and the :ref:`fitness <fitness_section_alpha>`.
+
+As in Emmy*, the protocol-specific header contains the fields:
+
+- ``signature``: a digital signature of the shell and protocol headers (excluding the signature itself)
+- ``seed_nonce_hash``: a commitment to :ref:`a random number<random_seed_alpha>`, used to generate entropy on the chain
+- ``proof_of_work_nonce``: a nonce used to pass a low-difficulty proof-of-work for the block, as a spam prevention measure
+- ``liquidity_baking_toggle_vote``: :ref:`a vote<toggle_alpha>` to continue the Liquidity Baking Subsidy, stop it, or abstain.
+
+There are two additional fields: ``payload_hash`` and ``payload_round`` which are needed for establishing if a block is :ref:`final<finality_alpha>`.
+
+Operations
+~~~~~~~~~~
+
+Operations implement
 and reify different functionalities provided by a Tezos economic
 protocol: from reaching consensus on the state of the Tezos
 blockchain, to performing smart contract calls and transactions. Each
 Tezos economic protocol can specify different kinds of operations.
 
-This entry describes the operations supported by :doc:`the economic
+This page only describes the operations supported by :doc:`the economic
 protocol <./protocol>` that implement *enabled* features -- that is,
 those available to end-users on Tezos Mainnet. The complete list of
 operations, including those corresponding to features in development
@@ -32,17 +57,7 @@ operations<manager_operations_alpha>`. This order also specifies the
 of each of these classes. Consensus operations are considered the
 highest priority ones, and manager operations the lowest.
 
-The current protocol implementation enforces the following invariant:
-
-- each kind of operation belongs to *at most one* validation pass;
-- operations whose kind does not belong to any validation pass cannot
-  be :ref:`applied<operation_validity_alpha>`.
-
-.. FIXME tezos/tezos#3915:
-
-   Failing noops don't fit within any of the validation passes
-   below. We need to change the structure a bit to be able to list
-   them here.
+Each kind of operation belongs to exactly one validation pass, except for the :ref:`failing_noop_alpha` which belongs to no validation pass and therefore cannot be :ref:`applied<operation_validity_alpha>`.
 
 In the sequel, we describe the different classes of operations, and
 the different kinds of operations belonging to each class.
@@ -59,13 +74,23 @@ to implement the :doc:`consensus algorithm<consensus>`. There are two
 kinds of consensus operations, each belonging to the different voting
 phases required to agree on the next block.
 
-- A ``Preendorsement`` operation implements a first vote for a
+- A ``Preattestation`` operation implements a first vote for a
   :ref:`candidate block <candidate_block_alpha>` with the aim of
-  building a :ref:`preendorsement quorum <quorum_alpha>`.
+  building a :ref:`preattestation quorum <quorum_alpha>`.
 
-- An ``Endorsement`` operation implements a vote for a candidate block
-  for which a preendorsement quorum certificate (PQC) has been
-  observed.
+- An ``Attestation`` operation implements a vote for a candidate block
+  for which a preattestation quorum certificate (PQC) has been
+  observed. These operations also hold information on :doc:`DAL attestations <../shell/dal_bakers>`
+  when the attesting baker participates in the DAL.
+
+.. _consensus_operations_aggregate_alpha:
+
+Starting in protocol S, blocks are also able to include these operations in an aggregated form, using operations ``Attestations_aggregate`` and ``Preattestations_aggregate``.
+If the attesting baker uses a tz4 consensus key, thanks to the BLS signature scheme,
+its attestation can be aggregated with all the other tz4 pre/attestations,
+which helps reducing the size and validation time of blocks without compromising on
+security. A valid block can include at most one aggregated preattestation
+and at most one aggregated attestation.
 
 .. _voting_operations_alpha:
 
@@ -82,12 +107,11 @@ voting operations:
 
 - The ``Ballot`` operation enables delegates to participate in the
   Exploration and Promotion periods. Delegates use this operation to
-  vote for (``Yay``), against (``Nay``), or to side with the majority
+  vote for (``Yea``), against (``Nay``), or to side with the majority
   (``Pass``), when examining a protocol amendment proposal.
 
 Further details on each operation's implementation and semantics are
-provided in the dedicated entry for :ref:`on-chain
-governance<voting_operations_alpha>`.
+provided in the dedicated entry for :doc:`on-chain governance<voting>`.
 
 .. _anonymous_operations_alpha:
 
@@ -117,21 +141,21 @@ Further details on the latter operation's implementation and semantics
 are provided in the :ref:`random seed generation
 protocol<randomness_generation_alpha>`.
 
-Three operations in this class are used to :ref:`punish participants
+Two operations in this class are used to :ref:`punish participants
 which engage in Byzantine behaviour<slashing_alpha>` -- notably
-delegates which :ref:`"double sign" <Double signing>` blocks, or emit
+delegates which :ref:`"double sign" <def_double_signing_alpha>` blocks, or emit
 conflicting :ref:`consensus operations<consensus_operations_alpha>`:
 
-- The ``Double_preendorsement_evidence`` operation allows for accusing
-  a delegate of having *double-preendorsed* -- i.e., of having
-  preendorsed two different block candidates, at the same level and at
+- The ``Double_consensus_operation_evidence`` operation allows for accusing
+  a delegate of having *double-preattested* or *double-attested* -- i.e., of having
+  preattested, or respectively attested, two different block candidates, at the same level and at
   the same round. The bulk of the evidence, the two arguments
-  provided, consists of the two offending preendorsements.
+  provided, consists of the two offending preattestations, respectively attestations.
 
-- Similarly, the ``Double_endorsement_evidence`` operation allows for
-  accusing a delegate of having *double-endorsed* -- i.e., of having
-  endorsed two different block candidates at the same level and the
-  same round -- by providing the two offending endorsements.
+  Beside the two offending operations, there is a ``slot`` field containing the delegate's slot used in the offending operations.
+  More precisely, each offending operation may be either a standalone operation for this slot, or an :ref:`aggregate operation<consensus_operations_alpha>` containing this slot in its committee.
+
+  In protocols older than S, there were two operations, ``Double_preattestation_evidence`` and ``Double_attestation_evidence``, instead of ``Double_consensus_operation_evidence``, which did not exist.
 
 - The ``Double_baking_evidence`` allows for accusing a delegate of
   having "double-baked" a block -- i.e., of having signed two
@@ -143,7 +167,7 @@ See :ref:`here<slashing_alpha>` for further detail on the semantics of
 evidence-providing operations.
 
 The ``Activation`` operation allows users which participated in the
-Tezos fundraiser to make their :ref:`accounts <Account>` operational.
+Tezos fundraiser to make their :ref:`accounts <def_account_alpha>` operational.
 
 Finally, the ``Drain_delegate`` operation allows an active
 consensus-key account, i.e., an account to which a baker delegated its
@@ -151,6 +175,8 @@ consensus-signing responsibility, to **empty** its delegate
 account. This operation is used as a deterrent to ensure that a
 delegate secures its consensus key as much as its manager (or main)
 key.
+
+The DAL also adds the anonymous operation ``DAL_entrapment_evidence``, see :doc:`./dal_support`.
 
 .. _manager_operations_alpha:
 
@@ -167,23 +193,31 @@ Manager operations enable end-users to interact with the Tezos
 blockchain -- e.g., transferring funds or calling :doc:`smart
 contracts<michelson>`. A manager operation is issued by a single
 *manager* account which signs the operation and pays the
-:ref:`fees<Fee>` to the baker for its inclusion in a block. Indeed,
+:ref:`fees<def_fee_alpha>` to the baker for its inclusion in a block. Indeed,
 manager operations are the only fee-paying and
-:ref:`gas-consuming<Gas>` operations.
+:ref:`gas-consuming<def_gas_alpha>` operations.
 
 - The ``Reveal`` operation reveals the public key of the sending
   manager. Knowing this public key is indeed necessary to check the signature
-  of future operations signed by this manager.
-- The ``Transaction`` operation allows users to either transfer tez
-  between accounts and/or to invoke a smart contract.
-- The ``Delegation`` operation allows users to :ref:`delegate their
-  stake <delegating_coins>` to a :ref:`delegate<Delegate>` (a
-  *baker*), or to register themselves as delegates.
-- The ``Update_consensus_key`` operation allows users to delegate the
-  responsibility of signing blocks and consensus-related operations to
-  another account. Note that consensus keys cannot be BLS public keys.
+  of future operations signed by this manager. Additionally, when revealing a tz4 public key,
+  the manager must also include a proof of possession, which is the signature
+  of the public key itself.
+- The ``Transaction`` operation allows users to transfer tez
+  between accounts, to invoke a smart contract, or to invoke :ref:`pseudo-operations <pseudo_operations_alpha>` on user accounts.
+- The ``Delegation`` operation allows users to designate a :ref:`delegate<def_delegate_alpha>` (a
+  *baker*) for :ref:`delegating <delegating_coins>` or :ref:`staking <delegating_coins>` their coins, or to register themselves as delegates.
+- The ``Update_consensus_key`` operation allows users to register a
+  :ref:`consensus key<consensus_key_alpha>`, which is a dedicated key
+  for signing blocks and consensus-related operations.
+  When the new consensus key is a tz4 (BLS key), the optional ``proof`` field
+  must contain a proof of possession, which is the signature of the public key
+  itself. Note that consensus keys cannot be ML-DSA-44 public keys.
+- The ``Update_companion_key`` operation allows users to register a
+  :ref:`companion key<companion_key>`, which is a dedicated key (introduced in protocol S)
+  for signing the DAL specific part of consensus operations,
+  when using a tz4 consensus key.
 - The ``Origination`` operation is used to
-  :ref:`originate<Origination>`, that is to deploy, smart contracts
+  :ref:`originate<def_origination_alpha>`, that is to deploy, smart contracts
   in the Tezos blockchain.
 - The ``Set_deposits_limit`` operation enables delegates to adjust the
   amount of stake a delegate :ref:`has locked in
@@ -195,6 +229,7 @@ manager operations are the only fee-paying and
 - The ``Event`` operation enables sending event-like information to
   external applications from Tezos smart contracts -- see
   :doc:`Contract Events<event>` for further detail.
+- The ``DAL_publish_commitment`` operation (see :doc:`./dal_support`)
 
 Moreover, all operations necessary to implement Tezos' *enshrined*
 Layer 2 solutions into the economic protocol are also manager
@@ -211,7 +246,7 @@ handled with dedicated manager operations.
   according to their specific semantics.
 - The ``Smart_rollup_publish`` operation is used to regularly declare
   what is the new state of a given smart rollup in a so-called
-  “commitment”. To publish commitments, an implicit account has to
+  “commitment”. To publish commitments, a user account has to
   own at least ꜩ 10,000, which are frozen as long as at least one of
   their commitments is disputable.
 - The ``Smart_rollup_cement`` operation is used to cement a
@@ -219,9 +254,9 @@ handled with dedicated manager operations.
   published for long enough, and there is no concurrent commitment for
   the same state update. Once a commitment is cemented, it cannot be
   disputed anymore.
-- The ``Smart_rollup_recover_bond`` operation is used by an implicit
+- The ``Smart_rollup_recover_bond`` operation is used by a user
   account to unfreeze their ꜩ 10,000. This operation only succeeds if
-  and only if all the commitments published by the implicit account
+  and only if all the commitments published by the user account
   have been cemented.
 - The ``Smart_rollup_refute`` operation is used to start or pursue a
   dispute. A dispute is resolved on the Tezos blockchain through a
@@ -259,3 +294,26 @@ Batches satisfy the following properties:
   atomically: all its operations are executed sequentially, without
   interleaving other operations. Either all the operations in the
   batch succeed, or none is applied.
+
+.. _failing_noop_alpha:
+
+Failing_noop operation
+~~~~~~~~~~~~~~~~~~~~~~
+
+The ``Failing_noop`` operation is not executable in the protocol:
+
+- it can only be validated in :ref:`mempool mode <partial_construction_alpha>`, by the :doc:`prevalidator component <../shell/prevalidation>`;
+- consequently, this operation cannot be :ref:`applied <operation_validity_alpha>`, and in fact will never be included into a block.
+
+Rather, the ``Failing_noop`` operation allows
+to sign an arbitrary string, without introducing an operation that could be misinterpreted in the protocol.
+
+The Octez client provides commands to sign and verify the signature of input messages by a given key. These commands create a ``failing_noop``
+operation from the message that is being signed or checked.
+
+::
+
+   octez-client sign message "hello world" for <account>
+
+   octez-client check that message "hello world" was signed by <account> to
+   produce <signature>

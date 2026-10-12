@@ -33,7 +33,7 @@
 
 let check_protocol ?protocol_hash ~__LOC__ client expected =
   let* {protocol; _} =
-    RPC.Client.call ?protocol_hash client @@ RPC.get_chain_block_metadata ()
+    Client.RPC.call ?protocol_hash client @@ RPC.get_chain_block_metadata ()
   in
   Check.(
     (protocol = expected)
@@ -44,7 +44,7 @@ let check_protocol ?protocol_hash ~__LOC__ client expected =
 
 let check_level ?protocol_hash ~__LOC__ client expected =
   let* header =
-    RPC.Client.call ?protocol_hash client @@ RPC.get_chain_block_header ()
+    Client.RPC.call ?protocol_hash client @@ RPC.get_chain_block_header ()
   in
   let level = JSON.(header |-> "level" |> as_int) in
   Check.(
@@ -111,10 +111,10 @@ module Demo_counter = struct
     let* () = Demo_client.increment_a client in
     let* mempool = Mempool.get_mempool client in
     Check.(
-      (List.length mempool.applied = 1)
+      (List.length mempool.validated = 1)
         int
         ~__LOC__
-        ~error_msg:"Expected %R applied operations, got %L") ;
+        ~error_msg:"Expected %R validated operations, got %L") ;
     let* () = Demo_client.bake client in
     let* () = check_a ~__LOC__ client 1 in
     let* () = check_b ~__LOC__ client 0 in
@@ -180,7 +180,7 @@ module Demo_noops = struct
     Log.info "Forge and bake a block" ;
     let* () =
       let genesis_rpc_call =
-        RPC.Client.call ~protocol_hash:Protocol.genesis_hash client
+        Client.RPC.call ~protocol_hash:Protocol.genesis_hash client
       in
       let message = "Hello world" in
       let data =

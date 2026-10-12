@@ -15,10 +15,11 @@ The rest of this page gives more details about the amendment and voting process.
 Periods
 -------
 
-The amendment process consists of five *periods*. Each period lasts for 5 cycles
-(or approximately two weeks). The periods (listed below)
-typically succeed one to another for a total duration of approximately 2 months and
-a half, after which the whole amendment process starts again.
+The amendment process consists of five *periods*. Each period lasts
+for ``CYCLES_PER_VOTING_PERIOD`` = 14 cycles (that is, around 14
+days). The periods (listed below) typically succeed one to another for
+a total duration of approximately 2 months and a half, after which the
+whole amendment process starts again.
 
 The five periods are as follows:
 
@@ -34,21 +35,21 @@ The five periods are as follows:
   At the end of a **proposal period**, if participation reaches a
   :ref:`proposal quorum <proposal_quorum>`, the proposal with most support is
   selected and we move to an **exploration period**. Note that support is
-  measured in the cumulated staking power (expressed in mutez) that delegates supporting the
-  proposal have. E.g., a proposal supported by a single delegate with 600,000 tz of staking power
+  measured in the :ref:`voting power <voting_power_alpha>` that delegates supporting the
+  proposal have. E.g., a proposal supported by a single delegate with 600,000 tz of voting power
   has more support than a proposal supported by two delegates with 100,000 tz
-  each of staking power.
+  each of voting power.
 
   If there are no proposals, or a tie between two or more proposals,
   or if participation did not reach the proposal quorum, the process
   moves back to a new **proposal period**.
 
 - *Exploration period*: During this period delegates can cast one
-  Yay, Nay, or Pass ballot on the selected proposal. They do so using the
+  Yea, Nay, or Pass ballot on the selected proposal. They do so using the
   ``Ballot`` operation.
 
   If the voting participation reaches *quorum* and there is a *super-majority*
-  of Yay, the process moves to the **cooldown period**. (See below for details
+  of Yea, the process moves to the **cooldown period**. (See below for details
   on participation, quorum, and super-majority.)
 
   Otherwise the process moves back to the **proposal period**.
@@ -60,11 +61,11 @@ The five periods are as follows:
 
   At the end of this period, the process moves to the **promotion period**.
 
-- *Promotion period*: During this period, delegates can cast a Yay, Nay, or Pass
+- *Promotion period*: During this period, delegates can cast a Yea, Nay, or Pass
   ballots using the ``Ballot`` operation.
 
   If the voting participation reaches *quorum* and there is a super-majority of
-  Yay, the process moves to the **adoption period**.
+  Yea, the process moves to the **adoption period**.
 
   Otherwise the process moves back to the **proposal period**.
 
@@ -83,9 +84,20 @@ The five periods are as follows:
 
   And a new **proposal period** starts.
 
+.. warning::
+   Thanks to an old spelling mistake, the most enthusiastic voters can cast ``Yay`` ballots. Enthusiasm does however not impact the result of the vote and the tools accepting ``Yay`` consider it as a deprecated synonym for ``Yea``.
+
 
 Activation
 ----------
+
+In the last block of the last cycle of an Adoption period (called activation block),
+the current Protocol learns about the Protocol into which the next
+block should be validated.
+Once the activation block is applied, the Octez shell initializes the new protocol and
+performs the protocol-stitching process. The first block of the cycle after the Adoption period
+belongs to the new Protocol. It does not contain attestations for the
+previous block.
 
 After the activation step, the blocks added to the chain are interpreted in the
 newly activated protocol. As a result gas costs may differ, new operations may
@@ -98,15 +110,23 @@ might be introduced, a different selection mechanism may be used, the quorum
 requirement might differ, etc.
 
 
+.. _voting_power_alpha:
+
 Voting Power
 ------------
 
-When supporting a proposal or casting a Yay, Nay, or Pass ballot, each delegate
-has voting power equal to its *stake*. The stake is always measured in
-**mutez**.
+When supporting a proposal or casting a Yea, Nay, or Pass ballot, each
+delegate has a **voting power** equal to the amount of tez owned by
+all its delegators (including the delegate itself of course), no
+matter whether they are :doc:`staked<staking>` or not.
 
-Note that the stake of each delegate is computed at the beginning of each
-period.
+More precisely, the voting power of a delegate during a voting period
+is the sum of its :ref:`total_staked<total_staked_alpha>` and
+:ref:`total_delegated<total_delegated_alpha>` amounts, measured in
+*mutez*, and snapshotted at the beginning of the voting period. (Note
+the differences from the validator selection for consensus, which is
+based on the more complex :doc:`baking power<baking_power>` instead,
+and sampled at the end of an earlier cycle.)
 
 
 Super-majority and Quorum
@@ -114,12 +134,12 @@ Super-majority and Quorum
 
 As mentioned above, during either of the **exploration** or **promotion** periods,
 delegates can cast ballots using the ``Ballot`` operation (see below).
-In both cases, delegates can cast a single Yay, Nay, or Pass ballot. A ballot
-has a weight equal to the delegate's stake as detailed above.
+In both cases, delegates can cast a single Yea, Nay, or Pass ballot. A ballot
+has a weight equal to the delegate's voting power as detailed above.
 
 For either of these two periods, the process continues to the next period if the
 *vote participation* reaches *quorum* and there is a *super-majority* of
-Yay.
+Yea.
 
 The *vote participation* is the ratio of all the cumulated stake of cast ballots
 (including Pass ballots) to the total stake.
@@ -139,8 +159,8 @@ This formula avoids establishing quorums close to 100% that would be
 very difficult to attain, or, conversely, low quorums close to 0% making
 little participation chronic, ensuring that the quorums are lower- and upper-bounded by :ref:`quorum_caps` (0.2 and 0.7, respectively).
 
-The *super-majority* is reached if the cumulated stake of Yay ballots is
-greater than 8/10 of the cumulated stake of Yay and Nay ballots.
+The *super-majority* is reached if the cumulated stake of Yea ballots is
+greater than 8/10 of the cumulated stake of Yea and Nay ballots.
 
 Note that Pass ballots do not count towards or against the super-majority;
 they still counts towards participation and quorum.
@@ -169,7 +189,7 @@ fails.
 .. sidebar:: Checking a hash is of a valid protocol
 
    When a hash is proposed by a delegate, it is usually accompanied by some
-   blogposts and forum threads on :ref:`community websites <tezos_community>`.
+   blogposts and forum threads on :ref:`community <tezos_community>` websites.
    These should include directions for testing the proposed protocols. If you
    cannot find such directions, do not hesitate to ask.
 
@@ -236,7 +256,7 @@ A *ballot* operation can only be submitted during periods where a vote happens
      ballot: Vote_repr.ballot ; }
 
 The fields ``source`` and ``period`` are the same as above, while ``proposal``
-is the currently selected proposal and ``ballot`` is one of ``Yay``, ``Nay`` or
+is the currently selected proposal and ``ballot`` is one of ``Yea``, ``Nay`` or
 ``Pass``.
 The ``Pass`` vote allows a delegate to contribute towards the quorum without
 contributing towards the super-majority. This is important because, as detailed
@@ -284,8 +304,6 @@ in the following samples::
   Blocks remaining until end of period: 64
   Current proposal: PsNa6jTtsRfbGaNSoYXNTNM5A7c3Lji22Yf2ZhpFUjQFC17iZVp
 
-It should be noted that the ballot number 2,400,000 ꜩ above is the stake counted in
-mutez (displayed in tez).
 The proposal has a total stake of 2,400,000 ꜩ, which may come from a single ballot
 from a delegate having a staking balance of 2,400,000 ꜩ or it may come from multiple ballots from
 delegates with a combined stake of 2,400,000 ꜩ.
@@ -305,7 +323,7 @@ following two conditions:
 
 - the protocol hash was already proposed on the network. In this case
   we can submit an additional proposal that "upvotes" an existing one
-  and our staking power are added to the ones already supporting the proposal.
+  and our voting power are added to the ones already supporting the proposal.
 - the protocol is known by the node. In particular the first proposer
   of a protocol should be able to successfully inject the protocol in
   its node which performs some checks, compiles and loads the
@@ -323,7 +341,7 @@ Submit ballots
 During either of the **exploration** or **promotion** periods,
 ballots can be submitted once with::
 
-    octez-client submit ballot for <delegate> <proposal> <yay|nay|pass>
+    octez-client submit ballot for <delegate> <proposal> <yea|nay|pass>
 
 Further External Resources
 --------------------------

@@ -25,6 +25,13 @@
 
 open Tezos_scoru_wasm_helpers
 open Tezos_scoru_wasm
+
+module Wasm_vm = Wasm_vm.Make_vm (struct
+  let config = Wasm_pvm_config.empty
+
+  let make_empty_nds = None
+end)
+
 open Wasm_pvm_state.Internal_state
 open Pvm_instance
 
@@ -66,22 +73,29 @@ let should_continue phase (pvm_state : pvm_state) =
   Lwt.return continue
 
 let finish_top_level_call_on_state pvm_state =
-  Wasm_vm.compute_step_many ~max_steps:Int64.max_int ~write_debug:Noop pvm_state
-
-let execute_fast pvm_state =
-  Wasm_fast_vm.compute_step_many
-    ~reveal_builtins:builtins
+  Wasm_vm.compute_step_many
+    ~wasm_entrypoint:Constants.wasm_entrypoint
     ~max_steps:Int64.max_int
     ~write_debug:Noop
     pvm_state
 
-let execute_on_state phase state =
+let execute_fast ~reveal_builtins pvm_state =
+  Wasm_fast_vm.compute_step_many
+    ~wasm_entrypoint:Constants.wasm_entrypoint
+    ~reveal_builtins
+    ~max_steps:Int64.max_int
+    ~write_debug:Noop
+    pvm_state
+
+let execute_on_state ~reveal_builtins phase state =
   match state.tick_state with
   | Stuck _ -> Lwt.return (state, 0L)
   | _ ->
       Wasm_vm.compute_step_many_until
-        ~write_debug:Noop
+        ~wasm_entrypoint:Constants.wasm_entrypoint
+        ~reveal_builtins
         ~max_steps:Int64.max_int
+        ~write_debug:Wasm_utils.write_debug_on_stdout
         (should_continue phase)
         state
 
@@ -102,15 +116,11 @@ let read_message name =
   read_file kernel_file
 
 let initial_boot_sector_from_kernel ?(max_tick = 1000000000000L) kernel =
-  let open Lwt_syntax in
-  let+ tree =
-    Wasm_utils.initial_tree
-      ~version:V1
-      ~ticks_per_snapshot:max_tick
-      ~from_binary:true
-      kernel
-  in
-  tree
+  Wasm_utils.initial_state
+    ~version:V1
+    ~ticks_per_snapshot:max_tick
+    ~from_binary:true
+    kernel
 
 type input = File of string | Str of string
 

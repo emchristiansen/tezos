@@ -167,8 +167,8 @@ let classify op =
   | None -> `Bad
   | Some pass ->
       let open Operation_repr in
-      if pass = consensus_pass then `Consensus
-        (* TODO filter outdated consensus ops ? *)
+      if pass = consensus_pass then
+        `Consensus (* TODO filter outdated consensus ops ? *)
       else if pass = voting_pass then `Votes
       else if pass = anonymous_pass then `Anonymous
       else if pass = manager_pass then `Managers
@@ -198,97 +198,102 @@ type consensus_filter = {
   level : int32;
   round : Round.t;
   payload_hash : Block_payload_hash.t;
+  branch : Block_hash.t;
 }
 
 (** From a pool of operations [operation_pool], the function filters
-    out the endorsements that are different from the [current_level],
+    out the attestations that are different from the [current_level],
     the [current_round] or the optional [current_block_payload_hash],
-    as well as preendorsements. *)
-let filter_with_relevant_consensus_ops ~(endorsement_filter : consensus_filter)
-    ~(preendorsement_filter : consensus_filter option) operation_set =
+    as well as preattestations. *)
+let filter_with_relevant_consensus_ops ~(attestation_filter : consensus_filter)
+    ~(preattestation_filter : consensus_filter option) operation_set =
   Operation_set.filter
-    (fun {protocol_data; _} ->
-      match (protocol_data, preendorsement_filter) with
-      (* 1a. Remove preendorsements. *)
-      | Operation_data {contents = Single (Preendorsement _); _}, None -> false
-      (* 1b. Filter preendorsements. *)
+    (fun {shell = {branch}; protocol_data} ->
+      match (protocol_data, preattestation_filter) with
+      (* 1a. Remove preattestations. *)
+      | Operation_data {contents = Single (Preattestation _); _}, None -> false
+      (* 1b. Filter preattestations. *)
       | ( Operation_data
             {
               contents =
-                Single (Preendorsement {level; round; block_payload_hash; _});
+                Single (Preattestation {level; round; block_payload_hash; _});
               _;
             },
           Some
-            {level = level'; round = round'; payload_hash = block_payload_hash'}
-        ) ->
+            {
+              level = level';
+              round = round';
+              payload_hash = block_payload_hash';
+              branch = branch';
+            } ) ->
           Compare.Int32.(Raw_level.to_int32 level = level')
           && Round.(round = round')
           && Block_payload_hash.(block_payload_hash = block_payload_hash')
-      (* 2. Filter endorsements. *)
+          && Block_hash.(branch = branch')
+      (* 2. Filter attestations. *)
       | ( Operation_data
             {
               contents =
-                Single (Endorsement {level; round; block_payload_hash; _});
+                Single
+                  (Attestation
+                     {
+                       consensus_content = {level; round; block_payload_hash; _};
+                       dal_content = _;
+                     });
               _;
             },
           _ ) ->
-          Compare.Int32.(Raw_level.to_int32 level = endorsement_filter.level)
-          && Round.(round = endorsement_filter.round)
+          Compare.Int32.(Raw_level.to_int32 level = attestation_filter.level)
+          && Round.(round = attestation_filter.round)
           && Block_payload_hash.(
-               block_payload_hash = endorsement_filter.payload_hash)
+               block_payload_hash = attestation_filter.payload_hash
+               && Block_hash.(branch = attestation_filter.branch))
       (* 3. Preserve all non-consensus operations. *)
       | _ -> true)
     operation_set
 
-let unpack_preendorsement packed_preendorsement =
-  let {shell; protocol_data = Operation_data data} = packed_preendorsement in
+let unpack_preattestation packed_preattestation =
+  let {shell; protocol_data = Operation_data data} = packed_preattestation in
   match data with
-  | {contents = Single (Preendorsement _); _} ->
-      Some ({shell; protocol_data = data} : Kind.preendorsement Operation.t)
+  | {contents = Single (Preattestation _); _} ->
+      Some ({shell; protocol_data = data} : Kind.preattestation Operation.t)
   | _ -> None
 
-let unpack_endorsement packed_endorsement =
-  let {shell; protocol_data = Operation_data data} = packed_endorsement in
+let unpack_attestation packed_attestation =
+  let {shell; protocol_data = Operation_data data} = packed_attestation in
   match data with
-  | {contents = Single (Endorsement _); _} ->
-      Some ({shell; protocol_data = data} : Kind.endorsement Operation.t)
+  | {contents = Single (Attestation _); _} ->
+      Some ({shell; protocol_data = data} : Kind.attestation Operation.t)
   | _ -> None
 
-let unpack_dal_attestation packed_dal_attestation =
-  let {shell; protocol_data = Operation_data data} = packed_dal_attestation in
-  match data with
-  | {contents = Single (Dal_attestation _); _} ->
-      Some ({shell; protocol_data = data} : Kind.dal_attestation Operation.t)
-  | _ -> None
-
-let filter_preendorsements ops =
+let filter_preattestations ops =
   List.filter_map
     (function
       | {
           shell = {branch};
           protocol_data =
             Operation_data
-              ({contents = Single (Preendorsement _); _} as content);
+              ({contents = Single (Preattestation _); _} as content);
           _;
         } ->
           Some
             ({shell = {branch}; protocol_data = content}
-              : Kind.preendorsement operation)
+              : Kind.preattestation operation)
       | _ -> None)
     ops
 
-let filter_endorsements ops =
+let filter_attestations ops =
   List.filter_map
     (function
       | {
           shell = {branch};
           protocol_data =
-            Operation_data ({contents = Single (Endorsement _); _} as content);
+            Operation_data ({contents = Single (Attestation _); _} as content);
           _;
         } ->
           Some
             ({shell = {branch}; protocol_data = content}
-              : Kind.endorsement operation)
+              : Kind.attestation operation)
       | _ -> None)
     ops
 
@@ -318,38 +323,34 @@ let ordered_pool_of_payload ~consensus_operations
 
 let extract_operations_of_list_list = function
   | [consensus; votes_payload; anonymous_payload; managers_payload] ->
-      let preendorsements, endorsements, dal_attestations =
+      let preattestations, attestations =
         List.fold_left
-          (fun ( (preendorsements : Kind.preendorsement Operation.t list),
-                 (endorsements : Kind.endorsement Operation.t list),
-                 (dal_attestations : Kind.dal_attestation Operation.t list) )
-               packed_op ->
-            let {shell; protocol_data = Operation_data data} = packed_op in
-            match data with
-            | {contents = Single (Preendorsement _); _} ->
-                ( {shell; protocol_data = data} :: preendorsements,
-                  endorsements,
-                  dal_attestations )
-            | {contents = Single (Endorsement _); _} ->
-                ( preendorsements,
-                  {shell; protocol_data = data} :: endorsements,
-                  dal_attestations )
-            | {contents = Single (Dal_attestation _); _} ->
-                ( preendorsements,
-                  endorsements,
-                  {shell; protocol_data = data} :: dal_attestations )
+          (fun ( (preattestations : packed_operation list),
+                 (attestations : packed_operation list) )
+               packed_op
+             ->
+            let (Operation_data protocol_data) = packed_op.protocol_data in
+            match protocol_data.contents with
+            | Single (Preattestation _) ->
+                (packed_op :: preattestations, attestations)
+            | Single (Preattestations_aggregate _) ->
+                (packed_op :: preattestations, attestations)
+            | Single (Attestation _) ->
+                (preattestations, packed_op :: attestations)
+            | Single (Attestations_aggregate _) ->
+                (preattestations, packed_op :: attestations)
             | _ ->
                 (* unreachable *)
-                (preendorsements, endorsements, dal_attestations))
-          ([], [], [])
+                (preattestations, attestations))
+          ([], [])
           consensus
         (* N.b. the order doesn't matter *)
       in
-      let preendorsements =
-        if preendorsements = [] then None else Some preendorsements
+      let preattestations =
+        if preattestations = [] then None else Some preattestations
       in
       let payload = {votes_payload; anonymous_payload; managers_payload} in
-      Some (preendorsements, endorsements, dal_attestations, payload)
+      Some (preattestations, attestations, payload)
   | _ -> None
 
 let filter_pool p {consensus; votes; anonymous; managers} =

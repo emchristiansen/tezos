@@ -30,16 +30,13 @@ let section = ["node"; "validator"; "bootstrap_pipeline"]
 (* notice level events *)
 
 let fetching_locator =
-  declare_3
+  declare_2
     ~section
     ~name:"fetching_locator"
-    ~msg:
-      "fetching branch of about {locator_length} blocks from peer {peer_id} in \
-       {steps_number} steps"
+    ~msg:"fetching branch of {locator_length} blocks from peer {peer_id}"
     ~level:Notice
     ("locator_length", Data_encoding.int31)
     ("peer_id", P2p_peer.Id.encoding)
-    ("steps_number", Data_encoding.int31)
 
 let still_fetching_large_step_from_peer =
   declare_3
@@ -48,7 +45,7 @@ let still_fetching_large_step_from_peer =
     ~msg:
       "still fetching headers from peer {peer_id}: \
        {block_fetched}/{step_length}"
-    ~level:Notice
+    ~level:Info
     ("peer_id", P2p_peer.Id.encoding)
     ("block_fetched", Data_encoding.int31)
     ("step_length", Data_encoding.int31)
@@ -70,6 +67,8 @@ let fetching_step_from_peer =
     ("predecessor", Block_hash.encoding)
     ("peer_id", P2p_peer.Id.encoding)
 
+(* debug level events *)
+
 let fetching_block_header_from_peer =
   declare_4
     ~section
@@ -80,8 +79,6 @@ let fetching_block_header_from_peer =
     ("peer_id", P2p_peer.Id.encoding)
     ("block_fetched", Data_encoding.int31)
     ("step_length", Data_encoding.int31)
-
-(* debug level events *)
 
 let fetching_all_steps_from_peer =
   declare_1

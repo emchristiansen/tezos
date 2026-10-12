@@ -27,6 +27,12 @@
 open Tezos_scoru_wasm
 module Wasmer = Tezos_wasmer
 
+module Wasm_vm = Wasm_vm.Make_vm (struct
+  let config = Wasm_pvm_config.empty
+
+  let make_empty_nds = None
+end)
+
 include (Wasm_vm : Wasm_vm_sig.S)
 
 let compiler_env_variable = "OCTEZ_WASMER_COMPILER"
@@ -46,34 +52,67 @@ let get_compiler () =
       |> Stdlib.failwith
   | None -> Wasmer.Config.CRANELIFT
 
-let store =
+let engine =
   Lazy.from_fun @@ fun () ->
-  let engine =
-    Wasmer.Engine.create Wasmer.Config.{compiler = get_compiler ()}
-  in
-  Wasmer.Store.create engine
+  Wasmer.Engine.create Wasmer.Config.{compiler = get_compiler ()}
 
-let load_kernel durable =
-  let store = Lazy.force store in
-  Module_cache.load_kernel store durable
+(** This store will largely remain empty. It is mainly useful when a function
+    wants to access the underlying engine, but its interface requires a store.
 
-let compute ~reveal_builtins ~write_debug durable buffers =
+    This is the case with [wasm_module_new]. In Wasmer, the underlying function
+    only needs access to the engine, but the standardised WebAssembly C API
+    dictates that the function requires a store parameter. *)
+let static_store = Lazy.map Wasmer.Store.create engine
+
+(** Allocate a new store, pass it to the given function and destroy the
+    store once the function is done.
+
+    We do this to combat an issue with Wasmer 3.3.0 where the store objects
+    belonging to a module instance are kept alive after the instance has been
+    destroyed. *)
+let with_store f =
+  let store = Wasmer.Store.create (Lazy.force engine) in
+  Lwt.finalize
+    (fun () -> f store)
+    (fun () ->
+      Wasmer.Store.delete store ;
+      Lwt.return_unit)
+
+let load_kernel ~hooks durable =
+  let store = Lazy.force static_store in
+  Module_cache.load_kernel ~hooks store durable
+
+let preload_kernel ~hooks durable =
+  let open Lwt_syntax in
+  let* _ = load_kernel ~hooks durable in
+  return_unit
+
+let compute ?(wasm_entrypoint = Constants.wasm_entrypoint) ~hooks ~version ~nds
+    ~nds_host_functions_enabled ~reveal_builtins ~write_debug durable buffers =
   let open Lwt.Syntax in
-  let* module_ = load_kernel durable in
+  let* module_ = load_kernel ~hooks durable in
 
   let main_mem : (unit -> Wasmer.Memory.t) option ref = ref None in
   let retrieve_mem () =
     match !main_mem with Some x -> x () | None -> assert false
   in
 
-  let host_state = Funcs.{retrieve_mem; buffers; durable} in
-  let host_funcs = Funcs.make ~reveal_builtins ~write_debug host_state in
+  let host_state = Funcs.{retrieve_mem; buffers; durable; nds} in
+  let host_funcs =
+    Funcs.make
+      ~version
+      ~nds_host_functions_enabled
+      ~reveal_builtins
+      ~write_debug
+      host_state
+  in
 
   let with_durable f =
     let+ durable = f host_state.durable in
     host_state.durable <- durable
   in
-  let store = Lazy.force store in
+
+  with_store @@ fun store ->
   let* instance = Wasmer.Instance.create store module_ host_funcs in
 
   let* () =
@@ -84,20 +123,50 @@ let compute ~reveal_builtins ~write_debug durable buffers =
 
   let exports = Wasmer.Exports.from_instance instance in
   let kernel_run =
-    Wasmer.(Exports.fn exports "kernel_run" (producer nothing))
+    Wasmer.(Exports.fn exports wasm_entrypoint (producer nothing))
   in
 
   main_mem := Some (fun () -> Wasmer.Exports.mem0 exports) ;
 
-  let* () =
-    Lwt.finalize kernel_run (fun () ->
+  let* success =
+    Lwt.finalize
+      (fun () ->
+        Lwt.catch
+          (fun () ->
+            let* () = kernel_run () in
+            Lwt.return_true)
+          (function
+            | Tezos_wasmer.Trap rust_str as exn -> (
+                (* [String.split_on_char] never returns [] so using
+                   [Stdlib.List.hd] is safe. *)
+                let str =
+                  Stdlib.List.hd (String.split_on_char '\000' rust_str)
+                in
+                match str with
+                | "unreachable" | "out of bounds memory access"
+                | "integer divide by zero" | "indirect call type mismatch" ->
+                    let* () =
+                      Option.value
+                        ~default:(Fun.const Lwt.return_unit)
+                        hooks.fast_exec.wasm_trap
+                        str
+                    in
+                    Lwt.return_false
+                | _ -> Lwt.reraise exn)
+            | exn -> Lwt.reraise exn))
+      (fun () ->
         (* Make sure that the instance is deleted regardless of whether
            [kernel_run] succeeds or not. *)
+        main_mem := None ;
+        Wasmer.Exports.delete exports ;
         Wasmer.Instance.delete instance ;
         Lwt.return_unit)
   in
 
-  let* durable = Wasm_vm.patch_flags_on_eval_successful host_state.durable in
+  let* durable =
+    if success then Wasm_vm.patch_flags_on_eval_successful host_state.durable
+    else Wasm_vm.patch_flags_on_eval_trapped host_state.durable
+  in
   (* TODO: #4283
      The module is cached, but the cash is never cleaned.
      This is the point where it was scrubed before.*)

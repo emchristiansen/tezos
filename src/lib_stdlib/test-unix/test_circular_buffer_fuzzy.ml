@@ -26,7 +26,8 @@
 (** Testing
     -------
     Component:    stdlib
-    Invocation:   dune build @src/lib_stdlib/test/runtest
+    Invocation:   dune exec src/lib_stdlib/test-unix/main.exe \
+                  -- --file test_circular_buffer_fuzzy.ml
     Subject:      Test the circular buffer with a reference implementation
  *)
 
@@ -253,7 +254,7 @@ let () =
             read_data ~without_invalid_argument read_len right_state
           in
           if left_has_raised then
-            if right_has_raised then Lwt.return true
+            if right_has_raised then Lwt.return_true
             else
               QCheck2.Test.fail_report "Different behaviors (invalid_argument)"
           else
@@ -347,6 +348,7 @@ let () =
         true)
   in
   Alcotest.run
+    ~__FILE__
     "Stdlib.circular_buffer"
     [
       ("Invalid argument", qcheck_wrap [test_invalid_argument]);

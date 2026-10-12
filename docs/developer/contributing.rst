@@ -7,43 +7,66 @@ Octez.
 Introduction
 ------------
 
-There are several ways to get involved with the codebase, and you may want to start with some preliminary steps.
+There are several ways to get involved with the codebase and its documentation, and you may want to start with some preliminary steps.
 
+.. _feedback_doc:
+
+Providing feedback on documentation
+~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+
+As your journey will likely start by reading this documentation, please consider giving us feedback using the "Send feedback" button available in all entries.
+You can use it to mention aspects you like or don't like.
+Many kinds of feedback are useful!
+For instance, there are more objective aspects of documentation, such as:
+
+- reliable: are the explanations accurate? up-to-date?
+- consistent: are there any contradictions between the different parts?
+- complete: are there important topics or aspects not described?
+- precise: are the explanations detailed enough?
+- grammatically correct: is the phrasing correct?
+
+or more subjective aspects such as:
+
+- clear: are the explanations easy to understand?
+- easy to find: did you have troubles locating some information?
+- useful: does the text help in some way?
+
+However, if the feedback is about grammar, spelling, and other similar aspects, please consider implementing your suggested changes by submitting fixes to the Octez Docs' typo train -- explained next.
+
+Fixing typos
+~~~~~~~~~~~~
+
+You may want to fix some typos and minor errors or incoherencies in the documentation, which is situated in the ``docs/`` subfolder of the code repository, or within *comments* or *docstrings* within the code.
+Small tweaks like these can be contributed without creating a merge request and commits can rather be pushed directly to the ``typo-doc`` branch in the ``tezos/tezos`` repository. This branch is regularly merged into the master branch, e.g., every one or two weeks.
+(If the branch has been automatically deleted following a merge, just create it again.)
+This periodic merging is implemented by a series of MRs named "the Typo Train", created for you by a volunteer, and batching the currently pending fixes.
+Of course, all these commits will be reviewed before being integrated.
+The current edition of the typo train MR can be found in meta-issue :gl:`#2329`.
+
+If you don't have enough permissions to push to the branch above, you can still make commits in your own fork of the Octez repository, and ask for them to be cherry-picked on the typo/train on the ``#documentation`` channel on the Tezos Dev Slack space.
+Alternatively, you may of course create your own MRs on the tezos/tezos repository for submitting documentations changes without using the Typo Train. In that case, Doc owners might contact you on the MR to suggest changes, including integrating these in a current open train.
 
 Reporting issues
 ~~~~~~~~~~~~~~~~
 
-The simplest way to contribute to Octez is to report issues that you may
+Another simple way to contribute to Octez is to report issues that you may
 find with the software on `GitLab <https://gitlab.com/tezos/tezos/-/issues>`__.
 If you are unsure about an issue
-consult the :doc:`technical support sources <../introduction/support>`
+consult the :ref:`Tezos community <tezos_community>`
 first and always make sure
 to search the existing issues before reporting a new one.
 Some information that are probably important to include in the description:
 the architecture (e.g. *ARM64*), the operating system (e.g. *Debian
-Stretch*), the network you are connected to (e.g. *Ghostnet*), the
+Stretch*), the network you are connected to (e.g. *Shadownet*), the
 binary or component (e.g. *octez-node crashes* or *rpc X returns Y
 while Z was expected*).
 
 Other useful contributions consist in inspecting existing issues and adding details, suggesting workarounds, etc.
 
-Fixing typos
-~~~~~~~~~~~~
-
-You may also want to fix some typos and minor errors or incoherencies in the *documentation*, which is situated in the ``docs/`` subfolder of the code repository, or within *comments* or *docstrings* within the code.
-Small tweaks like these can be contributed without creating a merge request and commits can rather be pushed directly to the ``typo-doc`` branch in the ``tezos/tezos`` repository. This branch is regularly merged into the master branch, e.g., every one or two weeks.
-(If the branch has been automatically deleted following a merge, just create it again.)
-This periodic merging is implemented by a series of MRs named "the typo train", created for you by a volunteer, and batching the currently pending fixes.
-Of course, all these commits will be reviewed before being integrated.
-The current edition of the typo train MR can be found in meta-issue :gl:`#2329`.
-
-If you don't have enough permissions to push to the branch above, you can  still make commits in your own fork of the Octez repository, and ask for them to be cherry-picked on the typo/train on the ``#documentation`` channel on the Tezos Dev Slack space.
-Alternatively, you may of course create your own MRs for submitting your changes, without using the typo train.
-
 Other non-code contributions
 ~~~~~~~~~~~~~~~~~~~~~~~~~~~~
 
-If you acquired a good expertise level in using, configuring, or overcoming problems with the various Octez executables, you may bring useful contributions by providing assistance to others via the different channels (Slack,  StackExchange, etc.) listed in the :doc:`technical support page <../introduction/support>`.
+If you acquired a good expertise level in using, configuring, or overcoming problems with the various Octez executables, you may bring useful contributions by providing assistance to others via the different channels (Slack,  StackExchange, etc.) in the :ref:`Tezos community <tezos_community>`.
 
 If you want to shape the future of Octez, you may consider contributing to Tezos Improvement Proposals (TZIPs), that specify new features or define standards. These are located in the `TZIP repo <https://gitlab.com/tezos/tzip/>`__.
 
@@ -52,7 +75,7 @@ Going further
 
 To directly contribute to the *code* itself, expertise in a few areas is necessary.
 
-First, make sure that you are proficient enough in OCaml. The community
+First, make sure that you are proficient enough in OCaml. The OCaml community
 website https://ocaml.org gives a few useful pointers for that. In
 particular, we use a lot of functors, and a few GADTs in the codebase,
 so you may want to make sure that you master these advanced concepts.
@@ -96,7 +119,7 @@ merge request is ready, it is reviewed and approved, then merged with a merge co
 
 Therefore, you can bring useful contributions both by creating your own MRs and by reviewing MRs submitted by others.
 
-We maintain a `semi-linear history <https://docs.gitlab.com/ee/user/project/merge_requests/reviews/index.html#semi-linear-history-merge-requests>`_,
+We maintain a `semi-linear history <https://docs.gitlab.com/user/project/merge_requests/reviews/#semi-linear-history-merge-requests>`_,
 which means that merge requests are only
 merged if they are direct suffixes of the master branch.
 This means that merge requests are rebased on top of ``master`` before they are merged.
@@ -109,7 +132,7 @@ Then use ``push -f`` in your branch to rewrite the history.
 Being proficient with interactive rebases is mandatory to avoid
 mistakes and wasting time.
 
-This Git strategy is a variant of the `git rebase workflow <https://www.atlassian.com/git/articles/git-team-workflows-merge-or-rebase>`_.
+This Git strategy is a variant of the `git rebase workflow <https://www.atlassian.com/git/tutorials/merging-vs-rebasing>`_.
 
 .. _mr_workflow:
 
@@ -155,7 +178,7 @@ approach will make it easier for the reviewer to keep interacting till
 each discussion is resolved. When the reviewer is satisfied, they
 will mark the discussion resolved.
 
-The `Draft: <https://docs.gitlab.com/ee/user/project/merge_requests/drafts.html>`_
+The `Draft: <https://docs.gitlab.com/user/project/merge_requests/drafts/>`_
 status can be set at any time during the
 authoring/review process to signal that the MR is not yet ready for
 merge (for instance, the ``git`` history might not be clean). But, the
@@ -183,8 +206,8 @@ When all discussions are resolved, and the MR has got at least two
 approvals from Octez Merge Team members, the developer should squash
 any fix-up commits that were applied (remembering to edit the commit
 message appropriately). Then the developer (or anyone else when not possible) can assign the MR to the `Nomadic
-Marge-bot <https://gitlab.com/nomadic-margebot>`__, which will
-automatically rebase the branch on top of master and finally merge it.
+Marge-bot <https://gitlab.com/nomadic-margebot>`__, which will check the MR and
+automatically add it to a `merge train <https://docs.gitlab.com/ci/pipelines/merge_trains/>`__.
 
 .. _preparing_MR:
 
@@ -208,7 +231,7 @@ While working on your branch to prepare a Merge Request, make sure you respect t
    commits later.
 -  We expect every commit to compile and pass tests.
    Obviously, we require tests to pass between each MR.
--  Follow the format of commit names, `<Component>: <message>`, with
+-  Follow the format of commit names, ``<Component>: <message>``, with
    message in indicative or imperative present mood e.g. ``Shell: fix
    bug #13`` rather than ``Shell: fixed bug #13``.
    Use multiline commit messages for important commits.
@@ -316,17 +339,18 @@ Therefore, when creating your MR, observe the following rules:
     be added before any push action is made on the MR.
 
     + ``ci--opam`` is for triggering the opam packaging tests pipeline.
-    + ``ci--extended-tests`` is for triggering the extended tests pipeline, including Python tests for the non-alpha protocols.
     + ``ci--docs`` is for testing some scripts in the documentation (e.g. Octez installation scenarios).
     + ``ci--docker`` is for publishing the Docker image of the MR.
     + ``ci--arm64`` is for building on the ARM64 architecture.
+    + ``ci--no-coverage`` disables the job ``unified_coverage`` (but it does not disable coverage instrumentation).
+
 
 - *MR Options*: When opening an MR you should probably tick the following
   options:
 
-  + `Delete source branch when merge request is accepted.`
+  + ``Delete source branch when merge request is accepted.``
     Helps keeping the repository clean of old branches.
-  + `Squash commits when merge request is accepted.`
+  + ``Squash commits when merge request is accepted.``
     Sometimes it's useful to have many small commits to ease the
     review and see the story of a branch, but they are not relevant
     for the history of the project. In this case they can be squashed
@@ -334,7 +358,7 @@ Therefore, when creating your MR, observe the following rules:
     should squash yourself all fix-up commits when all discussions are resolved,
     as described above in the :ref:`MR workflow <mr_workflow>`, in order
     to ease the reviewers' task.
-  + `Allow commits from members who can merge to the target branch.`
+  + ``Allow commits from members who can merge to the target branch.``
     This option is useful to allow members of the :doc:`Octez merge team <merge_team>`, who are
     not developers in your project, to commit to your branch.
     It helps to rebase and propose fixes.
@@ -429,9 +453,6 @@ The assignee will thus often be one of the reviewers (if they needs to review
 or respond to a comment) or one of the merge request authors (if they need
 to update the code or respond to a comment).
 
-If a merge request has no assignee, it is implicitly the role of the
-:ref:`merge coordinator <merge_coordinator>` to assign it to someone.
-
 Even though merge requests could require action from several people
 to be merged, we avoid assigning more than one to avoid diluting responsibility.
 
@@ -447,15 +468,13 @@ you specified in the reviewers field.
 As mentioned previously, it is the responsibility of authors to find reviewers.
 To find reviewers, either:
 
-  - Advertize your merge request on the ``#mr-advertizing`` channel of
-    the `tezos-dev <https://tezos-dev.slack.com/>`_ Slack. Good advertisement
-    consists of a link to the MR and a one sentence summary.
-  - Look at authors of the code you are modifying using
-    `git blame <https://git-scm.com/docs/git-blame>`_.
-  - Ask help to the :ref:`merge coordinator <merge_coordinator>`, either
-    by asking them on Slack or mentioning them in a comment (see next paragraph).
+- Advertize your merge request on the ``#mr-advertizing`` channel of
+  the `tezos-dev <https://tezos-dev.slack.com/>`_ Slack. Good advertisement
+  consists of a link to the MR and a one sentence summary.
+- Look at authors of the code you are modifying using
+  `git blame <https://git-scm.com/docs/git-blame>`_.
 
-Depending on your `GitLab role <https://docs.gitlab.com/ee/user/permissions.html>`_
+Depending on your `GitLab role <https://docs.gitlab.com/user/permissions/>`_
 you may or may not be able to use the *Reviewers* field for specifying
 the reviewers. If you don't have the right, mention the reviewers using
 their GitLab handle (username prefixed with ``@``) in a comment.
@@ -468,7 +487,7 @@ Merge Request "Draft" Mode
 
 A merge request that is not yet ready to be merged should be marked as
 `draft
-<https://docs.gitlab.com/ee/user/project/merge_requests/drafts.html>`_
+<https://docs.gitlab.com/user/project/merge_requests/drafts/>`_
 by prefixing its title with ``Draft:``. Typical reasons for this is
 that the author still has some minor tasks to accomplish, such as
 cleaning up the merge request's ``git`` history (e.g. squashing ``fixup!`` commits), even
@@ -538,7 +557,7 @@ In the special case where your MR adds a new Python, Rust, JavaScript, or other
 dependency, additional steps must also be followed.
 
 * for Python, you can refer to the related section in the :ref:`python testing documentation <python_adding_new_dependencies>`.
-* the Rust dependencies are located in the GitLab repository `tezos-rust-libs <https://gitlab.com/tezos/tezos-rust-libs>`_ and the instructions are listed there.
+* the Rust dependencies are located in the ``src/rust_deps`` folder
 
 For others, there is currently no dedicated guide. Do not hesitate to ask for
 help on the ``#devteam`` channel on the `tezos-dev <https://tezos-dev.slack.com/>`_ Slack.
@@ -711,33 +730,6 @@ pitfalls a code reviewer should avoid.
   general remark is valid for any comment.
 
 When reviewing MRs involving documentation, you may check the built documentation directly within the GitLab interface, see :ref:`build_doc_ci`.
-
-.. _merge_bot:
-
-The Merge-Request Bot
----------------------
-
-Every 6 hours, an automated process running as the
-`Tezbocop <https://gitlab.com/tezbocop>`__ 🤖 user, inspects recent MRs and posts
-or edits comments on them, giving an inspection report on the contents of the
-MR.
-
-Some warnings/comments are for you to potentially improve your MR, other
-comments just help us in the assignment & review process.
-
-The first time Tezbocop posts a message you should receive a notification; for
-the subsequent edits there won't be notifications; feel free to check Tezbocop's
-comments any time.
-
-If you think some of the remarks/warnings do not apply to your MR feel free to
-add a comment to justify it.
-
-In particular, the Merge-Request Bot may complain about :ref:`TODO/FIXME comments <todo_fixme>` without an issue number ensuring that the intended evolution is tracked.
-
-The code for the bot is at
-`oxheadalpha/merbocop <https://gitlab.com/oxheadalpha/merbocop>`__. It is of
-course work-in-progress and new warnings and comments will appear little by
-little. We welcome specific issues or contributions there too.
 
 .. _dev_tools:
 

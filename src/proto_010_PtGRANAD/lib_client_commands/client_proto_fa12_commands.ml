@@ -33,7 +33,7 @@ let group =
     title = "Commands for managing FA1.2-compatible smart contracts";
   }
 
-let alias_param = Client_proto_contracts.ContractAlias.destination_param
+let alias_param = Client_proto_contracts.Contract_alias.destination_param
 
 let token_contract_param () =
   alias_param
@@ -73,7 +73,7 @@ let custom_gas_flag =
          with _ -> failwith "invalid gas limit (must be a positive number)"))
 
 let payer_arg =
-  Client_proto_contracts.ContractAlias.destination_arg
+  Client_proto_contracts.Contract_alias.destination_arg
     ~name:"payer"
     ~doc:"name of the payer (i.e. SOURCE) contract for the transaction"
     ()
@@ -196,7 +196,8 @@ let commands () : #Protocol_client_context.full Tezos_clic.command list =
         (fun (gas, payer, unparsing_mode)
              (_, contract)
              (_, addr)
-             (cctxt : #Protocol_client_context.full) ->
+             (cctxt : #Protocol_client_context.full)
+           ->
           let action =
             Client_proto_fa12.Get_balance (addr, (dummy_callback, None))
           in
@@ -232,7 +233,8 @@ let commands () : #Protocol_client_context.full Tezos_clic.command list =
              (_, contract)
              (_, source)
              (_, destination)
-             (cctxt : #Protocol_client_context.full) ->
+             (cctxt : #Protocol_client_context.full)
+           ->
           let action =
             Client_proto_fa12.Get_allowance
               (source, destination, (dummy_callback, None))
@@ -260,7 +262,8 @@ let commands () : #Protocol_client_context.full Tezos_clic.command list =
         @@ stop)
         (fun (gas, payer, unparsing_mode)
              (_, contract)
-             (cctxt : #Protocol_client_context.full) ->
+             (cctxt : #Protocol_client_context.full)
+           ->
           let action =
             Client_proto_fa12.Get_total_supply (dummy_callback, None)
           in
@@ -311,7 +314,8 @@ let commands () : #Protocol_client_context.full Tezos_clic.command list =
              (_, contract)
              (_, addr)
              (_, callback)
-             (cctxt : #Protocol_client_context.full) ->
+             (cctxt : #Protocol_client_context.full)
+           ->
           get_contract_caller_keys cctxt addr
           >>=? fun (source, src_pk, src_sk) ->
           let action =
@@ -389,7 +393,8 @@ let commands () : #Protocol_client_context.full Tezos_clic.command list =
              (_, src)
              (_, dst)
              (_, callback)
-             (cctxt : #Protocol_client_context.full) ->
+             (cctxt : #Protocol_client_context.full)
+           ->
           get_contract_caller_keys cctxt src
           >>=? fun (source, src_pk, src_sk) ->
           let action =
@@ -464,7 +469,8 @@ let commands () : #Protocol_client_context.full Tezos_clic.command list =
              (_, contract)
              (_, addr)
              (_, callback)
-             (cctxt : #Protocol_client_context.full) ->
+             (cctxt : #Protocol_client_context.full)
+           ->
           get_contract_caller_keys cctxt addr
           >>=? fun (source, src_pk, src_sk) ->
           let action =

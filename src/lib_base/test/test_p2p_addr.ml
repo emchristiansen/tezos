@@ -26,7 +26,8 @@
 (* Testing
    -------
    Component:    Base, P2p
-   Invocation:   dune build @src/lib_base/runtest
+   Invocation:   dune exec src/lib_base/test/main.exe \
+                  -- --file test_p2p_addr.ml
    Subject:      Check the parsing of addresses with domain names
 *)
 
@@ -252,6 +253,7 @@ let tests =
 
 let () =
   Alcotest.run
+    ~__FILE__
     "Base.P2p"
     [
       ("P2p_addr", qcheck_wrap p2p_addr);

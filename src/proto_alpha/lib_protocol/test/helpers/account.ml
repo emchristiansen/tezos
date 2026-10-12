@@ -41,11 +41,18 @@ let random_seed ~rng_state =
       Char.chr (Random.State.int rng_state 256))
 
 let random_algo ~rng_state : Signature.algo =
-  match Random.State.int rng_state 3 with
+  match
+    Random.State.int rng_state 3
+    (* FIXME: https://gitlab.com/tezos/tezos/-/issues/8220
+
+     Should be 5 but adaptation for BLS gas cost and ML-DSA-44 delegate
+     forbidden are needed. *)
+  with
   | 0 -> Ed25519
   | 1 -> Secp256k1
   | 2 -> P256
   | 3 -> Bls
+  | 4 -> Mldsa44
   | _ -> assert false
 
 let new_account ?(rng_state = Random.State.make_self_init ())
@@ -63,6 +70,7 @@ let activator_account =
   new_account ~seed ()
 
 let find pkh =
+  let open Lwt_result_syntax in
   match Signature.Public_key_hash.Table.find known_accounts pkh with
   | Some k -> return k
   | None -> failwith "Missing account: %a" Signature.Public_key_hash.pp pkh
@@ -84,11 +92,55 @@ let dummy_account =
   in
   new_account ~seed ()
 
-let default_initial_balance = Tez.of_mutez_exn 4_000_000_000_000L
+let bootstrap_initial_staked_balance ~(constants : Constants.Parametric.t)
+    ~initial_full_balance =
+  (* Bootstrap accounts are initialized with just enough staked balance
+     to meet the [minimal_stake] and [minimal_frozen_stake]
+     requirements, and to not be over-delegated. See the [init_account]
+     function in {!Protocol.Bootstrap_storage}. *)
+  let minimal_staked =
+    Tez.max constants.minimal_stake constants.minimal_frozen_stake
+  in
+  let minimal_to_not_be_overdelegated =
+    Tez.div_exn
+      initial_full_balance
+      (constants.limit_of_delegation_over_baking + 1)
+  in
+  Tez.(
+    min
+      initial_full_balance
+      (max minimal_staked minimal_to_not_be_overdelegated))
 
-let generate_accounts ?rng_state n : t list tzresult =
+let bootstrap_initial_baking_power ~constants ~initial_full_balance =
+  let initial_staked_balance =
+    bootstrap_initial_staked_balance ~constants ~initial_full_balance
+  in
+  let open Tez in
+  Tez_helpers.(
+    initial_staked_balance
+    +! div_exn
+         (initial_full_balance -! initial_staked_balance)
+         constants.adaptive_issuance.edge_of_staking_over_delegation)
+
+let default_initial_full_balance =
+  Default_parameters.Internal_for_tests.bootstrap_balance
+
+let default_initial_staked_balance =
+  bootstrap_initial_staked_balance
+    ~constants:Default_parameters.constants_test
+    ~initial_full_balance:default_initial_full_balance
+
+let default_initial_spendable_balance =
+  Tez_helpers.(default_initial_full_balance -! default_initial_staked_balance)
+
+let generate_accounts ?algo ?rng_state n : t list tzresult =
   Signature.Public_key_hash.Table.clear known_accounts ;
-  List.init ~when_negative_length:[] n (fun _i -> new_account ?rng_state ())
+  List.init ~when_negative_length:[] n (fun _i ->
+      new_account ?algo ?rng_state ())
+
+let generate_accounts_with_algo_list ?rng_state algo_list : t list =
+  Signature.Public_key_hash.Table.clear known_accounts ;
+  List.map (fun algo -> new_account ?algo ?rng_state ()) algo_list
 
 let commitment_secret =
   Blinded_public_key_hash.activation_code_of_hex
@@ -96,27 +148,30 @@ let commitment_secret =
   |> WithExceptions.Option.get ~loc:__LOC__
 
 let new_commitment ?seed () =
+  let open Lwt_result_wrap_syntax in
   let pkh, pk, sk = Signature.generate_key ?seed ~algo:Ed25519 () in
   let unactivated_account = {pkh; pk; sk} in
   let open Commitment in
   let pkh = match pkh with Ed25519 pkh -> pkh | _ -> assert false in
   let bpkh = Blinded_public_key_hash.of_ed25519_pkh commitment_secret pkh in
-  Lwt.return
-    ( (Environment.wrap_tzresult @@ Tez.(one *? 4_000L)) >|? fun amount ->
-      (unactivated_account, {blinded_public_key_hash = bpkh; amount}) )
+  let*?@ amount = Tez.(one *? 4_000L) in
+  return (unactivated_account, {blinded_public_key_hash = bpkh; amount})
 
 let pkh_of_contract_exn = function
   | Contract.Implicit pkh -> pkh
   | Originated _ -> assert false
 
-let make_bootstrap_account ?(balance = default_initial_balance)
+let make_bootstrap_account ?(balance = default_initial_full_balance)
     ?(delegate_to = None) ?(consensus_key = None) account =
   Parameters.
     {
-      public_key_hash = account.pkh;
+      (* FIXME-PA *)
+      public_key_hash = Implicit_account_repr.Forbidden.of_pkh account.pkh;
       public_key = Some account.pk;
       amount = balance;
-      delegate_to;
+      (* FIXME-PA *)
+      delegate_to =
+        Option.map Implicit_account_repr.Forbidden.of_pkh delegate_to;
       consensus_key;
     }
 
@@ -144,3 +199,11 @@ let rec make_bootstrap_accounts ?(bootstrap_balances = [])
            ~bootstrap_consensus_keys
            accounts
   | [] -> []
+
+let make_bootstrap_accounts_packed =
+  List.map (fun (account, balance, delegate_to, consensus_key) ->
+      make_bootstrap_account
+        ?balance:(Option.map Tez.of_mutez_exn balance)
+        ~delegate_to
+        ~consensus_key
+        account)

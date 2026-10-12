@@ -3,6 +3,7 @@
 (* Open Source License                                                       *)
 (* Copyright (c) 2018 Dynamic Ledger Solutions, Inc. <contact@tezos.com>     *)
 (* Copyright (c) 2020 Metastate AG <hello@metastate.dev>                     *)
+(* Copyright (c) 2024 Marigold, <contact@marigold.dev>                       *)
 (*                                                                           *)
 (* Permission is hereby granted, free of charge, to any person obtaining a   *)
 (* copy of this software and associated documentation files (the "Software"),*)
@@ -61,6 +62,7 @@ type prim =
   | D_Some
   | D_True
   | D_Unit
+  | D_Ticket
   | D_Lambda_rec
   | I_PACK
   | I_UNPACK
@@ -82,6 +84,7 @@ type prim =
   | I_CREATE_ACCOUNT
   | I_CREATE_CONTRACT
   | I_IMPLICIT_ACCOUNT
+  | I_IS_IMPLICIT_ACCOUNT
   | I_DIP
   | I_DROP
   | I_DUP
@@ -170,6 +173,8 @@ type prim =
   | I_EMIT
   | I_BYTES
   | I_NAT
+  | I_INDEX_ADDRESS
+  | I_GET_ADDRESS_INDEX
   | T_bool
   | T_contract
   | T_int

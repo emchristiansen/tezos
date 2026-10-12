@@ -32,6 +32,13 @@ include
      and type t = Bls12_381_signature.MinPk.signature
      and type watermark = Bytes.t
 
+include
+  S.THRESHOLD_SIGNATURE
+    with type Public_key.t = Public_key.t
+     and type Secret_key.t = Secret_key.t
+     and type t = t
+     and type watermark = watermark
+
 include S.RAW_DATA with type t := t
 
 (** Module to access/expose the primitives of BLS12-381 *)
@@ -44,3 +51,11 @@ module Primitive : sig
 
   val pairing_check : (G1.t * G2.t) list -> bool
 end
+
+val sign_aug : ?watermark:watermark -> Bls12_381_signature.sk -> watermark -> t
+
+val check_aug : ?watermark:watermark -> Public_key.t -> t -> watermark -> bool
+
+val pop_prove : ?msg:Public_key.t -> Bls12_381_signature.sk -> Bytes.t
+
+val pop_verify : Public_key.t -> ?msg:Public_key.t -> Bytes.t -> bool

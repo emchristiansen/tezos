@@ -74,11 +74,10 @@ type ('msg, 'meta, 'meta_conn) t
 val create :
   ?discovery:P2p_discovery.t ->
   config ->
-  ('msg, 'meta, 'meta_conn) P2p_pool.t ->
   ('msg, 'meta, 'meta_conn) P2p_connect_handler.t ->
   P2p_trigger.t ->
   log:(P2p_connection.P2p_event.t -> unit) ->
-  ('msg, 'meta, 'meta_conn) t
+  ('msg, 'meta, 'meta_conn) t tzresult Lwt.t
 
 (** [activate t] starts the worker that will maintain connections. *)
 val activate : ('msg, 'meta, 'meta_conn) t -> unit
@@ -101,14 +100,14 @@ module Internal_for_tests : sig
   }
 
   val create :
+    ?rng:Random.State.t ->
     ?discovery:P2p_discovery.t ->
     config ->
     ?debug_config:test_config ->
-    ('msg, 'meta, 'meta_conn) P2p_pool.t ->
     ('msg, 'meta, 'meta_conn) P2p_connect_handler.t ->
     P2p_trigger.t ->
     log:(P2p_connection.P2p_event.t -> unit) ->
-    ('msg, 'meta, 'meta_conn) t
+    ('msg, 'meta, 'meta_conn) t tzresult Lwt.t
 
-  val activate : ?rng:Random.State.t -> ('msg, 'meta, 'meta_conn) t -> unit
+  val activate : ('msg, 'meta, 'meta_conn) t -> unit
 end

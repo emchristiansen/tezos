@@ -1,0 +1,1226 @@
+// SPDX-FileCopyrightText: 2025-2026 Functori <contact@functori.com>
+// SPDX-FileCopyrightText: 2025 Nomadic Labs <contact@nomadic-labs.com>
+//
+// SPDX-License-Identifier: MIT
+
+use revm::{
+    bytecode::Bytecode,
+    context::journaled_state::{
+        account::JournaledAccount, AccountInfoLoad, JournalLoadError,
+    },
+    context_interface::{
+        context::{SStoreResult, SelfDestructResult, StateLoad},
+        journaled_state::{AccountLoad, JournalCheckpoint, JournalTr, TransferError},
+        Database as RevmDatabase,
+    },
+    inspector::JournalExt,
+    interpreter::Gas,
+    primitives::{
+        hardfork::SpecId, Address, AddressMap, AddressSet, HashSet, Log, StorageKey,
+        StorageValue, B256, U256,
+    },
+    state::{Account, EvmState},
+    DatabaseCommit, JournalEntry,
+};
+use std::vec::Vec;
+
+use evm_inspectors::{Tracer, TracerContainer};
+use tezosx_journal::{LayeredStateError, OriginalSource, TezosXJournal};
+
+use crate::database::EtherlinkVMDB;
+use crate::error::{EvmDbError, EvmRunError};
+use crate::precompiles::send_outbox_message::{
+    check_outbox_message_size, SendOutboxRevertReason,
+};
+use crate::storage::world_state_handler::StorageAccount;
+use evm_types::{
+    CustomPrecompileError, DatabaseCommitPrecompileStateChanges,
+    DatabasePrecompileStateChanges, FaDepositWithProxy, IntoWithRemainder,
+    SequencerKeyChange,
+};
+use michelson_types::Withdrawal;
+use tezos_ethereum::block::BlockConstants;
+use tezos_evm_runtime::runtime_keyspaces::RuntimeKeyspaces;
+use tezos_smart_rollup_host::runtime::RuntimeError;
+use tezos_smart_rollup_host::storage::StorageV1;
+use tezos_smart_rollup_keyspace::{KeySpace, KeySpaceLoader};
+use tezosx_interfaces::{
+    canonicalize_native_address, resolve_routing, AliasInfo, AliasResolution,
+    CrossRuntimeContext, Gas as TezosXGas, Registry, RoutingDecision, RuntimeId,
+    TezosXRuntimeError, ALIAS_LOOKUP_COST,
+};
+
+/// A journal of state changes internal to the EVM
+///
+/// On each additional call, the depth of the journaled state is increased (`depth`) and a new journal is added.
+///
+/// The journal contains every state change that happens within that call, making it possible to revert changes made in a specific call.
+pub struct Journal<
+    'a,
+    'host,
+    Host: StorageV1,
+    KS: KeySpace,
+    R: Registry<Journal = tezosx_journal::TezosXJournal>,
+> {
+    /// Database
+    pub database: EtherlinkVMDB<'a, 'host, Host, KS, R>,
+
+    /// TezosX journal combining EVM and Michelson journal state.
+    pub journal: &'a mut TezosXJournal,
+
+    /// Deferred error from michelson journal checkpoint operations.
+    /// The `JournalTr` trait methods `checkpoint_commit` and `checkpoint_revert`
+    /// cannot return errors, so we store them here for later retrieval.
+    deferred_error: Option<RuntimeError>,
+}
+
+impl<
+        'a,
+        'host,
+        Host: StorageV1,
+        KS: KeySpace,
+        R: Registry<Journal = tezosx_journal::TezosXJournal>,
+    > Journal<'a, 'host, Host, KS, R>
+{
+    pub fn new_with_inner(
+        database: EtherlinkVMDB<'a, 'host, Host, KS, R>,
+        journal: &'a mut TezosXJournal,
+    ) -> Self {
+        Self {
+            database,
+            journal,
+            deferred_error: None,
+        }
+    }
+
+    /// Take any deferred error from michelson journal checkpoint operations.
+    pub fn take_deferred_error(&mut self) -> Option<RuntimeError> {
+        self.deferred_error.take()
+    }
+}
+
+/// Expose the journal-owned tracer to the `TracerInspector` filling the
+/// `Evm` inspector slot (see `evm_inspectors::TracerInspector`).
+impl<
+        'a,
+        'host,
+        Host: StorageV1,
+        KS: KeySpace,
+        R: Registry<Journal = tezosx_journal::TezosXJournal>,
+    > TracerContainer for Journal<'a, 'host, Host, KS, R>
+{
+    fn take_tracer(&mut self) -> Option<Box<Tracer>> {
+        self.journal.evm.take_tracer()
+    }
+
+    fn restore_tracer(&mut self, tracer: Option<Box<Tracer>>) {
+        self.journal.evm.restore_tracer(tracer)
+    }
+}
+
+/// The implementation is only calling the underline REVM object which is the same as the REVM journal one.
+/// The only changes are the invocation of `LayeredDB` methods in some functions.
+impl<
+        'a,
+        'host,
+        Host: StorageV1,
+        KS: KeySpace,
+        R: Registry<Journal = tezosx_journal::TezosXJournal>,
+    > JournalTr for Journal<'a, 'host, Host, KS, R>
+{
+    type Database = EtherlinkVMDB<'a, 'host, Host, KS, R>;
+    type State = EvmState;
+    type JournaledAccount<'b>
+        = JournaledAccount<'b, EtherlinkVMDB<'a, 'host, Host, KS, R>>
+    where
+        EtherlinkVMDB<'a, 'host, Host, KS, R>: 'b,
+        'a: 'b;
+
+    fn new(
+        _database: EtherlinkVMDB<'a, 'host, Host, KS, R>,
+    ) -> Journal<'a, 'host, Host, KS, R> {
+        unimplemented!("Use Journal::new_with_inner instead")
+    }
+
+    fn db(&self) -> &Self::Database {
+        &self.database
+    }
+
+    fn db_mut(&mut self) -> &mut Self::Database {
+        &mut self.database
+    }
+
+    fn sload(
+        &mut self,
+        address: Address,
+        key: StorageKey,
+    ) -> Result<StateLoad<StorageValue>, <Self::Database as RevmDatabase>::Error> {
+        self.sload_skip_cold_load(address, key, false)
+            .map_err(JournalLoadError::unwrap_db_error)
+    }
+
+    #[inline]
+    fn sload_skip_cold_load(
+        &mut self,
+        address: Address,
+        key: StorageKey,
+        skip_cold_load: bool,
+    ) -> Result<
+        StateLoad<StorageValue>,
+        JournalLoadError<<Self::Database as RevmDatabase>::Error>,
+    > {
+        self.journal
+            .evm
+            .inner
+            .sload(&mut self.database, address, key, skip_cold_load)
+    }
+
+    fn sstore(
+        &mut self,
+        address: Address,
+        key: StorageKey,
+        value: StorageValue,
+    ) -> Result<StateLoad<SStoreResult>, <Self::Database as RevmDatabase>::Error> {
+        self.sstore_skip_cold_load(address, key, value, false)
+            .map_err(JournalLoadError::unwrap_db_error)
+    }
+
+    #[inline]
+    fn sstore_skip_cold_load(
+        &mut self,
+        address: Address,
+        key: StorageKey,
+        value: StorageValue,
+        skip_cold_load: bool,
+    ) -> Result<
+        StateLoad<SStoreResult>,
+        JournalLoadError<<Self::Database as RevmDatabase>::Error>,
+    > {
+        self.journal.evm.inner.sstore(
+            &mut self.database,
+            address,
+            key,
+            value,
+            skip_cold_load,
+        )
+    }
+
+    fn tload(&mut self, address: Address, key: StorageKey) -> StorageValue {
+        self.journal.evm.inner.tload(address, key)
+    }
+
+    fn tstore(&mut self, address: Address, key: StorageKey, value: StorageValue) {
+        self.journal.evm.inner.tstore(address, key, value)
+    }
+
+    fn log(&mut self, log: Log) {
+        self.journal.evm.inner.log(log)
+    }
+
+    fn selfdestruct(
+        &mut self,
+        address: Address,
+        target: Address,
+        skip_cold_load: bool,
+    ) -> Result<
+        StateLoad<SelfDestructResult>,
+        JournalLoadError<<Self::Database as RevmDatabase>::Error>,
+    > {
+        self.journal.evm.inner.selfdestruct(
+            &mut self.database,
+            address,
+            target,
+            skip_cold_load,
+        )
+    }
+
+    fn warm_coinbase_account(&mut self, address: Address) {
+        self.journal.evm.inner.warm_addresses.set_coinbase(address);
+    }
+
+    fn warm_precompiles(&mut self, precompiles: AddressSet) {
+        self.journal
+            .evm
+            .inner
+            .warm_addresses
+            .set_precompile_addresses(precompiles);
+    }
+
+    #[inline]
+    fn precompile_addresses(&self) -> &AddressSet {
+        self.journal.evm.inner.warm_addresses.precompiles()
+    }
+
+    /// Returns call depth.
+    #[inline]
+    fn depth(&self) -> usize {
+        self.journal.evm.inner.depth
+    }
+
+    #[inline]
+    fn set_spec_id(&mut self, spec_id: SpecId) {
+        self.journal.evm.inner.cfg.spec = spec_id;
+    }
+
+    #[inline]
+    fn set_eip7708_config(&mut self, disabled: bool, delayed_burn_disabled: bool) {
+        self.journal.evm.inner.cfg.eip7708_disabled = disabled;
+        self.journal.evm.inner.cfg.eip7708_delayed_burn_disabled = delayed_burn_disabled;
+    }
+
+    #[inline]
+    fn transfer(
+        &mut self,
+        from: Address,
+        to: Address,
+        balance: U256,
+    ) -> Result<Option<TransferError>, <Self::Database as RevmDatabase>::Error> {
+        self.journal
+            .evm
+            .inner
+            .transfer(&mut self.database, from, to, balance)
+    }
+
+    #[inline]
+    fn transfer_loaded(
+        &mut self,
+        from: Address,
+        to: Address,
+        balance: U256,
+    ) -> Option<TransferError> {
+        self.journal.evm.inner.transfer_loaded(from, to, balance)
+    }
+
+    #[inline]
+    fn touch_account(&mut self, address: Address) {
+        self.journal.evm.inner.touch(address);
+    }
+
+    #[inline]
+    fn caller_accounting_journal_entry(
+        &mut self,
+        address: Address,
+        old_balance: U256,
+        bump_nonce: bool,
+    ) {
+        #[allow(deprecated)]
+        self.journal.evm.inner.caller_accounting_journal_entry(
+            address,
+            old_balance,
+            bump_nonce,
+        );
+    }
+
+    /// Increments the balance of the account.
+    #[inline]
+    fn balance_incr(
+        &mut self,
+        address: Address,
+        balance: U256,
+    ) -> Result<(), <Self::Database as RevmDatabase>::Error> {
+        self.journal
+            .evm
+            .inner
+            .balance_incr(&mut self.database, address, balance)
+    }
+
+    /// Increments the nonce of the account.
+    #[inline]
+    fn nonce_bump_journal_entry(&mut self, address: Address) {
+        #[allow(deprecated)]
+        self.journal.evm.inner.nonce_bump_journal_entry(address)
+    }
+
+    #[inline]
+    fn load_account(
+        &mut self,
+        address: Address,
+    ) -> Result<StateLoad<&Account>, <Self::Database as RevmDatabase>::Error> {
+        self.journal
+            .evm
+            .inner
+            .load_account(&mut self.database, address)
+    }
+
+    #[inline]
+    fn load_account_code(
+        &mut self,
+        address: Address,
+    ) -> Result<StateLoad<&Account>, <Self::Database as RevmDatabase>::Error> {
+        self.journal
+            .evm
+            .inner
+            .load_code(&mut self.database, address)
+    }
+
+    #[inline]
+    fn load_account_delegated(
+        &mut self,
+        address: Address,
+    ) -> Result<StateLoad<AccountLoad>, <Self::Database as RevmDatabase>::Error> {
+        self.journal
+            .evm
+            .inner
+            .load_account_delegated(&mut self.database, address)
+    }
+
+    #[inline]
+    fn checkpoint(&mut self) -> JournalCheckpoint {
+        self.journal.global_checkpoint();
+        self.journal.evm.inner.checkpoint()
+    }
+
+    #[inline]
+    fn checkpoint_commit(&mut self) {
+        self.journal.evm.inner.checkpoint_commit();
+        if let Err(e) = self.journal.global_commit(self.database.rk.host_mut()) {
+            self.deferred_error.get_or_insert(e);
+        }
+    }
+
+    #[inline]
+    fn checkpoint_revert(&mut self, checkpoint: JournalCheckpoint) {
+        self.journal.evm.inner.checkpoint_revert(checkpoint);
+        // `global_revert` rolls back every runtime's durable overlay. The
+        // Michelson side recovers each snapshot's revert target from the
+        // snapshot itself (see `MichelsonJournal`), so no path is supplied
+        // — CRACs may snapshot subtrees other than `/evm/world_state`.
+        if let Err(e) = self.journal.global_revert(self.database.rk.host_mut()) {
+            self.deferred_error.get_or_insert(e);
+        }
+    }
+
+    #[inline]
+    fn set_code_with_hash(&mut self, address: Address, code: Bytecode, hash: B256) {
+        self.journal
+            .evm
+            .inner
+            .set_code_with_hash(address, code, hash);
+    }
+
+    #[inline]
+    fn create_account_checkpoint(
+        &mut self,
+        caller: Address,
+        address: Address,
+        balance: U256,
+        spec_id: SpecId,
+    ) -> Result<JournalCheckpoint, TransferError> {
+        let checkpoint = self
+            .journal
+            .evm
+            .inner
+            .create_account_checkpoint(caller, address, balance, spec_id)?;
+        // A CREATE frame is closed by revm's `return_create` through
+        // `checkpoint_commit` / `checkpoint_revert`, i.e. `global_commit` /
+        // `global_revert`. Open the matching global checkpoint here so the
+        // frame stack stays balanced (the `checkpoint` path does the same for
+        // CALL frames); otherwise a committed CRAC's world-state snapshot is
+        // dropped at the sub-call commit and the enclosing CREATE revert
+        // cannot restore it — e.g. an alias forwarder materialized by a CRAC
+        // inside a constructor survives the constructor's revert. Done only
+        // after the inner checkpoint succeeds, so a failed account creation
+        // (which never enters the frame) leaves the stack untouched.
+        self.journal.global_checkpoint();
+        Ok(checkpoint)
+    }
+
+    #[inline]
+    fn take_logs(&mut self) -> Vec<Log> {
+        // Clone instead of drain: inner CRAC EVM executions share the
+        // JournalInner with the outer EVM transaction. Draining would
+        // invalidate checkpoint.log_i indices held by outer CALL frames.
+        // The logs are properly drained by finalize() at the top level.
+        self.journal.evm.inner.logs.clone()
+    }
+
+    #[inline]
+    fn commit_tx(&mut self) {
+        // Noop: CRAC sub-calls reuse the outer EVM transaction JournalInner.
+        // All the transaction state (logs, journal entries, depth, transient
+        // storage, warm addresses, selfdestructed addresses, transaction_id)
+        // belongs to the outer frame and must not be reset.
+        // Full cleanup happens in finalize() for top-level UserInput transactions.
+    }
+
+    #[inline]
+    fn discard_tx(&mut self) {
+        // Noop: an inbound CRAC/NAC sub-execution shares the outer tx's
+        // JournalInner; revm's tx-global discard_tx would drain the outer
+        // frame's entries. Sub-execution cleanup is done by the parent CALL
+        // frame's checkpoint_revert. Top-level failures don't need it either:
+        // the journal is fresh per tx (apply.rs) and only committed on Ok
+        // on `run_transaction`, so a failed tx's journal is dropped — revm allows
+        // "cleared by discard_tx OR dropped".
+    }
+
+    /// Clear current journal resetting it to initial state and return changes state.
+    #[inline]
+    fn finalize(&mut self) -> Self::State {
+        DatabaseCommitPrecompileStateChanges::commit(
+            &mut self.database,
+            self.journal.evm.layered_state.finalize(),
+        );
+        self.journal.evm.inner.finalize()
+    }
+
+    fn load_account_info_skip_cold_load(
+        &mut self,
+        address: Address,
+        load_code: bool,
+        skip_cold_load: bool,
+    ) -> Result<
+        AccountInfoLoad<'_>,
+        JournalLoadError<<Self::Database as RevmDatabase>::Error>,
+    > {
+        let spec = self.journal.evm.inner.cfg.spec;
+        self.journal
+            .evm
+            .inner
+            .load_account_optional(&mut self.database, address, load_code, skip_cold_load)
+            .map(|a| {
+                AccountInfoLoad::new(
+                    &a.data.info,
+                    a.is_cold,
+                    a.state_clear_aware_is_empty(spec),
+                )
+            })
+    }
+
+    #[inline]
+    fn logs(&self) -> &[Log] {
+        &self.journal.evm.inner.logs
+    }
+
+    #[inline]
+    fn warm_access_list(&mut self, access_list: AddressMap<HashSet<StorageKey>>) {
+        self.journal
+            .evm
+            .inner
+            .warm_addresses
+            .set_access_list(access_list)
+    }
+
+    #[inline]
+    fn load_account_with_code(
+        &mut self,
+        address: Address,
+    ) -> Result<StateLoad<&Account>, <Self::Database as RevmDatabase>::Error> {
+        self.journal
+            .evm
+            .inner
+            .load_code(&mut self.database, address)
+    }
+
+    #[inline]
+    fn load_account_mut_skip_cold_load(
+        &mut self,
+        address: Address,
+        skip_cold_load: bool,
+    ) -> Result<
+        StateLoad<Self::JournaledAccount<'_>>,
+        <Self::Database as RevmDatabase>::Error,
+    > {
+        self.journal
+            .evm
+            .inner
+            .load_account_mut_optional(&mut self.database, address, skip_cold_load)
+            .map_err(JournalLoadError::unwrap_db_error)
+    }
+
+    #[inline]
+    fn load_account_mut_optional_code(
+        &mut self,
+        address: Address,
+        load_code: bool,
+    ) -> Result<
+        StateLoad<Self::JournaledAccount<'_>>,
+        <Self::Database as RevmDatabase>::Error,
+    > {
+        self.journal
+            .evm
+            .inner
+            .load_account_mut_optional_code(&mut self.database, address, load_code, false)
+            .map_err(JournalLoadError::unwrap_db_error)
+    }
+}
+
+impl<
+        Host: StorageV1,
+        KS: KeySpace,
+        R: Registry<Journal = tezosx_journal::TezosXJournal>,
+    > JournalExt for Journal<'_, '_, Host, KS, R>
+{
+    #[inline]
+    fn journal(&self) -> &[JournalEntry] {
+        &self.journal.evm.inner.journal
+    }
+
+    #[inline]
+    fn evm_state(&self) -> &EvmState {
+        &self.journal.evm.inner.state
+    }
+
+    #[inline]
+    fn evm_state_mut(&mut self) -> &mut EvmState {
+        &mut self.journal.evm.inner.state
+    }
+}
+
+impl<
+        Host: StorageV1,
+        KS: KeySpace,
+        R: Registry<Journal = tezosx_journal::TezosXJournal>,
+    > Journal<'_, '_, Host, KS, R>
+{
+    pub fn get_and_increment_global_counter(
+        &mut self,
+    ) -> Result<U256, LayeredStateError> {
+        self.journal
+            .evm
+            .layered_state
+            .get_and_increment_global_counter(&self.database)
+    }
+
+    pub fn ticket_balance_add(
+        &mut self,
+        ticket_hash: U256,
+        owner: Address,
+        amount: U256,
+    ) -> Result<(), LayeredStateError> {
+        self.journal.evm.layered_state.ticket_balance_add(
+            &ticket_hash,
+            &owner,
+            amount,
+            &self.database,
+        )
+    }
+
+    pub fn ticket_balance_remove(
+        &mut self,
+        ticket_hash: U256,
+        owner: Address,
+        amount: U256,
+    ) -> Result<(), LayeredStateError> {
+        self.journal.evm.layered_state.ticket_balance_remove(
+            &ticket_hash,
+            &owner,
+            amount,
+            &self.database,
+        )
+    }
+
+    pub fn remove_deposit_from_queue(
+        &mut self,
+        deposit_id: U256,
+    ) -> Result<(), LayeredStateError> {
+        self.journal
+            .evm
+            .layered_state
+            .remove_deposit(&deposit_id, &self.database)
+    }
+
+    pub fn queue_deposit(&mut self, deposit: FaDepositWithProxy, deposit_id: U256) {
+        self.journal
+            .evm
+            .layered_state
+            .queue_deposit(deposit, deposit_id)
+    }
+
+    pub(crate) fn push_withdrawal(
+        &mut self,
+        withdrawal: Withdrawal,
+    ) -> Result<(), SendOutboxRevertReason> {
+        // Reject any withdrawal whose serialized outbox message would exceed
+        // the outbox size limit, before it is accepted. Otherwise the failure
+        // surfaces only later, at queueing time, after the EVM transaction has
+        // already succeeded -- which for a forced (delayed-inbox) transaction
+        // aborts block production and wedges the sequencer.
+        check_outbox_message_size(&withdrawal)?;
+        self.journal.evm.layered_state.push_withdrawal(withdrawal);
+        Ok(())
+    }
+
+    pub fn find_deposit_in_queue(
+        &self,
+        deposit_id: &U256,
+    ) -> Result<FaDepositWithProxy, LayeredStateError> {
+        if self
+            .journal
+            .evm
+            .layered_state
+            .is_deposit_removed(deposit_id)
+        {
+            return Err(LayeredStateError::DepositAlreadyRemoved);
+        }
+        Ok(self.database.deposit_in_queue(deposit_id)?)
+    }
+
+    /// Counter the next sequencer key change must be signed against, read
+    /// through the layered state so a second inner precompile call in the same
+    /// transaction sees the in-memory value (see
+    /// `LayeredState::sequencer_change_counter`).
+    pub fn sequencer_change_counter(&self) -> Result<U256, LayeredStateError> {
+        self.journal
+            .evm
+            .layered_state
+            .sequencer_change_counter(&self.database)
+    }
+
+    pub fn store_sequencer_key_change(
+        &mut self,
+        upgrade: SequencerKeyChange,
+        base_counter: U256,
+    ) -> Result<(), LayeredStateError> {
+        self.journal
+            .evm
+            .layered_state
+            .store_sequencer_key_change(upgrade, base_counter)
+    }
+
+    pub fn log(&mut self, log: Log) {
+        self.journal.evm.inner.log(log)
+    }
+}
+
+/// Outcome of [`CrossRuntimeCall::tezosx_materialize_evm_alias`].
+#[derive(Debug, PartialEq, Eq)]
+pub enum MaterializedAlias {
+    /// The alias exists already and is left untouched. Holds its address.
+    Existing(String),
+    /// The alias is created by this call.
+    Created {
+        /// The address of the created alias.
+        alias: String,
+        /// Storage cost in mutez that the creation delegates to the caller,
+        /// or `None` when it delegates none.
+        delegated_storage_cost: Option<u64>,
+    },
+}
+
+/// Outcome of resolving a source alias for an outgoing CRAC: what the
+/// caller must charge for the resolution.
+///
+/// Distinct from [`AliasResolution`] (returned by `ensure_alias`, whose
+/// `gas_remaining` is the gas *remaining*): here the gas figure is what
+/// the resolution *consumed*, ready to be charged to the caller.
+pub struct ResolvedAliasCost {
+    /// Gas consumed by the resolution, carrying the unit of the runtime
+    /// that reported it; zero on cache hit.
+    pub consumed_gas: TezosXGas,
+    /// Storage cost the target runtime delegates to the caller, in mutez
+    /// (`None` when it makes no claim). Forwarded verbatim from
+    /// `AliasResolution.delegated_storage_cost`.
+    pub delegated_storage_cost: Option<u64>,
+}
+
+/// Trait for cross-runtime call support on the journal.
+///
+/// This is implemented for Journal backed by EtherlinkVMDB, which has access
+/// to the host, registry, and block constants needed for cross-runtime calls.
+pub trait CrossRuntimeCall {
+    /// Resolve the alias for an EVM address in `target_runtime`.
+    /// `remaining_evm_gas` is the caller's remaining gas budget (used to
+    /// cap alias generation).
+    ///
+    /// Returns `(alias, ResolvedAliasCost)`: the gas consumed by the
+    /// resolution (in `target_runtime` units, 0 on cache hit) and the
+    /// storage cost (in mutez) the target runtime delegates to the
+    /// caller, `None` when it does not delegate.
+    fn tezosx_resolve_source_alias(
+        &mut self,
+        source: Address,
+        target_runtime: RuntimeId,
+        remaining_evm_gas: u64,
+    ) -> Result<(String, ResolvedAliasCost), CustomPrecompileError>;
+
+    /// Read-only variant of [`Self::tezosx_resolve_source_alias`]: on
+    /// cache hit returns the persisted alias for `target_runtime`, on
+    /// cache miss computes the deterministic alias from the EVM
+    /// address without writing anything to storage.
+    ///
+    /// The deterministic alias is the same value
+    /// [`Self::tezosx_resolve_source_alias`] would persist — by design
+    /// of [`Registry::ensure_alias`]:
+    /// - `RuntimeId::Tezos` → `blake2b-160(lowercase_hex(address))`
+    ///   formatted as a `KT1...` base58check string;
+    /// - `RuntimeId::Ethereum` → `keccak256(lowercase_hex(address))[..20]`
+    ///   formatted as a `0x...` hex string.
+    ///
+    /// Callers can rely on the read-only path producing the canonical
+    /// alias for the target runtime even when no state-mutating call
+    /// has ever seen this address before.
+    ///
+    /// This variant is safe to call from a STATICCALL context, where
+    /// any storage write would revert the enclosing frame. It is used
+    /// by read-only precompile entries such as `callMichelsonView`.
+    fn tezosx_resolve_source_alias_readonly(
+        &self,
+        source: Address,
+        target_runtime: RuntimeId,
+        remaining_evm_gas: u64,
+    ) -> Result<String, CustomPrecompileError>;
+
+    /// Materialize the EVM alias of the native account `alias_info`
+    /// describes, storing `native_public_key` in it. The caller must have
+    /// checked that the account is native.
+    ///
+    /// The lookup of the alias, and its materialization when it doesn't
+    /// exist yet, are consumed from `budget`.
+    fn tezosx_materialize_evm_alias(
+        &mut self,
+        alias_info: AliasInfo,
+        native_public_key: &[u8],
+        budget: &mut TezosXGas,
+    ) -> Result<MaterializedAlias, TezosXRuntimeError>;
+
+    /// Dispatch a cross-runtime HTTP call by invoking the runtime
+    /// registry's `serve` synchronously.
+    ///
+    /// `serve` is invoked synchronously from inside the gateway
+    /// precompile, which is what makes a CRAC sub-tree execute
+    /// depth-first within the caller's frame — matching the shape of an
+    /// intra-runtime synchronous call (EVM `CALL`) or a DFS-expanded
+    /// `TRANSFER_TOKENS` (Michelson since Florence). The target is always
+    /// the *other* runtime: a NAC back into the caller's own runtime is
+    /// refused by the gateway (see `ERR_SAME_RUNTIME_NAC`).
+    fn tezosx_call_http(
+        &mut self,
+        http_request: http::Request<Vec<u8>>,
+    ) -> http::Response<Vec<u8>>;
+
+    /// Get the CRAC-ID for the current transaction.
+    fn crac_id(&self) -> String;
+
+    /// Cross-runtime chain depth read from the inbound `X-Tezos-CRAC-Depth`
+    /// header on the current EVM transaction. Counts CRAC hops only;
+    /// outgoing CRACs from precompiles stamp `crac_chain_depth() + 1`
+    /// so the receiver sees the same counter shape Michelson would.
+    fn crac_chain_depth(&self) -> u32;
+
+    /// Originating runtime of the current top-level transaction.
+    fn crac_origin_runtime(&self) -> RuntimeId;
+
+    /// Store the original source (E_0) on the first outgoing gateway
+    /// call; subsequent calls are no-ops.
+    fn set_original_source(&mut self, source: OriginalSource);
+
+    fn original_source(&self) -> Option<&OriginalSource>;
+
+    /// Originator of the inbound CRAC being serviced (the
+    /// `X-Tezos-Source` alias). Read by the kernel's custom `ORIGIN`
+    /// opcode so `tx.origin` carries the real outer-tx originator while
+    /// `TxEnv.caller` (and thus `msg.sender`, the nonce bump, the value
+    /// deduction) keeps its standard REVM meaning. `None` outside an
+    /// inbound CRAC; the opcode then falls back to `TxEnv.caller`.
+    fn cross_runtime_originator(&self) -> Option<Address>;
+}
+
+impl<
+        'a,
+        'host,
+        Host: StorageV1 + KeySpaceLoader<KeySpace = KS>,
+        KS: KeySpace,
+        R: Registry<Journal = TezosXJournal>,
+    > CrossRuntimeCall for Journal<'a, 'host, Host, KS, R>
+{
+    fn tezosx_resolve_source_alias(
+        &mut self,
+        source: Address,
+        target_runtime: RuntimeId,
+        remaining_evm_gas: u64,
+    ) -> Result<(String, ResolvedAliasCost), CustomPrecompileError> {
+        if target_runtime == RuntimeId::Ethereum {
+            // Short-circuit for Ethereum: the alias is the EVM address itself,
+            // and no generation cost is incurred even on cache miss.
+            //
+            // Kept defensively: no live caller reaches it now that
+            // same-runtime NACs are refused in the gateway (see
+            // `ERR_SAME_RUNTIME_NAC`) — every remaining caller passes a
+            // non-Ethereum target. It stays so the function remains total
+            // over `RuntimeId` rather than silently producing a wrong alias
+            // if a future caller does pass Ethereum.
+            return Ok((
+                source.to_string(),
+                ResolvedAliasCost {
+                    consumed_gas: TezosXGas::ZERO,
+                    delegated_storage_cost: None,
+                },
+            ));
+        }
+        let context = CrossRuntimeContext {
+            timestamp: self.database.block.timestamp,
+            block_number: self.database.block.number,
+        };
+        let remaining = Gas::new(remaining_evm_gas);
+        // An alias staged earlier in this transaction is not yet durable;
+        // consult the overlay so round-trip routing resolves within the
+        // same transaction.
+        let origin = match self.journal.evm.layered_state.pending_alias_origin(&source) {
+            Some(origin) => Some(origin),
+            None => StorageAccount::from_address(&source)
+                .map_err(EvmDbError::from)
+                .and_then(|a| {
+                    Ok(a.info_without_migration(self.database.rk.eth_accounts())?
+                        .map(|info| info.origin)
+                        .unwrap_or_default()
+                        .into())
+                })
+                .map_err(|e| e.into_with_remainder(remaining))?,
+        };
+        let alias_info = match resolve_routing(origin, target_runtime) {
+            RoutingDecision::RoundTrip(target) => {
+                return Ok((
+                    target,
+                    ResolvedAliasCost {
+                        consumed_gas: TezosXGas::ZERO,
+                        delegated_storage_cost: None,
+                    },
+                ))
+            }
+            RoutingDecision::Transitive(info) => info,
+            RoutingDecision::Native => AliasInfo {
+                runtime: RuntimeId::Ethereum,
+                native_address: canonicalize_native_address(
+                    RuntimeId::Ethereum,
+                    &source.to_string(),
+                ),
+            },
+        };
+        // Caps what alias generation may spend. `Gas` carries the unit, so
+        // the target runtime converts it itself.
+        let target_gas_budget = TezosXGas::new(remaining_evm_gas, RuntimeId::Ethereum);
+        let (
+            alias_str,
+            AliasResolution {
+                gas_remaining,
+                delegated_storage_cost,
+            },
+        ) = self
+            .database
+            .registry
+            .ensure_alias(
+                self.database.rk,
+                self.journal,
+                alias_info,
+                None,
+                target_runtime,
+                context,
+                target_gas_budget,
+            )
+            .map_err(|e| match e {
+                // Running out of gas means the alias creation used the whole
+                // budget: charged as such, so that a caller catching the
+                // failure can't retry it for cheap.
+                TezosXRuntimeError::OutOfGas => CustomPrecompileError::OutOfGas,
+                e => CustomPrecompileError::Revert(
+                    format!("Failed to generate alias for source address: {e:?}"),
+                    remaining,
+                ),
+            })?;
+        let consumed_gas = target_gas_budget - gas_remaining;
+        Ok((
+            alias_str,
+            ResolvedAliasCost {
+                consumed_gas,
+                delegated_storage_cost,
+            },
+        ))
+    }
+
+    fn tezosx_materialize_evm_alias(
+        &mut self,
+        alias_info: AliasInfo,
+        native_public_key: &[u8],
+        budget: &mut TezosXGas,
+    ) -> Result<MaterializedAlias, TezosXRuntimeError> {
+        let registry = self.database.registry;
+        budget.consume(ALIAS_LOOKUP_COST)?;
+        let alias = registry.compute_alias(&AliasInfo {
+            runtime: RuntimeId::Ethereum,
+            native_address: alias_info.native_address.clone(),
+        })?;
+        if registry.alias_exists(
+            self.database.rk,
+            self.journal,
+            RuntimeId::Ethereum,
+            &alias,
+        )? {
+            return Ok(MaterializedAlias::Existing(alias));
+        }
+        let context = CrossRuntimeContext {
+            timestamp: self.database.block.timestamp,
+            block_number: self.database.block.number,
+        };
+        // The alias is initialized by a nested EVM transaction: seed its
+        // call depth from the current frame, as a re-entrant CRAC does (see
+        // `tezosx_call_http`).
+        let revm_depth = self.depth().try_into().unwrap_or(u32::MAX);
+        let saved = self.journal.evm.revm_call_depth();
+        self.journal.evm.set_revm_call_depth(Some(revm_depth));
+        let result = registry.ensure_alias(
+            self.database.rk,
+            self.journal,
+            alias_info,
+            Some(native_public_key),
+            RuntimeId::Ethereum,
+            context,
+            *budget,
+        );
+        self.journal.evm.set_revm_call_depth(saved);
+        // TODO: https://linear.app/tezos/issue/L2-2188
+        // Only an alias creation running out of gas reports what it used (the
+        // whole budget); on another failure, the gas used is not charged.
+        let (
+            alias,
+            AliasResolution {
+                gas_remaining,
+                delegated_storage_cost,
+            },
+        ) = result?;
+        budget.consume(*budget - gas_remaining)?;
+        Ok(MaterializedAlias::Created {
+            alias,
+            delegated_storage_cost,
+        })
+    }
+
+    fn tezosx_resolve_source_alias_readonly(
+        &self,
+        source: Address,
+        target_runtime: RuntimeId,
+        remaining_evm_gas: u64,
+    ) -> Result<String, CustomPrecompileError> {
+        if target_runtime == RuntimeId::Ethereum {
+            // Short-circuit for Ethereum: the alias is the EVM address itself,
+            // and no generation cost is incurred even on cache miss. Kept
+            // defensively for the same reason as in
+            // `tezosx_resolve_source_alias` above: callers now always pass a
+            // non-Ethereum target.
+            return Ok(source.to_string());
+        }
+        let remaining = Gas::new(remaining_evm_gas);
+        // An alias staged earlier in this transaction is not yet durable;
+        // consult the overlay so round-trip routing resolves within the
+        // same transaction.
+        let origin = match self.journal.evm.layered_state.pending_alias_origin(&source) {
+            Some(origin) => Some(origin),
+            None => StorageAccount::from_address(&source)
+                .map_err(EvmDbError::from)
+                .and_then(|a| {
+                    Ok(a.info_without_migration(self.database.rk.eth_accounts())?
+                        .map(|info| info.origin)
+                        .unwrap_or_default()
+                        .into())
+                })
+                .map_err(|e| e.into_with_remainder(remaining))?,
+        };
+        let native_address = match resolve_routing(origin, target_runtime) {
+            RoutingDecision::RoundTrip(target) => return Ok(target),
+            RoutingDecision::Transitive(info) => info.native_address,
+            RoutingDecision::Native => {
+                canonicalize_native_address(RuntimeId::Ethereum, &source.to_string())
+            }
+        };
+        // Deterministic fallback: reproduce the alias that the target
+        // runtime's `ensure_alias` would compute (and persist on the
+        // state-mutating path), but skip the storage writes.
+        self.database
+            .registry
+            .compute_alias(&AliasInfo {
+                runtime: target_runtime,
+                native_address,
+            })
+            .map_err(|e| {
+                CustomPrecompileError::Revert(
+                    format!("Failed to compute alias for source address: {e:?}"),
+                    remaining,
+                )
+            })
+    }
+
+    fn tezosx_call_http(
+        &mut self,
+        http_request: http::Request<Vec<u8>>,
+    ) -> http::Response<Vec<u8>> {
+        let revm_depth = self.depth().try_into().unwrap_or(u32::MAX);
+        let saved = self.journal.evm.revm_call_depth();
+        self.journal.evm.set_revm_call_depth(Some(revm_depth));
+        let response =
+            self.database
+                .registry
+                .serve(self.database.rk, self.journal, http_request);
+        self.journal.evm.set_revm_call_depth(saved);
+        response
+    }
+
+    fn crac_id(&self) -> String {
+        self.journal.crac_id().to_string()
+    }
+
+    fn crac_chain_depth(&self) -> u32 {
+        self.journal.evm.crac_chain_depth()
+    }
+
+    fn crac_origin_runtime(&self) -> RuntimeId {
+        // `CracId.origin_runtime` is always written from `RuntimeId::into`,
+        // so the inverse conversion is total. The `expect` surfaces a clear
+        // panic if that invariant is ever broken upstream.
+        RuntimeId::try_from(self.journal.crac_id().origin_runtime)
+            .expect("CracId.origin_runtime must encode a valid RuntimeId")
+    }
+
+    fn set_original_source(&mut self, source: OriginalSource) {
+        self.journal.set_original_source(source);
+    }
+
+    fn original_source(&self) -> Option<&OriginalSource> {
+        self.journal.original_source()
+    }
+
+    fn cross_runtime_originator(&self) -> Option<Address> {
+        self.journal.evm.cross_runtime_originator()
+    }
+}
+
+pub fn commit_evm_journal_from_external<Host, KS>(
+    rk: &mut RuntimeKeyspaces<'_, Host, KS>,
+    registry: &impl Registry<Journal = tezosx_journal::TezosXJournal>,
+    block_constants: &BlockConstants,
+    journal: &mut TezosXJournal,
+    sequencer_credit: Option<(Address, U256)>,
+) -> Result<Vec<Withdrawal>, EvmRunError>
+where
+    Host: StorageV1,
+    KS: KeySpace,
+{
+    // Cross-runtime callers are classified through their staged alias,
+    // never as Native: no caller to classify here.
+    let db = EtherlinkVMDB::new(rk, registry, block_constants, None)?;
+    let mut journal = Journal::new_with_inner(db, journal);
+    // Credit the sequencer through the journal so the payment joins the state this commit writes.
+    if let Some((address, amount)) = sequencer_credit {
+        journal.balance_incr(address, amount)?;
+    }
+    let state = journal.finalize();
+    DatabaseCommit::commit(journal.db_mut(), state);
+    Ok(journal.db_mut().take_withdrawals())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use tezos_evm_runtime::runtime::MockKernelHost;
+    use tezos_evm_runtime::runtime_keyspaces::MockRuntimeKeyspaces;
+    use tezos_smart_rollup_keyspace::KeySpace;
+    use tezosx_interfaces::{AliasInfo, Origin};
+
+    fn alias_origin(runtime: RuntimeId, native: &str) -> Origin {
+        Origin::Alias(AliasInfo {
+            runtime,
+            native_address: native.to_string(),
+        })
+    }
+
+    // Write `origin` into the account record and read it back the way
+    // the routing code does.
+    fn write_origin(eth_accounts: &mut impl KeySpace, source: &Address, origin: Origin) {
+        StorageAccount::from_address(source)
+            .unwrap()
+            .set_info_without_code(
+                eth_accounts,
+                crate::storage::world_state_handler::AccountInfo {
+                    origin: origin.into(),
+                    ..Default::default()
+                },
+            )
+            .unwrap();
+    }
+
+    fn read_origin(eth_accounts: &impl KeySpace, source: &Address) -> Option<Origin> {
+        StorageAccount::from_address(source)
+            .unwrap()
+            .info_without_migration(eth_accounts)
+            .unwrap()
+            .map(|info| info.origin)
+            .unwrap_or_default()
+            .into()
+    }
+
+    #[test]
+    fn routing_returns_round_trip_for_matching_alias() {
+        let mut host = MockKernelHost::default();
+        let mut rk = MockRuntimeKeyspaces::init(&mut host).unwrap();
+        let eth_accounts = rk.eth_accounts_mut();
+        let source = Address::from_slice(&[0xaa; 20]);
+        write_origin(
+            eth_accounts,
+            &source,
+            alias_origin(RuntimeId::Tezos, "tz1abcdef"),
+        );
+
+        let origin = read_origin(eth_accounts, &source);
+        match resolve_routing(origin, RuntimeId::Tezos) {
+            RoutingDecision::RoundTrip(target) => assert_eq!(target, "tz1abcdef"),
+            other => panic!(
+                "expected RoundTrip, got {:?}",
+                std::mem::discriminant(&other)
+            ),
+        }
+    }
+
+    #[test]
+    fn routing_returns_native_for_native_origin() {
+        let mut host = MockKernelHost::default();
+        let mut rk = MockRuntimeKeyspaces::init(&mut host).unwrap();
+        let eth_accounts = rk.eth_accounts_mut();
+        let source = Address::from_slice(&[0xcc; 20]);
+        write_origin(eth_accounts, &source, Origin::Native);
+
+        let origin = read_origin(rk.eth_accounts(), &source);
+        assert!(matches!(
+            resolve_routing(origin, RuntimeId::Tezos),
+            RoutingDecision::Native,
+        ));
+    }
+
+    #[test]
+    fn routing_returns_native_for_unrecorded_source() {
+        let mut host = MockKernelHost::default();
+        let rk = MockRuntimeKeyspaces::init(&mut host).unwrap();
+        let source = Address::from_slice(&[0xdd; 20]);
+
+        let origin = read_origin(rk.eth_accounts(), &source);
+        assert!(matches!(
+            resolve_routing(origin, RuntimeId::Tezos),
+            RoutingDecision::Native,
+        ));
+    }
+
+    #[test]
+    fn routing_returns_transitive_for_mismatched_runtime() {
+        // The recorded info is the basis for derivation toward a third target.
+        // Unreachable in two runtime mode.
+        let mut host = MockKernelHost::default();
+        let mut rk = MockRuntimeKeyspaces::init(&mut host).unwrap();
+        let eth_accounts = rk.eth_accounts_mut();
+        let source = Address::from_slice(&[0xbb; 20]);
+        write_origin(
+            eth_accounts,
+            &source,
+            alias_origin(RuntimeId::Tezos, "tz1abcdef"),
+        );
+
+        let origin = read_origin(eth_accounts, &source);
+        match resolve_routing(origin, RuntimeId::Ethereum) {
+            RoutingDecision::Transitive(info) => {
+                assert_eq!(info.runtime, RuntimeId::Tezos);
+                assert_eq!(info.native_address, "tz1abcdef");
+            }
+            other => panic!(
+                "expected Transitive, got {:?}",
+                std::mem::discriminant(&other)
+            ),
+        }
+    }
+}

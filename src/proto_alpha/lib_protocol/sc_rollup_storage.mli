@@ -24,7 +24,7 @@
 (*                                                                           *)
 (*****************************************************************************)
 
-(** [originate context ~kind ~parameters_ty ~genesis_commitment] produces an
+(** [originate ?whitelist context ~kind ~parameters_ty ~genesis_commitment] produces an
    address [a] for a smart contract rollup using the origination nonce found in
    [context]. This function also initializes the storage with a new
    entry indexed by [a] to remember the [kind] of the rollup at
@@ -32,6 +32,7 @@
 
    Also returns the number of allocated bytes.  *)
 val originate :
+  ?whitelist:Sc_rollup_whitelist_repr.t ->
   Raw_context.t ->
   kind:Sc_rollups.Kind.t ->
   parameters_ty:Script_repr.lazy_expr ->
@@ -42,6 +43,22 @@ val originate :
   * Raw_context.t)
   tzresult
   Lwt.t
+
+(** [raw_originate ?whitelist context ~kind ~parameters_ty ~genesis_commitment ~address] is
+    exactly {!originate} but provides the rollup's address ([address]) instead
+    of randomly generating it.
+
+    This should not be used by [apply.ml], this is needed for bootstrap
+    smart rollups only.
+*)
+val raw_originate :
+  ?whitelist:Sc_rollup_whitelist_repr.t ->
+  Raw_context.t ->
+  kind:Sc_rollups.Kind.t ->
+  parameters_ty:Script_repr.lazy_expr ->
+  genesis_commitment:Sc_rollup_commitment_repr.t ->
+  address:Sc_rollup_repr.Address.t ->
+  (Z.t * Sc_rollup_commitment_repr.Hash.t * Raw_context.t) tzresult Lwt.t
 
 (** [kind context address] returns the kind of the given rollup [address] iff
     [address] is an existing rollup. Fails with an [Sc_rollup_does_not_exist]
@@ -83,3 +100,29 @@ val parameters_type :
     returned. *)
 val must_exist :
   Raw_context.t -> Sc_rollup_repr.t -> Raw_context.t tzresult Lwt.t
+
+(** [enable_signal ctxt signal] toggles the activation switch
+    for [signal]. Does nothing if [signal] has already been activated. *)
+val enable_signal : Raw_context.t -> string -> Raw_context.t tzresult Lwt.t
+
+val signals : Raw_context.t -> (string * Raw_level_repr.t) list tzresult Lwt.t
+
+(** [is_signal_enable ctxt signal] returns true iff [signal] has already been
+    sent by the canonical rollup. *)
+val is_signal_enable : Raw_context.t -> string -> bool tzresult Lwt.t
+
+(** [save_commitment_period ctxt previous_commitment_period next_protocol_activation]
+    records that before level [next_protocol_activation], the commitment period
+    to use is [previous_commitment_period]. *)
+val save_commitment_period :
+  Raw_context.t -> int -> Raw_level_repr.t -> Raw_context.t tzresult Lwt.t
+
+(** [next_commitment_level ctxt inbox_level] returns the level that the next
+    commitment should target, taking into account the commitment periods of
+    past protocols as well as the current one.
+
+    {b Precondition:} For [next_commitment_level] result to actually be a
+    valid level for a commitment requires that [inbox_level] is a valid level
+    for a commitment as well. *)
+val next_commitment_level :
+  Raw_context.t -> Raw_level_repr.t -> Raw_level_repr.t tzresult Lwt.t

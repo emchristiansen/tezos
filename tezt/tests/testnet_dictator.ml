@@ -31,8 +31,10 @@
                  the dictator is able to force a protocol migration.
 *)
 
+let team = Tag.layer1
+
 let bake node client =
-  let level = Node.get_level node in
+  let* level = Node.get_level node in
   let* () =
     Client.bake_for
       ~keys:
@@ -116,7 +118,7 @@ let reveal_dictator_key node client dictator =
     Operation.inject_transfer
       ~source:Constant.bootstrap1
       ~dest:dictator
-      ~gas_limit:1500
+      ~gas_limit:3500
       ~fee:0
       ~amount:1
       ~async:true
@@ -142,6 +144,7 @@ let register_test chain_id period =
          (Voting.period_kind_to_string period))
     ~tags:
       [
+        team;
         "amendment";
         string_of_chain_id chain_id;
         Voting.period_kind_to_string period;

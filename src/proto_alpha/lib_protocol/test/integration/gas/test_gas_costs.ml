@@ -26,9 +26,8 @@
 (** Testing
     -------
     Component:  Protocol (gas costs)
-    Invocation: dune exec \
-                src/proto_alpha/lib_protocol/test/integration/gas/main.exe \
-                -- test "^gas cost functions$"
+    Invocation: dune exec src/proto_alpha/lib_protocol/test/integration/gas/main.exe \
+                  -- --file test_gas_costs.ml
     Subject:    Gas costs
                 Current limitations: for maps, sets & compare, we only test
                 integer comparable keys.
@@ -193,7 +192,8 @@ let all_parsing_costs =
     ("contract_optimized", contract_optimized);
     ("contract_readable", contract_readable);
     ("check_printable", check_printable "dummy");
-    ("merge_cycle", merge_cycle);
+    ("ty_eq", ty_eq dummy_ty dummy_ty);
+    ("ty_eq_prim", ty_eq_prim);
     ("parse_type_cycle", parse_type_cycle);
     ("parse_instr_cycle", parse_instr_cycle);
     ("parse_data_cycle", parse_data_cycle);
@@ -247,13 +247,14 @@ let cast_cost_to_s (c : Alpha_context.Gas.cost) : _ S.t =
 
 (** Checks that all costs are positive values. *)
 let test_cost_reprs_are_all_positive list () =
+  let open Lwt_result_syntax in
   List.iter_es
     (fun (cost_name, cost) ->
       if S.(cost > S.zero) then return_unit
       else if S.equal cost S.zero && List.mem ~equal:String.equal cost_name free
       then return_unit
       else
-        fail
+        tzfail
           (Exn
              (Failure (Format.asprintf "Gas cost test \"%s\" failed" cost_name))))
     list
@@ -284,3 +285,7 @@ let tests =
       `Quick
       (test_cost_reprs_are_all_positive all_io_costs);
   ]
+
+let () =
+  Alcotest_lwt.run ~__FILE__ Protocol.name [("gas cost functions", tests)]
+  |> Lwt_main.run

@@ -95,9 +95,7 @@ let commands () =
             ()
         in
         let* signature = sign_message cctxt ~src_sk ~block ~message in
-        let*! () =
-          cctxt#message "Signature: %a" Tezos_crypto.Signature.pp signature
-        in
+        let*! () = cctxt#message "Signature: %a" Signature.pp signature in
         return_unit);
     command
       ~group
@@ -124,7 +122,8 @@ let commands () =
            message
            (_, (key_locator, _))
            signature
-           (cctxt : #Protocol_client_context.full) ->
+           (cctxt : #Protocol_client_context.full)
+         ->
         let open Lwt_result_syntax in
         let* block =
           Shell_services.Blocks.hash
@@ -157,7 +156,8 @@ let commands () =
       (fun ()
            unsigned_block_header
            delegate
-           (cctxt : #Protocol_client_context.full) ->
+           (cctxt : #Protocol_client_context.full)
+         ->
         let open Lwt_result_syntax in
         let unsigned_header =
           Data_encoding.Binary.to_bytes_exn
@@ -177,8 +177,6 @@ let commands () =
             sk
             unsigned_header
         in
-        let*! () =
-          cctxt#message "%a" Hex.pp (Tezos_crypto.Signature.to_hex s)
-        in
+        let*! () = cctxt#message "%a" Hex.pp (Signature.to_hex s) in
         return_unit);
   ]
